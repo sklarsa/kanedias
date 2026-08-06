@@ -4,6 +4,7 @@ go 1.26.5
 
 require (
 	github.com/elazarl/goproxy v1.8.6
+	github.com/pelletier/go-toml/v2 v2.4.3
 	github.com/prometheus/client_golang v1.24.1
 )
 
