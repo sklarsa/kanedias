@@ -19,6 +19,14 @@ type ExecRequest struct {
 	Stdin       io.Reader
 }
 
+func (c *Client) GetImageAlias(ctx context.Context, name string) (*api.ImageAliasesEntry, error) {
+	alias, _, err := c.server.WithContext(ctx).GetImageAlias(name)
+	if err != nil {
+		return nil, fmt.Errorf("get Incus image alias %q: %w", name, err)
+	}
+	return alias, nil
+}
+
 func (c *Client) GetInstance(ctx context.Context, name string) (*api.Instance, string, error) {
 	server := c.server.WithContext(ctx)
 	instance, etag, err := server.GetInstance(name)
@@ -26,6 +34,14 @@ func (c *Client) GetInstance(ctx context.Context, name string) (*api.Instance, s
 		return nil, "", fmt.Errorf("get Incus instance %q: %w", name, err)
 	}
 	return instance, etag, nil
+}
+
+func (c *Client) GetInstanceState(ctx context.Context, name string) (*api.InstanceState, error) {
+	state, _, err := c.server.WithContext(ctx).GetInstanceState(name)
+	if err != nil {
+		return nil, fmt.Errorf("get state for Incus instance %q: %w", name, err)
+	}
+	return state, nil
 }
 
 func (c *Client) CreateInstance(ctx context.Context, request api.InstancesPost) error {
