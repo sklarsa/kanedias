@@ -22,6 +22,15 @@ const cleanupTimeout = 30 * time.Second
 //go:embed install.sh
 var installer []byte
 
+//go:embed kanedias-pi.socket
+var piRPCSocket []byte
+
+//go:embed kanedias-pi@.service
+var piRPCService []byte
+
+//go:embed kanedias-pi-rpc
+var piRPCLauncher []byte
+
 type imageClient interface {
 	EnsureProfile(context.Context, string, []byte) error
 	CreateInstance(context.Context, api.InstancesPost) error
@@ -151,6 +160,9 @@ func createWithClient(ctx context.Context, client imageClient, cfg config.Config
 		{path: "/root/assets/pi-settings.json", content: inputs.piSettings, mode: 0o644},
 		{path: "/root/assets/cobalt-ember.json", content: inputs.piTheme, mode: 0o644},
 		{path: "/root/assets/tmux.conf", content: inputs.tmuxConfig, mode: 0o644},
+		{path: "/root/assets/kanedias-pi.socket", content: piRPCSocket, mode: 0o644},
+		{path: "/root/assets/kanedias-pi@.service", content: piRPCService, mode: 0o644},
+		{path: "/root/assets/kanedias-pi-rpc", content: piRPCLauncher, mode: 0o700},
 	}
 	for _, file := range files {
 		if err := client.PushFile(ctx, instanceName, file.path, file.content, file.mode); err != nil {

@@ -21,10 +21,14 @@ authorized_hosts_file="$assets_dir/authorized_hosts"
 pi_settings_file="$assets_dir/pi-settings.json"
 pi_theme_file="$assets_dir/cobalt-ember.json"
 tmux_config_file="$assets_dir/tmux.conf"
+pi_rpc_socket_file="$assets_dir/kanedias-pi.socket"
+pi_rpc_service_file="$assets_dir/kanedias-pi@.service"
+pi_rpc_launcher_file="$assets_dir/kanedias-pi-rpc"
 
 for required_file in \
     "$authorized_hosts_file" "$pi_settings_file" "$pi_theme_file" \
-    "$tmux_config_file"; do
+    "$tmux_config_file" "$pi_rpc_socket_file" "$pi_rpc_service_file" \
+    "$pi_rpc_launcher_file"; do
     if [[ ! -f $required_file ]]; then
         echo "missing install input: $required_file" >&2
         exit 1
@@ -471,6 +475,17 @@ EOF
         "$pi_theme_file" "$managed_home/.pi/agent/themes/cobalt-ember.json"
 }
 
+install_pi_rpc_service() {
+    install -d -m 0755 /usr/local/libexec
+    install -m 0755 "$assets_dir/kanedias-pi-rpc" \
+        /usr/local/libexec/kanedias-pi-rpc
+    install -m 0644 "$assets_dir/kanedias-pi.socket" \
+        /etc/systemd/system/kanedias-pi.socket
+    install -m 0644 "$assets_dir/kanedias-pi@.service" \
+        /etc/systemd/system/kanedias-pi@.service
+    systemctl enable kanedias-pi.socket
+}
+
 install_cloud_apt_packages
 install_aws_cli
 install_session_manager_plugin
@@ -482,3 +497,4 @@ install_uv
 install_tfenv
 install_nvm
 install_pi
+install_pi_rpc_service

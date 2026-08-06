@@ -1,0 +1,7 @@
+#!/usr/bin/env bash
+set -Eeuo pipefail
+
+export NVM_DIR=/home/kanedias/.nvm
+# shellcheck source=/dev/null
+source "$NVM_DIR/nvm.sh"
+exec pi --mode rpc --no-session

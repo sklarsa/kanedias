@@ -1,0 +1,11 @@
+[Unit]
+Description=Kanedias Pi RPC socket
+
+[Socket]
+ListenStream=0.0.0.0:7777
+Accept=yes
+MaxConnections=1
+NoDelay=yes
+
+[Install]
+WantedBy=sockets.target

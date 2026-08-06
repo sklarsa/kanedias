@@ -19,7 +19,7 @@ import (
 
 func TestCreateRunsImageWorkflowInOrder(t *testing.T) {
 	cfg := imageConfig(t, []string{"github.com", "gitlab.com"})
-	client := &recordingClient{files: make(map[string][]byte)}
+	client := &recordingClient{files: make(map[string]uploadedFile)}
 
 	var stdout bytes.Buffer
 	var stderr bytes.Buffer
@@ -39,6 +39,9 @@ func TestCreateRunsImageWorkflowInOrder(t *testing.T) {
 		"push /root/assets/pi-settings.json",
 		"push /root/assets/cobalt-ember.json",
 		"push /root/assets/tmux.conf",
+		"push /root/assets/kanedias-pi.socket",
+		"push /root/assets/kanedias-pi@.service",
+		"push /root/assets/kanedias-pi-rpc",
 		"exec bash /root/install.sh",
 		"stop",
 		"publish",
@@ -64,8 +67,41 @@ func TestCreateRunsImageWorkflowInOrder(t *testing.T) {
 	if request.Source.Type != "image" || request.Source.Server != cfg.BaseImage.Source || request.Source.Protocol != "simplestreams" || request.Source.Alias != cfg.BaseImage.Image {
 		t.Errorf("instance source = %#v", request.Source)
 	}
-	if got := string(client.files["/root/assets/authorized_hosts"]); got != "github.com\ngitlab.com" {
+	if got := string(client.files["/root/assets/authorized_hosts"].content); got != "github.com\ngitlab.com" {
 		t.Errorf("authorized_hosts = %q, want newline-joined hosts", got)
+	}
+	socket := string(client.files["/root/assets/kanedias-pi.socket"].content)
+	if !strings.Contains(socket, "ListenStream=0.0.0.0:7777") ||
+		!strings.Contains(socket, "Accept=yes") ||
+		!strings.Contains(socket, "MaxConnections=1") {
+		t.Fatalf("socket unit = %q", socket)
+	}
+	service := string(client.files["/root/assets/kanedias-pi@.service"].content)
+	for _, want := range []string{
+		"User=kanedias",
+		"WorkingDirectory=/workspace",
+		"StandardInput=socket",
+		"StandardOutput=inherit",
+		"StandardError=journal",
+	} {
+		if !strings.Contains(service, want) {
+			t.Errorf("service unit missing %q", want)
+		}
+	}
+	launcher := client.files["/root/assets/kanedias-pi-rpc"]
+	if !strings.Contains(string(launcher.content), "exec pi --mode rpc --no-session") {
+		t.Fatalf("launcher = %q", launcher.content)
+	}
+	if launcher.mode != 0o700 {
+		t.Errorf("launcher mode = %#o, want 0700", launcher.mode)
+	}
+	for _, path := range []string{
+		"/root/assets/kanedias-pi.socket",
+		"/root/assets/kanedias-pi@.service",
+	} {
+		if client.files[path].mode != 0o644 {
+			t.Errorf("%s mode = %#o, want 0644", path, client.files[path].mode)
+		}
 	}
 	if got, want := client.publishAlias, cfg.BaseImage.Name; got != want {
 		t.Errorf("published alias = %q, want %q", got, want)
@@ -80,14 +116,14 @@ func TestCreateRunsImageWorkflowInOrder(t *testing.T) {
 
 func TestCreateUploadsEmptyAuthorizedHosts(t *testing.T) {
 	cfg := imageConfig(t, nil)
-	client := &recordingClient{files: make(map[string][]byte)}
+	client := &recordingClient{files: make(map[string]uploadedFile)}
 
 	if err := create(context.Background(), cfg, io.Discard, io.Discard, func(context.Context) (imageClient, error) {
 		return client, nil
 	}); err != nil {
 		t.Fatal(err)
 	}
-	if got := client.files["/root/assets/authorized_hosts"]; len(got) != 0 {
+	if got := client.files["/root/assets/authorized_hosts"].content; len(got) != 0 {
 		t.Errorf("authorized_hosts = %q, want empty file", got)
 	}
 }
@@ -98,7 +134,7 @@ func TestCreateUsesRequestDerivedNonCanceledBoundedContextForCleanup(t *testing.
 	ctx := context.WithValue(context.Background(), imageRequestContextKey{}, sentinel)
 	ctx, cancel := context.WithCancel(ctx)
 	client := &recordingClient{
-		files: make(map[string][]byte),
+		files: make(map[string]uploadedFile),
 		exec: func() error {
 			cancel()
 			return context.Canceled
@@ -135,7 +171,7 @@ func TestCreateJoinsPrimaryAndRunningInstanceCleanupErrors(t *testing.T) {
 	primaryErr := errors.New("installer failed")
 	stopErr := errors.New("cleanup stop failed")
 	client := &recordingClient{
-		files:   make(map[string][]byte),
+		files:   make(map[string]uploadedFile),
 		exec:    func() error { return primaryErr },
 		stopErr: stopErr,
 	}
@@ -226,9 +262,14 @@ type cleanupContextObservation struct {
 
 var errDeleteRunningInstance = errors.New("cannot delete running instance")
 
+type uploadedFile struct {
+	content []byte
+	mode    int
+}
+
 type recordingClient struct {
 	calls              []string
-	files              map[string][]byte
+	files              map[string]uploadedFile
 	profileDefinition  []byte
 	createRequest      api.InstancesPost
 	publishAlias       string
@@ -252,9 +293,9 @@ func (c *recordingClient) CreateInstance(_ context.Context, request api.Instance
 	return nil
 }
 
-func (c *recordingClient) PushFile(_ context.Context, _ string, path string, content []byte, _ int) error {
+func (c *recordingClient) PushFile(_ context.Context, _ string, path string, content []byte, mode int) error {
 	c.calls = append(c.calls, "push "+path)
-	c.files[path] = append([]byte(nil), content...)
+	c.files[path] = uploadedFile{content: append([]byte(nil), content...), mode: mode}
 	return nil
 }
 

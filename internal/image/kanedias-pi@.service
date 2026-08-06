@@ -1,0 +1,13 @@
+[Unit]
+Description=Kanedias Pi RPC session
+After=network-online.target
+
+[Service]
+User=kanedias
+Group=kanedias
+Environment=HOME=/home/kanedias
+WorkingDirectory=/workspace
+ExecStart=/usr/local/libexec/kanedias-pi-rpc
+StandardInput=socket
+StandardOutput=inherit
+StandardError=journal
