@@ -44,6 +44,17 @@ func TestInstallerIncludesUninitializedContainerOnlyIncus(t *testing.T) {
 	if strings.Contains(script, "incus admin init") {
 		t.Error("installer initializes Incus")
 	}
+
+	allowedIncusLines := map[string]bool{
+		`incus-base \`: true,
+		`usermod --append --groups sudo,incus-admin "$managed_user"`: true,
+	}
+	for _, line := range strings.Split(script, "\n") {
+		line = strings.TrimSpace(line)
+		if strings.Contains(line, "incus") && !allowedIncusLines[line] {
+			t.Errorf("installer contains unexpected Incus operation %q", line)
+		}
+	}
 }
 
 func TestCreateRunsImageWorkflowInOrder(t *testing.T) {
