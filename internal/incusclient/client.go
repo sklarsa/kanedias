@@ -9,9 +9,65 @@ import (
 	"github.com/lxc/incus/v7/shared/api"
 )
 
+const ProjectName = "kanedias"
+
+var requiredProjectFeatures = map[string]string{
+	"features.images":          "true",
+	"features.profiles":        "true",
+	"features.networks":        "true",
+	"features.storage.volumes": "true",
+}
+
+type projectManager interface {
+	GetProject(string) (*api.Project, string, error)
+	CreateProject(api.ProjectsPost) error
+}
+
 type contextServer interface {
 	incus.InstanceServer
 	WithContext(context.Context) incus.InstanceServer
+}
+
+func ensureProject(server projectManager) error {
+	project, _, err := server.GetProject(ProjectName)
+	if err != nil {
+		if !IsNotFound(err) {
+			return fmt.Errorf("get Incus project %q: %w", ProjectName, err)
+		}
+
+		config := make(map[string]string, len(requiredProjectFeatures))
+		for key, value := range requiredProjectFeatures {
+			config[key] = value
+		}
+		if err := server.CreateProject(api.ProjectsPost{
+			Name: ProjectName,
+			ProjectPut: api.ProjectPut{
+				Description: "Kanedias managed resources",
+				Config:      config,
+			},
+		}); err != nil {
+			return fmt.Errorf("create Incus project %q: %w", ProjectName, err)
+		}
+		return nil
+	}
+
+	if project == nil {
+		return fmt.Errorf("get Incus project %q: returned no project", ProjectName)
+	}
+	for key, required := range requiredProjectFeatures {
+		if project.Config[key] != required {
+			return fmt.Errorf("Incus project %q has incompatible feature %q", ProjectName, key)
+		}
+	}
+	return nil
+}
+
+func scopeProject(server contextServer) (contextServer, error) {
+	scoped, ok := server.UseProject(ProjectName).(contextServer)
+	if !ok {
+		return nil, fmt.Errorf("select Incus project %q: client does not support request contexts", ProjectName)
+	}
+	return scoped, nil
 }
 
 // Client is a thin, context-aware adapter over the Incus client.
@@ -30,7 +86,16 @@ func Connect(ctx context.Context) (*Client, error) {
 		server.Disconnect()
 		return nil, fmt.Errorf("connect to Incus: client does not support request contexts")
 	}
-	return &Client{server: contextual}, nil
+	if err := ensureProject(contextual.WithContext(ctx)); err != nil {
+		server.Disconnect()
+		return nil, fmt.Errorf("connect to Incus: %w", err)
+	}
+	scoped, err := scopeProject(contextual)
+	if err != nil {
+		server.Disconnect()
+		return nil, fmt.Errorf("connect to Incus: %w", err)
+	}
+	return &Client{server: scoped}, nil
 }
 
 func (c *Client) Disconnect() {
