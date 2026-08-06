@@ -6,6 +6,7 @@ import (
 	"errors"
 	"fmt"
 	"io"
+	"strings"
 	"time"
 
 	"github.com/lxc/incus/v7/shared/api"
@@ -22,6 +23,7 @@ const (
 	managedUser     = "kanedias"
 	managedHome     = "/home/kanedias"
 	cleanupTimeout  = 30 * time.Second
+	systemdTimeout  = 60 * time.Second
 	dnsTimeout      = 60 * time.Second
 )
 
@@ -43,10 +45,12 @@ type client interface {
 }
 
 type dependencies struct {
-	connect       func(context.Context) (client, error)
-	initCA        func() error
-	ensureNetwork func(context.Context, client, config.Config) error
-	renderProfile func(io.Writer, string, config.Config) error
+	connect               func(context.Context) (client, error)
+	initCA                func() error
+	ensureNetwork         func(context.Context, client, config.Config) error
+	renderProfile         func(io.Writer, string, config.Config) error
+	readinessTimeout      time.Duration
+	readinessPollInterval time.Duration
 }
 
 func defaultDependencies() dependencies {
@@ -64,7 +68,9 @@ func defaultDependencies() dependencies {
 		ensureNetwork: func(ctx context.Context, client client, cfg config.Config) error {
 			return network.EnsureWithClient(ctx, client, cfg)
 		},
-		renderProfile: profiles.Render,
+		renderProfile:         profiles.Render,
+		readinessTimeout:      systemdTimeout,
+		readinessPollInterval: time.Second,
 	}
 }
 
@@ -150,10 +156,13 @@ func syncWithDependencies(ctx context.Context, cfg config.Config, stdout, stderr
 	if err := incus.StartInstance(ctx, name); err != nil {
 		return err
 	}
-	if err := waitForDNS(ctx, incus, name); err != nil {
+	if err := waitForSystemd(ctx, incus, name, deps.readinessTimeout, deps.readinessPollInterval); err != nil {
 		return err
 	}
 	if err := exec(ctx, incus, name, stdout, stderr, []string{"update-ca-certificates"}); err != nil {
+		return err
+	}
+	if err := waitForDNS(ctx, incus, name); err != nil {
 		return err
 	}
 	if err := prepareRepositoryRoot(ctx, incus, name, stdout, stderr); err != nil {
@@ -174,6 +183,41 @@ func ensureSeedVolume(ctx context.Context, incus client, pool, volume string) er
 		return incus.CreateStorageVolume(ctx, pool, volume)
 	default:
 		return err
+	}
+}
+
+func waitForSystemd(ctx context.Context, incus client, name string, timeout, pollInterval time.Duration) error {
+	readyCtx, cancel := context.WithTimeout(ctx, timeout)
+	defer cancel()
+
+	var lastState string
+	var lastStderr string
+	var lastErr error
+	for {
+		stdout, stderr, err := incus.Exec(readyCtx, name, incusclient.ExecRequest{
+			Command: []string{"systemctl", "is-system-running", "--wait"},
+		})
+		state := strings.TrimSpace(stdout)
+		if state == "running" || state == "degraded" {
+			return nil
+		}
+		lastState = state
+		lastStderr = strings.TrimSpace(stderr)
+		lastErr = err
+
+		if readyCtx.Err() != nil {
+			return fmt.Errorf("wait for systemd in workspace instance %q: %w (last state %q, stderr %q, exec error %v)", name, readyCtx.Err(), lastState, lastStderr, lastErr)
+		}
+
+		timer := time.NewTimer(pollInterval)
+		select {
+		case <-readyCtx.Done():
+			if !timer.Stop() {
+				<-timer.C
+			}
+			return fmt.Errorf("wait for systemd in workspace instance %q: %w (last state %q, stderr %q, exec error %v)", name, readyCtx.Err(), lastState, lastStderr, lastErr)
+		case <-timer.C:
+		}
 	}
 }
 

@@ -23,13 +23,21 @@ type cleanupObservation struct {
 	remaining time.Duration
 }
 
+type workspaceExecResponse struct {
+	stdout string
+	stderr string
+	err    error
+}
+
 type fakeClient struct {
-	calls         []string
-	storageFound  bool
-	cancel        context.CancelFunc
-	requestCtx    context.Context
-	dnsCtxBounded bool
-	cleanupCtxs   []cleanupObservation
+	calls               []string
+	storageFound        bool
+	cancel              context.CancelFunc
+	requestCtx          context.Context
+	dnsCtxBounded       bool
+	readinessCtxBounded bool
+	systemdResponses    []workspaceExecResponse
+	cleanupCtxs         []cleanupObservation
 }
 
 func (f *fakeClient) observeCleanup(ctx context.Context) {
@@ -119,10 +127,23 @@ func (f *fakeClient) Exec(ctx context.Context, name string, request incusclient.
 	command := strings.Join(request.Command, " ")
 	f.record("exec " + command)
 	isDNS := reflect.DeepEqual(request.Command, []string{"getent", "ahosts", "github.com"})
-	if isDNS {
+	isSystemd := reflect.DeepEqual(request.Command, []string{"systemctl", "is-system-running", "--wait"})
+	switch {
+	case isDNS:
 		deadline, ok := ctx.Deadline()
 		f.dnsCtxBounded = ok && time.Until(deadline) > 0 && time.Until(deadline) <= dnsTimeout
-	} else if f.requestCtx != nil && ctx != f.requestCtx {
+	case isSystemd:
+		deadline, ok := ctx.Deadline()
+		f.readinessCtxBounded = ok && time.Until(deadline) > 0 && time.Until(deadline) <= systemdTimeout
+		if len(f.systemdResponses) > 0 {
+			response := f.systemdResponses[0]
+			if len(f.systemdResponses) > 1 {
+				f.systemdResponses = f.systemdResponses[1:]
+			}
+			return response.stdout, response.stderr, response.err
+		}
+		return "running\n", "", nil
+	case f.requestCtx != nil && ctx != f.requestCtx:
 		return "", "", errors.New("exec did not receive request context")
 	}
 	if isDNS && f.cancel != nil {
@@ -168,7 +189,9 @@ func testDependencies(fake *fakeClient) dependencies {
 			fake.record("ensure-network")
 			return nil
 		},
-		renderProfile: func(io.Writer, string, config.Config) error { return nil },
+		renderProfile:         func(io.Writer, string, config.Config) error { return nil },
+		readinessTimeout:      systemdTimeout,
+		readinessPollInterval: time.Nanosecond,
 	}
 }
 
@@ -257,16 +280,24 @@ func TestSyncEmptyRepositoriesEnsuresSeedAndWarns(t *testing.T) {
 	}
 }
 
-func TestSyncSequenceAndDestructiveRefresh(t *testing.T) {
+func TestSyncRetriesSystemdBeforeCAAndDNSAndDestructiveRefresh(t *testing.T) {
 	ctx := context.WithValue(context.Background(), struct{}{}, "request")
-	fake := &fakeClient{requestCtx: ctx}
+	fake := &fakeClient{
+		requestCtx: ctx,
+		systemdResponses: []workspaceExecResponse{
+			{stderr: "Failed to connect to system scope bus via local transport: No such file or directory", err: errors.New("exit status 1")},
+			{stdout: "running\n"},
+		},
+	}
 	if err := syncWithDependencies(ctx, testConfig("one/existing", "two/new"), io.Discard, io.Discard, testDependencies(fake)); err != nil {
 		t.Fatal(err)
 	}
 
 	ordered := []string{
 		"resolve-pool", "get-seed", "create-seed", "init-ca", "ensure-network", "ensure-profile sandbox",
-		"create-instance base pool seed", "start", "exec getent ahosts github.com", "exec update-ca-certificates",
+		"create-instance base pool seed", "start",
+		"exec systemctl is-system-running --wait", "exec systemctl is-system-running --wait",
+		"exec update-ca-certificates", "exec getent ahosts github.com",
 		"exec install -d -o kanedias -g kanedias /workspace/repos",
 		"exec runuser -u kanedias -- env HOME=/home/kanedias USER=kanedias LOGNAME=kanedias gh auth setup-git --hostname github.com --force",
 		"exec runuser -u kanedias -- env HOME=/home/kanedias USER=kanedias LOGNAME=kanedias git config --global --replace-all url.https://github.com/.insteadOf git@github.com:",
@@ -275,6 +306,9 @@ func TestSyncSequenceAndDestructiveRefresh(t *testing.T) {
 		"stop", "get-instance", "update-instance", "delete-instance", "disconnect",
 	}
 	assertOrdered(t, fake.calls, ordered)
+	if !fake.readinessCtxBounded {
+		t.Fatal("systemd exec did not receive a bounded request-derived context")
+	}
 	if !fake.dnsCtxBounded {
 		t.Fatal("DNS exec did not receive a bounded request-derived context")
 	}
@@ -295,6 +329,47 @@ func TestSyncSequenceAndDestructiveRefresh(t *testing.T) {
 			t.Errorf("missing destructive refresh command %q\ncalls:\n%s", want, commands)
 		}
 	}
+}
+
+func TestSyncReadinessTimeoutPreventsCAUpdateAndDNS(t *testing.T) {
+	fake := &fakeClient{
+		storageFound: true,
+		systemdResponses: []workspaceExecResponse{{
+			stderr: "system bus unavailable",
+			err:    errors.New("exit status 1"),
+		}},
+	}
+	deps := testDependencies(fake)
+	deps.readinessTimeout = 10 * time.Millisecond
+	deps.readinessPollInterval = time.Millisecond
+
+	err := syncWithDependencies(context.Background(), testConfig("one/repo"), io.Discard, io.Discard, deps)
+	if !errors.Is(err, context.DeadlineExceeded) {
+		t.Fatalf("Sync error = %v, want systemd readiness deadline", err)
+	}
+	if countWorkspaceCall(fake.calls, "exec systemctl is-system-running --wait") < 2 {
+		t.Fatalf("systemd calls did not retry by condition: %v", fake.calls)
+	}
+	for _, forbidden := range []string{"exec update-ca-certificates", "exec getent ahosts github.com", "exec install -d -o kanedias -g kanedias /workspace/repos"} {
+		if containsWorkspaceCall(fake.calls, forbidden) {
+			t.Fatalf("call %q occurred before systemd readiness: %v", forbidden, fake.calls)
+		}
+	}
+}
+
+func TestSyncAcceptsDegradedSystemdBeforeCAUpdate(t *testing.T) {
+	fake := &fakeClient{storageFound: true, systemdResponses: []workspaceExecResponse{{
+		stdout: "degraded\n",
+		err:    errors.New("systemd degraded exit status"),
+	}}}
+	if err := syncWithDependencies(context.Background(), testConfig("one/repo"), io.Discard, io.Discard, testDependencies(fake)); err != nil {
+		t.Fatal(err)
+	}
+	assertOrdered(t, fake.calls, []string{
+		"exec systemctl is-system-running --wait",
+		"exec update-ca-certificates",
+		"exec getent ahosts github.com",
+	})
 }
 
 func TestSyncCancellationUsesBoundedNonCancelledCleanupContext(t *testing.T) {
@@ -318,6 +393,25 @@ func TestSyncCancellationUsesBoundedNonCancelledCleanupContext(t *testing.T) {
 			t.Errorf("cleanup deadline remaining = %v, want (0, %v]", cleanupCtx.remaining, cleanupTimeout)
 		}
 	}
+}
+
+func countWorkspaceCall(calls []string, want string) int {
+	count := 0
+	for _, call := range calls {
+		if call == want {
+			count++
+		}
+	}
+	return count
+}
+
+func containsWorkspaceCall(calls []string, want string) bool {
+	for _, call := range calls {
+		if call == want {
+			return true
+		}
+	}
+	return false
 }
 
 func assertOrdered(t *testing.T, calls, want []string) {
