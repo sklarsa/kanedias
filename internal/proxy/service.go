@@ -61,6 +61,11 @@ func LoginOpenAICodex(ctx context.Context, authPath string, out io.Writer) error
 
 // Run starts the proxy and optional metrics servers and blocks until either server fails.
 func Run(options Options) error {
+	return RunContext(context.Background(), options)
+}
+
+// RunContext starts the proxy and optional metrics servers until either a server fails or ctx is canceled.
+func RunContext(ctx context.Context, options Options) error {
 	if strings.TrimSpace(options.ListenAddress) == "" {
 		return errors.New("proxy listen address must not be empty")
 	}
@@ -99,8 +104,9 @@ func Run(options Options) error {
 	}()
 	logger.Info("proxy listening", "address", options.ListenAddress, "ca_certificate", options.CACertPath, "request_logging", options.RequestLog)
 
+	var metricsServer *http.Server
 	if metricsHandler != nil {
-		metricsServer := &http.Server{
+		metricsServer = &http.Server{
 			Addr:              options.MetricsListenAddress,
 			Handler:           metricsHandler,
 			ReadHeaderTimeout: 10 * time.Second,
@@ -111,7 +117,17 @@ func Run(options Options) error {
 		logger.Info("Prometheus metrics listening", "address", options.MetricsListenAddress, "path", "/metrics")
 	}
 
-	err = <-serverErrors
-	logger.Error("proxy stopped", "error", err)
-	return err
+	select {
+	case err = <-serverErrors:
+		logger.Error("proxy stopped", "error", err)
+		return err
+	case <-ctx.Done():
+		shutdownCtx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+		defer cancel()
+		shutdownErr := proxyServer.Shutdown(shutdownCtx)
+		if metricsServer != nil {
+			shutdownErr = errors.Join(shutdownErr, metricsServer.Shutdown(shutdownCtx))
+		}
+		return errors.Join(ctx.Err(), shutdownErr)
+	}
 }

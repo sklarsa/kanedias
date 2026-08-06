@@ -39,7 +39,7 @@ func newProxyRunCommand(service services, configPath func() string, defaults pro
 			if err := service.ensureNetwork(cmd.Context(), cfg); err != nil {
 				return err
 			}
-			return service.runProxy(options)
+			return service.runProxy(cmd.Context(), options)
 		},
 	}
 	command.Flags().StringVar(&options.MetricsListenAddress, "metrics-listen", options.MetricsListenAddress, "address for the Prometheus metrics listener")

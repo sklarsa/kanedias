@@ -19,7 +19,7 @@ type services struct {
 	loadConfig       func(string) (config.Config, error)
 	ensureNetwork    func(context.Context, config.Config) error
 	renderProfile    func(io.Writer, string, config.Config) error
-	runProxy         func(proxy.Options) error
+	runProxy         func(context.Context, proxy.Options) error
 	initCA           func(string, string) error
 	loginOpenAICodex func(context.Context, string, io.Writer) error
 	createImage      func(context.Context, config.Config, io.Writer, io.Writer) error
@@ -48,7 +48,7 @@ func realServices() services {
 		loadConfig:       config.Load,
 		ensureNetwork:    network.Ensure,
 		renderProfile:    profiles.Render,
-		runProxy:         proxy.Run,
+		runProxy:         proxy.RunContext,
 		initCA:           proxy.InitCA,
 		loginOpenAICodex: proxy.LoginOpenAICodex,
 		createImage:      image.Create,

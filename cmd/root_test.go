@@ -393,8 +393,13 @@ func TestProxyRunOrchestration(t *testing.T) {
 		}
 		return nil
 	}
-	service.runProxy = func(options proxy.Options) error {
+	type proxyContextKey struct{}
+	ctx := context.WithValue(context.Background(), proxyContextKey{}, "proxy-context")
+	service.runProxy = func(gotContext context.Context, options proxy.Options) error {
 		calls = append(calls, "run")
+		if got := gotContext.Value(proxyContextKey{}); got != "proxy-context" {
+			t.Errorf("proxy context value = %v, want proxy-context", got)
+		}
 		gotOptions = options
 		return nil
 	}
@@ -403,7 +408,7 @@ func TestProxyRunOrchestration(t *testing.T) {
 	root.SetOut(io.Discard)
 	root.SetErr(io.Discard)
 	root.SetArgs([]string{"proxy", "run", "--request-log", "--metrics-listen", "127.0.0.1:9090"})
-	if err := root.Execute(); err != nil {
+	if err := root.ExecuteContext(ctx); err != nil {
 		t.Fatalf("execute proxy run: %v", err)
 	}
 
@@ -472,7 +477,7 @@ func stubServices() services {
 		},
 		ensureNetwork: func(context.Context, config.Config) error { return nil },
 		renderProfile: func(io.Writer, string, config.Config) error { return nil },
-		runProxy:      func(proxy.Options) error { return nil },
+		runProxy:      func(context.Context, proxy.Options) error { return nil },
 		initCA:        func(string, string) error { return nil },
 		loginOpenAICodex: func(context.Context, string, io.Writer) error {
 			return nil

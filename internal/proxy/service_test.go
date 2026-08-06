@@ -2,6 +2,7 @@ package proxy
 
 import (
 	"context"
+	"errors"
 	"io"
 	"os"
 	"path/filepath"
@@ -83,5 +84,20 @@ func TestRunRejectsEmptyListenAddress(t *testing.T) {
 	err := Run(Options{})
 	if err == nil {
 		t.Fatal("Run returned nil error for empty listen address")
+	}
+}
+
+func TestRunContextHonorsCanceledContext(t *testing.T) {
+	ctx, cancel := context.WithCancel(context.Background())
+	cancel()
+	dir := t.TempDir()
+
+	err := RunContext(ctx, Options{
+		ListenAddress: "127.0.0.1:0",
+		CACertPath:    filepath.Join(dir, "ca.crt"),
+		CAKeyPath:     filepath.Join(dir, "ca.key"),
+	})
+	if !errors.Is(err, context.Canceled) {
+		t.Fatalf("RunContext() error = %v, want context.Canceled", err)
 	}
 }
