@@ -33,7 +33,11 @@ func TestHandlerRoutes(t *testing.T) {
 			path:        "/",
 			status:      http.StatusOK,
 			contentType: "text/html; charset=utf-8",
-			contains:    []string{"<title>Kanedias</title>", "Refresh status", "Not refreshed yet."},
+			contains: []string{
+				"<title>Kanedias — Circle of the Fleet</title>",
+				"KANEDIAS // CIRCLE OF THE FLEET",
+				"STATIC DEMONSTRATION",
+			},
 		},
 		{
 			name:        "health",
@@ -135,65 +139,81 @@ func TestHandlerRejectsUnsupportedMethods(t *testing.T) {
 	}
 }
 
-func TestInitialPageContainsInertPanels(t *testing.T) {
+func TestInitialPageContainsCircleOfFleetMockup(t *testing.T) {
 	body := indexBody(t)
-	panels := []string{
-		`<section id="dashboard-panel" aria-labelledby="dashboard-heading">
-  <h2 id="dashboard-heading">Dashboard</h2>
-  <p>Dashboard view is not available in this scaffold.</p>
-</section>`,
-		`<section id="session-panel" aria-labelledby="session-heading">
-  <h2 id="session-heading">Sessions</h2>
-  <p>Session view is not available in this scaffold.</p>
-</section>`,
+	required := []string{
+		`<html lang="en" data-theme="dark">`,
+		`<body class="terminal">`,
+		`KANEDIAS // CIRCLE OF THE FLEET`,
+		`STATIC DEMONSTRATION`,
+		`id="question-alert"`,
+		`2 QUESTIONS`,
+		`id="fleet-orbit"`,
+		`RPC-SPIKE`,
+		`WEB-SHELL`,
+		`PTY-OWNER`,
+		`id="maker-aperture"`,
+		`Should shell sessions survive a browser reconnect`,
+		`12.8K`,
+		`TOKENS`,
+		`id="command-deck"`,
+		`● ACTIVE`,
+		`◇ QUESTION`,
+		`○ COMPLETE`,
 	}
-	for _, panel := range panels {
-		if !strings.Contains(body, panel) {
-			t.Errorf("initial page is missing exact inert panel:\n%s", panel)
+	for _, want := range required {
+		if !strings.Contains(body, want) {
+			t.Errorf("initial page does not contain %q", want)
 		}
 	}
 
-	sectionRE := regexp.MustCompile(`(?s)<section id="(?:dashboard|session)-panel".*?</section>`)
-	sections := sectionRE.FindAllString(body, -1)
-	if len(sections) != 2 {
-		t.Fatalf("found %d future-view panels, want 2", len(sections))
+	obsolete := []string{
+		"Refresh status",
+		"Not refreshed yet.",
+		"Dashboard view is not available in this scaffold.",
+		"Session view is not available in this scaffold.",
+		`id="dashboard-panel"`,
+		`id="session-panel"`,
 	}
-	for _, section := range sections {
-		lower := strings.ToLower(section)
-		for _, forbidden := range []string{"<form", "<a ", "<button", "data-on:", "data-init", "incus", "delete", "create", "update"} {
-			if strings.Contains(lower, forbidden) {
-				t.Errorf("future-view panel contains forbidden interactive or mutable content %q: %s", forbidden, section)
-			}
-		}
-	}
-	if got := strings.Count(strings.ToLower(body), "<button"); got != 1 {
-		t.Errorf("interactive button count = %d, want 1", got)
-	}
-	for _, tag := range []string{"<form", "<select", "<textarea", "<input", "<a "} {
-		if strings.Contains(strings.ToLower(body), tag) {
-			t.Errorf("page contains unexpected interactive element %q", tag)
+	for _, unwanted := range obsolete {
+		if strings.Contains(body, unwanted) {
+			t.Errorf("initial page retains obsolete content %q", unwanted)
 		}
 	}
 }
 
-func TestIndexRequiresClickForStatusRefresh(t *testing.T) {
+func TestCircleOfFleetMockupIsStatic(t *testing.T) {
 	body := indexBody(t)
-	const binding = `data-on:click="@get('/ui/status')"`
-	if got := strings.Count(body, "/ui/status"); got != 1 {
-		t.Errorf("/ui/status occurrence count = %d, want 1", got)
+	lower := strings.ToLower(body)
+	forbidden := []string{
+		"data-on:",
+		"data-init",
+		"@get(",
+		"/ui/status",
+		"fetch(",
+		"xmlhttprequest",
+		"onclick=",
+		"contenteditable",
+		"<form",
+		"<input",
+		"<textarea",
+		"<select",
+		"<a ",
 	}
-	if got := strings.Count(body, binding); got != 1 {
-		t.Errorf("status click binding count = %d, want 1", got)
+	for _, unwanted := range forbidden {
+		if strings.Contains(lower, unwanted) {
+			t.Errorf("static mockup contains active mechanism %q", unwanted)
+		}
 	}
+
 	buttonRE := regexp.MustCompile(`(?s)<button\b[^>]*>.*?</button>`)
 	buttons := buttonRE.FindAllString(body, -1)
-	if len(buttons) != 1 || !strings.Contains(buttons[0], binding) || !strings.Contains(buttons[0], "Refresh status") {
-		t.Errorf("visible refresh button does not have the sole click binding: %q", buttons)
+	if len(buttons) != 7 {
+		t.Fatalf("button count = %d, want 7", len(buttons))
 	}
-	lower := strings.ToLower(body)
-	for _, forbidden := range []string{"data-init", "fetch(", "xmlhttprequest"} {
-		if strings.Contains(lower, forbidden) {
-			t.Errorf("page contains automatic request mechanism %q", forbidden)
+	for _, button := range buttons {
+		if !strings.Contains(button, " disabled") {
+			t.Errorf("mockup button is not disabled: %s", button)
 		}
 	}
 }
@@ -258,20 +278,64 @@ func TestTerminalCSSProvenanceMatchesEmbeddedAsset(t *testing.T) {
 	}
 }
 
-func TestRenderedPageHasNoExternalRuntimeAssets(t *testing.T) {
+func TestRenderedPageHasOnlyOrderedLocalRuntimeAssets(t *testing.T) {
 	body := indexBody(t)
 	assetRE := regexp.MustCompile(`(?:src|href)="([^"]+)"`)
-	assets := assetRE.FindAllStringSubmatch(body, -1)
-	if len(assets) != 2 {
-		t.Fatalf("runtime asset count = %d, want 2", len(assets))
+	matches := assetRE.FindAllStringSubmatch(body, -1)
+	want := []string{
+		"/assets/terminal.css",
+		"/assets/app.css",
+		"/assets/datastar.js",
 	}
-	for _, match := range assets {
+	if len(matches) != len(want) {
+		t.Fatalf("runtime asset count = %d, want %d", len(matches), len(want))
+	}
+	for index, match := range matches {
+		if match[1] != want[index] {
+			t.Errorf("runtime asset %d = %q, want %q", index, match[1], want[index])
+		}
 		asset := strings.ToLower(match[1])
-		if strings.HasPrefix(asset, "http://") || strings.HasPrefix(asset, "https://") || strings.HasPrefix(asset, "//") || strings.Contains(asset, "cdn") || strings.Contains(asset, "node_modules") || strings.Contains(asset, "npm") || strings.Contains(asset, "unpkg") {
+		if strings.HasPrefix(asset, "http://") ||
+			strings.HasPrefix(asset, "https://") ||
+			strings.HasPrefix(asset, "//") ||
+			strings.Contains(asset, "cdn") ||
+			strings.Contains(asset, "node_modules") ||
+			strings.Contains(asset, "npm") ||
+			strings.Contains(asset, "unpkg") {
 			t.Errorf("external runtime asset %q", match[1])
 		}
-		if !strings.HasPrefix(asset, "/assets/") {
-			t.Errorf("runtime asset is not local: %q", match[1])
+	}
+}
+
+func TestProjectStylesDefineStaticCircleVisualSystem(t *testing.T) {
+	contents, err := webFiles.ReadFile("web/app.css")
+	if err != nil {
+		t.Fatalf("read embedded project stylesheet: %v", err)
+	}
+	styles := string(contents)
+	required := []string{
+		"--page-bg: #05070b",
+		"--active: #69a9ed",
+		"--question: #d9ae70",
+		"min-width: 72rem",
+		"#fleet-orbit",
+		".orbit-ring",
+		".run-node",
+		".child-moon",
+		"#maker-aperture",
+		"#question-alert",
+		"#command-deck",
+	}
+	for _, want := range required {
+		if !strings.Contains(styles, want) {
+			t.Errorf("project stylesheet does not contain %q", want)
+		}
+	}
+
+	lower := strings.ToLower(styles)
+	for _, unwanted := range []string{"@import", "http://", "https://", "url(", "@keyframes", "animation:"} {
+		if strings.Contains(lower, unwanted) {
+			t.Errorf("project stylesheet contains disallowed runtime or motion construct %q", unwanted)
 		}
 	}
 }

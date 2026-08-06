@@ -1,36 +1,195 @@
 <!doctype html>
-<html lang="en">
+<html lang="en" data-theme="dark">
 <head>
   <meta charset="utf-8">
   <meta name="viewport" content="width=device-width, initial-scale=1">
-  <title>Kanedias</title>
+  <meta name="color-scheme" content="dark">
+  <title>Kanedias — Circle of the Fleet</title>
+  <link rel="stylesheet" href="/assets/terminal.css">
   <link rel="stylesheet" href="/assets/app.css">
   <script type="module" src="/assets/datastar.js"></script>
 </head>
-<body>
-  <main>
-    <header>
-      <p class="eyebrow">Local server</p>
-      <h1>Kanedias</h1>
-      <p>This is the local Kanedias server shell.</p>
+<body class="terminal">
+  <div class="app-shell container-fluid">
+    <header class="command-header">
+      <div>
+        <p class="kicker">Master Maker’s operator console</p>
+        <h1>KANEDIAS // CIRCLE OF THE FLEET</h1>
+      </div>
+      <div class="session-proof" aria-label="Mock Pi session">
+        <span class="session-label">PI SESSION</span>
+        <strong>019FD8D2</strong>
+        <span class="mock-label">STATIC DEMONSTRATION</span>
+      </div>
+      <div id="question-alert" class="terminal-alert question-count" role="note">
+        <span aria-hidden="true">◇</span>
+        <strong>2 QUESTIONS</strong>
+        <span>await the Maker</span>
+      </div>
     </header>
 
-    <section class="status-card" aria-labelledby="status-heading">
-      <h2 id="status-heading">Server status</h2>
-      <output id="server-status" role="status">Not refreshed yet.</output>
-      <button type="button" data-on:click="@get('/ui/status')">Refresh status</button>
-    </section>
+    <main class="fleet-console" aria-label="Static subagent fleet mockup">
+      <section id="fleet-orbit" aria-labelledby="fleet-heading">
+        <div class="section-heading">
+          <div>
+            <p class="kicker">Inner ring: parent runs · Moons: nested subagents</p>
+            <h2 id="fleet-heading">Fleet orrery</h2>
+          </div>
+          <span class="view-label">ALL POSITIONS ARE MOCK DATA</span>
+        </div>
 
-    <div class="panels">
-<section id="dashboard-panel" aria-labelledby="dashboard-heading">
-  <h2 id="dashboard-heading">Dashboard</h2>
-  <p>Dashboard view is not available in this scaffold.</p>
-</section>
-<section id="session-panel" aria-labelledby="session-heading">
-  <h2 id="session-heading">Sessions</h2>
-  <p>Session view is not available in this scaffold.</p>
-</section>
-    </div>
-  </main>
+        <div class="orrery" aria-label="Four parent runs and four nested subagents">
+          <div class="orbit-ring orbit-inner" aria-hidden="true"></div>
+          <div class="orbit-ring orbit-middle" aria-hidden="true"></div>
+          <div class="orbit-ring orbit-outer" aria-hidden="true"></div>
+
+          <div class="maker-center" aria-label="The Maker at the fleet center">
+            <strong>K∴D</strong>
+            <span>YOU / MAKER</span>
+          </div>
+
+          <article class="run-node run-rpc terminal-card" aria-label="RPC Spike workflow active">
+            <header><span>RPC-SPIKE</span><span>◆</span></header>
+            <div>
+              <p>workflow · 3 children</p>
+              <strong>● ACTIVE</strong>
+              <span>READ docs/rpc.md · 01:42</span>
+            </div>
+          </article>
+
+          <article class="run-node run-shell terminal-card question-node" aria-label="Web Shell worker paused with a question">
+            <header><span>WEB-SHELL</span><span>◇</span></header>
+            <div>
+              <p>worker · 2 children</p>
+              <strong>◇ QUESTION</strong>
+              <span>PAUSED FOR THE MAKER</span>
+            </div>
+          </article>
+
+          <article class="run-node run-incus terminal-card" aria-label="Incus Image worker active">
+            <header><span>INCUS-IMAGE</span><span>◆</span></header>
+            <div>
+              <p>worker · 1 child</p>
+              <strong>● ACTIVE</strong>
+              <span>TEST ./internal/image · 00:44</span>
+            </div>
+          </article>
+
+          <article class="run-node run-review terminal-card" aria-label="Final Review parallel run partially complete">
+            <header><span>FINAL-REVIEW</span><span>◆</span></header>
+            <div>
+              <p>parallel · 3 children</p>
+              <strong>○ COMPLETE 1/3</strong>
+              <span>8.4K TOKENS OBSERVED</span>
+            </div>
+          </article>
+
+          <div class="child-moon moon-researcher">
+            <span class="moon-mark" aria-hidden="true">○</span>
+            <span><strong>RESEARCHER</strong><small>COMPLETE</small></span>
+          </div>
+          <div class="child-moon moon-pty question-moon">
+            <span class="moon-mark" aria-hidden="true">◇</span>
+            <span><strong>PTY-OWNER</strong><small>QUESTION</small></span>
+          </div>
+          <div class="child-moon moon-tests">
+            <span class="moon-mark" aria-hidden="true">●</span>
+            <span><strong>TEST-RUNNER</strong><small>ACTIVE</small></span>
+          </div>
+          <div class="child-moon moon-correctness">
+            <span class="moon-mark" aria-hidden="true">●</span>
+            <span><strong>CORRECTNESS</strong><small>ACTIVE</small></span>
+          </div>
+        </div>
+
+        <ul class="fleet-legend" aria-label="Fleet state legend">
+          <li><span aria-hidden="true">●</span> ACTIVE</li>
+          <li><span aria-hidden="true">◇</span> QUESTION</li>
+          <li><span aria-hidden="true">○</span> COMPLETE</li>
+          <li>Shape and text repeat every color-coded state.</li>
+        </ul>
+      </section>
+
+      <aside id="maker-aperture" aria-labelledby="aperture-heading">
+        <header class="aperture-header">
+          <div>
+            <p class="kicker">Selected nested child</p>
+            <h2 id="aperture-heading">MAKER’S APERTURE</h2>
+          </div>
+          <span>NESTED DEPTH 1</span>
+        </header>
+
+        <p class="selection-path">WEB-SHELL <span>›</span> PTY-OWNER</p>
+
+        <ul class="aperture-tabs" aria-label="Static detail views">
+          <li aria-current="page">QUESTION</li>
+          <li>TRANSCRIPT</li>
+          <li>TOOLS</li>
+          <li>ARTIFACTS</li>
+        </ul>
+
+        <section class="terminal-alert full-question" aria-labelledby="question-heading">
+          <p class="kicker">The child has left its orbit</p>
+          <h3 id="question-heading">Should shell sessions survive a browser reconnect, or can v1 terminate them when the tab closes?</h3>
+          <div class="answer-preview" aria-label="Disabled answer previews">
+            <button class="btn btn-ghost" type="button" disabled>PRESERVE + REPLAY</button>
+            <button class="btn btn-ghost" type="button" disabled>TAB-BOUND V1</button>
+            <button class="btn btn-ghost" type="button" disabled>WRITE ANSWER…</button>
+          </div>
+        </section>
+
+        <section class="run-tree-panel" aria-labelledby="tree-heading">
+          <h3 id="tree-heading">Run lineage</h3>
+          <ul class="run-tree">
+            <li><span aria-hidden="true">◆</span> WEB-SHELL <small>worker · paused</small></li>
+            <li class="tree-child tree-question"><span aria-hidden="true">◇</span> PTY-OWNER <small>asks you now</small></li>
+            <li class="tree-child"><span aria-hidden="true">├</span> RPC-SCOUT <small>complete · 4.1K tokens</small></li>
+            <li class="tree-grandchild"><span aria-hidden="true">└</span> DOCS-FETCH <small>complete</small></li>
+          </ul>
+        </section>
+
+        <section class="transcript-panel" aria-labelledby="transcript-heading">
+          <div class="panel-title">
+            <h3 id="transcript-heading">Recent transmission</h3>
+            <span>STATIC TAIL</span>
+          </div>
+          <div class="transcript-line">
+            <time>20:41:11</time>
+            <p><strong>ASSISTANT</strong>The server-owned PTY enables replay after reconnect.</p>
+          </div>
+          <div class="transcript-line tool-line">
+            <time>20:41:15</time>
+            <p><strong>TOOL / READ</strong>docs/rpc.md · 281 lines</p>
+          </div>
+          <div class="transcript-line">
+            <time>20:41:18</time>
+            <p><strong>ASSISTANT</strong>That creates one product decision I should not guess.</p>
+          </div>
+        </section>
+
+        <dl class="run-metrics" aria-label="Mock run metrics">
+          <div><dt>TOKENS</dt><dd>12.8K</dd></div>
+          <div><dt>TOOLS</dt><dd>09</dd></div>
+          <div><dt>TURNS</dt><dd>12</dd></div>
+          <div><dt>ELAPSED</dt><dd>06:14</dd></div>
+        </dl>
+      </aside>
+    </main>
+
+    <footer id="command-deck">
+      <div class="command-copy">
+        <span class="command-mark" aria-hidden="true">CENTER&gt;</span>
+        <span>answer or steer selected child…</span>
+        <span class="static-cursor" aria-hidden="true"></span>
+      </div>
+      <div class="command-controls" aria-label="Disabled future controls">
+        <button class="btn btn-primary" type="button" disabled>STEER</button>
+        <button class="btn btn-ghost question-control" type="button" disabled>INTERRUPT</button>
+        <button class="btn btn-ghost stop-control" type="button" disabled>STOP RUN</button>
+        <button class="btn btn-ghost" type="button" disabled>＋ FORGE ORBIT</button>
+      </div>
+      <span class="deck-state">STATIC MOCKUP</span>
+    </footer>
+  </div>
 </body>
 </html>
