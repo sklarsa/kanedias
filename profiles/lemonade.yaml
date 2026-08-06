@@ -1,0 +1,8 @@
+config: {}
+description: Expose the host Lemonade GPU service inside the container
+devices:
+  lemonade:
+    bind: instance
+    connect: tcp:127.0.0.1:13305
+    listen: tcp:127.0.0.1:13305
+    type: proxy

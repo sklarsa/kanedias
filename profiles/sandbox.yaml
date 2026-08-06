@@ -1,0 +1,24 @@
+config:
+  environment.HTTP_PROXY: "http://10.75.177.1:3128"
+  environment.HTTPS_PROXY: "http://10.75.177.1:3128"
+  environment.http_proxy: "http://10.75.177.1:3128"
+  environment.https_proxy: "http://10.75.177.1:3128"
+  environment.GH_TOKEN: "container-dummy"
+  environment.NO_PROXY: "localhost,127.0.0.1,::1"
+  environment.no_proxy: "localhost,127.0.0.1,::1"
+  environment.NODE_EXTRA_CA_CERTS: "/usr/local/share/ca-certificates/kanedias-proxy.crt"
+  environment.SSL_CERT_FILE: "/etc/ssl/certs/ca-certificates.crt"
+  security.nesting: "true"
+  security.privileged: "false"
+description: Kanedias sandbox with persistent workspace and credential proxy
+devices:
+  workspace:
+    type: disk
+    pool: default
+    source: agent-workspace-seed
+    path: /workspace
+  proxy-ca:
+    type: disk
+    source: /home/steven/.config/kanedias-proxy/ca.crt
+    path: /usr/local/share/ca-certificates/kanedias-proxy.crt
+    readonly: "true"

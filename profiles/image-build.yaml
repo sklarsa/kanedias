@@ -1,0 +1,5 @@
+config:
+  security.nesting: "true"
+  security.privileged: "false"
+description: Unprivileged container with nesting for Docker and kind
+devices: {}
