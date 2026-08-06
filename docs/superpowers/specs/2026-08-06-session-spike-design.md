@@ -30,17 +30,17 @@ It forwards records until Pi emits `agent_settled`, then closes the connection a
 
 ## Hardcoded Incus Project
 
-All Kanedias Incus operations, including the existing image, workspace, sandbox, profile, and network workflows, will use the hardcoded project `kanedias`.
+Kanedias images, profiles, instances, and custom volumes live in the hardcoded Incus project `kanedias`. The Incus-managed bridge remains in the default network project and is shared with `kanedias` through `features.networks=false`, because bridge networks cannot be project-local. Network operations still flow through the project-scoped client, and Incus maps them to the default network project.
 
 Connection setup will:
 
 1. connect to the local Incus daemon;
 2. create `kanedias` when it is absent;
-3. enable isolated images, profiles, networks, and storage volumes on a newly created project;
-4. validate those required features when the project already exists;
+3. enable isolated images, profiles, and storage volumes while setting `features.networks=false` on a newly created project;
+4. validate those exact required feature values when the project already exists;
 5. return a client scoped with `UseProject("kanedias")`.
 
-Existing resources in the default project are not migrated or deleted. Once this change lands, the base image and workspace seed must be recreated in `kanedias`. Migration tooling is outside the spike.
+Existing resources in the default project are not migrated or deleted. Once this change lands, the base image and workspace seed must be recreated in `kanedias`, while the existing managed bridge remains in the default network project. Migration tooling is outside the spike.
 
 ## Incus-Owned Session State
 

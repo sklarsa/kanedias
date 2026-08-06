@@ -4,7 +4,7 @@
 
 **Goal:** Add `kanedias session`, which reads one prompt from stdin, runs one Pi RPC process in an ephemeral Incus sandbox, streams raw RPC JSONL over TCP, and deletes the session resources.
 
-**Architecture:** Every Incus client is scoped to an automatically ensured hardcoded `kanedias` project. The guest base image uses systemd socket activation to connect TCP port 7777 directly to `pi --mode rpc` stdin/stdout, while a focused Go session workflow owns Incus lifecycle, address discovery, raw JSONL forwarding, and cleanup.
+**Architecture:** Every Incus client is scoped to an automatically ensured hardcoded `kanedias` project. Kanedias images, profiles, instances, and custom volumes live in that project, while its Incus-managed bridge remains in the default network project and is shared through `features.networks=false`. The guest base image uses systemd socket activation to connect TCP port 7777 directly to `pi --mode rpc` stdin/stdout, while a focused Go session workflow owns Incus lifecycle, address discovery, raw JSONL forwarding, and cleanup.
 
 **Tech Stack:** Go 1.26.5, Cobra, github.com/lxc/incus/v7 v7.3.0, systemd socket activation, Pi RPC JSONL, TCP.
 
@@ -14,8 +14,9 @@
 - Execute Tasks 1, 2, and 3 in parallel because their files are disjoint.
 - Merge those commits into one integration worktree before Tasks 4 and 5.
 - Run exactly one independent code review after all implementation tasks are integrated and verified. Do not dispatch task-level review agents.
-- All Kanedias Incus operations use the hardcoded project name `kanedias`.
-- A missing project is created with isolated images, profiles, networks, and storage volumes; an existing project with incompatible feature values fails clearly.
+- Kanedias images, profiles, instances, and custom volumes use the hardcoded project name `kanedias`.
+- The Incus-managed bridge remains in the default network project and is shared through `features.networks=false`, because bridge networks cannot be project-local. Network operations still flow through the project-scoped client, and Incus maps them to the default network project.
+- A missing project is created with isolated images, profiles, and storage volumes plus access to the shared default-project bridge; an existing project with incompatible feature values fails clearly.
 - `kanedias session` accepts no arguments and reads the complete prompt from stdin.
 - Stdout contains only raw Pi RPC JSONL. Progress and Kanedias errors go to stderr.
 - The existing `kanedias proxy run` process is a prerequisite and is not started by the session command.
@@ -101,21 +102,21 @@ Add `TestEnsureProjectCreatesMissingKanediasProject`. Return `api.StatusErrorf(h
 if fake.created.Name != ProjectName {
     t.Fatalf("created project = %q, want %q", fake.created.Name, ProjectName)
 }
-for _, key := range []string{
-    "features.images",
-    "features.profiles",
-    "features.networks",
-    "features.storage.volumes",
+for key, want := range map[string]string{
+    "features.images":          "true",
+    "features.profiles":        "true",
+    "features.networks":        "false",
+    "features.storage.volumes": "true",
 } {
-    if fake.created.Config[key] != "true" {
-        t.Errorf("created feature %q = %q, want true", key, fake.created.Config[key])
+    if fake.created.Config[key] != want {
+        t.Errorf("created feature %q = %q, want %s", key, fake.created.Config[key], want)
     }
 }
 ```
 
-Add `TestEnsureProjectAcceptsRequiredFeatures` with an existing project containing all four values set to `"true"`.
+Add `TestEnsureProjectAcceptsRequiredFeatures` with an existing project containing images, profiles, and storage volumes set to `"true"` and networks set to `"false"`.
 
-Add a table-driven `TestEnsureProjectRejectsIncompatibleFeatures` that sets each required key to `"false"` in turn and requires the error to contain both `ProjectName` and the key.
+Add a table-driven `TestEnsureProjectRejectsIncompatibleFeatures` that sets each required isolated feature to `"false"` in turn and sets networks to `"true"`, requiring the error to contain both `ProjectName` and the key.
 
 Add a project-selection test using an embedded upstream interface so the fake does not implement every Incus method:
 
@@ -156,7 +157,7 @@ const ProjectName = "kanedias"
 var requiredProjectFeatures = map[string]string{
     "features.images":          "true",
     "features.profiles":        "true",
-    "features.networks":        "true",
+    "features.networks":        "false",
     "features.storage.volumes": "true",
 }
 
@@ -170,7 +171,7 @@ Implement `ensureProject` directly:
 
 - when `GetProject(ProjectName)` returns 404, call `CreateProject` with name `kanedias`, description `Kanedias managed resources`, and a copy of `requiredProjectFeatures`;
 - propagate non-404 lookup and create errors with operation context;
-- for an existing project, require every feature value to equal `"true"` and report the mismatched key.
+- for an existing project, require every feature value to equal its configured required value and report the mismatched key.
 
 Implement `scopeProject(server contextServer) (contextServer, error)` by calling `server.UseProject(ProjectName)`, asserting the result supports `contextServer`, and returning it. After the Unix connection and current `contextServer` assertion, call `ensureProject(contextual.WithContext(ctx))`, then `scopeProject(contextual)`, and store the result in `Client.server`. Disconnect the original server before returning on any setup error.
 

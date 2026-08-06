@@ -15,7 +15,7 @@ const ProjectName = "kanedias"
 var requiredProjectFeatures = map[string]string{
 	"features.images":          "true",
 	"features.profiles":        "true",
-	"features.networks":        "true",
+	"features.networks":        "false",
 	"features.storage.volumes": "true",
 }
 

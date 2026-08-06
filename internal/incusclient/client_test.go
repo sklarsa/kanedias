@@ -13,7 +13,7 @@ import (
 var projectFeatures = map[string]string{
 	"features.images":          "true",
 	"features.profiles":        "true",
-	"features.networks":        "true",
+	"features.networks":        "false",
 	"features.storage.volumes": "true",
 }
 
@@ -47,12 +47,14 @@ func TestEnsureProjectCreatesMissingKanediasProject(t *testing.T) {
 	for _, key := range []string{
 		"features.images",
 		"features.profiles",
-		"features.networks",
 		"features.storage.volumes",
 	} {
 		if fake.created.Config[key] != "true" {
 			t.Errorf("created feature %q = %q, want true", key, fake.created.Config[key])
 		}
+	}
+	if fake.created.Config["features.networks"] != "false" {
+		t.Errorf("created feature %q = %q, want false", "features.networks", fake.created.Config["features.networks"])
 	}
 }
 
@@ -68,13 +70,17 @@ func TestEnsureProjectAcceptsRequiredFeatures(t *testing.T) {
 }
 
 func TestEnsureProjectRejectsIncompatibleFeatures(t *testing.T) {
-	for key := range projectFeatures {
+	for key, required := range projectFeatures {
 		t.Run(key, func(t *testing.T) {
 			features := make(map[string]string, len(projectFeatures))
 			for feature, value := range projectFeatures {
 				features[feature] = value
 			}
-			features[key] = "false"
+			if required == "true" {
+				features[key] = "false"
+			} else {
+				features[key] = "true"
+			}
 			fake := &fakeProjectManager{project: &api.Project{ProjectPut: api.ProjectPut{Config: features}}}
 
 			err := ensureProject(fake)
