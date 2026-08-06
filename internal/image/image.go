@@ -50,6 +50,7 @@ type connector func(context.Context) (imageClient, error)
 
 type buildInputs struct {
 	piSettings []byte
+	piAuth     []byte
 	piTheme    []byte
 	tmuxConfig []byte
 	profile    []byte
@@ -88,6 +89,7 @@ func loadBuildInputs(cfg config.Config) (buildInputs, error) {
 		destination *[]byte
 	}{
 		{name: "pi-settings.json", destination: &inputs.piSettings},
+		{name: "pi-auth.json", destination: &inputs.piAuth},
 		{name: "cobalt-ember.json", destination: &inputs.piTheme},
 		{name: "tmux.conf", destination: &inputs.tmuxConfig},
 	}
@@ -179,6 +181,7 @@ func createWithClient(ctx context.Context, client imageClient, cfg config.Config
 	}{
 		{path: "/root/assets/authorized_hosts", content: []byte(strings.Join(cfg.BaseImage.AuthorizedHosts, "\n")), mode: 0o600},
 		{path: "/root/assets/pi-settings.json", content: inputs.piSettings, mode: 0o644},
+		{path: "/root/assets/pi-auth.json", content: inputs.piAuth, mode: 0o600},
 		{path: "/root/assets/cobalt-ember.json", content: inputs.piTheme, mode: 0o644},
 		{path: "/root/assets/tmux.conf", content: inputs.tmuxConfig, mode: 0o644},
 		{path: "/root/assets/kanedias-pi.socket", content: piRPCSocket, mode: 0o644},

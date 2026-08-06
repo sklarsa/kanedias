@@ -40,6 +40,7 @@ func TestCreateRunsImageWorkflowInOrder(t *testing.T) {
 		"exec install -d /root/assets",
 		"push /root/assets/authorized_hosts",
 		"push /root/assets/pi-settings.json",
+		"push /root/assets/pi-auth.json",
 		"push /root/assets/cobalt-ember.json",
 		"push /root/assets/tmux.conf",
 		"push /root/assets/kanedias-pi.socket",
@@ -99,6 +100,13 @@ func TestCreateRunsImageWorkflowInOrder(t *testing.T) {
 		if !strings.Contains(service, want) {
 			t.Errorf("service unit missing %q", want)
 		}
+	}
+	auth := client.files["/root/assets/pi-auth.json"]
+	if got := string(auth.content); got != "auth" {
+		t.Errorf("pi auth = %q, want test asset", got)
+	}
+	if auth.mode != 0o600 {
+		t.Errorf("pi auth mode = %#o, want 0600", auth.mode)
 	}
 	launcher := client.files["/root/assets/kanedias-pi-rpc"]
 	if !strings.Contains(string(launcher.content), "exec pi --mode rpc --no-session") {
@@ -246,6 +254,7 @@ func imageConfig(t *testing.T, hosts []string) config.Config {
 	}
 	for name, content := range map[string]string{
 		"pi-settings.json":  "settings",
+		"pi-auth.json":      "auth",
 		"cobalt-ember.json": "theme",
 		"tmux.conf":         "tmux",
 	} {

@@ -1,0 +1,9 @@
+{
+  "openai-codex": {
+    "type": "oauth",
+    "access": "eyJhbGciOiJub25lIn0.eyJodHRwczovL2FwaS5vcGVuYWkuY29tL2F1dGgiOnsiY2hhdGdwdF9hY2NvdW50X2lkIjoiY29udGFpbmVyLWFjY291bnQifX0.signature",
+    "refresh": "container-dummy",
+    "expires": 9999999999999,
+    "accountId": "container-account"
+  }
+}
