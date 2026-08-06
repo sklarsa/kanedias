@@ -69,6 +69,6 @@ incus stop "$container"
 
 printf 'Publishing image alias %s...\n' "$image_alias"
 incus publish "$container" --alias "$image_alias" --reuse \
-    --property "description=kanedias sandbox from $source_image"
+    description="kanedias sandbox from $source_image"
 
 printf 'Published image %s from %s.\n' "$image_alias" "$source_image"
