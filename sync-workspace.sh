@@ -133,6 +133,11 @@ managed_user=${INCUS_WORKSPACE_USER:-kanedias}
 managed_home="/home/$managed_user"
 workspace_path=/workspace
 dns_timeout=${INCUS_DNS_TIMEOUT:-60}
+if [[ ! $dns_timeout =~ ^[1-9][0-9]{0,3}$ ]] ||
+    (( 10#$dns_timeout > 3600 )); then
+    echo "INCUS_DNS_TIMEOUT must be an integer from 1 to 3600" >&2
+    exit 2
+fi
 instance="workspace-sync-$(date +%s)-$$"
 instance_created=0
 workspace_attached=0

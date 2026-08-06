@@ -74,6 +74,8 @@ grep -Fxq "repo clone https://github.com/test/example.git $workspace/example -- 
     https://github.com/test/example.git ]]
 git -C "$remote_repo" update-ref -d refs/tags/obsolete
 
+git -C "$workspace/example" remote set-url origin \
+    git@github.com:test/example.git
 printf 'dirty\n' > "$workspace/example/version.txt"
 printf 'remove me\n' > "$workspace/example/generated"
 printf 'two\n' > "$source_repo/version.txt"
@@ -84,6 +86,8 @@ git -C "$source_repo" push --quiet "$remote_repo" main
 [[ $(<"$workspace/example/version.txt") == two ]]
 [[ ! -e $workspace/example/generated ]]
 [[ -z $(git -C "$workspace/example" status --short) ]]
+[[ $(git -C "$workspace/example" config --get remote.origin.url) == \
+    https://github.com/test/example.git ]]
 if git -C "$workspace/example" rev-parse --verify refs/tags/obsolete \
     >/dev/null 2>&1; then
     fail 'tag deleted from remote was not pruned locally'
@@ -188,6 +192,28 @@ exit 0
 FAKE_INCUS
 chmod +x "$fake_bin/go" "$fake_bin/incus"
 export FAKE_DNS_STATE="$dns_state"
+
+printf 'Testing DNS timeout validation before Incus mutation...\n'
+timeout_marker="$temp_dir/arithmetic-injection"
+malicious_timeout="BASH_VERSINFO[\$(touch $timeout_marker)0]"
+for invalid_timeout in invalid "$malicious_timeout" 3601; do
+    : > "$incus_log"
+    rm -f "$timeout_marker" "$dns_state"
+    if invalid_timeout_output=$(PATH="$fake_bin:$PATH" HOME="$fake_home" \
+        FAKE_INCUS_LOG="$incus_log" INCUS_REPOS_FILE="$repo_list" \
+        INCUS_DNS_TIMEOUT="$invalid_timeout" "$sync_script" \
+        test-image 2>&1); then
+        fail "invalid DNS timeout was accepted: $invalid_timeout"
+    fi
+    if [[ $invalid_timeout_output != \
+        *'INCUS_DNS_TIMEOUT must be an integer from 1 to 3600'* ]]; then
+        fail "invalid DNS timeout failure was unclear: $invalid_timeout_output"
+    fi
+    [[ ! -e $timeout_marker ]] || \
+        fail 'DNS timeout arithmetic executed a command substitution'
+    [[ ! -s $incus_log ]] || \
+        fail 'Incus was mutated before DNS timeout validation'
+done
 
 PATH="$fake_bin:$PATH" HOME="$fake_home" FAKE_INCUS_LOG="$incus_log" \
     INCUS_REPOS_FILE="$repo_list" FAKE_DNS_FAILURES=1 \
