@@ -52,6 +52,7 @@ apt-get install -y --no-install-recommends \
     diffutils \
     file \
     findutils \
+    fd \
     gcc \
     gh \
     git \
@@ -76,6 +77,7 @@ apt-get install -y --no-install-recommends \
     openssh-server \
     procps \
     python3 \
+    ripgrep \
     sed \
     shellcheck \
     sudo \
