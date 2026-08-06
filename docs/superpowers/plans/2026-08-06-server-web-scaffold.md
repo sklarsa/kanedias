@@ -6,7 +6,7 @@
 
 **Architecture:** A sequential foundation commit establishes the stable `internal/server` API, loopback-only validation, HTTP lifecycle, logging, timeouts, and shutdown behavior. From that exact commit, disjoint web and Cobra lanes run in parallel; one integration writer then combines them, verifies the integrated binary and smoke behavior, dispositions exactly one fresh-context final review, and preserves the managed integration branch and native handoff artifact.
 
-**Tech Stack:** Go 1.26.5, Cobra v1.10.2, Chi v5.2.3, `html/template`, `embed`, `log/slog`, `net/http`, official `github.com/starfederation/datastar-go` v1.2.2, and the official Datastar browser bundle v1.0.2.
+**Tech Stack:** Go 1.26.5, Cobra v1.10.2, Chi v5.3.1, `html/template`, `embed`, `log/slog`, `net/http`, official `github.com/starfederation/datastar-go` v1.2.2, and the official Datastar browser bundle v1.0.2.
 
 ## Global Constraints
 
@@ -25,7 +25,8 @@
 - Do not launch task-level or lane reviewers. After integrated verification and curl smoke pass, launch exactly one independent fresh-context final reviewer. The integration/fix writer dispositions findings; do not launch a second reviewer.
 - Keep the server local and offline. Accept only case-insensitive exact `localhost`, IPv4 loopback literals, and IPv6 loopback literals. Reject empty, wildcard, unspecified, private-LAN, public, and arbitrary hostname binds before listening. Permit port `0`.
 - Browser resources must all be flat files below `internal/server/web`: `index.html`, `app.css`, `datastar.js`, `datastar.LICENSE`, and `datastar.PROVENANCE`. Embed with `//go:embed web/*`. Do not create `internal/server/templates` or `internal/server/assets`.
-- Pin `github.com/go-chi/chi/v5` to v5.2.3 and `github.com/starfederation/datastar-go` to v1.2.2. Vendor the official Datastar v1.0.2 browser bundle unchanged and record its verified SHA-256 and upstream license/provenance.
+- Pin `github.com/go-chi/chi/v5` to v5.3.1 and `github.com/starfederation/datastar-go` to v1.2.2. Vendor the official Datastar v1.0.2 browser bundle unchanged and record its verified SHA-256 and upstream license/provenance.
+- Chi v5.3.1 is the existing module graph's MVS floor; do not force it backward with a `replace` directive.
 - Do not add runtime downloads, CDN references, npm, lockfiles, bundlers, Templ, generators, generated frontend source, or filesystem-served runtime assets.
 - The page status refresh is click-only. It must not request status on load or create a persistent event loop.
 - Do not add Incus calls, authentication, authorization, databases, persistence, sessions, state mutation, forms, state-changing routes, or configuration-file dependencies.
@@ -132,7 +133,7 @@ File responsibilities:
 - Create `cmd/server.go`: Cobra command, listen flag, stderr logger, validation, and service delegation.
 - Modify `cmd/root.go`: server injection, command registration, signal context, and `execute` helper.
 - Modify `cmd/root_test.go`: hierarchy, command contract, injection, stderr logger, and exact canceled-context propagation.
-- Modify `go.mod` and `go.sum`: exact Chi v5.2.3 and datastar-go v1.2.2 pins.
+- Modify `go.mod` and `go.sum`: exact Chi v5.3.1 and datastar-go v1.2.2 pins.
 - Do not modify `main.go` or any existing Incus, image, proxy, sandbox, workspace, network, profile, or configuration package.
 
 ### Task 1: Establish the Managed Foundation Lane and Baseline
@@ -478,7 +479,7 @@ Expected: FAIL because the foundation handler returns `404`, browser resources d
 Run:
 
 ```bash
-go get github.com/go-chi/chi/v5@v5.2.3
+go get github.com/go-chi/chi/v5@v5.3.1
 go get github.com/starfederation/datastar-go@v1.2.2
 go list -m github.com/go-chi/chi/v5 github.com/starfederation/datastar-go
 ```
@@ -486,7 +487,7 @@ go list -m github.com/go-chi/chi/v5 github.com/starfederation/datastar-go
 Expected module lines:
 
 ```text
-github.com/go-chi/chi/v5 v5.2.3
+github.com/go-chi/chi/v5 v5.3.1
 github.com/starfederation/datastar-go v1.2.2
 ```
 
@@ -615,7 +616,7 @@ printf '%s  %s\n' "$RECORDED_SHA256" internal/server/web/datastar.js | sha256sum
 git diff --name-only "$FOUNDATION_COMMIT"...HEAD
 ```
 
-Expected: tests and vet pass; versions are exactly v5.2.3 and v1.2.2; checksum reports `OK`; changed paths are only the web lane ownership list.
+Expected: tests and vet pass; versions are exactly v5.3.1 and v1.2.2; checksum reports `OK`; changed paths are only the web lane ownership list.
 
 Use precise runtime/scope scans that intentionally exclude upstream license, provenance, vendored JavaScript, and test method names:
 
@@ -838,7 +839,7 @@ Expected: every command exits `0` and the binary exists at `.tmp/kanedias`.
 Run:
 
 ```bash
-test "$(go list -m -f '{{.Version}}' github.com/go-chi/chi/v5)" = "v5.2.3"
+test "$(go list -m -f '{{.Version}}' github.com/go-chi/chi/v5)" = "v5.3.1"
 test "$(go list -m -f '{{.Version}}' github.com/starfederation/datastar-go)" = "v1.2.2"
 RECORDED_SHA256=$(sed -n 's/^SHA-256: //p' internal/server/web/datastar.PROVENANCE)
 test "${#RECORDED_SHA256}" -eq 64
@@ -1144,7 +1145,7 @@ approved design + committed plan
 - [ ] Both approved inert panels appear in implementation instructions, handler tests, and curl smoke.
 - [ ] Exported and private signatures remain consistent from foundation through Cobra and web lanes.
 - [ ] All browser resources are below `internal/server/web` and embedded with `//go:embed web/*`.
-- [ ] Chi is v5.2.3, datastar-go is v1.2.2, and the unchanged browser bundle is v1.0.2 with verified license/provenance/SHA-256.
+- [ ] Chi is v5.3.1, datastar-go is v1.2.2, and the unchanged browser bundle is v1.0.2 with verified license/provenance/SHA-256.
 - [ ] No CSP or unapproved general security-header requirement/test exists.
 - [ ] No task-level or lane reviews occurred; exactly one final review follows integrated verification and curl smoke.
 - [ ] Every writer used harness-native `worktree:true`; no manual worktree was created.
