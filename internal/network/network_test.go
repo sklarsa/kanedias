@@ -3,217 +3,166 @@ package network
 import (
 	"context"
 	"errors"
-	"reflect"
+	"net/http"
 	"strings"
 	"testing"
 
+	"github.com/lxc/incus/v7/shared/api"
 	"github.com/sklarsa/kanedias/internal/config"
 )
 
-type runnerResult struct {
-	output []byte
-	err    error
+type fakeClient struct {
+	network       *api.Network
+	getErr        error
+	createErr     error
+	getCalls      int
+	createCalls   int
+	created       api.NetworksPost
+	getContext    context.Context
+	createContext context.Context
 }
 
-type fakeRunner struct {
-	calls   [][]string
-	results []runnerResult
+func (f *fakeClient) GetNetwork(ctx context.Context, _ string) (*api.Network, error) {
+	f.getCalls++
+	f.getContext = ctx
+	return f.network, f.getErr
 }
-
-func (f *fakeRunner) Run(_ context.Context, args ...string) ([]byte, error) {
-	f.calls = append(f.calls, append([]string(nil), args...))
-	if len(f.results) == 0 {
-		return nil, errors.New("unexpected runner call")
-	}
-	result := f.results[0]
-	f.results = f.results[1:]
-	return result.output, result.err
+func (f *fakeClient) CreateNetwork(ctx context.Context, network api.NetworksPost) error {
+	f.createCalls++
+	f.createContext = ctx
+	f.created = network
+	return f.createErr
 }
 
 func testConfig(ipv6 string) config.Config {
-	return config.Config{Network: config.Network{
-		IPv4: "10.76.111.1/24",
-		IPv6: ipv6,
-	}}
+	return config.Config{Network: config.Network{IPv4: "10.76.111.1/24", IPv6: ipv6}}
 }
 
-var lookupCall = []string{"network", "list", "name=kanedias", "--format=json"}
-
-func TestEnsureCreatesMissingBridge(t *testing.T) {
-	fake := &fakeRunner{results: []runnerResult{{output: []byte("[]")}, {}}}
-
-	if err := ensure(context.Background(), fake, testConfig("")); err != nil {
-		t.Fatalf("ensure() error = %v", err)
-	}
-
-	wantCalls := [][]string{
-		lookupCall,
-		{"network", "create", "kanedias", "--type=bridge", "ipv4.address=10.76.111.1/24"},
-	}
-	if !reflect.DeepEqual(fake.calls, wantCalls) {
-		t.Fatalf("runner calls = %#v, want %#v", fake.calls, wantCalls)
-	}
+func missingClient() *fakeClient {
+	return &fakeClient{getErr: api.StatusErrorf(http.StatusNotFound, "missing")}
 }
 
-func TestEnsureCreatesMissingDualStackBridge(t *testing.T) {
-	fake := &fakeRunner{results: []runnerResult{{output: []byte("[]")}, {}}}
-
-	if err := ensure(context.Background(), fake, testConfig("fd42:28e2:2375:7000::1/64")); err != nil {
-		t.Fatalf("ensure() error = %v", err)
+func TestEnsureWithClientCreatesMissingBridge(t *testing.T) {
+	ctx := context.WithValue(context.Background(), struct{}{}, "request")
+	fake := missingClient()
+	if err := EnsureWithClient(ctx, fake, testConfig("")); err != nil {
+		t.Fatal(err)
 	}
-
-	wantCalls := [][]string{
-		lookupCall,
-		{
-			"network", "create", "kanedias", "--type=bridge",
-			"ipv4.address=10.76.111.1/24",
-			"ipv6.address=fd42:28e2:2375:7000::1/64",
-		},
+	if fake.getCalls != 1 || fake.createCalls != 1 {
+		t.Fatalf("calls = get %d, create %d", fake.getCalls, fake.createCalls)
 	}
-	if !reflect.DeepEqual(fake.calls, wantCalls) {
-		t.Fatalf("runner calls = %#v, want %#v", fake.calls, wantCalls)
+	if fake.getContext != ctx || fake.createContext != ctx {
+		t.Fatal("network requests did not receive supplied context")
+	}
+	if fake.created.Name != Name || fake.created.Type != "bridge" {
+		t.Fatalf("created network = %#v", fake.created)
+	}
+	if got := fake.created.Config["ipv4.address"]; got != "10.76.111.1/24" {
+		t.Fatalf("ipv4.address = %q", got)
+	}
+	if _, exists := fake.created.Config["ipv6.address"]; exists {
+		t.Fatal("unexpected ipv6.address")
 	}
 }
 
-func TestEnsureAcceptsMatchingBridge(t *testing.T) {
-	fake := &fakeRunner{results: []runnerResult{{output: []byte(`[{"name":"kanedias","type":"bridge","managed":true,"config":{"ipv4.address":"10.76.111.1/24","ipv6.address":"fd42:28e2:2375:7000:0:0:0:1/64"}}]`)}}}
-
-	if err := ensure(context.Background(), fake, testConfig("fd42:28e2:2375:7000::1/64")); err != nil {
-		t.Fatalf("ensure() error = %v", err)
+func TestEnsureWithClientCreatesMissingDualStackBridge(t *testing.T) {
+	fake := missingClient()
+	if err := EnsureWithClient(context.Background(), fake, testConfig("fd42:28e2:2375:7000::1/64")); err != nil {
+		t.Fatal(err)
 	}
-	assertCalls(t, fake, lookupCall)
-}
-
-func TestEnsureRejectsUnmanagedNetwork(t *testing.T) {
-	fake := listRunner(`[{"name":"kanedias","type":"bridge","managed":false,"config":{"ipv4.address":"10.76.111.1/24"}}]`)
-
-	err := ensure(context.Background(), fake, testConfig(""))
-	assertErrorContains(t, err, "not managed")
-	assertCalls(t, fake, lookupCall)
-}
-
-func TestEnsureRejectsNonBridgeNetwork(t *testing.T) {
-	fake := listRunner(`[{"name":"kanedias","type":"physical","managed":true,"config":{"ipv4.address":"10.76.111.1/24"}}]`)
-
-	err := ensure(context.Background(), fake, testConfig(""))
-	assertErrorContains(t, err, "must be a bridge")
-	assertCalls(t, fake, lookupCall)
-}
-
-func TestEnsureRejectsDifferentIPv4Address(t *testing.T) {
-	fake := listRunner(`[{"name":"kanedias","type":"bridge","managed":true,"config":{"ipv4.address":"10.76.112.1/24"}}]`)
-
-	err := ensure(context.Background(), fake, testConfig(""))
-	assertErrorContains(t, err, "10.76.112.1/24", "10.76.111.1/24")
-	assertCalls(t, fake, lookupCall)
-}
-
-func TestEnsureRejectsDifferentConfiguredIPv6Address(t *testing.T) {
-	fake := listRunner(`[{"name":"kanedias","type":"bridge","managed":true,"config":{"ipv4.address":"10.76.111.1/24","ipv6.address":"fd42:28e2:2375:8000::1/64"}}]`)
-
-	err := ensure(context.Background(), fake, testConfig("fd42:28e2:2375:7000::1/64"))
-	assertErrorContains(t, err, "fd42:28e2:2375:8000::1/64", "fd42:28e2:2375:7000::1/64")
-	assertCalls(t, fake, lookupCall)
-}
-
-func TestEnsureIgnoresExistingIPv6WhenUnconfigured(t *testing.T) {
-	fake := listRunner(`[{"name":"kanedias","type":"bridge","managed":true,"config":{"ipv4.address":"10.76.111.1/24","ipv6.address":"fd42:ffff::1/48"}}]`)
-
-	if err := ensure(context.Background(), fake, testConfig("")); err != nil {
-		t.Fatalf("ensure() error = %v", err)
-	}
-	assertCalls(t, fake, lookupCall)
-}
-
-func TestEnsureRejectsMalformedListJSON(t *testing.T) {
-	fake := listRunner(`not-json`)
-
-	err := ensure(context.Background(), fake, testConfig(""))
-	assertErrorContains(t, err, "decode Incus network list")
-	assertCalls(t, fake, lookupCall)
-}
-
-func TestEnsurePropagatesListErrorWithoutCreating(t *testing.T) {
-	listErr := errors.New("list failed")
-	fake := &fakeRunner{results: []runnerResult{{err: listErr}}}
-
-	err := ensure(context.Background(), fake, testConfig(""))
-	if !errors.Is(err, listErr) {
-		t.Fatalf("ensure() error = %v, want error wrapping %v", err, listErr)
-	}
-	assertCalls(t, fake, lookupCall)
-}
-
-func TestEnsurePropagatesCreateError(t *testing.T) {
-	createErr := errors.New("create failed")
-	fake := &fakeRunner{results: []runnerResult{{output: []byte("[]")}, {err: createErr}}}
-
-	err := ensure(context.Background(), fake, testConfig(""))
-	if !errors.Is(err, createErr) {
-		t.Fatalf("ensure() error = %v, want error wrapping %v", err, createErr)
-	}
-	wantCalls := [][]string{
-		lookupCall,
-		{"network", "create", "kanedias", "--type=bridge", "ipv4.address=10.76.111.1/24"},
-	}
-	if !reflect.DeepEqual(fake.calls, wantCalls) {
-		t.Fatalf("runner calls = %#v, want %#v", fake.calls, wantCalls)
+	if got := fake.created.Config["ipv6.address"]; got != "fd42:28e2:2375:7000::1/64" {
+		t.Fatalf("ipv6.address = %q", got)
 	}
 }
 
-func TestEnsureValidatesDirectConfigBeforeRunnerCall(t *testing.T) {
+func TestEnsureWithClientAcceptsMatchingBridge(t *testing.T) {
+	fake := &fakeClient{network: bridge(true, "bridge", "10.76.111.1/24", "fd42:28e2:2375:7000:0:0:0:1/64")}
+	if err := EnsureWithClient(context.Background(), fake, testConfig("fd42:28e2:2375:7000::1/64")); err != nil {
+		t.Fatal(err)
+	}
+	if fake.createCalls != 0 {
+		t.Fatal("matching network was recreated")
+	}
+}
+
+func TestEnsureWithClientRejectsInvalidExistingNetwork(t *testing.T) {
 	tests := []struct {
 		name    string
+		network *api.Network
 		cfg     config.Config
-		wantErr string
+		want    []string
 	}{
-		{name: "missing IPv4", cfg: config.Config{}, wantErr: "network.ipv4"},
-		{name: "invalid IPv4", cfg: config.Config{Network: config.Network{IPv4: "bad"}}, wantErr: "network.ipv4"},
-		{name: "invalid IPv6", cfg: config.Config{Network: config.Network{IPv4: "10.76.111.1/24", IPv6: "bad"}}, wantErr: "network.ipv6"},
+		{name: "unmanaged", network: bridge(false, "bridge", "10.76.111.1/24", ""), cfg: testConfig(""), want: []string{"not managed"}},
+		{name: "non-bridge", network: bridge(true, "physical", "10.76.111.1/24", ""), cfg: testConfig(""), want: []string{"must be a bridge"}},
+		{name: "IPv4 mismatch", network: bridge(true, "bridge", "10.76.112.1/24", ""), cfg: testConfig(""), want: []string{"10.76.112.1/24", "10.76.111.1/24"}},
+		{name: "IPv6 mismatch", network: bridge(true, "bridge", "10.76.111.1/24", "fd42:28e2:2375:8000::1/64"), cfg: testConfig("fd42:28e2:2375:7000::1/64"), want: []string{"fd42:28e2:2375:8000::1/64", "fd42:28e2:2375:7000::1/64"}},
 	}
-
 	for _, tt := range tests {
 		t.Run(tt.name, func(t *testing.T) {
-			fake := &fakeRunner{}
-			err := ensure(context.Background(), fake, tt.cfg)
-			assertErrorContains(t, err, tt.wantErr)
-			if len(fake.calls) != 0 {
-				t.Fatalf("runner calls = %#v, want none", fake.calls)
+			err := EnsureWithClient(context.Background(), &fakeClient{network: tt.network}, tt.cfg)
+			assertErrorContains(t, err, tt.want...)
+		})
+	}
+}
+
+func TestEnsureWithClientIgnoresExistingIPv6WhenUnconfigured(t *testing.T) {
+	fake := &fakeClient{network: bridge(true, "bridge", "10.76.111.1/24", "fd42:ffff::1/48")}
+	if err := EnsureWithClient(context.Background(), fake, testConfig("")); err != nil {
+		t.Fatal(err)
+	}
+}
+
+func TestEnsureWithClientPropagatesClientErrors(t *testing.T) {
+	getErr := errors.New("get failed")
+	if err := EnsureWithClient(context.Background(), &fakeClient{getErr: getErr}, testConfig("")); !errors.Is(err, getErr) {
+		t.Fatalf("get error = %v", err)
+	}
+
+	createErr := errors.New("create failed")
+	fake := missingClient()
+	fake.createErr = createErr
+	if err := EnsureWithClient(context.Background(), fake, testConfig("")); !errors.Is(err, createErr) {
+		t.Fatalf("create error = %v", err)
+	}
+}
+
+func TestEnsureWithClientValidatesConfigBeforeClientCall(t *testing.T) {
+	tests := []struct {
+		name string
+		cfg  config.Config
+		want string
+	}{
+		{name: "missing IPv4", cfg: config.Config{}, want: "network.ipv4"},
+		{name: "invalid IPv4", cfg: config.Config{Network: config.Network{IPv4: "bad"}}, want: "network.ipv4"},
+		{name: "invalid IPv6", cfg: config.Config{Network: config.Network{IPv4: "10.76.111.1/24", IPv6: "bad"}}, want: "network.ipv6"},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			fake := &fakeClient{}
+			assertErrorContains(t, EnsureWithClient(context.Background(), fake, tt.cfg), tt.want)
+			if fake.getCalls != 0 {
+				t.Fatalf("get calls = %d, want 0", fake.getCalls)
 			}
 		})
 	}
 }
 
-func TestEnsureRejectsMultipleExactNameResults(t *testing.T) {
-	fake := listRunner(`[
-		{"name":"kanedias","type":"bridge","managed":true,"config":{"ipv4.address":"10.76.111.1/24"}},
-		{"name":"kanedias","type":"bridge","managed":true,"config":{"ipv4.address":"10.76.111.1/24"}}
-	]`)
-
-	err := ensure(context.Background(), fake, testConfig(""))
-	assertErrorContains(t, err, "multiple", "kanedias")
-	assertCalls(t, fake, lookupCall)
-}
-
-func listRunner(output string) *fakeRunner {
-	return &fakeRunner{results: []runnerResult{{output: []byte(output)}}}
-}
-
-func assertCalls(t *testing.T, fake *fakeRunner, calls ...[]string) {
-	t.Helper()
-	if !reflect.DeepEqual(fake.calls, calls) {
-		t.Fatalf("runner calls = %#v, want %#v", fake.calls, calls)
+func bridge(managed bool, networkType, ipv4, ipv6 string) *api.Network {
+	config := api.ConfigMap{"ipv4.address": ipv4}
+	if ipv6 != "" {
+		config["ipv6.address"] = ipv6
 	}
+	return &api.Network{Name: Name, Type: networkType, Managed: managed, NetworkPut: api.NetworkPut{Config: config}}
 }
 
 func assertErrorContains(t *testing.T, err error, values ...string) {
 	t.Helper()
 	if err == nil {
-		t.Fatalf("ensure() error = nil, want error containing %q", values)
+		t.Fatalf("error = nil, want error containing %q", values)
 	}
 	for _, value := range values {
 		if !strings.Contains(err.Error(), value) {
-			t.Errorf("ensure() error = %q, want it to contain %q", err, value)
+			t.Errorf("error = %q, want it to contain %q", err, value)
 		}
 	}
 }

@@ -2,43 +2,31 @@ package network
 
 import (
 	"context"
-	"encoding/json"
 	"fmt"
 	"net/netip"
-	"os/exec"
-	"strings"
 
+	"github.com/lxc/incus/v7/shared/api"
 	"github.com/sklarsa/kanedias/internal/config"
+	"github.com/sklarsa/kanedias/internal/incusclient"
 )
 
 const Name = "kanedias"
 
-type runner interface {
-	Run(ctx context.Context, args ...string) ([]byte, error)
-}
-
-type incusRunner struct{}
-
-func (incusRunner) Run(ctx context.Context, args ...string) ([]byte, error) {
-	output, err := exec.CommandContext(ctx, "incus", args...).CombinedOutput()
-	if err != nil {
-		return output, fmt.Errorf("incus %s: %w (output: %q)", strings.Join(args, " "), err, strings.TrimSpace(string(output)))
-	}
-	return output, nil
-}
-
-type incusNetwork struct {
-	Name    string            `json:"name"`
-	Type    string            `json:"type"`
-	Managed bool              `json:"managed"`
-	Config  map[string]string `json:"config"`
+type Client interface {
+	GetNetwork(context.Context, string) (*api.Network, error)
+	CreateNetwork(context.Context, api.NetworksPost) error
 }
 
 func Ensure(ctx context.Context, cfg config.Config) error {
-	return ensure(ctx, incusRunner{}, cfg)
+	client, err := incusclient.Connect(ctx)
+	if err != nil {
+		return err
+	}
+	defer client.Disconnect()
+	return EnsureWithClient(ctx, client, cfg)
 }
 
-func ensure(ctx context.Context, commandRunner runner, cfg config.Config) error {
+func EnsureWithClient(ctx context.Context, client Client, cfg config.Config) error {
 	ipv4, err := cfg.Network.IPv4Prefix()
 	if err != nil {
 		return err
@@ -48,43 +36,27 @@ func ensure(ctx context.Context, commandRunner runner, cfg config.Config) error 
 		return err
 	}
 
-	output, err := commandRunner.Run(ctx, "network", "list", "name="+Name, "--format=json")
-	if err != nil {
-		return fmt.Errorf("list Incus network %q: %w", Name, err)
-	}
-
-	var listed []incusNetwork
-	if err := json.Unmarshal(output, &listed); err != nil {
-		return fmt.Errorf("decode Incus network list: %w", err)
-	}
-
-	matches := make([]incusNetwork, 0, 1)
-	for _, network := range listed {
-		if network.Name == Name {
-			matches = append(matches, network)
-		}
-	}
-
-	switch len(matches) {
-	case 0:
-		args := []string{
-			"network", "create", Name, "--type=bridge",
-			"ipv4.address=" + ipv4.String(),
-		}
+	network, err := client.GetNetwork(ctx, Name)
+	if incusclient.IsNotFound(err) {
+		config := api.ConfigMap{"ipv4.address": ipv4.String()}
 		if ipv6Present {
-			args = append(args, "ipv6.address="+ipv6.String())
+			config["ipv6.address"] = ipv6.String()
 		}
-		if _, err := commandRunner.Run(ctx, args...); err != nil {
+		if err := client.CreateNetwork(ctx, api.NetworksPost{
+			Name: Name,
+			Type: "bridge",
+			NetworkPut: api.NetworkPut{
+				Config: config,
+			},
+		}); err != nil {
 			return fmt.Errorf("create Incus network %q: %w", Name, err)
 		}
 		return nil
-	case 1:
-		// Reconcile the single existing network below.
-	default:
-		return fmt.Errorf("Incus returned multiple networks named %q", Name)
+	}
+	if err != nil {
+		return fmt.Errorf("get Incus network %q: %w", Name, err)
 	}
 
-	network := matches[0]
 	if !network.Managed {
 		return fmt.Errorf("Incus network %q is not managed", Name)
 	}
