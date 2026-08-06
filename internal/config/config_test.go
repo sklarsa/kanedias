@@ -3,6 +3,7 @@ package config
 import (
 	"os"
 	"path/filepath"
+	"reflect"
 	"strings"
 	"testing"
 )
@@ -73,6 +74,140 @@ func TestLoad(t *testing.T) {
 	}
 }
 
+func TestLoadLifecycleConfig(t *testing.T) {
+	path := writeConfig(t, `[network]
+ipv4 = "10.76.111.1/24"
+ipv6 = "fd42:28e2:2375:7000::1/64"
+[base_image]
+name = "sandbox"
+source = "https://images.linuxcontainers.org"
+image = "debian/13"
+authorized_hosts = ["github.com", "gitlab.com"]
+[workspace]
+pool = "default"
+volume = "workspace"
+repos = ["owner/repo", "other/project"]
+`)
+
+	cfg, err := Load(path)
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	if got, want := cfg.BaseImage, (BaseImage{
+		Name:            "sandbox",
+		Source:          "https://images.linuxcontainers.org",
+		Image:           "debian/13",
+		AuthorizedHosts: []string{"github.com", "gitlab.com"},
+	}); !reflect.DeepEqual(got, want) {
+		t.Errorf("BaseImage = %#v, want %#v", got, want)
+	}
+	if got, want := cfg.Workspace, (Workspace{
+		Pool:   "default",
+		Volume: "workspace",
+		Repos:  []string{"owner/repo", "other/project"},
+	}); !reflect.DeepEqual(got, want) {
+		t.Errorf("Workspace = %#v, want %#v", got, want)
+	}
+}
+
+func TestLoadLifecycleDefaultsAndPaths(t *testing.T) {
+	t.Chdir(t.TempDir())
+	path := filepath.Join("config", "config.toml")
+	if err := os.MkdirAll(filepath.Dir(path), 0o700); err != nil {
+		t.Fatalf("create config directory: %v", err)
+	}
+	if err := os.WriteFile(path, []byte(`[network]
+ipv4 = "10.76.111.1/24"
+[base_image]
+name = "sandbox"
+source = "https://images.linuxcontainers.org"
+image = "debian/13"
+[workspace]
+repos = []
+`), 0o600); err != nil {
+		t.Fatalf("write config: %v", err)
+	}
+
+	cfg, err := Load(path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if cfg.Workspace.Volume != DefaultWorkspaceVolume {
+		t.Fatalf("Workspace.Volume = %q, want %q", cfg.Workspace.Volume, DefaultWorkspaceVolume)
+	}
+	wantDir, err := filepath.Abs(filepath.Dir(path))
+	if err != nil {
+		t.Fatalf("resolve config directory: %v", err)
+	}
+	if cfg.Dir != wantDir {
+		t.Errorf("Dir = %q, want %q", cfg.Dir, wantDir)
+	}
+	if got := cfg.AssetPath("tmux.conf"); got != filepath.Join(wantDir, "assets", "tmux.conf") {
+		t.Errorf("AssetPath() = %q, want %q", got, filepath.Join(wantDir, "assets", "tmux.conf"))
+	}
+	if err := cfg.ValidateLifecycle(); err != nil {
+		t.Fatalf("ValidateLifecycle() error = %v", err)
+	}
+}
+
+func TestValidateLifecycleRequiredFields(t *testing.T) {
+	tests := []struct {
+		name    string
+		cfg     Config
+		wantErr string
+	}{
+		{
+			name: "missing name",
+			cfg: Config{BaseImage: BaseImage{
+				Source: "https://images.linuxcontainers.org",
+				Image:  "debian/13",
+			}},
+			wantErr: "base_image.name is required",
+		},
+		{
+			name: "missing source",
+			cfg: Config{BaseImage: BaseImage{
+				Name:  "sandbox",
+				Image: "debian/13",
+			}},
+			wantErr: "base_image.source is required",
+		},
+		{
+			name: "missing image",
+			cfg: Config{BaseImage: BaseImage{
+				Name:   "sandbox",
+				Source: "https://images.linuxcontainers.org",
+			}},
+			wantErr: "base_image.image is required",
+		},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			if err := tt.cfg.ValidateLifecycle(); err == nil || err.Error() != tt.wantErr {
+				t.Fatalf("ValidateLifecycle() error = %v, want %q", err, tt.wantErr)
+			}
+		})
+	}
+}
+
+func TestValidateLifecycleAllowsEmptyLists(t *testing.T) {
+	cfg := Config{
+		BaseImage: BaseImage{
+			Name:            "sandbox",
+			Source:          "https://images.linuxcontainers.org",
+			Image:           "debian/13",
+			AuthorizedHosts: []string{},
+		},
+		Workspace: Workspace{Repos: []string{}},
+	}
+
+	if err := cfg.ValidateLifecycle(); err != nil {
+		t.Fatalf("ValidateLifecycle() error = %v", err)
+	}
+}
+
 func TestLoadReadError(t *testing.T) {
 	path := filepath.Join(t.TempDir(), "missing.toml")
 
@@ -98,4 +233,13 @@ func TestLoadDecodeError(t *testing.T) {
 	if !strings.Contains(err.Error(), "decode config") {
 		t.Fatalf("Load() error = %q, want error identifying config decode", err)
 	}
+}
+
+func writeConfig(t *testing.T, content string) string {
+	t.Helper()
+	path := filepath.Join(t.TempDir(), "config.toml")
+	if err := os.WriteFile(path, []byte(content), 0o600); err != nil {
+		t.Fatalf("write config: %v", err)
+	}
+	return path
 }

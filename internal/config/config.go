@@ -4,13 +4,32 @@ import (
 	"fmt"
 	"net/netip"
 	"os"
+	"path/filepath"
 
 	"github.com/pelletier/go-toml/v2"
 )
 
 type Config struct {
-	Network Network `toml:"network"`
+	Network   Network   `toml:"network"`
+	BaseImage BaseImage `toml:"base_image"`
+	Workspace Workspace `toml:"workspace"`
+	Dir       string    `toml:"-"`
 }
+
+type BaseImage struct {
+	Name            string   `toml:"name"`
+	Source          string   `toml:"source"`
+	Image           string   `toml:"image"`
+	AuthorizedHosts []string `toml:"authorized_hosts"`
+}
+
+type Workspace struct {
+	Pool   string   `toml:"pool"`
+	Volume string   `toml:"volume"`
+	Repos  []string `toml:"repos"`
+}
+
+const DefaultWorkspaceVolume = "kanedias-workspace-seed"
 
 type Network struct {
 	IPv4 string `toml:"ipv4"`
@@ -18,6 +37,11 @@ type Network struct {
 }
 
 func Load(path string) (Config, error) {
+	absPath, err := filepath.Abs(path)
+	if err != nil {
+		return Config{}, fmt.Errorf("resolve config path %q: %w", path, err)
+	}
+
 	data, err := os.ReadFile(path)
 	if err != nil {
 		return Config{}, fmt.Errorf("read config %q: %w", path, err)
@@ -26,6 +50,10 @@ func Load(path string) (Config, error) {
 	if err := toml.Unmarshal(data, &cfg); err != nil {
 		return Config{}, fmt.Errorf("decode config %q: %w", path, err)
 	}
+	cfg.Dir = filepath.Dir(absPath)
+	if cfg.Workspace.Volume == "" {
+		cfg.Workspace.Volume = DefaultWorkspaceVolume
+	}
 	if _, err := cfg.Network.IPv4Prefix(); err != nil {
 		return Config{}, err
 	}
@@ -33,6 +61,23 @@ func Load(path string) (Config, error) {
 		return Config{}, err
 	}
 	return cfg, nil
+}
+
+func (cfg Config) ValidateLifecycle() error {
+	if cfg.BaseImage.Name == "" {
+		return fmt.Errorf("base_image.name is required")
+	}
+	if cfg.BaseImage.Source == "" {
+		return fmt.Errorf("base_image.source is required")
+	}
+	if cfg.BaseImage.Image == "" {
+		return fmt.Errorf("base_image.image is required")
+	}
+	return nil
+}
+
+func (cfg Config) AssetPath(name string) string {
+	return filepath.Join(cfg.Dir, "assets", name)
 }
 
 func (network Network) IPv4Prefix() (netip.Prefix, error) {
