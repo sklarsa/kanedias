@@ -391,6 +391,96 @@ func TestProxyTunnelsOtherHostsWithoutChangingRequests(t *testing.T) {
 	}
 }
 
+func TestProxyPassesAnonymousGitHubWebTraffic(t *testing.T) {
+	ca, caPEM, _, err := generateCA("anonymous GitHub test")
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	receivedAuthorization := make(chan string, 1)
+	upstream := httptest.NewTLSServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		receivedAuthorization <- r.Header.Get("Authorization")
+		_, _ = io.WriteString(w, "github home")
+	}))
+	defer upstream.Close()
+
+	handler := newProxy(ca, credentials{})
+	handler.Tr.DialContext = func(ctx context.Context, network, address string) (net.Conn, error) {
+		return (&net.Dialer{}).DialContext(ctx, network, upstream.Listener.Addr().String())
+	}
+	handler.Tr.TLSClientConfig = &tls.Config{InsecureSkipVerify: true} // local fake upstream
+	proxyServer := httptest.NewServer(handler)
+	defer proxyServer.Close()
+
+	resp, err := observedMITMClient(t, proxyServer.URL, caPEM).Get("https://github.com/")
+	if err != nil {
+		t.Fatal(err)
+	}
+	body, err := io.ReadAll(resp.Body)
+	_ = resp.Body.Close()
+	if err != nil {
+		t.Fatal(err)
+	}
+	if resp.StatusCode != http.StatusOK {
+		t.Fatalf("status = %d, want 200; body = %q", resp.StatusCode, body)
+	}
+	if string(body) != "github home" {
+		t.Fatalf("body = %q, want %q", body, "github home")
+	}
+	if authorization := <-receivedAuthorization; authorization != "" {
+		t.Fatalf("Authorization = %q, want empty", authorization)
+	}
+}
+
+func TestProxyReturnsAgentFriendlyGitHubAuthError(t *testing.T) {
+	ca, caPEM, _, err := generateCA("missing GitHub auth test")
+	if err != nil {
+		t.Fatal(err)
+	}
+	handler := newProxy(ca, credentials{})
+	proxyServer := httptest.NewServer(handler)
+	defer proxyServer.Close()
+	client := observedMITMClient(t, proxyServer.URL, caPEM)
+
+	tests := []struct {
+		name          string
+		url           string
+		authorization string
+	}{
+		{name: "API", url: "https://api.github.com/user"},
+		{name: "authenticated web", url: "https://github.com/owner/repository.git", authorization: "Basic sandbox-placeholder"},
+	}
+	for _, test := range tests {
+		t.Run(test.name, func(t *testing.T) {
+			req, err := http.NewRequest(http.MethodGet, test.url, nil)
+			if err != nil {
+				t.Fatal(err)
+			}
+			if test.authorization != "" {
+				req.Header.Set("Authorization", test.authorization)
+			}
+			resp, err := client.Do(req)
+			if err != nil {
+				t.Fatal(err)
+			}
+			body, err := io.ReadAll(resp.Body)
+			_ = resp.Body.Close()
+			if err != nil {
+				t.Fatal(err)
+			}
+			if resp.StatusCode != http.StatusBadGateway {
+				t.Errorf("status = %d, want 502", resp.StatusCode)
+			}
+			if contentType := resp.Header.Get("Content-Type"); contentType != "text/plain" {
+				t.Errorf("Content-Type = %q, want text/plain", contentType)
+			}
+			if string(body) != "GitHub auth unavailable" {
+				t.Errorf("body = %q, want %q", body, "GitHub auth unavailable")
+			}
+		})
+	}
+}
+
 func TestInitCAGeneratesValidKeyPair(t *testing.T) {
 	dir := t.TempDir()
 	certPath := filepath.Join(dir, "ca.crt")
