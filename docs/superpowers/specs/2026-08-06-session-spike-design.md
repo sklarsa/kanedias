@@ -18,7 +18,7 @@ This is a focused spike toward a future Kanedias server with an integrated crede
 
 Stdout contains only the raw LF-delimited JSON records emitted by Pi RPC. This includes command responses, text and thinking deltas, tool events, and lifecycle events. Kanedias lifecycle progress and errors go to stderr so stdout remains machine-readable.
 
-The existing credential proxy is an external prerequisite. `kanedias proxy run` must already be listening at the configured sandbox proxy endpoint; the session command does not start or own the proxy.
+The existing credential proxy is an external prerequisite for sandbox/session traffic. `kanedias proxy run` must already be listening at the configured sandbox proxy endpoint; the session command does not start or own the proxy. Base-image construction uses direct IPv4 egress through the managed bridge and does not use or require the Kanedias proxy.
 
 The command sends exactly one RPC request:
 
@@ -30,7 +30,7 @@ It forwards records until Pi emits `agent_settled`, then closes the connection a
 
 ## Hardcoded Incus Project
 
-Kanedias images, profiles, instances, and custom volumes live in the hardcoded Incus project `kanedias`. The Incus-managed bridge remains in the default network project and is shared with `kanedias` through `features.networks=false`, because bridge networks cannot be project-local. Network operations still flow through the project-scoped client, and Incus maps them to the default network project.
+Kanedias images, profiles, instances, and custom volumes live in the hardcoded Incus project `kanedias`. The Incus-managed bridge remains in the default network project and is shared with `kanedias` through `features.networks=false`, because bridge networks cannot be project-local. Network operations still flow through the project-scoped client, and Incus maps them to the default network project. The bridge requires `ipv4.nat=true` so temporary image-build containers have direct package-download egress; an existing bridge without that setting fails with an actionable manual correction rather than being mutated automatically.
 
 Connection setup will:
 
@@ -129,6 +129,7 @@ Testing remains intentionally narrow:
 - one happy-path session lifecycle using a narrow fake Incus client;
 - a local TCP fake that verifies the prompt request, byte-for-byte JSONL forwarding, and completion on `agent_settled`;
 - cleanup after one representative startup or session failure;
+- managed-network assertions for direct IPv4 NAT on creation and validation;
 - image-installer assertions for the installed and enabled systemd socket;
 - the existing `go test ./...` suite;
 - one live smoke test with the proxy running:

@@ -60,6 +60,9 @@ func TestEnsureWithClientCreatesMissingBridge(t *testing.T) {
 	if got := fake.created.Config["ipv4.address"]; got != "10.76.111.1/24" {
 		t.Fatalf("ipv4.address = %q", got)
 	}
+	if got := fake.created.Config["ipv4.nat"]; got != "true" {
+		t.Fatalf("ipv4.nat = %q, want true", got)
+	}
 	if _, exists := fake.created.Config["ipv6.address"]; exists {
 		t.Fatal("unexpected ipv6.address")
 	}
@@ -83,6 +86,18 @@ func TestEnsureWithClientAcceptsMatchingBridge(t *testing.T) {
 	if fake.createCalls != 0 {
 		t.Fatal("matching network was recreated")
 	}
+}
+
+func TestEnsureWithClientRejectsExistingBridgeWithoutIPv4NAT(t *testing.T) {
+	network := bridge(true, "bridge", "10.76.111.1/24", "")
+	delete(network.Config, "ipv4.nat")
+
+	err := EnsureWithClient(context.Background(), &fakeClient{network: network}, testConfig(""))
+	assertErrorContains(t, err,
+		"ipv4.nat",
+		"true",
+		"incus network set kanedias ipv4.nat=true --project default",
+	)
 }
 
 func TestEnsureWithClientRejectsInvalidExistingNetwork(t *testing.T) {
@@ -148,7 +163,7 @@ func TestEnsureWithClientValidatesConfigBeforeClientCall(t *testing.T) {
 }
 
 func bridge(managed bool, networkType, ipv4, ipv6 string) *api.Network {
-	config := api.ConfigMap{"ipv4.address": ipv4}
+	config := api.ConfigMap{"ipv4.address": ipv4, "ipv4.nat": "true"}
 	if ipv6 != "" {
 		config["ipv6.address"] = ipv6
 	}

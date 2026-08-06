@@ -4,7 +4,7 @@
 
 **Goal:** Add `kanedias session`, which reads one prompt from stdin, runs one Pi RPC process in an ephemeral Incus sandbox, streams raw RPC JSONL over TCP, and deletes the session resources.
 
-**Architecture:** Every Incus client is scoped to an automatically ensured hardcoded `kanedias` project. Kanedias images, profiles, instances, and custom volumes live in that project, while its Incus-managed bridge remains in the default network project and is shared through `features.networks=false`. The guest base image uses systemd socket activation to connect TCP port 7777 directly to `pi --mode rpc` stdin/stdout, while a focused Go session workflow owns Incus lifecycle, address discovery, raw JSONL forwarding, and cleanup.
+**Architecture:** Every Incus client is scoped to an automatically ensured hardcoded `kanedias` project. Kanedias images, profiles, instances, and custom volumes live in that project, while its Incus-managed bridge remains in the default network project and is shared through `features.networks=false`. The bridge supplies direct IPv4 NAT egress for image construction; sandbox/session traffic continues to use the externally managed Kanedias proxy. The guest base image uses systemd socket activation to connect TCP port 7777 directly to `pi --mode rpc` stdin/stdout, while a focused Go session workflow owns Incus lifecycle, address discovery, raw JSONL forwarding, and cleanup.
 
 **Tech Stack:** Go 1.26.5, Cobra, github.com/lxc/incus/v7 v7.3.0, systemd socket activation, Pi RPC JSONL, TCP.
 
@@ -16,6 +16,7 @@
 - Run exactly one independent code review after all implementation tasks are integrated and verified. Do not dispatch task-level review agents.
 - Kanedias images, profiles, instances, and custom volumes use the hardcoded project name `kanedias`.
 - The Incus-managed bridge remains in the default network project and is shared through `features.networks=false`, because bridge networks cannot be project-local. Network operations still flow through the project-scoped client, and Incus maps them to the default network project.
+- The managed bridge requires `ipv4.nat=true` for direct image-build egress. Image creation does not use the Kanedias proxy; `kanedias proxy run` remains a prerequisite only for sandbox/session traffic.
 - A missing project is created with isolated images, profiles, and storage volumes plus access to the shared default-project bridge; an existing project with incompatible feature values fails clearly.
 - `kanedias session` accepts no arguments and reads the complete prompt from stdin.
 - Stdout contains only raw Pi RPC JSONL. Progress and Kanedias errors go to stderr.
@@ -838,7 +839,7 @@ Expected: build succeeds and help identifies stdin-driven ephemeral Pi session b
 
 - [ ] **Step 3: Prepare and run the live smoke test**
 
-With a working local Incus daemon, use the user's existing ignored configuration and assets from the original checkout while keeping all code changes in the integration worktree:
+With a working local Incus daemon, use the user's existing ignored configuration and assets from the original checkout while keeping all code changes in the integration worktree. Image creation uses the bridge's direct IPv4 NAT egress and does not require `kanedias proxy run`:
 
 ```bash
 KANEDIAS_CONFIG=/home/steven/source/github/kanedias/config.toml
@@ -846,7 +847,7 @@ KANEDIAS_CONFIG=/home/steven/source/github/kanedias/config.toml
 /tmp/kanedias-session-spike --config "$KANEDIAS_CONFIG" workspace sync
 ```
 
-Start `proxy run` with the same config in a separately managed process if it is not already running, then execute:
+After image creation and workspace sync complete, start `proxy run` with the same config in a separately managed process if it is not already running, then execute the sandbox session:
 
 ```bash
 printf '%s\n' 'Reply with a short greeting.' | \

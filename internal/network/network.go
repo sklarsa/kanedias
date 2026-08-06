@@ -38,7 +38,10 @@ func EnsureWithClient(ctx context.Context, client Client, cfg config.Config) err
 
 	network, err := client.GetNetwork(ctx, Name)
 	if incusclient.IsNotFound(err) {
-		config := api.ConfigMap{"ipv4.address": ipv4.String()}
+		config := api.ConfigMap{
+			"ipv4.address": ipv4.String(),
+			"ipv4.nat":     "true",
+		}
 		if ipv6Present {
 			config["ipv6.address"] = ipv6.String()
 		}
@@ -62,6 +65,9 @@ func EnsureWithClient(ctx context.Context, client Client, cfg config.Config) err
 	}
 	if network.Type != "bridge" {
 		return fmt.Errorf("Incus network %q has type %q; it must be a bridge", Name, network.Type)
+	}
+	if network.Config["ipv4.nat"] != "true" {
+		return fmt.Errorf("Incus network %q must have ipv4.nat=true for direct image-build egress; run: incus network set %s ipv4.nat=true --project default", Name, Name)
 	}
 	if err := requirePrefix("ipv4.address", network.Config["ipv4.address"], ipv4); err != nil {
 		return err
