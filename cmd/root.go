@@ -5,9 +5,12 @@ import (
 	"io"
 
 	"github.com/sklarsa/kanedias/internal/config"
+	"github.com/sklarsa/kanedias/internal/image"
 	"github.com/sklarsa/kanedias/internal/network"
 	"github.com/sklarsa/kanedias/internal/profiles"
 	"github.com/sklarsa/kanedias/internal/proxy"
+	"github.com/sklarsa/kanedias/internal/sandbox"
+	"github.com/sklarsa/kanedias/internal/workspace"
 	"github.com/spf13/cobra"
 )
 
@@ -18,6 +21,10 @@ type services struct {
 	runProxy         func(proxy.Options) error
 	initCA           func(string, string) error
 	loginOpenAICodex func(context.Context, string, io.Writer) error
+	createImage      func(context.Context, config.Config, io.Writer, io.Writer) error
+	createSandbox    func(context.Context, config.Config, string, io.Writer, io.Writer) error
+	destroySandbox   func(context.Context, config.Config, string, io.Writer, io.Writer) error
+	syncWorkspace    func(context.Context, config.Config, io.Writer, io.Writer) error
 }
 
 // Execute runs the Kanedias command-line interface.
@@ -37,6 +44,10 @@ func realServices() services {
 		runProxy:         proxy.Run,
 		initCA:           proxy.InitCA,
 		loginOpenAICodex: proxy.LoginOpenAICodex,
+		createImage:      image.Create,
+		createSandbox:    sandbox.Create,
+		destroySandbox:   sandbox.Destroy,
+		syncWorkspace:    workspace.Sync,
 	}
 }
 
@@ -44,14 +55,17 @@ func newRootCommand(service services, options proxy.Options) *cobra.Command {
 	configPath := "./config.toml"
 	root := &cobra.Command{
 		Use:          "kanedias",
-		Short:        "Manage Kanedias Incus profiles and proxy",
+		Short:        "Incus lifecycle management for Kanedias profiles and proxy",
 		SilenceUsage: true,
 	}
 	root.PersistentFlags().StringVar(&configPath, "config", configPath, "path to the Kanedias configuration file")
 	getConfigPath := func() string { return configPath }
 	root.AddCommand(
+		newImageCommand(service, getConfigPath),
 		newProfileCommand(service, getConfigPath),
 		newProxyCommand(service, getConfigPath, options),
+		newSandboxCommand(service, getConfigPath),
+		newWorkspaceCommand(service, getConfigPath),
 	)
 	return root
 }

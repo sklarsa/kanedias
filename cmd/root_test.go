@@ -3,6 +3,7 @@ package cmd
 import (
 	"bytes"
 	"context"
+	"errors"
 	"io"
 	"reflect"
 	"strings"
@@ -11,22 +12,33 @@ import (
 	"github.com/sklarsa/kanedias/internal/config"
 	"github.com/sklarsa/kanedias/internal/proxy"
 	"github.com/spf13/cobra"
+	"github.com/spf13/pflag"
 )
 
 func TestCommandHierarchyAndFlags(t *testing.T) {
 	root := newRootCommand(stubServices(), testProxyOptions())
 
-	assertChildCommands(t, root, "profile", "proxy")
+	assertChildCommands(t, root, "image", "profile", "proxy", "sandbox", "workspace")
+	assertChildCommands(t, mustFindCommand(t, root, "image"), "create")
 	assertChildCommands(t, mustFindCommand(t, root, "proxy"), "init-ca", "login", "run")
 	assertChildCommands(t, mustFindCommand(t, root, "proxy", "login"), "openai-codex")
+	assertChildCommands(t, mustFindCommand(t, root, "sandbox"), "create", "destroy")
+	assertChildCommands(t, mustFindCommand(t, root, "workspace"), "sync")
 
 	for _, path := range [][]string{
+		{"image"},
+		{"image", "create"},
 		{"profile"},
 		{"proxy"},
 		{"proxy", "run"},
 		{"proxy", "init-ca"},
 		{"proxy", "login"},
 		{"proxy", "login", "openai-codex"},
+		{"sandbox"},
+		{"sandbox", "create"},
+		{"sandbox", "destroy"},
+		{"workspace"},
+		{"workspace", "sync"},
 	} {
 		command, remaining, err := root.Find(path)
 		if err != nil {
@@ -60,6 +72,170 @@ func TestCommandHierarchyAndFlags(t *testing.T) {
 	}
 	if root.DisableAutoGenTag {
 		t.Error("Cobra generated-command behavior is disabled")
+	}
+	if !strings.Contains(root.Short, "Incus lifecycle management") {
+		t.Errorf("root short help = %q, want Incus lifecycle management", root.Short)
+	}
+
+	for _, path := range [][]string{
+		{"image", "create"},
+		{"sandbox", "create"},
+		{"sandbox", "destroy"},
+		{"workspace", "sync"},
+	} {
+		command := mustFindCommand(t, root, path...)
+		var localFlags []string
+		command.LocalNonPersistentFlags().VisitAll(func(flag *pflag.Flag) {
+			localFlags = append(localFlags, flag.Name)
+		})
+		if len(localFlags) != 0 {
+			t.Errorf("%s local flags = %q, want none", command.CommandPath(), localFlags)
+		}
+	}
+}
+
+func TestLifecycleCommandDelegation(t *testing.T) {
+	cfg := config.Config{Network: config.Network{IPv4: "10.76.111.1/24"}}
+	workflowErr := errors.New("workflow failed")
+	tests := []struct {
+		name     string
+		args     []string
+		workflow string
+		wantName string
+	}{
+		{name: "image create", args: []string{"image", "create"}, workflow: "image"},
+		{name: "sandbox create default", args: []string{"sandbox", "create"}, workflow: "sandbox-create", wantName: "sandbox"},
+		{name: "sandbox create named", args: []string{"sandbox", "create", "personal"}, workflow: "sandbox-create", wantName: "personal"},
+		{name: "sandbox destroy default", args: []string{"sandbox", "destroy"}, workflow: "sandbox-destroy", wantName: "sandbox"},
+		{name: "sandbox destroy named", args: []string{"sandbox", "destroy", "personal"}, workflow: "sandbox-destroy", wantName: "personal"},
+		{name: "workspace sync", args: []string{"workspace", "sync"}, workflow: "workspace"},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			ctx, cancel := context.WithCancel(context.Background())
+			cancel()
+			var stdout, stderr bytes.Buffer
+			var calls []string
+
+			service := stubServices()
+			service.loadConfig = func(path string) (config.Config, error) {
+				calls = append(calls, "load")
+				if path != "/tmp/lifecycle.toml" {
+					t.Errorf("loaded path = %q, want /tmp/lifecycle.toml", path)
+				}
+				return cfg, nil
+			}
+			check := func(gotContext context.Context, gotConfig config.Config, gotStdout, gotStderr io.Writer, workflow, name string) error {
+				calls = append(calls, workflow)
+				if gotContext != ctx {
+					t.Error("workflow did not receive the exact command context")
+				}
+				if !reflect.DeepEqual(gotConfig, cfg) {
+					t.Errorf("workflow config = %#v, want %#v", gotConfig, cfg)
+				}
+				if gotStdout != &stdout {
+					t.Error("workflow did not receive the exact stdout writer")
+				}
+				if gotStderr != &stderr {
+					t.Error("workflow did not receive the exact stderr writer")
+				}
+				if workflow != tt.workflow {
+					t.Errorf("workflow = %q, want %q", workflow, tt.workflow)
+				}
+				if name != tt.wantName {
+					t.Errorf("sandbox name = %q, want %q", name, tt.wantName)
+				}
+				return workflowErr
+			}
+			service.createImage = func(ctx context.Context, cfg config.Config, stdout, stderr io.Writer) error {
+				return check(ctx, cfg, stdout, stderr, "image", "")
+			}
+			service.createSandbox = func(ctx context.Context, cfg config.Config, name string, stdout, stderr io.Writer) error {
+				return check(ctx, cfg, stdout, stderr, "sandbox-create", name)
+			}
+			service.destroySandbox = func(ctx context.Context, cfg config.Config, name string, stdout, stderr io.Writer) error {
+				return check(ctx, cfg, stdout, stderr, "sandbox-destroy", name)
+			}
+			service.syncWorkspace = func(ctx context.Context, cfg config.Config, stdout, stderr io.Writer) error {
+				return check(ctx, cfg, stdout, stderr, "workspace", "")
+			}
+
+			root := newRootCommand(service, testProxyOptions())
+			root.SetContext(ctx)
+			root.SetOut(&stdout)
+			root.SetErr(&stderr)
+			root.SetArgs(append([]string{"--config", "/tmp/lifecycle.toml"}, tt.args...))
+			if err := root.Execute(); !errors.Is(err, workflowErr) {
+				t.Fatalf("Execute() error = %v, want workflow error", err)
+			}
+			if !reflect.DeepEqual(calls, []string{"load", tt.workflow}) {
+				t.Errorf("call order = %q, want [load %s]", calls, tt.workflow)
+			}
+		})
+	}
+}
+
+func TestLifecycleCommandsStopWhenConfigLoadFails(t *testing.T) {
+	loadErr := errors.New("load failed")
+	for _, args := range [][]string{
+		{"image", "create"},
+		{"sandbox", "create"},
+		{"sandbox", "destroy", "personal"},
+		{"workspace", "sync"},
+	} {
+		t.Run(strings.Join(args, " "), func(t *testing.T) {
+			calls := 0
+			service := stubServices()
+			service.loadConfig = func(string) (config.Config, error) {
+				calls++
+				return config.Config{}, loadErr
+			}
+			service.createImage = func(context.Context, config.Config, io.Writer, io.Writer) error {
+				t.Fatal("createImage called after config error")
+				return nil
+			}
+			service.createSandbox = func(context.Context, config.Config, string, io.Writer, io.Writer) error {
+				t.Fatal("createSandbox called after config error")
+				return nil
+			}
+			service.destroySandbox = func(context.Context, config.Config, string, io.Writer, io.Writer) error {
+				t.Fatal("destroySandbox called after config error")
+				return nil
+			}
+			service.syncWorkspace = func(context.Context, config.Config, io.Writer, io.Writer) error {
+				t.Fatal("syncWorkspace called after config error")
+				return nil
+			}
+
+			root := newRootCommand(service, testProxyOptions())
+			root.SetOut(io.Discard)
+			root.SetErr(io.Discard)
+			root.SetArgs(args)
+			if err := root.Execute(); !errors.Is(err, loadErr) {
+				t.Fatalf("Execute() error = %v, want load error", err)
+			}
+			if calls != 1 {
+				t.Errorf("loadConfig calls = %d, want 1", calls)
+			}
+		})
+	}
+}
+
+func TestLifecycleCommandsRejectExtraArguments(t *testing.T) {
+	for _, args := range [][]string{
+		{"image", "create", "extra"},
+		{"sandbox", "create", "one", "two"},
+		{"sandbox", "destroy", "one", "two"},
+		{"workspace", "sync", "extra"},
+	} {
+		root := newRootCommand(stubServices(), testProxyOptions())
+		root.SetOut(io.Discard)
+		root.SetErr(io.Discard)
+		root.SetArgs(args)
+		if err := root.Execute(); err == nil {
+			t.Errorf("Execute(%q) succeeded, want argument error", args)
+		}
 	}
 }
 
@@ -216,6 +392,18 @@ func stubServices() services {
 		runProxy:      func(proxy.Options) error { return nil },
 		initCA:        func(string, string) error { return nil },
 		loginOpenAICodex: func(context.Context, string, io.Writer) error {
+			return nil
+		},
+		createImage: func(context.Context, config.Config, io.Writer, io.Writer) error {
+			return nil
+		},
+		createSandbox: func(context.Context, config.Config, string, io.Writer, io.Writer) error {
+			return nil
+		},
+		destroySandbox: func(context.Context, config.Config, string, io.Writer, io.Writer) error {
+			return nil
+		},
+		syncWorkspace: func(context.Context, config.Config, io.Writer, io.Writer) error {
 			return nil
 		},
 	}
