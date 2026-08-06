@@ -151,7 +151,12 @@ func TestInitialPageContainsCircleOfFleetMockup(t *testing.T) {
 		`id="fleet-orbit"`,
 		`RPC-SPIKE`,
 		`WEB-SHELL`,
+		`INCUS-IMAGE`,
+		`FINAL-REVIEW`,
+		`RESEARCHER`,
 		`PTY-OWNER`,
+		`TEST-RUNNER`,
+		`CORRECTNESS`,
 		`id="maker-aperture"`,
 		`Should shell sessions survive a browser reconnect`,
 		`12.8K`,
@@ -216,6 +221,55 @@ func TestCircleOfFleetMockupIsStatic(t *testing.T) {
 			t.Errorf("mockup button is not disabled: %s", button)
 		}
 	}
+
+	scriptRE := regexp.MustCompile(`(?s)<script\b([^>]*)>(.*?)</script>`)
+	scripts := scriptRE.FindAllStringSubmatch(body, -1)
+	if len(scripts) != 1 {
+		t.Fatalf("script count = %d, want only the local Datastar module", len(scripts))
+	}
+	if !strings.Contains(scripts[0][1], `type="module"`) || !strings.Contains(scripts[0][1], `src="/assets/datastar.js"`) {
+		t.Errorf("sole script is not the local Datastar module: %s", scripts[0][0])
+	}
+	if strings.TrimSpace(scripts[0][2]) != "" {
+		t.Errorf("local Datastar script has unexpected inline body %q", scripts[0][2])
+	}
+}
+
+func TestCircleOfFleetGroupsNestedSubagentsWithParents(t *testing.T) {
+	body := indexBody(t)
+	if got := strings.Count(body, `class="run-cluster"`); got != 4 {
+		t.Errorf("run cluster count = %d, want 4 parent/child groups", got)
+	}
+	if got := strings.Count(body, `class="run-node `); got != 4 {
+		t.Errorf("parent run count = %d, want 4", got)
+	}
+	if got := strings.Count(body, `class="child-moon `); got != 4 {
+		t.Errorf("nested subagent count = %d, want 4", got)
+	}
+
+	groups := []string{
+		`aria-label="RPC-SPIKE parent run with nested RESEARCHER subagent"`,
+		`aria-label="WEB-SHELL parent run with nested PTY-OWNER subagent"`,
+		`aria-label="INCUS-IMAGE parent run with nested TEST-RUNNER subagent"`,
+		`aria-label="FINAL-REVIEW parent run with nested CORRECTNESS subagent"`,
+	}
+	for _, group := range groups {
+		if !strings.Contains(body, group) {
+			t.Errorf("mockup does not expose parent/child group %q", group)
+		}
+	}
+
+	decorativeMarks := []string{
+		`<header><span>RPC-SPIKE</span><span aria-hidden="true">◆</span></header>`,
+		`<header><span>WEB-SHELL</span><span aria-hidden="true">◇</span></header>`,
+		`<header><span>INCUS-IMAGE</span><span aria-hidden="true">◆</span></header>`,
+		`<header><span>FINAL-REVIEW</span><span aria-hidden="true">◆</span></header>`,
+	}
+	for _, mark := range decorativeMarks {
+		if !strings.Contains(body, mark) {
+			t.Errorf("card header does not hide decorative mark: %s", mark)
+		}
+	}
 }
 
 func TestAssetsAreEmbedded(t *testing.T) {
@@ -261,10 +315,14 @@ func TestTerminalCSSProvenanceMatchesEmbeddedAsset(t *testing.T) {
 		t.Fatalf("read Terminal.css provenance: %v", err)
 	}
 
+	const expectedDigest = "54382cfc04c064df22f6179453bb3eb85c50fd9cf855f7b57adfbe8c8f75b0f8"
 	digest := sha256.Sum256(stylesheet)
+	if got := fmt.Sprintf("%x", digest); got != expectedDigest {
+		t.Fatalf("Terminal.css SHA-256 = %q, want immutable upstream digest %q", got, expectedDigest)
+	}
 	checks := []string{
 		"Commit: 63551f0de711f2f634a0c2da7bab1d3bae216fef",
-		fmt.Sprintf("SHA-256: %x", digest),
+		"SHA-256: " + expectedDigest,
 		"License identifier: MIT",
 		"Modification: Vendored unchanged for offline embedding.",
 	}

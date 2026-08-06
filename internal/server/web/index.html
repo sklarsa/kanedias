@@ -48,57 +48,64 @@
             <span>YOU / MAKER</span>
           </div>
 
-          <article class="run-node run-rpc terminal-card" aria-label="RPC Spike workflow active">
-            <header><span>RPC-SPIKE</span><span>◆</span></header>
-            <div>
-              <p>workflow · 3 children</p>
-              <strong>● ACTIVE</strong>
-              <span>READ docs/rpc.md · 01:42</span>
+          <div class="run-cluster" role="group" aria-label="RPC-SPIKE parent run with nested RESEARCHER subagent">
+            <article class="run-node run-rpc terminal-card" aria-label="RPC Spike workflow active">
+              <header><span>RPC-SPIKE</span><span aria-hidden="true">◆</span></header>
+              <div>
+                <p>workflow · 3 children</p>
+                <strong>● ACTIVE</strong>
+                <span>READ docs/rpc.md · 01:42</span>
+              </div>
+            </article>
+            <div class="child-moon moon-researcher">
+              <span class="moon-mark" aria-hidden="true">○</span>
+              <span><strong>RESEARCHER</strong><small>COMPLETE</small></span>
             </div>
-          </article>
-
-          <article class="run-node run-shell terminal-card question-node" aria-label="Web Shell worker paused with a question">
-            <header><span>WEB-SHELL</span><span>◇</span></header>
-            <div>
-              <p>worker · 2 children</p>
-              <strong>◇ QUESTION</strong>
-              <span>PAUSED FOR THE MAKER</span>
-            </div>
-          </article>
-
-          <article class="run-node run-incus terminal-card" aria-label="Incus Image worker active">
-            <header><span>INCUS-IMAGE</span><span>◆</span></header>
-            <div>
-              <p>worker · 1 child</p>
-              <strong>● ACTIVE</strong>
-              <span>TEST ./internal/image · 00:44</span>
-            </div>
-          </article>
-
-          <article class="run-node run-review terminal-card" aria-label="Final Review parallel run partially complete">
-            <header><span>FINAL-REVIEW</span><span>◆</span></header>
-            <div>
-              <p>parallel · 3 children</p>
-              <strong>○ COMPLETE 1/3</strong>
-              <span>8.4K TOKENS OBSERVED</span>
-            </div>
-          </article>
-
-          <div class="child-moon moon-researcher">
-            <span class="moon-mark" aria-hidden="true">○</span>
-            <span><strong>RESEARCHER</strong><small>COMPLETE</small></span>
           </div>
-          <div class="child-moon moon-pty question-moon">
-            <span class="moon-mark" aria-hidden="true">◇</span>
-            <span><strong>PTY-OWNER</strong><small>QUESTION</small></span>
+
+          <div class="run-cluster" role="group" aria-label="WEB-SHELL parent run with nested PTY-OWNER subagent">
+            <article class="run-node run-shell terminal-card question-node" aria-label="Web Shell worker paused with a question">
+              <header><span>WEB-SHELL</span><span aria-hidden="true">◇</span></header>
+              <div>
+                <p>worker · 2 children</p>
+                <strong>◇ QUESTION</strong>
+                <span>PAUSED FOR THE MAKER</span>
+              </div>
+            </article>
+            <div class="child-moon moon-pty question-moon">
+              <span class="moon-mark" aria-hidden="true">◇</span>
+              <span><strong>PTY-OWNER</strong><small>QUESTION</small></span>
+            </div>
           </div>
-          <div class="child-moon moon-tests">
-            <span class="moon-mark" aria-hidden="true">●</span>
-            <span><strong>TEST-RUNNER</strong><small>ACTIVE</small></span>
+
+          <div class="run-cluster" role="group" aria-label="INCUS-IMAGE parent run with nested TEST-RUNNER subagent">
+            <article class="run-node run-incus terminal-card" aria-label="Incus Image worker active">
+              <header><span>INCUS-IMAGE</span><span aria-hidden="true">◆</span></header>
+              <div>
+                <p>worker · 1 child</p>
+                <strong>● ACTIVE</strong>
+                <span>TEST ./internal/image · 00:44</span>
+              </div>
+            </article>
+            <div class="child-moon moon-tests">
+              <span class="moon-mark" aria-hidden="true">●</span>
+              <span><strong>TEST-RUNNER</strong><small>ACTIVE</small></span>
+            </div>
           </div>
-          <div class="child-moon moon-correctness">
-            <span class="moon-mark" aria-hidden="true">●</span>
-            <span><strong>CORRECTNESS</strong><small>ACTIVE</small></span>
+
+          <div class="run-cluster" role="group" aria-label="FINAL-REVIEW parent run with nested CORRECTNESS subagent">
+            <article class="run-node run-review terminal-card" aria-label="Final Review parallel run partially complete">
+              <header><span>FINAL-REVIEW</span><span aria-hidden="true">◆</span></header>
+              <div>
+                <p>parallel · 3 children</p>
+                <strong>○ COMPLETE 1/3</strong>
+                <span>8.4K TOKENS OBSERVED</span>
+              </div>
+            </article>
+            <div class="child-moon moon-correctness">
+              <span class="moon-mark" aria-hidden="true">●</span>
+              <span><strong>CORRECTNESS</strong><small>ACTIVE</small></span>
+            </div>
           </div>
         </div>
 
