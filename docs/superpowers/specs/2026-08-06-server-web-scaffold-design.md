@@ -4,7 +4,7 @@
 
 Add `kanedias server` to the existing Cobra command hierarchy. The command serves a local-only web shell that proves the complete browser-to-Chi-to-Datastar path without introducing application state or Incus behavior.
 
-The initial page contains only a Kanedias title, a process/server status region, and clearly inert placeholder panels for future dashboard and session views. The status describes this HTTP process, not Incus or sandbox health.
+The initial page contains only a Kanedias title, a process/server status region with a visible `Refresh status` control, and clearly inert placeholder panels for future dashboard and session views. The status describes this HTTP process, not Incus or sandbox health.
 
 ## Command and Local-Only Boundary
 
@@ -44,13 +44,13 @@ A Chi router exposes exactly the initial read-only surface:
 | `GET /assets/app.css` | Embedded stylesheet with an explicit CSS content type. |
 | `GET /assets/datastar.js` | Embedded Datastar browser bundle with an explicit JavaScript content type. |
 
-Unknown paths and unsupported methods use Chi's normal not-found/method-not-allowed behavior. The HTML loads only the embedded asset URLs. Its `server-status` element begins in a neutral checking state and initiates `GET /ui/status` through Datastar; the endpoint emits a single SDK-generated element patch replacing that same ID with a running state, then completes the response. This one-shot exchange proves browser, routing, SSE generation, and DOM patching without implying a persistent event model.
+Unknown paths and unsupported methods use Chi's normal not-found/method-not-allowed behavior. The HTML loads only the embedded asset URLs. Its `server-status` element begins in a neutral idle state. The page does not request status automatically on load; activating the visible `Refresh status` control invokes a Datastar action that requests `GET /ui/status`. The endpoint emits a single SDK-generated element patch replacing that same ID with a running state, then completes the response. This one-shot exchange proves browser, routing, SSE generation, and DOM patching without implying a persistent event model.
 
 Handler failures return generic client-facing responses and never expose stack traces or internal error details. Detailed failures are recorded through the injected logger.
 
 ## Datastar and Offline Delivery
 
-The implementation pins the official `github.com/starfederation/datastar-go` SDK at `v1.2.2` in `go.mod`/`go.sum` and uses its `datastar.NewSSE` and `PatchElements` APIs rather than hand-formatting the wire protocol. It checks in `dist/bundles/datastar.js` from the official `@starfederation/datastar` `1.0.0-beta.11` release under `internal/server/web`, together with the corresponding upstream license. An adjacent attribution/provenance note records that release, the official archive URL, the vendored file path, and the vendored file's SHA-256 digest.
+The implementation pins the official `github.com/starfederation/datastar-go` SDK at `v1.2.2` in `go.mod`/`go.sum` and uses its `datastar.NewSSE` and `PatchElements` APIs rather than hand-formatting the wire protocol. It checks in the self-hosted `bundles/datastar.js` browser bundle from the official `starfederation/datastar` GitHub repository at the `v1.0.2` release under `internal/server/web`, together with the corresponding upstream license. An adjacent attribution/provenance note records the official repository, the `v1.0.2` release tag, the official release archive URL, the vendored file path, and the vendored file's SHA-256 digest.
 
 All HTML, CSS, JavaScript, license, and attribution files are embedded into one Go executable. There is no CDN, npm installation, package lockfile, bundler, generated frontend source, web-asset fetch during build or startup, or runtime static-file directory. Vendoring the browser artifact is distinct from generating application frontend code.
 
@@ -74,7 +74,7 @@ Automated coverage includes:
 
 - Cobra hierarchy, default and overridden `--listen` values, no-argument enforcement, and delegation with the command context and injected service;
 - table-driven acceptance of `localhost`, IPv4 loopback, and IPv6 loopback addresses, plus rejection of empty, wildcard, malformed, hostname, and non-loopback binds;
-- `httptest` coverage for the HTML shell, embedded CSS and JavaScript, plain health response, not-found behavior, and a Datastar SSE status patch with the expected content type and target element;
+- `httptest` coverage for the HTML shell, visible manual refresh control and its `GET /ui/status` Datastar action, embedded CSS and JavaScript, plain health response, not-found behavior, and a Datastar SSE status patch with the expected content type and target element;
 - a listener-level test using a loopback ephemeral port that cancels the serving context and proves bounded graceful shutdown;
 - confirmation that handler and recovery failures produce generic client errors while retaining structured server logs.
 
