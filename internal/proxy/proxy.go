@@ -146,6 +146,10 @@ func newProxyWithObserver(ca tls.Certificate, creds credentials, observer *proxy
 				http.StatusMisdirectedRequest, "request authority does not match CONNECT target")
 		}
 
+		if host == "github.com" && req.Header.Get("Authorization") == "" {
+			return req, nil
+		}
+
 		req.Header.Del("Authorization")
 		req.Header.Del("X-Api-Key")
 		req.Header.Del("Chatgpt-Account-Id")
@@ -153,14 +157,14 @@ func newProxyWithObserver(ca tls.Certificate, creds credentials, observer *proxy
 		case "api.github.com", "uploads.github.com":
 			if creds.github == "" {
 				observer.credentialResult("github", "missing")
-				return req, missingCredential(req, "GitHub")
+				return req, missingGitHubCredential(req)
 			}
 			observer.credentialResult("github", "injected")
 			req.Header.Set("Authorization", "Bearer "+creds.github)
 		case "github.com":
 			if creds.github == "" {
 				observer.credentialResult("github", "missing")
-				return req, missingCredential(req, "GitHub")
+				return req, missingGitHubCredential(req)
 			}
 			observer.credentialResult("github", "injected")
 			req.SetBasicAuth("x-access-token", creds.github)
@@ -245,6 +249,11 @@ func resolveBearerToken(req *http.Request, ctx *goproxy.ProxyCtx, provider strin
 		return bearerToken{}, errors.New("credential source returned an empty token")
 	}
 	return token, nil
+}
+
+func missingGitHubCredential(req *http.Request) *http.Response {
+	return goproxy.NewResponse(req, goproxy.ContentTypeText, http.StatusBadGateway,
+		"GitHub auth unavailable")
 }
 
 func missingCredential(req *http.Request, provider string) *http.Response {
