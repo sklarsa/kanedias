@@ -3,6 +3,8 @@ package server
 import (
 	"bytes"
 	"context"
+	"crypto/sha256"
+	"fmt"
 	"io/fs"
 	"log/slog"
 	"net/http"
@@ -54,6 +56,12 @@ func TestHandlerRoutes(t *testing.T) {
 			contentType: "text/css; charset=utf-8",
 		},
 		{
+			name:        "terminal stylesheet",
+			path:        "/assets/terminal.css",
+			status:      http.StatusOK,
+			contentType: "text/css; charset=utf-8",
+		},
+		{
 			name:        "javascript",
 			path:        "/assets/datastar.js",
 			status:      http.StatusOK,
@@ -85,10 +93,8 @@ func TestHandlerRoutes(t *testing.T) {
 			if tt.body != "" && response.Body.String() != tt.body {
 				t.Fatalf("body = %q, want %q", response.Body.String(), tt.body)
 			}
-			if tt.path == "/assets/app.css" || tt.path == "/assets/datastar.js" {
-				if response.Body.Len() == 0 {
-					t.Fatal("asset body is empty")
-				}
+			if strings.HasPrefix(tt.path, "/assets/") && response.Body.Len() == 0 {
+				t.Fatal("asset body is empty")
 			}
 			for _, want := range tt.contains {
 				if !strings.Contains(response.Body.String(), want) {
@@ -107,7 +113,14 @@ func TestHandlerRoutes(t *testing.T) {
 
 func TestHandlerRejectsUnsupportedMethods(t *testing.T) {
 	handler := mustNewHandler(t, slog.New(slog.NewTextHandler(&bytes.Buffer{}, nil)))
-	paths := []string{"/", "/healthz", "/ui/status", "/assets/app.css", "/assets/datastar.js"}
+	paths := []string{
+		"/",
+		"/healthz",
+		"/ui/status",
+		"/assets/terminal.css",
+		"/assets/app.css",
+		"/assets/datastar.js",
+	}
 	methods := []string{http.MethodPost, http.MethodPut, http.MethodPatch, http.MethodDelete}
 
 	for _, path := range paths {
@@ -200,10 +213,48 @@ func TestAssetsAreEmbedded(t *testing.T) {
 		}
 	})
 
-	for _, path := range []string{"/", "/healthz", "/ui/status", "/assets/app.css", "/assets/datastar.js"} {
+	for _, path := range []string{
+		"/",
+		"/healthz",
+		"/ui/status",
+		"/assets/terminal.css",
+		"/assets/app.css",
+		"/assets/datastar.js",
+	} {
 		if response := serveRequest(handler, http.MethodGet, path); response.Code != http.StatusOK {
 			t.Errorf("GET %s status = %d, want %d", path, response.Code, http.StatusOK)
 		}
+	}
+}
+
+func TestTerminalCSSProvenanceMatchesEmbeddedAsset(t *testing.T) {
+	stylesheet, err := webFiles.ReadFile("web/terminal.css")
+	if err != nil {
+		t.Fatalf("read embedded Terminal.css: %v", err)
+	}
+	license, err := webFiles.ReadFile("web/terminal.LICENSE")
+	if err != nil {
+		t.Fatalf("read embedded Terminal.css license: %v", err)
+	}
+	provenance, err := webFiles.ReadFile("web/terminal.PROVENANCE")
+	if err != nil {
+		t.Fatalf("read Terminal.css provenance: %v", err)
+	}
+
+	digest := sha256.Sum256(stylesheet)
+	checks := []string{
+		"Commit: 63551f0de711f2f634a0c2da7bab1d3bae216fef",
+		fmt.Sprintf("SHA-256: %x", digest),
+		"License identifier: MIT",
+		"Modification: Vendored unchanged for offline embedding.",
+	}
+	for _, want := range checks {
+		if !strings.Contains(string(provenance), want) {
+			t.Errorf("Terminal.css provenance does not contain %q", want)
+		}
+	}
+	if !strings.Contains(string(license), "MIT License") || !strings.Contains(string(license), "Copyright (c) 2019 Jonas D.") {
+		t.Fatal("embedded Terminal.css license is not the expected upstream MIT license")
 	}
 }
 

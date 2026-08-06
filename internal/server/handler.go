@@ -48,6 +48,7 @@ func newHandler(logger *slog.Logger) (http.Handler, error) {
 			logger.Error("send status event", "error", err)
 		}
 	}
+	serveTerminalCSS := serveEmbeddedAsset(logger, "web/terminal.css", "text/css; charset=utf-8")
 	serveCSS := serveEmbeddedAsset(logger, "web/app.css", "text/css; charset=utf-8")
 	serveJavaScript := serveEmbeddedAsset(logger, "web/datastar.js", "text/javascript; charset=utf-8")
 
@@ -56,6 +57,7 @@ func newHandler(logger *slog.Logger) (http.Handler, error) {
 	router.Get("/", serveIndex)
 	router.Get("/healthz", serveHealth)
 	router.Get("/ui/status", serveStatus)
+	router.Get("/assets/terminal.css", serveTerminalCSS)
 	router.Get("/assets/app.css", serveCSS)
 	router.Get("/assets/datastar.js", serveJavaScript)
 	return router, nil
