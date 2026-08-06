@@ -3,6 +3,9 @@ package cmd
 import (
 	"context"
 	"io"
+	"os"
+	"os/signal"
+	"syscall"
 
 	"github.com/sklarsa/kanedias/internal/config"
 	"github.com/sklarsa/kanedias/internal/image"
@@ -10,6 +13,7 @@ import (
 	"github.com/sklarsa/kanedias/internal/profiles"
 	"github.com/sklarsa/kanedias/internal/proxy"
 	"github.com/sklarsa/kanedias/internal/sandbox"
+	"github.com/sklarsa/kanedias/internal/server"
 	"github.com/sklarsa/kanedias/internal/workspace"
 	"github.com/spf13/cobra"
 )
@@ -25,6 +29,7 @@ type services struct {
 	createSandbox    func(context.Context, config.Config, string, io.Writer, io.Writer) error
 	destroySandbox   func(context.Context, config.Config, string, io.Writer, io.Writer) error
 	syncWorkspace    func(context.Context, config.Config, io.Writer, io.Writer) error
+	runServer        func(context.Context, server.Options) error
 }
 
 // Execute runs the Kanedias command-line interface.
@@ -33,7 +38,19 @@ func Execute() error {
 	if err != nil {
 		return err
 	}
-	return newRootCommand(realServices(), options).Execute()
+
+	ctx, stop := signal.NotifyContext(
+		context.Background(),
+		os.Interrupt,
+		syscall.SIGTERM,
+	)
+	defer stop()
+
+	return execute(ctx, realServices(), options)
+}
+
+func execute(ctx context.Context, service services, options proxy.Options) error {
+	return newRootCommand(service, options).ExecuteContext(ctx)
 }
 
 func realServices() services {
@@ -48,6 +65,7 @@ func realServices() services {
 		createSandbox:    sandbox.Create,
 		destroySandbox:   sandbox.Destroy,
 		syncWorkspace:    workspace.Sync,
+		runServer:        server.Run,
 	}
 }
 
@@ -65,6 +83,7 @@ func newRootCommand(service services, options proxy.Options) *cobra.Command {
 		newProfileCommand(service, getConfigPath),
 		newProxyCommand(service, getConfigPath, options),
 		newSandboxCommand(service, getConfigPath),
+		newServerCommand(service),
 		newWorkspaceCommand(service, getConfigPath),
 	)
 	return root
