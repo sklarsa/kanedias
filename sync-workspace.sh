@@ -3,10 +3,20 @@
 # --inside-instance to sync repositories on the persistent workspace volume.
 set -Eeuo pipefail
 
+repository_https_url() {
+    local slug=$1
+
+    if [[ ! $slug =~ ^[^/[:space:]]+/[^/[:space:]]+$ ]]; then
+        printf 'invalid GitHub repository slug: %s\n' "$slug" >&2
+        return 1
+    fi
+    printf 'https://github.com/%s.git\n' "$slug"
+}
+
 sync_repositories() {
     local repos_file=$1
     local repos_dir=$2
-    local url name target target_root actual_worktree default_ref branch
+    local slug url name target target_root actual_worktree default_ref branch
     local -A destinations=()
 
     if [[ -L $repos_dir ]]; then
@@ -18,12 +28,14 @@ sync_repositories() {
         return 1
     fi
 
-    while IFS= read -r url || [[ -n $url ]]; do
-        [[ -n $url ]] || continue
-        name=${url##*/}
-        name=${name%.git}
+    while IFS= read -r slug || [[ -n $slug ]]; do
+        [[ -n $slug ]] || continue
+        if ! url=$(repository_https_url "$slug"); then
+            return 1
+        fi
+        name=${slug##*/}
         if [[ -z $name || $name == . || $name == .. ]]; then
-            echo "cannot derive repository name from: $url" >&2
+            echo "cannot derive repository name from: $slug" >&2
             return 1
         fi
         if [[ -n ${destinations[$name]+present} ]]; then
@@ -33,21 +45,26 @@ sync_repositories() {
         destinations[$name]=$url
     done < "$repos_file"
 
+    gh auth setup-git --hostname github.com --force
+    git config --global --replace-all url.https://github.com/.insteadOf \
+        git@github.com:
+    git config --global --add url.https://github.com/.insteadOf \
+        ssh://git@github.com/
     mkdir -p "$repos_dir"
 
-    while IFS= read -r url || [[ -n $url ]]; do
-        [[ -n $url ]] || continue
+    while IFS= read -r slug || [[ -n $slug ]]; do
+        [[ -n $slug ]] || continue
 
-        name=${url##*/}
-        name=${name%.git}
+        name=${slug##*/}
+        url=${destinations[$name]}
         target="$repos_dir/$name"
 
-        printf 'Syncing %s...\n' "$url"
+        printf 'Syncing %s...\n' "$slug"
         if [[ -L $target ]]; then
             echo "refusing symlinked repository path: $target" >&2
             return 1
         elif [[ ! -e $target ]]; then
-            git clone --recurse-submodules "$url" "$target"
+            gh repo clone "$url" "$target" -- --recurse-submodules
         elif [[ ! -d $target/.git || -L $target/.git ]]; then
             echo "existing path is not a self-contained Git repository: $target" >&2
             return 1
@@ -132,7 +149,6 @@ cleanup() {
         if incus delete --force "$instance" >/dev/null 2>&1; then
             instance_created=0
             workspace_attached=0
-            ssh_attached=0
         else
             echo "failed to delete temporary instance: $instance" >&2
             failed=1

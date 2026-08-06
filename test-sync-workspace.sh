@@ -32,11 +32,46 @@ git -C "$source_repo" add .
 git -C "$source_repo" commit --quiet -m initial
 git -C "$source_repo" tag obsolete
 git clone --quiet --bare "$source_repo" "$remote_repo"
-printf 'file://%s\n' "$remote_repo" > "$repo_list"
+printf 'test/example\n' > "$repo_list"
+
+fake_bin="$temp_dir/bin"
+gh_log="$temp_dir/gh.log"
+git_config="$temp_dir/gitconfig"
+mkdir -p "$fake_bin"
+cat > "$fake_bin/gh" <<'FAKE_GH'
+#!/usr/bin/env bash
+set -Eeuo pipefail
+printf '%s\n' "$*" >> "$FAKE_GH_LOG"
+if [[ $* == 'auth setup-git --hostname github.com --force' ]]; then
+    exit 0
+fi
+if [[ ${1:-} == repo && ${2:-} == clone ]]; then
+    shift 2
+    url=$1
+    target=$2
+    shift 2
+    [[ ${1:-} == -- ]]
+    shift
+    exec git clone "$@" "$url" "$target"
+fi
+echo "unexpected gh command: $*" >&2
+exit 1
+FAKE_GH
+chmod +x "$fake_bin/gh"
+git config --file "$git_config" \
+    url."file://$remote_repo".insteadOf \
+    https://github.com/test/example.git
+export PATH="$fake_bin:$PATH"
+export FAKE_GH_LOG="$gh_log"
+export GIT_CONFIG_GLOBAL="$git_config"
 
 "$sync_script" --inside-instance "$repo_list" "$workspace"
 [[ $(<"$workspace/example/version.txt") == one ]]
 git -C "$workspace/example" rev-parse --verify refs/tags/obsolete >/dev/null
+grep -Fxq 'auth setup-git --hostname github.com --force' "$gh_log"
+grep -Fxq "repo clone https://github.com/test/example.git $workspace/example -- --recurse-submodules" "$gh_log"
+[[ $(git -C "$workspace/example" config --get remote.origin.url) == \
+    https://github.com/test/example.git ]]
 git -C "$remote_repo" update-ref -d refs/tags/obsolete
 
 printf 'dirty\n' > "$workspace/example/version.txt"
@@ -54,11 +89,23 @@ if git -C "$workspace/example" rev-parse --verify refs/tags/obsolete \
     fail 'tag deleted from remote was not pruned locally'
 fi
 
+printf 'Testing rejection of invalid GitHub repository slugs...\n'
+invalid_list="$temp_dir/invalid-repos.txt"
+invalid_workspace="$temp_dir/invalid-workspace"
+printf 'test/example/extra\n' > "$invalid_list"
+if invalid_output=$("$sync_script" --inside-instance \
+    "$invalid_list" "$invalid_workspace" 2>&1); then
+    fail 'invalid GitHub repository slug was accepted'
+fi
+if [[ $invalid_output != *'invalid GitHub repository slug: test/example/extra'* ]]; then
+    fail "invalid repository failure was unclear: $invalid_output"
+fi
+[[ ! -e $invalid_workspace ]]
+
 printf 'Testing rejection of repository name collisions...\n'
 duplicate_list="$temp_dir/duplicate-repos.txt"
 duplicate_workspace="$temp_dir/duplicate-workspace"
-printf 'file://%s\nfile://%s\n' "$remote_repo" "$remote_repo" \
-    > "$duplicate_list"
+printf 'test/example\ntest/example\n' > "$duplicate_list"
 if "$sync_script" --inside-instance "$duplicate_list" "$duplicate_workspace"; then
     fail 'duplicate repository destination was accepted'
 fi
@@ -103,10 +150,9 @@ fi
 [[ -e $redirected_external/untracked.txt ]]
 
 printf 'Testing Incus resource lifecycle...\n'
-fake_bin="$temp_dir/bin"
 fake_home="$temp_dir/home"
 incus_log="$temp_dir/incus.log"
-mkdir -p "$fake_bin" "$fake_home/.ssh"
+mkdir -p "$fake_home/.ssh"
 cat > "$fake_bin/incus" <<'FAKE_INCUS'
 #!/usr/bin/env bash
 set -u
