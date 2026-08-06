@@ -12,13 +12,12 @@ config:
   security.privileged: "false"
 description: Kanedias sandbox with persistent workspace and credential proxy
 devices:
-  workspace:
-    type: disk
-    pool: default
-    source: agent-workspace-seed
-    path: /workspace
+  eth0:
+    name: eth0
+    network: kanedias
+    type: nic
   proxy-ca:
     type: disk
-    source: /home/steven/.config/kanedias-proxy/ca.crt
+    source: {{ .ProxyCACertPath }}
     path: /usr/local/share/ca-certificates/kanedias-proxy.crt
     readonly: "true"

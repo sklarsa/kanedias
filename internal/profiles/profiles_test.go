@@ -2,6 +2,7 @@ package profiles
 
 import (
 	"bytes"
+	"path/filepath"
 	"reflect"
 	"strings"
 	"testing"
@@ -26,6 +27,28 @@ func TestRenderSandboxUsesConfiguredIPv4(t *testing.T) {
 	}
 	if strings.Contains(output.String(), "10.75.177.1") {
 		t.Fatal("rendered sandbox retained the old hard-coded endpoint")
+	}
+}
+
+func TestRenderSandboxUsesLifecycleDevicesAndDefaultProxyCA(t *testing.T) {
+	configHome := t.TempDir()
+	t.Setenv("XDG_CONFIG_HOME", configHome)
+
+	cfg := config.Config{Network: config.Network{IPv4: "10.76.111.1/24"}}
+	var output bytes.Buffer
+	if err := Render(&output, "sandbox", cfg); err != nil {
+		t.Fatal(err)
+	}
+
+	rendered := output.String()
+	if want := "  eth0:\n    name: eth0\n    network: kanedias\n    type: nic\n"; !strings.Contains(rendered, want) {
+		t.Errorf("rendered sandbox missing managed NIC:\n%s", want)
+	}
+	if strings.Contains(rendered, "  workspace:") {
+		t.Error("rendered sandbox contains inherited workspace disk")
+	}
+	if want := "    source: " + filepath.Join(configHome, "kanedias-proxy", "ca.crt"); !strings.Contains(rendered, want) {
+		t.Errorf("rendered sandbox missing proxy CA source %q", want)
 	}
 }
 

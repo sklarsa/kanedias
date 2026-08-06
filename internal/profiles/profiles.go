@@ -5,6 +5,8 @@ import (
 	"fmt"
 	"io"
 	"net"
+	"os"
+	"path/filepath"
 	"strings"
 	"text/template"
 
@@ -29,7 +31,8 @@ var profilePaths = map[string]string{
 }
 
 type templateData struct {
-	ProxyURL string
+	ProxyURL        string
+	ProxyCACertPath string
 }
 
 func Types() []string {
@@ -49,6 +52,12 @@ func Render(w io.Writer, name string, cfg config.Config) error {
 			return fmt.Errorf("render profile %q: %w", name, err)
 		}
 		data.ProxyURL = "http://" + net.JoinHostPort(prefix.Addr().String(), "3128")
+
+		configDir, err := os.UserConfigDir()
+		if err != nil {
+			return fmt.Errorf("render profile %q: locate user config directory: %w", name, err)
+		}
+		data.ProxyCACertPath = filepath.Join(configDir, "kanedias-proxy", "ca.crt")
 	}
 
 	contents, err := profileFiles.ReadFile(path)
