@@ -6,6 +6,7 @@ import (
 	"fmt"
 	"io"
 	"math"
+	"sync"
 
 	incus "github.com/lxc/incus/v7/client"
 	"github.com/lxc/incus/v7/shared/api"
@@ -92,9 +93,26 @@ func (c *Client) Exec(ctx context.Context, name string, request ExecRequest) (st
 
 type execCall func(api.InstanceExecPost, *incus.InstanceExecArgs) (operationWaiter, error)
 
+type captureBuffer struct {
+	mu     sync.Mutex
+	buffer bytes.Buffer
+}
+
+func (b *captureBuffer) Write(p []byte) (int, error) {
+	b.mu.Lock()
+	defer b.mu.Unlock()
+	return b.buffer.Write(p)
+}
+
+func (b *captureBuffer) String() string {
+	b.mu.Lock()
+	defer b.mu.Unlock()
+	return b.buffer.String()
+}
+
 func exec(ctx context.Context, call execCall, request ExecRequest) (stdout, stderr string, err error) {
-	var stdoutBuffer bytes.Buffer
-	var stderrBuffer bytes.Buffer
+	var stdoutBuffer captureBuffer
+	var stderrBuffer captureBuffer
 	dataDone := make(chan bool)
 	operation, err := call(api.InstanceExecPost{
 		Command:     request.Command,
@@ -109,17 +127,19 @@ func exec(ctx context.Context, call execCall, request ExecRequest) (stdout, stde
 		DataDone: dataDone,
 	})
 	if err != nil {
-		return "", "", fmt.Errorf("execute command in Incus instance: %w", err)
+		return stdoutBuffer.String(), stderrBuffer.String(), fmt.Errorf("execute command in Incus instance: %w", err)
 	}
 
 	waitErr := waitOperation(ctx, operation)
+	if waitErr != nil {
+		cancelExecOperation(operation)
+		return stdoutBuffer.String(), stderrBuffer.String(), fmt.Errorf("wait for command in Incus instance: %w", waitErr)
+	}
 	select {
 	case <-dataDone:
 	case <-ctx.Done():
+		cancelExecOperation(operation)
 		return stdoutBuffer.String(), stderrBuffer.String(), fmt.Errorf("flush command output from Incus instance: %w", ctx.Err())
-	}
-	if waitErr != nil {
-		return stdoutBuffer.String(), stderrBuffer.String(), fmt.Errorf("wait for command in Incus instance: %w", waitErr)
 	}
 
 	status, err := execReturnStatus(operation.Get().Metadata)
@@ -130,6 +150,12 @@ func exec(ctx context.Context, call execCall, request ExecRequest) (stdout, stde
 		return stdoutBuffer.String(), stderrBuffer.String(), fmt.Errorf("command in Incus instance exited with exit status %d", status)
 	}
 	return stdoutBuffer.String(), stderrBuffer.String(), nil
+}
+
+func cancelExecOperation(operation operationWaiter) {
+	if canceler, ok := operation.(interface{ Cancel() error }); ok {
+		_ = canceler.Cancel()
+	}
 }
 
 func execReturnStatus(metadata map[string]any) (int, error) {

@@ -4,8 +4,10 @@ import (
 	"context"
 	"errors"
 	"io"
+	"runtime"
 	"strings"
 	"testing"
+	"time"
 
 	incus "github.com/lxc/incus/v7/client"
 	"github.com/lxc/incus/v7/shared/api"
@@ -43,6 +45,66 @@ func TestExecCapturesStdoutAndStderr(t *testing.T) {
 	}
 	if gotArgs.Stdin == nil {
 		t.Fatal("stdin was not passed to Incus")
+	}
+}
+
+func TestExecCallFailurePreservesOutput(t *testing.T) {
+	callErr := errors.New("websocket setup failed")
+	call := func(_ api.InstanceExecPost, args *incus.InstanceExecArgs) (operationWaiter, error) {
+		_, _ = io.WriteString(args.Stdout, "stdout before call failure")
+		_, _ = io.WriteString(args.Stderr, "stderr before call failure")
+		return nil, callErr
+	}
+
+	stdout, stderr, err := exec(context.Background(), call, ExecRequest{Command: []string{"echo"}})
+	if !errors.Is(err, callErr) {
+		t.Fatalf("Exec error = %v, want call failure", err)
+	}
+	if stdout != "stdout before call failure" || stderr != "stderr before call failure" {
+		t.Fatalf("Exec output = %q, %q, want preserved output", stdout, stderr)
+	}
+}
+
+func TestExecWaitFailureReturnsWithoutDataDone(t *testing.T) {
+	waitErr := errors.New("operation wait failed")
+	operation := &cancelableFakeOperation{fakeOperation: &fakeOperation{waitErr: waitErr}}
+	argsSeen := make(chan *incus.InstanceExecArgs, 1)
+	call := func(_ api.InstanceExecPost, args *incus.InstanceExecArgs) (operationWaiter, error) {
+		argsSeen <- args
+		_, _ = io.WriteString(args.Stdout, "stdout before wait failure")
+		_, _ = io.WriteString(args.Stderr, "stderr before wait failure")
+		return operation, nil
+	}
+
+	type result struct {
+		stdout string
+		stderr string
+		err    error
+	}
+	resultCh := make(chan result, 1)
+	go func() {
+		stdout, stderr, err := exec(context.Background(), call, ExecRequest{Command: []string{"echo"}})
+		resultCh <- result{stdout: stdout, stderr: stderr, err: err}
+	}()
+	args := <-argsSeen
+
+	select {
+	case got := <-resultCh:
+		if !errors.Is(got.err, waitErr) {
+			t.Fatalf("Exec error = %v, want wait failure", got.err)
+		}
+		if got.stdout != "stdout before wait failure" || got.stderr != "stderr before wait failure" {
+			t.Fatalf("Exec output = %q, %q, want preserved output", got.stdout, got.stderr)
+		}
+		if !operation.cancelled {
+			t.Fatal("Exec did not best-effort cancel the failed operation")
+		}
+	case <-time.After(time.Second):
+		if args.DataDone != nil {
+			close(args.DataDone)
+		}
+		<-resultCh
+		t.Fatal("Exec waited for DataDone after the operation wait failed")
 	}
 }
 
@@ -147,6 +209,39 @@ func TestExecRejectsMissingOrMalformedReturnMetadataWithOutput(t *testing.T) {
 	}
 }
 
+func TestExecCancellationSnapshotsConcurrentOutputSafely(t *testing.T) {
+	ctx, cancel := context.WithCancel(context.Background())
+	writerStarted := make(chan struct{})
+	writerDone := make(chan struct{})
+	operation := &cancelingExecOperation{
+		cancel:        cancel,
+		writerStarted: writerStarted,
+		operation:     api.Operation{Metadata: map[string]any{"return": float64(0)}},
+	}
+	call := func(_ api.InstanceExecPost, args *incus.InstanceExecArgs) (operationWaiter, error) {
+		_, _ = io.WriteString(args.Stdout, "stdout before cancel")
+		go func() {
+			defer close(writerDone)
+			<-ctx.Done()
+			close(writerStarted)
+			for range 10_000 {
+				_, _ = io.WriteString(args.Stdout, " delayed output")
+				runtime.Gosched()
+			}
+		}()
+		return operation, nil
+	}
+
+	stdout, _, err := exec(ctx, call, ExecRequest{Command: []string{"echo"}})
+	<-writerDone
+	if !errors.Is(err, context.Canceled) {
+		t.Fatalf("Exec error = %v, want context cancellation", err)
+	}
+	if !strings.HasPrefix(stdout, "stdout before cancel") {
+		t.Fatalf("Exec stdout = %q, want safely captured prefix", stdout)
+	}
+}
+
 func TestExecDataFlushHonorsRequestCancellation(t *testing.T) {
 	ctx, cancel := context.WithCancel(context.Background())
 	call := func(_ api.InstanceExecPost, args *incus.InstanceExecArgs) (operationWaiter, error) {
@@ -162,6 +257,32 @@ func TestExecDataFlushHonorsRequestCancellation(t *testing.T) {
 	if stdout != "stdout before cancel" {
 		t.Fatalf("Exec stdout = %q, want preserved output", stdout)
 	}
+}
+
+type cancelableFakeOperation struct {
+	*fakeOperation
+	cancelled bool
+}
+
+func (o *cancelableFakeOperation) Cancel() error {
+	o.cancelled = true
+	return nil
+}
+
+type cancelingExecOperation struct {
+	cancel        context.CancelFunc
+	writerStarted <-chan struct{}
+	operation     api.Operation
+}
+
+func (o *cancelingExecOperation) WaitContext(context.Context) error {
+	o.cancel()
+	<-o.writerStarted
+	return nil
+}
+
+func (o *cancelingExecOperation) Get() api.Operation {
+	return o.operation
 }
 
 func completedExecOperation(status float64) *fakeOperation {
