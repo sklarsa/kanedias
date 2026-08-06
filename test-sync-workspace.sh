@@ -152,7 +152,13 @@ fi
 printf 'Testing Incus resource lifecycle...\n'
 fake_home="$temp_dir/home"
 incus_log="$temp_dir/incus.log"
+dns_state="$temp_dir/dns-attempts"
 mkdir -p "$fake_home/.ssh"
+cat > "$fake_bin/go" <<'FAKE_GO'
+#!/usr/bin/env bash
+set -u
+printf 'go %s\n' "$*" >> "$FAKE_INCUS_LOG"
+FAKE_GO
 cat > "$fake_bin/incus" <<'FAKE_INCUS'
 #!/usr/bin/env bash
 set -u
@@ -161,33 +167,89 @@ if [[ $* == 'storage volume show default agent-workspace-seed' ]]; then
     [[ ${FAKE_VOLUME_EXISTS:-0} == 1 ]]
     exit
 fi
+if [[ $* == 'profile show sandbox' ]]; then
+    [[ ${FAKE_PROFILE_EXISTS:-0} == 1 ]]
+    exit
+fi
 if [[ -n ${FAKE_FAIL_PREFIX:-} && $* == "$FAKE_FAIL_PREFIX"* ]]; then
     exit 1
 fi
+if [[ $* =~ ^exec\ workspace-sync-[^[:space:]]+\ --\ getent\ ahosts\ github\.com$ ]]; then
+    attempts=0
+    if [[ -f $FAKE_DNS_STATE ]]; then
+        read -r attempts < "$FAKE_DNS_STATE"
+    fi
+    (( attempts += 1 ))
+    printf '%d\n' "$attempts" > "$FAKE_DNS_STATE"
+    (( attempts > ${FAKE_DNS_FAILURES:-0} ))
+    exit
+fi
 exit 0
 FAKE_INCUS
-chmod +x "$fake_bin/incus"
+chmod +x "$fake_bin/go" "$fake_bin/incus"
+export FAKE_DNS_STATE="$dns_state"
 
 PATH="$fake_bin:$PATH" HOME="$fake_home" FAKE_INCUS_LOG="$incus_log" \
-    INCUS_REPOS_FILE="$repo_list" "$sync_script" test-image
+    INCUS_REPOS_FILE="$repo_list" FAKE_DNS_FAILURES=1 \
+    "$sync_script" test-image
 
+grep -Fxq 'go run ./proxy -init-ca' "$incus_log"
+grep -Fxq 'profile create sandbox' "$incus_log"
+grep -Fxq 'profile edit sandbox' "$incus_log"
 grep -Fxq 'storage volume create default agent-workspace-seed' "$incus_log"
-grep -Eq '^config device add workspace-sync-[^ ]+ workspace disk pool=default source=agent-workspace-seed path=/workspace$' "$incus_log"
+grep -Eq '^init test-image workspace-sync-[^ ]+ --profile default --profile sandbox$' "$incus_log"
+grep -Eq '^config device override workspace-sync-[^ ]+ workspace pool=default source=agent-workspace-seed path=/workspace$' "$incus_log"
+[[ $(grep -Ec '^exec workspace-sync-[^ ]+ -- getent ahosts github\.com$' "$incus_log") == 2 ]]
+grep -Eq '^exec workspace-sync-[^ ]+ -- update-ca-certificates$' "$incus_log"
 if grep -Fq 'host-ssh' "$incus_log"; then
     fail 'host SSH directory was exposed to the temporary instance'
 fi
 grep -Eq '^config device remove workspace-sync-[^ ]+ workspace$' "$incus_log"
 grep -Eq '^delete --force workspace-sync-[^ ]+$' "$incus_log"
+go_line=$(grep -nF 'go run ./proxy -init-ca' "$incus_log" | cut -d: -f1)
+profile_line=$(grep -nF 'profile edit sandbox' "$incus_log" | cut -d: -f1)
+init_line=$(grep -nE '^init test-image workspace-sync-[^ ]+ --profile default --profile sandbox$' "$incus_log" | cut -d: -f1)
+override_line=$(grep -nE '^config device override workspace-sync-[^ ]+ workspace ' "$incus_log" | cut -d: -f1)
+dns_line=$(grep -nE '^exec workspace-sync-[^ ]+ -- getent ahosts github\.com$' "$incus_log" | head -1 | cut -d: -f1)
+ca_line=$(grep -nE '^exec workspace-sync-[^ ]+ -- update-ca-certificates$' "$incus_log" | cut -d: -f1)
+sync_line=$(grep -nE '^exec workspace-sync-[^ ]+ -- runuser .* --inside-instance ' "$incus_log" | cut -d: -f1)
+(( go_line < profile_line && profile_line < init_line && \
+    init_line < override_line && override_line < dns_line && \
+    dns_line < ca_line && ca_line < sync_line )) || \
+    fail 'profile, DNS, CA, and repository synchronization ordering is wrong'
 remove_line=$(grep -nE '^config device remove workspace-sync-[^ ]+ workspace$' "$incus_log" | tail -1 | cut -d: -f1)
 delete_line=$(grep -nE '^delete --force workspace-sync-[^ ]+$' "$incus_log" | tail -1 | cut -d: -f1)
 (( remove_line < delete_line )) || fail 'workspace volume was not detached before instance deletion'
 
 : > "$incus_log"
+rm -f "$dns_state"
 PATH="$fake_bin:$PATH" HOME="$fake_home" FAKE_INCUS_LOG="$incus_log" \
     INCUS_REPOS_FILE="$repo_list" FAKE_VOLUME_EXISTS=1 \
-    "$sync_script" test-image
+    FAKE_PROFILE_EXISTS=1 "$sync_script" test-image
 if grep -Fq 'storage volume create' "$incus_log"; then
     fail 'existing workspace volume was created again'
+fi
+if grep -Fq 'profile create sandbox' "$incus_log"; then
+    fail 'existing sandbox profile was created again'
+fi
+grep -Fxq 'profile edit sandbox' "$incus_log"
+
+printf 'Testing DNS readiness timeout cleanup...\n'
+: > "$incus_log"
+rm -f "$dns_state"
+if dns_output=$(PATH="$fake_bin:$PATH" HOME="$fake_home" \
+    FAKE_INCUS_LOG="$incus_log" INCUS_REPOS_FILE="$repo_list" \
+    FAKE_VOLUME_EXISTS=1 FAKE_PROFILE_EXISTS=1 FAKE_DNS_FAILURES=100 \
+    INCUS_DNS_TIMEOUT=1 "$sync_script" test-image 2>&1); then
+    fail 'DNS readiness timeout was reported as success'
+fi
+if [[ $dns_output != *'Timed out waiting for DNS in '* ]]; then
+    fail "DNS timeout failure was unclear: $dns_output"
+fi
+grep -Eq '^delete --force workspace-sync-[^ ]+$' "$incus_log"
+if grep -Eq '^exec workspace-sync-[^ ]+ -- runuser .* --inside-instance ' \
+    "$incus_log"; then
+    fail 'repository synchronization ran before DNS became ready'
 fi
 
 printf 'Testing cleanup failure reporting...\n'

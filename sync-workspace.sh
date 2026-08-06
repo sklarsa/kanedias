@@ -112,9 +112,19 @@ command -v incus >/dev/null 2>&1 || {
     echo "incus is required" >&2
     exit 1
 }
+command -v go >/dev/null 2>&1 || {
+    echo "go is required" >&2
+    exit 1
+}
+command -v timeout >/dev/null 2>&1 || {
+    echo "timeout is required" >&2
+    exit 1
+}
 
 script_dir=$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")" && pwd)
 script_path="$script_dir/$(basename -- "${BASH_SOURCE[0]}")"
+profile_name=sandbox
+profile_file="$script_dir/profiles/sandbox.yaml"
 repos_file=${INCUS_REPOS_FILE:-"$script_dir/private/repos.txt"}
 image=$1
 pool=${INCUS_STORAGE_POOL:-default}
@@ -122,9 +132,27 @@ volume=${INCUS_WORKSPACE_VOLUME:-agent-workspace-seed}
 managed_user=${INCUS_WORKSPACE_USER:-kanedias}
 managed_home="/home/$managed_user"
 workspace_path=/workspace
+dns_timeout=${INCUS_DNS_TIMEOUT:-60}
 instance="workspace-sync-$(date +%s)-$$"
 instance_created=0
 workspace_attached=0
+
+wait_for_dns() {
+    local deadline=$((SECONDS + dns_timeout))
+    local remaining
+
+    while (( SECONDS < deadline )); do
+        remaining=$((deadline - SECONDS))
+        if timeout "${remaining}s" incus exec "$instance" -- \
+            getent ahosts github.com >/dev/null 2>&1; then
+            return 0
+        fi
+        sleep 1
+    done
+
+    printf 'Timed out waiting for DNS in %s.\n' "$instance" >&2
+    return 1
+}
 
 cleanup() {
     local failed=0
@@ -172,6 +200,10 @@ trap on_exit EXIT
     echo "missing or empty repository list: $repos_file" >&2
     exit 1
 }
+[[ -f $profile_file ]] || {
+    echo "missing Incus profile: $profile_file" >&2
+    exit 1
+}
 
 if incus storage volume show "$pool" "$volume" >/dev/null 2>&1; then
     printf 'Using existing workspace volume %s/%s.\n' "$pool" "$volume"
@@ -180,17 +212,35 @@ else
     incus storage volume create "$pool" "$volume"
 fi
 
+printf 'Initializing proxy CA...\n'
+(
+    cd "$script_dir"
+    go run ./proxy -init-ca
+)
+if incus profile show "$profile_name" >/dev/null 2>&1; then
+    printf 'Refreshing Incus profile %s...\n' "$profile_name"
+else
+    printf 'Creating Incus profile %s...\n' "$profile_name"
+    incus profile create "$profile_name"
+fi
+incus profile edit "$profile_name" < "$profile_file"
+
 printf 'Creating temporary instance %s from %s...\n' "$instance" "$image"
-incus init "$image" "$instance"
+incus init "$image" "$instance" \
+    --profile default --profile "$profile_name"
 instance_created=1
 
 printf 'Attaching workspace volume...\n'
-incus config device add "$instance" workspace disk \
+incus config device override "$instance" workspace \
     pool="$pool" source="$volume" path="$workspace_path"
 workspace_attached=1
 
 printf 'Starting temporary instance %s...\n' "$instance"
 incus start "$instance"
+printf 'Waiting for DNS in %s...\n' "$instance"
+wait_for_dns
+printf 'Updating trusted CA certificates...\n'
+incus exec "$instance" -- update-ca-certificates
 incus exec "$instance" -- chown "$managed_user:$managed_user" "$workspace_path"
 incus exec "$instance" -- install -d -o "$managed_user" -g "$managed_user" \
     "$workspace_path/repos"
