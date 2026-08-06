@@ -1,6 +1,7 @@
 package session
 
 import (
+	"bufio"
 	"bytes"
 	"context"
 	"encoding/json"
@@ -26,7 +27,13 @@ type cleanupContextObservation struct {
 type recordingSessionClient struct {
 	calls          *[]string
 	createdRequest api.InstancesPost
+	copyErr        error
+	createErr      error
 	startErr       error
+	stateErr       error
+	stateStatus    api.StatusCode
+	stateContexts  []cleanupContextObservation
+	stopForces     []bool
 	cleanup        []cleanupContextObservation
 }
 
@@ -61,7 +68,7 @@ func (c *recordingSessionClient) GetStorageVolume(_ context.Context, _, name str
 }
 func (c *recordingSessionClient) CopyStorageVolume(_ context.Context, _, source, target string) error {
 	c.record("copy-volume " + source + " " + target)
-	return nil
+	return c.copyErr
 }
 func (c *recordingSessionClient) DeleteStorageVolume(ctx context.Context, _, name string) error {
 	c.cleanup = append(c.cleanup, observeCleanupContext(ctx))
@@ -71,14 +78,15 @@ func (c *recordingSessionClient) DeleteStorageVolume(ctx context.Context, _, nam
 func (c *recordingSessionClient) CreateInstance(_ context.Context, request api.InstancesPost) error {
 	c.createdRequest = request
 	c.record("create-instance")
-	return nil
+	return c.createErr
 }
 func (c *recordingSessionClient) StartInstance(context.Context, string) error {
 	c.record("start-instance")
 	return c.startErr
 }
-func (c *recordingSessionClient) StopInstance(ctx context.Context, _ string, _ bool) error {
+func (c *recordingSessionClient) StopInstance(ctx context.Context, _ string, force bool) error {
 	c.cleanup = append(c.cleanup, observeCleanupContext(ctx))
+	c.stopForces = append(c.stopForces, force)
 	c.record("stop-instance")
 	return nil
 }
@@ -87,13 +95,24 @@ func (c *recordingSessionClient) DeleteInstance(ctx context.Context, _ string) e
 	c.record("delete-instance")
 	return nil
 }
-func (c *recordingSessionClient) GetInstanceState(context.Context, string) (*api.InstanceState, error) {
+func (c *recordingSessionClient) GetInstanceState(ctx context.Context, _ string) (*api.InstanceState, error) {
+	c.stateContexts = append(c.stateContexts, observeCleanupContext(ctx))
 	c.record("get-instance-state")
-	return &api.InstanceState{Network: map[string]api.InstanceStateNetwork{
-		"eth0": {Addresses: []api.InstanceStateNetworkAddress{
-			{Family: "inet", Scope: "global", Address: "10.76.111.42"},
-		}},
-	}}, nil
+	if c.stateErr != nil {
+		return nil, c.stateErr
+	}
+	status := c.stateStatus
+	if status == 0 {
+		status = api.Running
+	}
+	return &api.InstanceState{
+		StatusCode: status,
+		Network: map[string]api.InstanceStateNetwork{
+			"eth0": {Addresses: []api.InstanceStateNetworkAddress{
+				{Family: "inet", Scope: "global", Address: "10.76.111.42"},
+			}},
+		},
+	}, nil
 }
 
 func testDependencies(client sessionClient, calls *[]string, peerDone chan<- struct{}) dependencies {
@@ -136,6 +155,10 @@ func testDependencies(client sessionClient, calls *[]string, peerDone chan<- str
 						"{\"type\":\"agent_settled\"}\n")
 			}()
 			return clientConn, nil
+		},
+		operationWasSubmitted: func(err error) bool {
+			var submitted submittedTestError
+			return errors.As(err, &submitted)
 		},
 		newName:          func() (string, error) { return "session-test", nil },
 		readinessTimeout: time.Second,
@@ -204,6 +227,10 @@ func TestRunHappyPath(t *testing.T) {
 	if !reflect.DeepEqual(request.Devices["workspace"], wantDevice) {
 		t.Errorf("workspace device = %#v, want %#v", request.Devices["workspace"], wantDevice)
 	}
+	wantRoot := map[string]string{"type": "disk", "pool": "pool1", "path": "/"}
+	if !reflect.DeepEqual(request.Devices["root"], wantRoot) {
+		t.Errorf("root device = %#v, want %#v", request.Devices["root"], wantRoot)
+	}
 
 	const records = "{\"id\":\"prompt-1\",\"type\":\"response\",\"command\":\"prompt\",\"success\":true}\n" +
 		"{\"type\":\"agent_settled\"}\n"
@@ -214,6 +241,189 @@ func TestRunHappyPath(t *testing.T) {
 		if !strings.Contains(stderr.String(), progress) {
 			t.Errorf("stderr %q does not contain %q", stderr.String(), progress)
 		}
+	}
+}
+
+type submittedTestError struct{ err error }
+
+func (e submittedTestError) Error() string { return e.err.Error() }
+func (e submittedTestError) Unwrap() error { return e.err }
+
+func TestRunOwnsResourcesAfterSubmittedOperationWaitFailures(t *testing.T) {
+	waitErr := errors.New("operation wait failed")
+	tests := []struct {
+		name      string
+		configure func(*recordingSessionClient)
+		wantTail  []string
+	}{
+		{
+			name: "copy",
+			configure: func(client *recordingSessionClient) {
+				client.copyErr = submittedTestError{err: waitErr}
+			},
+			wantTail: []string{
+				"copy-volume kanedias-workspace-seed kanedias-workspace-session-test",
+				"delete-volume kanedias-workspace-session-test",
+			},
+		},
+		{
+			name: "create",
+			configure: func(client *recordingSessionClient) {
+				client.createErr = submittedTestError{err: waitErr}
+			},
+			wantTail: []string{
+				"create-instance",
+				"delete-instance",
+				"delete-volume kanedias-workspace-session-test",
+			},
+		},
+		{
+			name: "start",
+			configure: func(client *recordingSessionClient) {
+				client.startErr = submittedTestError{err: waitErr}
+				client.stateStatus = api.Running
+			},
+			wantTail: []string{
+				"start-instance",
+				"get-instance-state",
+				"stop-instance",
+				"delete-instance",
+				"delete-volume kanedias-workspace-session-test",
+			},
+		},
+	}
+
+	for _, test := range tests {
+		t.Run(test.name, func(t *testing.T) {
+			var calls []string
+			client := &recordingSessionClient{calls: &calls}
+			test.configure(client)
+			deps := testDependencies(client, &calls, make(chan struct{}))
+			deps.dialRPC = func(context.Context, string) (net.Conn, error) {
+				t.Fatal("dialRPC called after operation failure")
+				return nil, nil
+			}
+
+			err := run(context.Background(), validSessionConfig(), "prompt", io.Discard, io.Discard, deps)
+			if !errors.Is(err, waitErr) {
+				t.Fatalf("run error = %v, want wait failure", err)
+			}
+			if got := calls[len(calls)-len(test.wantTail):]; !reflect.DeepEqual(got, test.wantTail) {
+				t.Fatalf("calls tail = %#v, want %#v", got, test.wantTail)
+			}
+			if test.name == "start" {
+				if !reflect.DeepEqual(client.stopForces, []bool{true}) {
+					t.Fatalf("stop force values = %#v, want [true]", client.stopForces)
+				}
+				if len(client.stateContexts) != 1 {
+					t.Fatalf("state query contexts = %d, want 1", len(client.stateContexts))
+				}
+				observation := client.stateContexts[0]
+				if observation.err != nil || !observation.hasLimit {
+					t.Fatalf("state query cleanup context = %#v, want uncancelled and bounded", observation)
+				}
+				remaining := time.Until(observation.deadline)
+				if remaining <= 0 || remaining > cleanupTimeout {
+					t.Fatalf("state query deadline remaining = %v, want within %v", remaining, cleanupTimeout)
+				}
+			}
+		})
+	}
+}
+
+func TestRunDoesNotOwnResourcesAfterImmediateSubmissionFailures(t *testing.T) {
+	submitErr := errors.New("submission rejected")
+	tests := []struct {
+		name      string
+		configure func(*recordingSessionClient)
+		forbidden []string
+	}{
+		{
+			name: "copy",
+			configure: func(client *recordingSessionClient) {
+				client.copyErr = submitErr
+			},
+			forbidden: []string{"delete-volume", "delete-instance", "stop-instance"},
+		},
+		{
+			name: "create",
+			configure: func(client *recordingSessionClient) {
+				client.createErr = submitErr
+			},
+			forbidden: []string{"delete-instance", "stop-instance"},
+		},
+		{
+			name: "start",
+			configure: func(client *recordingSessionClient) {
+				client.startErr = submitErr
+			},
+			forbidden: []string{"stop-instance", "get-instance-state"},
+		},
+	}
+
+	for _, test := range tests {
+		t.Run(test.name, func(t *testing.T) {
+			var calls []string
+			client := &recordingSessionClient{calls: &calls}
+			test.configure(client)
+			deps := testDependencies(client, &calls, make(chan struct{}))
+			err := run(context.Background(), validSessionConfig(), "prompt", io.Discard, io.Discard, deps)
+			if !errors.Is(err, submitErr) {
+				t.Fatalf("run error = %v, want submission failure", err)
+			}
+			joined := strings.Join(calls, "\n")
+			for _, forbidden := range test.forbidden {
+				if strings.Contains(joined, forbidden) {
+					t.Fatalf("calls include unowned cleanup %q: %#v", forbidden, calls)
+				}
+			}
+		})
+	}
+}
+
+func TestRunCancellationClosesRPCAndCleansUpOwnedResources(t *testing.T) {
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+
+	var calls []string
+	client := &recordingSessionClient{calls: &calls}
+	deps := testDependencies(client, &calls, make(chan struct{}))
+	promptReceived := make(chan struct{})
+	peerClosed := make(chan struct{})
+	deps.dialRPC = func(_ context.Context, address string) (net.Conn, error) {
+		calls = append(calls, "dial "+address)
+		clientConn, serverConn := net.Pipe()
+		go func() {
+			defer close(peerClosed)
+			defer serverConn.Close()
+			reader := bufio.NewReader(serverConn)
+			if _, err := reader.ReadBytes('\n'); err != nil {
+				return
+			}
+			close(promptReceived)
+			_, _ = reader.ReadByte()
+		}()
+		return clientConn, nil
+	}
+
+	result := make(chan error, 1)
+	go func() {
+		result <- run(ctx, validSessionConfig(), "prompt", io.Discard, io.Discard, deps)
+	}()
+	<-promptReceived
+	cancel()
+
+	if err := <-result; !errors.Is(err, context.Canceled) {
+		t.Fatalf("run error = %v, want context cancellation", err)
+	}
+	select {
+	case <-peerClosed:
+	case <-time.After(time.Second):
+		t.Fatal("RPC peer did not observe the socket closing after cancellation")
+	}
+	wantCleanup := []string{"stop-instance", "delete-instance", "delete-volume kanedias-workspace-session-test"}
+	if got := calls[len(calls)-len(wantCleanup):]; !reflect.DeepEqual(got, wantCleanup) {
+		t.Fatalf("cleanup calls = %#v, want %#v", got, wantCleanup)
 	}
 }
 

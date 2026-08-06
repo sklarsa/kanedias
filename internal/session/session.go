@@ -47,16 +47,17 @@ type sessionClient interface {
 }
 
 type dependencies struct {
-	connect          func(context.Context) (sessionClient, error)
-	ensureNetwork    func(context.Context, sessionClient, config.Config) error
-	renderProfile    func(io.Writer, string, config.Config) error
-	defaultProxyOpts func() (proxy.Options, error)
-	initCA           func(string, string) error
-	checkProxy       func(context.Context, config.Config) error
-	dialRPC          func(context.Context, string) (net.Conn, error)
-	newName          func() (string, error)
-	readinessTimeout time.Duration
-	retryInterval    time.Duration
+	connect               func(context.Context) (sessionClient, error)
+	ensureNetwork         func(context.Context, sessionClient, config.Config) error
+	renderProfile         func(io.Writer, string, config.Config) error
+	defaultProxyOpts      func() (proxy.Options, error)
+	initCA                func(string, string) error
+	checkProxy            func(context.Context, config.Config) error
+	dialRPC               func(context.Context, string) (net.Conn, error)
+	operationWasSubmitted func(error) bool
+	newName               func() (string, error)
+	readinessTimeout      time.Duration
+	retryInterval         time.Duration
 }
 
 func defaultDependencies() dependencies {
@@ -74,9 +75,10 @@ func defaultDependencies() dependencies {
 		dialRPC: func(ctx context.Context, address string) (net.Conn, error) {
 			return (&net.Dialer{}).DialContext(ctx, "tcp", address)
 		},
-		newName:          newSessionName,
-		readinessTimeout: 60 * time.Second,
-		retryInterval:    500 * time.Millisecond,
+		operationWasSubmitted: incusclient.OperationWasSubmitted,
+		newName:               newSessionName,
+		readinessTimeout:      60 * time.Second,
+		retryInterval:         500 * time.Millisecond,
 	}
 }
 
@@ -152,12 +154,25 @@ func run(
 	volumeCreated := false
 	instanceCreated := false
 	instanceRunning := false
+	instanceStartAmbiguous := false
 	defer func() {
 		cleanupCtx, cancel := context.WithTimeout(context.WithoutCancel(ctx), cleanupTimeout)
 		defer cancel()
 
 		var cleanupErr error
-		if instanceRunning {
+		shouldStop := instanceRunning
+		if instanceStartAmbiguous {
+			state, stateErr := client.GetInstanceState(cleanupCtx, name)
+			switch {
+			case stateErr == nil:
+				shouldStop = state != nil && state.StatusCode != api.Stopped
+			case incusclient.IsNotFound(stateErr):
+				// The submitted create/start is already absent.
+			default:
+				cleanupErr = errors.Join(cleanupErr, stateErr)
+			}
+		}
+		if shouldStop {
 			fmt.Fprintf(stderr, "Stopping session %s...\n", name)
 			if stopErr := client.StopInstance(cleanupCtx, name, true); stopErr != nil && !incusclient.IsNotFound(stopErr) {
 				cleanupErr = errors.Join(cleanupErr, stopErr)
@@ -182,6 +197,9 @@ func run(
 
 	fmt.Fprintf(stderr, "Cloning workspace %s to %s...\n", seed, volume)
 	if err := client.CopyStorageVolume(ctx, pool, seed, volume); err != nil {
+		if deps.operationWasSubmitted(err) {
+			volumeCreated = true
+		}
 		return err
 	}
 	volumeCreated = true
@@ -195,6 +213,11 @@ func run(
 				"user.kanedias.rpc.port": rpcPort,
 			},
 			Devices: api.DevicesMap{
+				"root": {
+					"type": "disk",
+					"pool": pool,
+					"path": "/",
+				},
 				workspaceDevice: {
 					"type":   "disk",
 					"pool":   pool,
@@ -207,12 +230,18 @@ func run(
 	}
 	fmt.Fprintf(stderr, "Creating session %s...\n", name)
 	if err := client.CreateInstance(ctx, request); err != nil {
+		if deps.operationWasSubmitted(err) {
+			instanceCreated = true
+		}
 		return err
 	}
 	instanceCreated = true
 
 	fmt.Fprintf(stderr, "Starting session %s...\n", name)
 	if err := client.StartInstance(ctx, name); err != nil {
+		if deps.operationWasSubmitted(err) {
+			instanceStartAmbiguous = true
+		}
 		return err
 	}
 	instanceRunning = true

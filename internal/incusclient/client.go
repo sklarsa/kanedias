@@ -2,6 +2,7 @@ package incusclient
 
 import (
 	"context"
+	"errors"
 	"fmt"
 	"net/http"
 
@@ -146,6 +147,19 @@ func IsNotFound(err error) bool {
 	return api.StatusErrorCheck(err, http.StatusNotFound)
 }
 
+type submittedOperationError struct {
+	err error
+}
+
+func (e *submittedOperationError) Error() string { return e.err.Error() }
+func (e *submittedOperationError) Unwrap() error { return e.err }
+
+// OperationWasSubmitted reports whether an Incus request was accepted before its wait failed.
+func OperationWasSubmitted(err error) bool {
+	var submitted *submittedOperationError
+	return errors.As(err, &submitted)
+}
+
 type operationWaiter interface {
 	WaitContext(context.Context) error
 	Get() api.Operation
@@ -155,9 +169,31 @@ func waitOperation(ctx context.Context, operation operationWaiter) error {
 	return operation.WaitContext(ctx)
 }
 
+func submitAndWaitOperation(ctx context.Context, submit func() (operationWaiter, error)) error {
+	operation, err := submit()
+	if err != nil {
+		return err
+	}
+	if err := waitOperation(ctx, operation); err != nil {
+		return &submittedOperationError{err: err}
+	}
+	return nil
+}
+
 type remoteOperationWaiter interface {
 	Wait() error
 	CancelTarget() error
+}
+
+func submitAndWaitRemoteOperation(ctx context.Context, submit func() (remoteOperationWaiter, error)) error {
+	operation, err := submit()
+	if err != nil {
+		return err
+	}
+	if err := waitRemoteOperation(ctx, operation); err != nil {
+		return &submittedOperationError{err: err}
+	}
+	return nil
 }
 
 func waitRemoteOperation(ctx context.Context, operation remoteOperationWaiter) error {

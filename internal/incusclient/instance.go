@@ -46,11 +46,9 @@ func (c *Client) GetInstanceState(ctx context.Context, name string) (*api.Instan
 
 func (c *Client) CreateInstance(ctx context.Context, request api.InstancesPost) error {
 	server := c.server.WithContext(ctx)
-	operation, err := server.CreateInstance(request)
-	if err != nil {
-		return fmt.Errorf("create Incus instance %q: %w", request.Name, err)
-	}
-	if err := waitOperation(ctx, operation); err != nil {
+	if err := submitAndWaitOperation(ctx, func() (operationWaiter, error) {
+		return server.CreateInstance(request)
+	}); err != nil {
 		return fmt.Errorf("create Incus instance %q: %w", request.Name, err)
 	}
 	return nil
@@ -78,11 +76,9 @@ func (c *Client) StopInstance(ctx context.Context, name string, force bool) erro
 
 func (c *Client) changeInstanceState(ctx context.Context, name string, request api.InstanceStatePut) error {
 	server := c.server.WithContext(ctx)
-	operation, err := server.UpdateInstanceState(name, request, "")
-	if err != nil {
-		return fmt.Errorf("%s Incus instance %q: %w", request.Action, name, err)
-	}
-	if err := waitOperation(ctx, operation); err != nil {
+	if err := submitAndWaitOperation(ctx, func() (operationWaiter, error) {
+		return server.UpdateInstanceState(name, request, "")
+	}); err != nil {
 		return fmt.Errorf("%s Incus instance %q: %w", request.Action, name, err)
 	}
 	return nil

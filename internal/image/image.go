@@ -14,6 +14,7 @@ import (
 	"github.com/lxc/incus/v7/shared/api"
 	"github.com/sklarsa/kanedias/internal/config"
 	"github.com/sklarsa/kanedias/internal/incusclient"
+	"github.com/sklarsa/kanedias/internal/network"
 	"github.com/sklarsa/kanedias/internal/profiles"
 )
 
@@ -32,6 +33,9 @@ var piRPCService []byte
 var piRPCLauncher []byte
 
 type imageClient interface {
+	ResolvePool(context.Context, string) (string, error)
+	GetNetwork(context.Context, string) (*api.Network, error)
+	CreateNetwork(context.Context, api.NetworksPost) error
 	EnsureProfile(context.Context, string, []byte) error
 	CreateInstance(context.Context, api.InstancesPost) error
 	PushFile(context.Context, string, string, []byte, int) error
@@ -104,6 +108,14 @@ func loadBuildInputs(cfg config.Config) (buildInputs, error) {
 }
 
 func createWithClient(ctx context.Context, client imageClient, cfg config.Config, inputs buildInputs, stdout, stderr io.Writer) (err error) {
+	pool, err := client.ResolvePool(ctx, cfg.Workspace.Pool)
+	if err != nil {
+		return err
+	}
+	if err := network.EnsureWithClient(ctx, client, cfg); err != nil {
+		return err
+	}
+
 	fmt.Fprintln(stdout, "Ensuring image-build profile...")
 	if err := client.EnsureProfile(ctx, string(profiles.ImageBuild), inputs.profile); err != nil {
 		return fmt.Errorf("ensure image-build profile: %w", err)
@@ -112,8 +124,17 @@ func createWithClient(ctx context.Context, client imageClient, cfg config.Config
 	instanceName := fmt.Sprintf("image-build-%d-%d", time.Now().UnixNano(), os.Getpid())
 	fmt.Fprintf(stdout, "Creating temporary instance %s...\n", instanceName)
 	request := api.InstancesPost{
-		InstancePut: api.InstancePut{Profiles: []string{"default", string(profiles.ImageBuild)}},
-		Name:        instanceName,
+		InstancePut: api.InstancePut{
+			Profiles: []string{"default", string(profiles.ImageBuild)},
+			Devices: api.DevicesMap{
+				"root": {
+					"type": "disk",
+					"pool": pool,
+					"path": "/",
+				},
+			},
+		},
+		Name: instanceName,
 		Source: api.InstanceSource{
 			Type:     "image",
 			Alias:    cfg.BaseImage.Image,

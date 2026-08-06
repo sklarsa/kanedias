@@ -169,6 +169,11 @@ func create(ctx context.Context, cfg config.Config, name string, stdout, stderr 
 		InstancePut: api.InstancePut{
 			Profiles: []string{"default", sandboxProfile},
 			Devices: api.DevicesMap{
+				"root": {
+					"type": "disk",
+					"pool": pool,
+					"path": "/",
+				},
 				workspaceDevice: {
 					"type":   "disk",
 					"pool":   pool,

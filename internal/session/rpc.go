@@ -48,6 +48,9 @@ func runRPC(ctx context.Context, conn net.Conn, prompt string, stdout io.Writer)
 	for {
 		record, err := reader.ReadBytes('\n')
 		if err != nil {
+			if ctx.Err() != nil {
+				return ctx.Err()
+			}
 			if err == io.EOF {
 				if len(record) != 0 {
 					return fmt.Errorf("read RPC record: partial record before EOF")

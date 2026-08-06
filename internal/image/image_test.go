@@ -31,6 +31,9 @@ func TestCreateRunsImageWorkflowInOrder(t *testing.T) {
 	}
 
 	wantCalls := []string{
+		"resolve-pool",
+		"get-network kanedias",
+		"create-network kanedias",
 		"ensure-profile image-build",
 		"create-instance",
 		"push /root/install.sh",
@@ -53,6 +56,11 @@ func TestCreateRunsImageWorkflowInOrder(t *testing.T) {
 	if client.profileDefinition == nil {
 		t.Fatal("image-build profile definition was not supplied")
 	}
+	for _, want := range []string{"eth0:", "network: kanedias", "type: nic"} {
+		if !strings.Contains(string(client.profileDefinition), want) {
+			t.Errorf("image-build profile missing %q:\n%s", want, client.profileDefinition)
+		}
+	}
 
 	request := client.createRequest
 	if !strings.HasPrefix(request.Name, "image-build-") {
@@ -63,6 +71,10 @@ func TestCreateRunsImageWorkflowInOrder(t *testing.T) {
 	}
 	if got, want := request.Profiles, []string{"default", "image-build"}; !reflect.DeepEqual(got, want) {
 		t.Errorf("profiles = %#v, want %#v", got, want)
+	}
+	wantRoot := map[string]string{"type": "disk", "pool": "pool1", "path": "/"}
+	if got := request.Devices["root"]; !reflect.DeepEqual(got, wantRoot) {
+		t.Errorf("root device = %#v, want %#v", got, wantRoot)
 	}
 	if request.Source.Type != "image" || request.Source.Server != cfg.BaseImage.Source || request.Source.Protocol != "simplestreams" || request.Source.Alias != cfg.BaseImage.Image {
 		t.Errorf("instance source = %#v", request.Source)
@@ -242,7 +254,8 @@ func imageConfig(t *testing.T, hosts []string) config.Config {
 		}
 	}
 	return config.Config{
-		Dir: dir,
+		Dir:     dir,
+		Network: config.Network{IPv4: "10.76.111.1/24"},
 		BaseImage: config.BaseImage{
 			Name:            "sandbox",
 			Source:          "https://images.linuxcontainers.org",
@@ -278,6 +291,21 @@ type recordingClient struct {
 	running            bool
 	stopErr            error
 	cleanupContexts    []cleanupContextObservation
+}
+
+func (c *recordingClient) ResolvePool(context.Context, string) (string, error) {
+	c.calls = append(c.calls, "resolve-pool")
+	return "pool1", nil
+}
+
+func (c *recordingClient) GetNetwork(context.Context, string) (*api.Network, error) {
+	c.calls = append(c.calls, "get-network kanedias")
+	return nil, api.StatusErrorf(404, "missing")
+}
+
+func (c *recordingClient) CreateNetwork(_ context.Context, request api.NetworksPost) error {
+	c.calls = append(c.calls, "create-network "+request.Name)
+	return nil
 }
 
 func (c *recordingClient) EnsureProfile(_ context.Context, name string, definition []byte) error {

@@ -31,6 +31,7 @@ type workspaceExecResponse struct {
 
 type fakeClient struct {
 	calls               []string
+	createRequest       api.InstancesPost
 	storageFound        bool
 	cancel              context.CancelFunc
 	requestCtx          context.Context
@@ -84,6 +85,7 @@ func (f *fakeClient) EnsureProfile(ctx context.Context, name string, definition 
 }
 
 func (f *fakeClient) CreateInstance(ctx context.Context, request api.InstancesPost) error {
+	f.createRequest = request
 	device := request.Devices[workspaceDevice]
 	f.record(fmt.Sprintf("create-instance %s %s %s", request.Source.Alias, device["pool"], device["source"]))
 	return nil
@@ -311,6 +313,10 @@ func TestSyncRetriesSystemdBeforeCAAndDNSAndDestructiveRefresh(t *testing.T) {
 	}
 	if !fake.dnsCtxBounded {
 		t.Fatal("DNS exec did not receive a bounded request-derived context")
+	}
+	wantRoot := map[string]string{"type": "disk", "pool": "pool", "path": "/"}
+	if got := fake.createRequest.Devices["root"]; !reflect.DeepEqual(got, wantRoot) {
+		t.Fatalf("root device = %#v, want %#v", got, wantRoot)
 	}
 
 	commands := strings.Join(fake.calls, "\n")

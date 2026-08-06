@@ -10,12 +10,13 @@ type fakeRemoteOperation struct {
 	waitStarted chan struct{}
 	waitRelease chan struct{}
 	cancelled   chan struct{}
+	waitErr     error
 }
 
 func (o *fakeRemoteOperation) Wait() error {
 	close(o.waitStarted)
 	<-o.waitRelease
-	return nil
+	return o.waitErr
 }
 
 func (o *fakeRemoteOperation) CancelTarget() error {

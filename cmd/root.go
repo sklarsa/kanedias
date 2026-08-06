@@ -31,11 +31,16 @@ type services struct {
 
 // Execute runs the Kanedias command-line interface.
 func Execute() error {
+	return ExecuteContext(context.Background())
+}
+
+// ExecuteContext runs the Kanedias command-line interface with the supplied context.
+func ExecuteContext(ctx context.Context) error {
 	options, err := proxy.DefaultOptions()
 	if err != nil {
 		return err
 	}
-	return newRootCommand(realServices(), options).Execute()
+	return newRootCommand(realServices(), options).ExecuteContext(ctx)
 }
 
 func realServices() services {

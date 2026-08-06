@@ -132,13 +132,12 @@ func TestSessionReadsPromptFromStdinAndDelegates(t *testing.T) {
 	}
 
 	root := newRootCommand(service, testProxyOptions())
-	root.SetContext(ctx)
 	root.SetIn(strings.NewReader("first line\nsecond line\n"))
 	root.SetOut(&stdout)
 	root.SetErr(&stderr)
 	root.SetArgs([]string{"--config", "/tmp/session.toml", "session"})
-	if err := root.Execute(); err != nil {
-		t.Fatalf("Execute() error = %v", err)
+	if err := root.ExecuteContext(ctx); err != nil {
+		t.Fatalf("ExecuteContext() error = %v", err)
 	}
 	if !reflect.DeepEqual(calls, []string{"load", "run"}) {
 		t.Errorf("call order = %q, want [load run]", calls)

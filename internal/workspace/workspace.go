@@ -134,6 +134,11 @@ func syncWithDependencies(ctx context.Context, cfg config.Config, stdout, stderr
 		InstancePut: api.InstancePut{
 			Profiles: []string{"default", string(profiles.Sandbox)},
 			Devices: api.DevicesMap{
+				"root": {
+					"type": "disk",
+					"pool": pool,
+					"path": "/",
+				},
 				workspaceDevice: {
 					"type":   "disk",
 					"pool":   pool,

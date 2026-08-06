@@ -38,14 +38,12 @@ func (c *Client) CopyStorageVolume(ctx context.Context, pool, source, target str
 		return fmt.Errorf("get source Incus storage volume %q in pool %q: %w", source, pool, err)
 	}
 
-	operation, err := server.CopyStoragePoolVolume(pool, server, pool, *volume, &incus.StoragePoolVolumeCopyArgs{
-		Name: target,
-		Mode: "pull",
-	})
-	if err != nil {
-		return fmt.Errorf("copy Incus storage volume %q to %q: %w", source, target, err)
-	}
-	if err := waitRemoteOperation(ctx, operation); err != nil {
+	if err := submitAndWaitRemoteOperation(ctx, func() (remoteOperationWaiter, error) {
+		return server.CopyStoragePoolVolume(pool, server, pool, *volume, &incus.StoragePoolVolumeCopyArgs{
+			Name: target,
+			Mode: "pull",
+		})
+	}); err != nil {
 		return fmt.Errorf("copy Incus storage volume %q to %q: %w", source, target, err)
 	}
 	return nil

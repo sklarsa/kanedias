@@ -49,6 +49,10 @@ func TestCreateOrdersLifecycleAndBuildsOwnedWorkspaceDevice(t *testing.T) {
 	if got := request.Devices["workspace"]; !equalStringMap(got, wantDevice) {
 		t.Fatalf("workspace device = %#v, want %#v", got, wantDevice)
 	}
+	wantRoot := map[string]string{"type": "disk", "pool": "pool1", "path": "/"}
+	if got := request.Devices["root"]; !equalStringMap(got, wantRoot) {
+		t.Fatalf("root device = %#v, want %#v", got, wantRoot)
+	}
 	if remaining := time.Until(fake.readinessDeadline); remaining < 59*time.Second || remaining > 61*time.Second {
 		t.Fatalf("systemd readiness deadline is %v away, want about 60s", remaining)
 	}
