@@ -5,12 +5,14 @@ import (
 	"context"
 	"errors"
 	"io"
+	"os"
 	"reflect"
 	"strings"
 	"testing"
 
 	"github.com/sklarsa/kanedias/internal/config"
 	"github.com/sklarsa/kanedias/internal/proxy"
+	"github.com/sklarsa/kanedias/internal/server"
 	"github.com/spf13/cobra"
 	"github.com/spf13/pflag"
 )
@@ -18,7 +20,7 @@ import (
 func TestCommandHierarchyAndFlags(t *testing.T) {
 	root := newRootCommand(stubServices(), testProxyOptions())
 
-	assertChildCommands(t, root, "image", "profile", "proxy", "sandbox", "session", "workspace")
+	assertChildCommands(t, root, "image", "profile", "proxy", "sandbox", "server", "session", "workspace")
 	assertChildCommands(t, mustFindCommand(t, root, "image"), "create")
 	assertChildCommands(t, mustFindCommand(t, root, "proxy"), "init-ca", "login", "run")
 	assertChildCommands(t, mustFindCommand(t, root, "proxy", "login"), "openai-codex")
@@ -37,6 +39,7 @@ func TestCommandHierarchyAndFlags(t *testing.T) {
 		{"sandbox"},
 		{"sandbox", "create"},
 		{"sandbox", "destroy"},
+		{"server"},
 		{"session"},
 		{"workspace"},
 		{"workspace", "sync"},
@@ -60,6 +63,22 @@ func TestCommandHierarchyAndFlags(t *testing.T) {
 	assertFlags(t, run, "metrics-listen", "request-log", "ca-cert", "ca-key", "claude-credentials", "openai-codex-auth")
 	assertFlags(t, mustFindCommand(t, root, "proxy", "init-ca"), "ca-cert", "ca-key")
 	assertFlags(t, mustFindCommand(t, root, "proxy", "login", "openai-codex"), "openai-codex-auth")
+
+	serverCommand := mustFindCommand(t, root, "server")
+	var serverFlags []string
+	serverCommand.LocalNonPersistentFlags().VisitAll(func(flag *pflag.Flag) {
+		serverFlags = append(serverFlags, flag.Name)
+	})
+	if !reflect.DeepEqual(serverFlags, []string{"listen"}) {
+		t.Errorf("server local flags = %q, want [listen]", serverFlags)
+	}
+	listenFlag := serverCommand.Flags().Lookup("listen")
+	if listenFlag == nil {
+		t.Fatal("server listen flag is missing")
+	}
+	if listenFlag.DefValue != server.DefaultListenAddress {
+		t.Errorf("server listen default = %q, want %q", listenFlag.DefValue, server.DefaultListenAddress)
+	}
 
 	configFlag := root.PersistentFlags().Lookup("config")
 	if configFlag == nil {
@@ -173,6 +192,137 @@ func TestSessionRejectsEmptyInputBeforeWorkflow(t *testing.T) {
 				t.Errorf("runSession calls = %d, want 0", runCalls)
 			}
 		})
+	}
+}
+
+func TestServerCommandRejectsPositionalArguments(t *testing.T) {
+	service := serverServicesThatRejectDependencies(t)
+	service.runServer = func(context.Context, server.Options) error {
+		t.Fatal("runServer called with positional arguments")
+		return nil
+	}
+
+	root := newRootCommand(service, testProxyOptions())
+	root.SetOut(io.Discard)
+	root.SetErr(io.Discard)
+	root.SetArgs([]string{"server", "extra"})
+	if err := root.Execute(); err == nil {
+		t.Fatal("Execute() succeeded with a positional argument")
+	}
+}
+
+func TestServerCommandRejectsUnsafeListenAddressBeforeDelegation(t *testing.T) {
+	for _, address := range []string{"0.0.0.0:8080", "192.0.2.1:8080", ":8080"} {
+		t.Run(address, func(t *testing.T) {
+			service := serverServicesThatRejectDependencies(t)
+			service.runServer = func(context.Context, server.Options) error {
+				t.Fatal("runServer called with an unsafe listen address")
+				return nil
+			}
+
+			root := newRootCommand(service, testProxyOptions())
+			root.SetOut(io.Discard)
+			root.SetErr(io.Discard)
+			root.SetArgs([]string{"server", "--listen", address})
+			err := root.Execute()
+			if err == nil {
+				t.Fatal("Execute() succeeded with an unsafe listen address")
+			}
+			if !strings.Contains(err.Error(), "validate listen address") {
+				t.Errorf("Execute() error = %q, want listen validation error", err)
+			}
+		})
+	}
+}
+
+func TestServerCommandDelegates(t *testing.T) {
+	ctx := context.WithValue(context.Background(), struct{}{}, "server context")
+	runErr := errors.New("run server sentinel")
+	var stderr bytes.Buffer
+	calls := 0
+
+	service := serverServicesThatRejectDependencies(t)
+	service.runServer = func(gotContext context.Context, options server.Options) error {
+		calls++
+		if gotContext != ctx {
+			t.Error("runServer did not receive the exact command context")
+		}
+		if options.ListenAddress != "localhost:9090" {
+			t.Errorf("listen address = %q, want localhost:9090", options.ListenAddress)
+		}
+		if options.Logger == nil {
+			t.Fatal("runServer received a nil logger")
+		}
+		options.Logger.Info("server command test", "answer", 42)
+		return runErr
+	}
+
+	root := newRootCommand(service, testProxyOptions())
+	root.SetContext(ctx)
+	root.SetOut(io.Discard)
+	root.SetErr(&stderr)
+	root.SetArgs([]string{"server", "--listen", "localhost:9090"})
+	if err := root.Execute(); !errors.Is(err, runErr) {
+		t.Fatalf("Execute() error = %v, want run server sentinel", err)
+	}
+	if calls != 1 {
+		t.Errorf("runServer calls = %d, want 1", calls)
+	}
+	logOutput := stderr.String()
+	if !strings.Contains(logOutput, "msg=\"server command test\"") || !strings.Contains(logOutput, "answer=42") {
+		t.Errorf("command stderr = %q, want structured logger output", logOutput)
+	}
+}
+
+func TestServerCommandUsesDefaultListenAddress(t *testing.T) {
+	service := serverServicesThatRejectDependencies(t)
+	calls := 0
+	service.runServer = func(_ context.Context, options server.Options) error {
+		calls++
+		if options.ListenAddress != server.DefaultListenAddress {
+			t.Errorf("listen address = %q, want %q", options.ListenAddress, server.DefaultListenAddress)
+		}
+		return nil
+	}
+
+	root := newRootCommand(service, testProxyOptions())
+	root.SetOut(io.Discard)
+	root.SetErr(io.Discard)
+	root.SetArgs([]string{"server"})
+	if err := root.Execute(); err != nil {
+		t.Fatalf("Execute() error = %v", err)
+	}
+	if calls != 1 {
+		t.Errorf("runServer calls = %d, want 1", calls)
+	}
+}
+
+func TestExecuteContextPropagatesCancellationToServer(t *testing.T) {
+	ctx, cancel := context.WithCancel(context.Background())
+	cancel()
+
+	service := serverServicesThatRejectDependencies(t)
+	calls := 0
+	service.runServer = func(gotContext context.Context, _ server.Options) error {
+		calls++
+		if gotContext != ctx {
+			t.Error("runServer did not receive the exact execute context")
+		}
+		if !errors.Is(gotContext.Err(), context.Canceled) {
+			t.Errorf("runServer context error = %v, want context.Canceled", gotContext.Err())
+		}
+		return gotContext.Err()
+	}
+
+	oldArgs := os.Args
+	os.Args = []string{"kanedias", "server"}
+	t.Cleanup(func() { os.Args = oldArgs })
+
+	if err := execute(ctx, service, testProxyOptions()); !errors.Is(err, context.Canceled) {
+		t.Fatalf("execute() error = %v, want context.Canceled", err)
+	}
+	if calls != 1 {
+		t.Errorf("runServer calls = %d, want 1", calls)
 	}
 }
 
@@ -497,7 +647,58 @@ func stubServices() services {
 		syncWorkspace: func(context.Context, config.Config, io.Writer, io.Writer) error {
 			return nil
 		},
+		runServer: func(context.Context, server.Options) error { return nil },
 	}
+}
+
+func serverServicesThatRejectDependencies(t *testing.T) services {
+	t.Helper()
+	service := stubServices()
+	service.loadConfig = func(string) (config.Config, error) {
+		t.Fatal("loadConfig called by server command")
+		return config.Config{}, nil
+	}
+	service.ensureNetwork = func(context.Context, config.Config) error {
+		t.Fatal("ensureNetwork called by server command")
+		return nil
+	}
+	service.renderProfile = func(io.Writer, string, config.Config) error {
+		t.Fatal("renderProfile called by server command")
+		return nil
+	}
+	service.runProxy = func(context.Context, proxy.Options) error {
+		t.Fatal("runProxy called by server command")
+		return nil
+	}
+	service.initCA = func(string, string) error {
+		t.Fatal("initCA called by server command")
+		return nil
+	}
+	service.loginOpenAICodex = func(context.Context, string, io.Writer) error {
+		t.Fatal("loginOpenAICodex called by server command")
+		return nil
+	}
+	service.createImage = func(context.Context, config.Config, io.Writer, io.Writer) error {
+		t.Fatal("createImage called by server command")
+		return nil
+	}
+	service.createSandbox = func(context.Context, config.Config, string, io.Writer, io.Writer) error {
+		t.Fatal("createSandbox called by server command")
+		return nil
+	}
+	service.destroySandbox = func(context.Context, config.Config, string, io.Writer, io.Writer) error {
+		t.Fatal("destroySandbox called by server command")
+		return nil
+	}
+	service.runSession = func(context.Context, config.Config, string, io.Writer, io.Writer) error {
+		t.Fatal("runSession called by server command")
+		return nil
+	}
+	service.syncWorkspace = func(context.Context, config.Config, io.Writer, io.Writer) error {
+		t.Fatal("syncWorkspace called by server command")
+		return nil
+	}
+	return service
 }
 
 func servicesThatRejectConfigAndNetwork(t *testing.T) services {

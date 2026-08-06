@@ -1,0 +1,36 @@
+<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <title>Kanedias</title>
+  <link rel="stylesheet" href="/assets/app.css">
+  <script type="module" src="/assets/datastar.js"></script>
+</head>
+<body>
+  <main>
+    <header>
+      <p class="eyebrow">Local server</p>
+      <h1>Kanedias</h1>
+      <p>This is the local Kanedias server shell.</p>
+    </header>
+
+    <section class="status-card" aria-labelledby="status-heading">
+      <h2 id="status-heading">Server status</h2>
+      <output id="server-status" role="status">Not refreshed yet.</output>
+      <button type="button" data-on:click="@get('/ui/status')">Refresh status</button>
+    </section>
+
+    <div class="panels">
+<section id="dashboard-panel" aria-labelledby="dashboard-heading">
+  <h2 id="dashboard-heading">Dashboard</h2>
+  <p>Dashboard view is not available in this scaffold.</p>
+</section>
+<section id="session-panel" aria-labelledby="session-heading">
+  <h2 id="session-heading">Sessions</h2>
+  <p>Session view is not available in this scaffold.</p>
+</section>
+    </div>
+  </main>
+</body>
+</html>
