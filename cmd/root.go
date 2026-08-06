@@ -10,6 +10,7 @@ import (
 	"github.com/sklarsa/kanedias/internal/profiles"
 	"github.com/sklarsa/kanedias/internal/proxy"
 	"github.com/sklarsa/kanedias/internal/sandbox"
+	"github.com/sklarsa/kanedias/internal/session"
 	"github.com/sklarsa/kanedias/internal/workspace"
 	"github.com/spf13/cobra"
 )
@@ -24,6 +25,7 @@ type services struct {
 	createImage      func(context.Context, config.Config, io.Writer, io.Writer) error
 	createSandbox    func(context.Context, config.Config, string, io.Writer, io.Writer) error
 	destroySandbox   func(context.Context, config.Config, string, io.Writer, io.Writer) error
+	runSession       func(context.Context, config.Config, string, io.Writer, io.Writer) error
 	syncWorkspace    func(context.Context, config.Config, io.Writer, io.Writer) error
 }
 
@@ -47,6 +49,7 @@ func realServices() services {
 		createImage:      image.Create,
 		createSandbox:    sandbox.Create,
 		destroySandbox:   sandbox.Destroy,
+		runSession:       session.Run,
 		syncWorkspace:    workspace.Sync,
 	}
 }
@@ -65,6 +68,7 @@ func newRootCommand(service services, options proxy.Options) *cobra.Command {
 		newProfileCommand(service, getConfigPath),
 		newProxyCommand(service, getConfigPath, options),
 		newSandboxCommand(service, getConfigPath),
+		newSessionCommand(service, getConfigPath),
 		newWorkspaceCommand(service, getConfigPath),
 	)
 	return root

@@ -18,7 +18,7 @@ import (
 func TestCommandHierarchyAndFlags(t *testing.T) {
 	root := newRootCommand(stubServices(), testProxyOptions())
 
-	assertChildCommands(t, root, "image", "profile", "proxy", "sandbox", "workspace")
+	assertChildCommands(t, root, "image", "profile", "proxy", "sandbox", "session", "workspace")
 	assertChildCommands(t, mustFindCommand(t, root, "image"), "create")
 	assertChildCommands(t, mustFindCommand(t, root, "proxy"), "init-ca", "login", "run")
 	assertChildCommands(t, mustFindCommand(t, root, "proxy", "login"), "openai-codex")
@@ -37,6 +37,7 @@ func TestCommandHierarchyAndFlags(t *testing.T) {
 		{"sandbox"},
 		{"sandbox", "create"},
 		{"sandbox", "destroy"},
+		{"session"},
 		{"workspace"},
 		{"workspace", "sync"},
 	} {
@@ -81,6 +82,7 @@ func TestCommandHierarchyAndFlags(t *testing.T) {
 		{"image", "create"},
 		{"sandbox", "create"},
 		{"sandbox", "destroy"},
+		{"session"},
 		{"workspace", "sync"},
 	} {
 		command := mustFindCommand(t, root, path...)
@@ -91,6 +93,87 @@ func TestCommandHierarchyAndFlags(t *testing.T) {
 		if len(localFlags) != 0 {
 			t.Errorf("%s local flags = %q, want none", command.CommandPath(), localFlags)
 		}
+	}
+}
+
+func TestSessionReadsPromptFromStdinAndDelegates(t *testing.T) {
+	cfg := config.Config{BaseImage: config.BaseImage{Name: "sentinel"}}
+	ctx := context.WithValue(context.Background(), struct{}{}, "session-context")
+	var stdout, stderr bytes.Buffer
+	var calls []string
+
+	service := stubServices()
+	service.loadConfig = func(path string) (config.Config, error) {
+		calls = append(calls, "load")
+		if path != "/tmp/session.toml" {
+			t.Errorf("loaded path = %q, want /tmp/session.toml", path)
+		}
+		return cfg, nil
+	}
+	service.runSession = func(gotContext context.Context, gotConfig config.Config, prompt string, gotStdout, gotStderr io.Writer) error {
+		calls = append(calls, "run")
+		if gotContext != ctx {
+			t.Error("session did not receive the exact command context")
+		}
+		if !reflect.DeepEqual(gotConfig, cfg) {
+			t.Errorf("session config = %#v, want %#v", gotConfig, cfg)
+		}
+		if prompt != "first line\nsecond line\n" {
+			t.Errorf("prompt = %q, want exact stdin", prompt)
+		}
+		if gotStdout != &stdout {
+			t.Error("session did not receive the exact stdout writer")
+		}
+		if gotStderr != &stderr {
+			t.Error("session did not receive the exact stderr writer")
+		}
+		_, err := io.WriteString(gotStdout, "{\"type\":\"agent_settled\"}\n")
+		return err
+	}
+
+	root := newRootCommand(service, testProxyOptions())
+	root.SetContext(ctx)
+	root.SetIn(strings.NewReader("first line\nsecond line\n"))
+	root.SetOut(&stdout)
+	root.SetErr(&stderr)
+	root.SetArgs([]string{"--config", "/tmp/session.toml", "session"})
+	if err := root.Execute(); err != nil {
+		t.Fatalf("Execute() error = %v", err)
+	}
+	if !reflect.DeepEqual(calls, []string{"load", "run"}) {
+		t.Errorf("call order = %q, want [load run]", calls)
+	}
+	if stdout.String() != "{\"type\":\"agent_settled\"}\n" {
+		t.Errorf("stdout = %q", stdout.String())
+	}
+}
+
+func TestSessionRejectsEmptyInputBeforeWorkflow(t *testing.T) {
+	for _, input := range []string{"", " \n\t"} {
+		t.Run(strings.ReplaceAll(input, "\n", "\\n"), func(t *testing.T) {
+			runCalls := 0
+			service := stubServices()
+			service.loadConfig = func(string) (config.Config, error) {
+				t.Fatal("loadConfig called for empty session input")
+				return config.Config{}, nil
+			}
+			service.runSession = func(context.Context, config.Config, string, io.Writer, io.Writer) error {
+				runCalls++
+				return nil
+			}
+
+			root := newRootCommand(service, testProxyOptions())
+			root.SetIn(strings.NewReader(input))
+			root.SetOut(io.Discard)
+			root.SetErr(io.Discard)
+			root.SetArgs([]string{"session"})
+			if err := root.Execute(); err == nil {
+				t.Fatal("Execute() error = nil, want empty-input error")
+			}
+			if runCalls != 0 {
+				t.Errorf("runSession calls = %d, want 0", runCalls)
+			}
+		})
 	}
 }
 
@@ -227,6 +310,7 @@ func TestLifecycleCommandsRejectExtraArguments(t *testing.T) {
 		{"image", "create", "extra"},
 		{"sandbox", "create", "one", "two"},
 		{"sandbox", "destroy", "one", "two"},
+		{"session", "extra"},
 		{"workspace", "sync", "extra"},
 	} {
 		root := newRootCommand(stubServices(), testProxyOptions())
@@ -401,6 +485,9 @@ func stubServices() services {
 			return nil
 		},
 		destroySandbox: func(context.Context, config.Config, string, io.Writer, io.Writer) error {
+			return nil
+		},
+		runSession: func(context.Context, config.Config, string, io.Writer, io.Writer) error {
 			return nil
 		},
 		syncWorkspace: func(context.Context, config.Config, io.Writer, io.Writer) error {
