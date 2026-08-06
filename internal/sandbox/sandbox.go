@@ -42,12 +42,13 @@ type lifecycleClient interface {
 }
 
 type dependencies struct {
-	connect             func(context.Context) (lifecycleClient, error)
-	acquireLock         func(string) (io.Closer, error)
-	defaultProxyOptions func() (proxy.Options, error)
-	initCA              func(string, string) error
-	ensureNetwork       func(context.Context, lifecycleClient, config.Config) error
-	readinessTimeout    time.Duration
+	connect               func(context.Context) (lifecycleClient, error)
+	acquireLock           func(string) (io.Closer, error)
+	defaultProxyOptions   func() (proxy.Options, error)
+	initCA                func(string, string) error
+	ensureNetwork         func(context.Context, lifecycleClient, config.Config) error
+	readinessTimeout      time.Duration
+	readinessPollInterval time.Duration
 }
 
 func defaultDependencies() dependencies {
@@ -61,7 +62,8 @@ func defaultDependencies() dependencies {
 		ensureNetwork: func(ctx context.Context, client lifecycleClient, cfg config.Config) error {
 			return network.EnsureWithClient(ctx, client, cfg)
 		},
-		readinessTimeout: 60 * time.Second,
+		readinessTimeout:      60 * time.Second,
+		readinessPollInterval: time.Second,
 	}
 }
 
@@ -190,17 +192,8 @@ func create(ctx context.Context, cfg config.Config, name string, stdout, stderr 
 	instanceRunning = true
 
 	fmt.Fprintf(stdout, "Waiting for systemd in %s...\n", name)
-	readyCtx, cancel := context.WithTimeout(ctx, deps.readinessTimeout)
-	readyStdout, readyStderr, execErr := client.Exec(readyCtx, name, incusclient.ExecRequest{
-		Command: []string{"systemctl", "is-system-running", "--wait"},
-	})
-	cancel()
-	state := strings.TrimSpace(readyStdout)
-	if state != "running" && state != "degraded" {
-		if execErr != nil {
-			return fmt.Errorf("wait for systemd in sandbox %q: %w", name, execErr)
-		}
-		return fmt.Errorf("wait for systemd in sandbox %q: unexpected state %q (stderr: %s)", name, state, strings.TrimSpace(readyStderr))
+	if err := waitForSystemd(ctx, client, name, deps.readinessTimeout, deps.readinessPollInterval); err != nil {
+		return err
 	}
 
 	fmt.Fprintf(stdout, "Updating trusted CA certificates in %s...\n", name)
@@ -209,6 +202,41 @@ func create(ctx context.Context, cfg config.Config, name string, stdout, stderr 
 	}
 	fmt.Fprintf(stdout, "Sandbox %s is ready.\n", name)
 	return nil
+}
+
+func waitForSystemd(ctx context.Context, client lifecycleClient, name string, timeout, pollInterval time.Duration) error {
+	readyCtx, cancel := context.WithTimeout(ctx, timeout)
+	defer cancel()
+
+	var lastState string
+	var lastStderr string
+	var lastErr error
+	for {
+		stdout, stderr, err := client.Exec(readyCtx, name, incusclient.ExecRequest{
+			Command: []string{"systemctl", "is-system-running", "--wait"},
+		})
+		state := strings.TrimSpace(stdout)
+		if state == "running" || state == "degraded" {
+			return nil
+		}
+		lastState = state
+		lastStderr = strings.TrimSpace(stderr)
+		lastErr = err
+
+		if readyCtx.Err() != nil {
+			return fmt.Errorf("wait for systemd in sandbox %q: %w (last state %q, stderr %q, exec error %v)", name, readyCtx.Err(), lastState, lastStderr, lastErr)
+		}
+
+		timer := time.NewTimer(pollInterval)
+		select {
+		case <-readyCtx.Done():
+			if !timer.Stop() {
+				<-timer.C
+			}
+			return fmt.Errorf("wait for systemd in sandbox %q: %w (last state %q, stderr %q, exec error %v)", name, readyCtx.Err(), lastState, lastStderr, lastErr)
+		case <-timer.C:
+		}
+	}
 }
 
 // Destroy removes a sandbox instance and its verified, sandbox-owned workspace volume.

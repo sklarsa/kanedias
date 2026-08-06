@@ -54,10 +54,60 @@ func TestCreateOrdersLifecycleAndBuildsOwnedWorkspaceDevice(t *testing.T) {
 	}
 }
 
-func TestCreateAcceptsDegradedSystemd(t *testing.T) {
-	fake := &recordingClient{systemdState: "degraded\n", systemdErr: errors.New("systemd degraded exit status")}
+func TestCreateRetriesPreBusSystemdFailureUntilRunning(t *testing.T) {
+	fake := &recordingClient{systemdResponses: []execResponse{
+		{stderr: "Failed to connect to system scope bus via local transport: No such file or directory", err: errors.New("exit status 1")},
+		{stdout: "running\n"},
+	}}
 	if err := create(context.Background(), testConfig(), "demo", io.Discard, io.Discard, testDependencies(fake)); err != nil {
 		t.Fatal(err)
+	}
+	if got := countCall(fake.calls, "exec systemctl is-system-running --wait"); got != 2 {
+		t.Fatalf("systemd readiness calls = %d, want 2", got)
+	}
+	assertOrderedCalls(t, fake.calls, []string{
+		"exec systemctl is-system-running --wait",
+		"exec systemctl is-system-running --wait",
+		"exec update-ca-certificates",
+	})
+}
+
+func TestCreateRetriesPreBusSystemdFailureUntilDegraded(t *testing.T) {
+	fake := &recordingClient{systemdResponses: []execResponse{
+		{stderr: "Failed to connect to system scope bus via local transport: No such file or directory", err: errors.New("exit status 1")},
+		{stdout: "degraded\n", err: errors.New("systemd degraded exit status")},
+	}}
+	if err := create(context.Background(), testConfig(), "demo", io.Discard, io.Discard, testDependencies(fake)); err != nil {
+		t.Fatal(err)
+	}
+}
+
+func TestWaitForSystemdTimesOutWhileConditionRemainsFalse(t *testing.T) {
+	fake := &recordingClient{systemdResponses: []execResponse{{stderr: "system bus unavailable", err: errors.New("exit status 1")}}}
+	err := waitForSystemd(context.Background(), fake, "demo", 10*time.Millisecond, time.Millisecond)
+	if !errors.Is(err, context.DeadlineExceeded) {
+		t.Fatalf("waitForSystemd error = %v, want deadline exceeded", err)
+	}
+	if got := countCall(fake.calls, "exec systemctl is-system-running --wait"); got < 2 {
+		t.Fatalf("systemd readiness calls = %d, want a condition retry", got)
+	}
+}
+
+func TestWaitForSystemdStopsOnRequestCancellation(t *testing.T) {
+	ctx, cancel := context.WithCancel(context.Background())
+	attempted := make(chan struct{}, 1)
+	fake := &recordingClient{
+		systemdAttempted: attempted,
+		systemdResponses: []execResponse{{stderr: "system bus unavailable", err: errors.New("exit status 1")}},
+	}
+	result := make(chan error, 1)
+	go func() {
+		result <- waitForSystemd(ctx, fake, "demo", time.Minute, time.Hour)
+	}()
+	<-attempted
+	cancel()
+	if err := <-result; !errors.Is(err, context.Canceled) {
+		t.Fatalf("waitForSystemd error = %v, want context cancellation", err)
 	}
 }
 
@@ -277,7 +327,8 @@ func testDependencies(client *recordingClient) dependencies {
 			client.calls = append(client.calls, "ensure-network")
 			return nil
 		},
-		readinessTimeout: 60 * time.Second,
+		readinessTimeout:      60 * time.Second,
+		readinessPollInterval: time.Nanosecond,
 	}
 }
 
@@ -286,6 +337,12 @@ type nopCloser struct{}
 func (nopCloser) Close() error { return nil }
 
 type requestContextKey struct{}
+
+type execResponse struct {
+	stdout string
+	stderr string
+	err    error
+}
 
 type recordingClient struct {
 	calls                []string
@@ -298,6 +355,8 @@ type recordingClient struct {
 	startFunc            func(context.Context) error
 	systemdState         string
 	systemdErr           error
+	systemdResponses     []execResponse
+	systemdAttempted     chan<- struct{}
 	running              bool
 	cleanupContextErrs   []error
 	cleanupDeadlines     []time.Time
@@ -398,12 +457,25 @@ func (c *recordingClient) Exec(ctx context.Context, _ string, request incusclien
 	c.calls = append(c.calls, "exec "+command)
 	if command == "systemctl is-system-running --wait" {
 		c.readinessDeadline, _ = ctx.Deadline()
+		if c.systemdAttempted != nil {
+			select {
+			case c.systemdAttempted <- struct{}{}:
+			default:
+			}
+		}
+		if err := ctx.Err(); err != nil {
+			return "", "", err
+		}
+		if len(c.systemdResponses) > 0 {
+			response := c.systemdResponses[0]
+			if len(c.systemdResponses) > 1 {
+				c.systemdResponses = c.systemdResponses[1:]
+			}
+			return response.stdout, response.stderr, response.err
+		}
 		state := c.systemdState
 		if state == "" {
 			state = "running\n"
-		}
-		if err := ctx.Err(); err != nil {
-			return state, "", err
 		}
 		return state, "", c.systemdErr
 	}
@@ -418,6 +490,29 @@ func assertCalls(t *testing.T, got, want []string) {
 	if strings.Join(got, "\n") != strings.Join(want, "\n") {
 		t.Fatalf("calls:\n%v\nwant:\n%v", got, want)
 	}
+}
+
+func assertOrderedCalls(t *testing.T, calls, want []string) {
+	t.Helper()
+	next := 0
+	for _, call := range calls {
+		if next < len(want) && call == want[next] {
+			next++
+		}
+	}
+	if next != len(want) {
+		t.Fatalf("calls missing ordered item %q at index %d\ncalls:\n%s", want[next], next, strings.Join(calls, "\n"))
+	}
+}
+
+func countCall(calls []string, want string) int {
+	count := 0
+	for _, call := range calls {
+		if call == want {
+			count++
+		}
+	}
+	return count
 }
 
 func containsCall(calls []string, want string) bool {
