@@ -74,6 +74,9 @@ func Sync(ctx context.Context, cfg config.Config, stdout, stderr io.Writer) erro
 }
 
 func syncWithDependencies(ctx context.Context, cfg config.Config, stdout, stderr io.Writer, deps dependencies) (err error) {
+	if err := cfg.ValidateLifecycle(); err != nil {
+		return err
+	}
 	repositories, err := parseRepositories(cfg.Workspace.Repos)
 	if err != nil {
 		return err

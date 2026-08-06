@@ -148,7 +148,11 @@ func (f *fakeClient) Exec(ctx context.Context, name string, request incusclient.
 
 func testConfig(repos ...string) config.Config {
 	return config.Config{
-		BaseImage: config.BaseImage{Name: "base"},
+		BaseImage: config.BaseImage{
+			Name:   "base",
+			Source: "https://images.linuxcontainers.org",
+			Image:  "debian/13",
+		},
 		Workspace: config.Workspace{Pool: "pool", Volume: "seed", Repos: repos},
 	}
 }
@@ -165,6 +169,35 @@ func testDependencies(fake *fakeClient) dependencies {
 			return nil
 		},
 		renderProfile: func(io.Writer, string, config.Config) error { return nil },
+	}
+}
+
+func TestSyncValidatesEveryRequiredLifecycleFieldBeforeSideEffects(t *testing.T) {
+	for _, tt := range []struct {
+		name       string
+		invalidate func(*config.Config)
+		want       string
+	}{
+		{name: "name", invalidate: func(cfg *config.Config) { cfg.BaseImage.Name = "" }, want: "base_image.name is required"},
+		{name: "source", invalidate: func(cfg *config.Config) { cfg.BaseImage.Source = "" }, want: "base_image.source is required"},
+		{name: "image", invalidate: func(cfg *config.Config) { cfg.BaseImage.Image = "" }, want: "base_image.image is required"},
+	} {
+		t.Run("missing-"+tt.name, func(t *testing.T) {
+			cfg := testConfig()
+			tt.invalidate(&cfg)
+			connected := false
+			deps := dependencies{connect: func(context.Context) (client, error) {
+				connected = true
+				return nil, errors.New("unexpected connection")
+			}}
+			err := syncWithDependencies(context.Background(), cfg, io.Discard, io.Discard, deps)
+			if err == nil || !strings.Contains(err.Error(), tt.want) {
+				t.Fatalf("error = %v, want containing %q", err, tt.want)
+			}
+			if connected {
+				t.Fatal("connected before validating lifecycle config")
+			}
+		})
 	}
 }
 

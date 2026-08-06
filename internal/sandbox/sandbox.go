@@ -36,6 +36,7 @@ type lifecycleClient interface {
 	GetInstance(context.Context, string) (*api.Instance, string, error)
 	CreateInstance(context.Context, api.InstancesPost) error
 	StartInstance(context.Context, string) error
+	StopInstance(context.Context, string, bool) error
 	DeleteInstance(context.Context, string) error
 	Exec(context.Context, string, incusclient.ExecRequest) (string, string, error)
 }
@@ -46,7 +47,6 @@ type dependencies struct {
 	defaultProxyOptions func() (proxy.Options, error)
 	initCA              func(string, string) error
 	ensureNetwork       func(context.Context, lifecycleClient, config.Config) error
-	cleanupTimeout      time.Duration
 	readinessTimeout    time.Duration
 }
 
@@ -61,7 +61,6 @@ func defaultDependencies() dependencies {
 		ensureNetwork: func(ctx context.Context, client lifecycleClient, cfg config.Config) error {
 			return network.EnsureWithClient(ctx, client, cfg)
 		},
-		cleanupTimeout:   30 * time.Second,
 		readinessTimeout: 60 * time.Second,
 	}
 }
@@ -72,6 +71,9 @@ func Create(ctx context.Context, cfg config.Config, name string, stdout, stderr 
 }
 
 func create(ctx context.Context, cfg config.Config, name string, stdout, stderr io.Writer, deps dependencies) (err error) {
+	if err := cfg.ValidateLifecycle(); err != nil {
+		return err
+	}
 	if err := validateName(name); err != nil {
 		return err
 	}
@@ -123,14 +125,21 @@ func create(ctx context.Context, cfg config.Config, name string, stdout, stderr 
 	volume := workspaceVolume(name)
 	volumeCreated := false
 	instanceCreated := false
+	instanceRunning := false
 	defer func() {
 		if err == nil {
 			return
 		}
-		cleanupCtx, cancel := context.WithTimeout(context.Background(), deps.cleanupTimeout)
+		cleanupCtx, cancel := context.WithTimeout(context.WithoutCancel(ctx), 30*time.Second)
 		defer cancel()
 		var cleanupErr error
 		if instanceCreated {
+			if instanceRunning {
+				fmt.Fprintf(stderr, "Stopping failed sandbox %s...\n", name)
+				if stopErr := client.StopInstance(cleanupCtx, name, true); stopErr != nil && !incusclient.IsNotFound(stopErr) {
+					cleanupErr = errors.Join(cleanupErr, stopErr)
+				}
+			}
 			fmt.Fprintf(stderr, "Deleting failed sandbox %s...\n", name)
 			if deleteErr := client.DeleteInstance(cleanupCtx, name); deleteErr != nil && !incusclient.IsNotFound(deleteErr) {
 				cleanupErr = errors.Join(cleanupErr, deleteErr)
@@ -178,6 +187,7 @@ func create(ctx context.Context, cfg config.Config, name string, stdout, stderr 
 	if err := client.StartInstance(ctx, name); err != nil {
 		return err
 	}
+	instanceRunning = true
 
 	fmt.Fprintf(stdout, "Waiting for systemd in %s...\n", name)
 	readyCtx, cancel := context.WithTimeout(ctx, deps.readinessTimeout)
@@ -207,6 +217,9 @@ func Destroy(ctx context.Context, cfg config.Config, name string, stdout, stderr
 }
 
 func destroy(ctx context.Context, cfg config.Config, name string, stdout, _ io.Writer, deps dependencies) error {
+	if err := cfg.ValidateLifecycle(); err != nil {
+		return err
+	}
 	if err := validateName(name); err != nil {
 		return err
 	}
@@ -243,6 +256,12 @@ func destroy(ctx context.Context, cfg config.Config, name string, stdout, _ io.W
 		}
 		if workspace["source"] != volume {
 			return fmt.Errorf("refusing to remove %q: workspace source is %q, expected %q", name, workspace["source"], volume)
+		}
+		if instance.StatusCode == api.Running {
+			fmt.Fprintf(stdout, "Stopping sandbox %s...\n", name)
+			if err := client.StopInstance(ctx, name, true); err != nil {
+				return err
+			}
 		}
 		fmt.Fprintf(stdout, "Deleting sandbox %s...\n", name)
 		if err := client.DeleteInstance(ctx, name); err != nil {

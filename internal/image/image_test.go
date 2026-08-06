@@ -92,9 +92,11 @@ func TestCreateUploadsEmptyAuthorizedHosts(t *testing.T) {
 	}
 }
 
-func TestCreateUsesNonCanceledBoundedContextForCleanup(t *testing.T) {
+func TestCreateUsesRequestDerivedNonCanceledBoundedContextForCleanup(t *testing.T) {
 	cfg := imageConfig(t, nil)
-	ctx, cancel := context.WithCancel(context.Background())
+	const sentinel = "request-value"
+	ctx := context.WithValue(context.Background(), imageRequestContextKey{}, sentinel)
+	ctx, cancel := context.WithCancel(ctx)
 	client := &recordingClient{
 		files: make(map[string][]byte),
 		exec: func() error {
@@ -109,14 +111,45 @@ func TestCreateUsesNonCanceledBoundedContextForCleanup(t *testing.T) {
 	if !errors.Is(err, context.Canceled) {
 		t.Fatalf("create() error = %v, want context cancellation", err)
 	}
-	if client.cleanupContextErr != nil {
-		t.Errorf("cleanup context error = %v, want non-canceled context", client.cleanupContextErr)
+	if got, want := client.calls[len(client.calls)-2:], []string{"cleanup-stop", "cleanup-delete-instance"}; !reflect.DeepEqual(got, want) {
+		t.Fatalf("cleanup calls = %#v, want %#v", got, want)
 	}
-	if client.cleanupDeadlineRemaining <= 0 || client.cleanupDeadlineRemaining > 30*time.Second {
-		t.Errorf("cleanup deadline remaining = %v, want bounded by 30s", client.cleanupDeadlineRemaining)
+	if len(client.cleanupContexts) != 2 {
+		t.Fatalf("cleanup contexts = %d, want 2", len(client.cleanupContexts))
 	}
-	if got := client.calls[len(client.calls)-1]; got != "cleanup-delete-instance" {
-		t.Errorf("last call = %q, want cleanup-delete-instance", got)
+	for _, observed := range client.cleanupContexts {
+		if observed.err != nil {
+			t.Errorf("cleanup context error = %v, want non-canceled context", observed.err)
+		}
+		if observed.deadlineRemaining <= 0 || observed.deadlineRemaining > 30*time.Second {
+			t.Errorf("cleanup deadline remaining = %v, want bounded by 30s", observed.deadlineRemaining)
+		}
+		if observed.value != sentinel {
+			t.Errorf("cleanup context value = %v, want %q", observed.value, sentinel)
+		}
+	}
+}
+
+func TestCreateJoinsPrimaryAndRunningInstanceCleanupErrors(t *testing.T) {
+	cfg := imageConfig(t, nil)
+	primaryErr := errors.New("installer failed")
+	stopErr := errors.New("cleanup stop failed")
+	client := &recordingClient{
+		files:   make(map[string][]byte),
+		exec:    func() error { return primaryErr },
+		stopErr: stopErr,
+	}
+
+	err := create(context.Background(), cfg, io.Discard, io.Discard, func(context.Context) (imageClient, error) {
+		return client, nil
+	})
+	for _, want := range []error{primaryErr, stopErr, errDeleteRunningInstance} {
+		if !errors.Is(err, want) {
+			t.Errorf("create() error = %v, want errors.Is(_, %v)", err, want)
+		}
+	}
+	if got, want := client.calls[len(client.calls)-2:], []string{"cleanup-stop", "cleanup-delete-instance"}; !reflect.DeepEqual(got, want) {
+		t.Fatalf("cleanup calls = %#v, want %#v", got, want)
 	}
 }
 
@@ -183,16 +216,27 @@ func imageConfig(t *testing.T, hosts []string) config.Config {
 	}
 }
 
+type imageRequestContextKey struct{}
+
+type cleanupContextObservation struct {
+	err               error
+	deadlineRemaining time.Duration
+	value             any
+}
+
+var errDeleteRunningInstance = errors.New("cannot delete running instance")
+
 type recordingClient struct {
-	calls                    []string
-	files                    map[string][]byte
-	profileDefinition        []byte
-	createRequest            api.InstancesPost
-	publishAlias             string
-	publishDescription       string
-	exec                     func() error
-	cleanupContextErr        error
-	cleanupDeadlineRemaining time.Duration
+	calls              []string
+	files              map[string][]byte
+	profileDefinition  []byte
+	createRequest      api.InstancesPost
+	publishAlias       string
+	publishDescription string
+	exec               func() error
+	running            bool
+	stopErr            error
+	cleanupContexts    []cleanupContextObservation
 }
 
 func (c *recordingClient) EnsureProfile(_ context.Context, name string, definition []byte) error {
@@ -204,6 +248,7 @@ func (c *recordingClient) EnsureProfile(_ context.Context, name string, definiti
 func (c *recordingClient) CreateInstance(_ context.Context, request api.InstancesPost) error {
 	c.calls = append(c.calls, "create-instance")
 	c.createRequest = request
+	c.running = request.Start
 	return nil
 }
 
@@ -221,8 +266,20 @@ func (c *recordingClient) Exec(_ context.Context, _ string, request incusclient.
 	return "installer output", "", nil
 }
 
-func (c *recordingClient) StopInstance(_ context.Context, _ string, _ bool) error {
-	c.calls = append(c.calls, "stop")
+func (c *recordingClient) StopInstance(ctx context.Context, _ string, force bool) error {
+	if _, cleanup := ctx.Deadline(); cleanup {
+		c.calls = append(c.calls, "cleanup-stop")
+		c.observeCleanupContext(ctx)
+		if !force {
+			return errors.New("cleanup stop was not forced")
+		}
+	} else {
+		c.calls = append(c.calls, "stop")
+	}
+	if c.stopErr != nil {
+		return c.stopErr
+	}
+	c.running = false
 	return nil
 }
 
@@ -235,12 +292,20 @@ func (c *recordingClient) PublishInstance(_ context.Context, _ string, alias, de
 
 func (c *recordingClient) DeleteInstance(ctx context.Context, _ string) error {
 	c.calls = append(c.calls, "cleanup-delete-instance")
-	c.cleanupContextErr = ctx.Err()
-	deadline, ok := ctx.Deadline()
-	if ok {
-		c.cleanupDeadlineRemaining = time.Until(deadline)
+	c.observeCleanupContext(ctx)
+	if c.running {
+		return errDeleteRunningInstance
 	}
 	return nil
+}
+
+func (c *recordingClient) observeCleanupContext(ctx context.Context) {
+	deadline, _ := ctx.Deadline()
+	c.cleanupContexts = append(c.cleanupContexts, cleanupContextObservation{
+		err:               ctx.Err(),
+		deadlineRemaining: time.Until(deadline),
+		value:             ctx.Value(imageRequestContextKey{}),
+	})
 }
 
 func (c *recordingClient) Disconnect() {}

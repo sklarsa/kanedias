@@ -4,6 +4,7 @@ import (
 	"bytes"
 	"context"
 	_ "embed"
+	"errors"
 	"fmt"
 	"io"
 	"os"
@@ -116,19 +117,20 @@ func createWithClient(ctx context.Context, client imageClient, cfg config.Config
 	if err := client.CreateInstance(ctx, request); err != nil {
 		return fmt.Errorf("create temporary image-build instance: %w", err)
 	}
+	instanceRunning := true
 	defer func() {
-		cleanupCtx, cancel := context.WithTimeout(context.Background(), cleanupTimeout)
+		cleanupCtx, cancel := context.WithTimeout(context.WithoutCancel(ctx), cleanupTimeout)
 		defer cancel()
-		cleanupErr := client.DeleteInstance(cleanupCtx, instanceName)
-		if cleanupErr == nil {
-			return
+		var cleanupErr error
+		if instanceRunning {
+			if stopErr := client.StopInstance(cleanupCtx, instanceName, true); stopErr != nil {
+				cleanupErr = errors.Join(cleanupErr, fmt.Errorf("stop temporary image-build instance %q: %w", instanceName, stopErr))
+			}
 		}
-		cleanupErr = fmt.Errorf("delete temporary image-build instance %q: %w", instanceName, cleanupErr)
-		if err == nil {
-			err = cleanupErr
-			return
+		if deleteErr := client.DeleteInstance(cleanupCtx, instanceName); deleteErr != nil {
+			cleanupErr = errors.Join(cleanupErr, fmt.Errorf("delete temporary image-build instance %q: %w", instanceName, deleteErr))
 		}
-		fmt.Fprintf(stderr, "warning: %v\n", cleanupErr)
+		err = errors.Join(err, cleanupErr)
 	}()
 
 	fmt.Fprintln(stdout, "Uploading image build inputs...")
@@ -170,6 +172,7 @@ func createWithClient(ctx context.Context, client imageClient, cfg config.Config
 	if err := client.StopInstance(ctx, instanceName, false); err != nil {
 		return fmt.Errorf("stop temporary image-build instance: %w", err)
 	}
+	instanceRunning = false
 
 	description := fmt.Sprintf("kanedias sandbox from %s/%s", cfg.BaseImage.Source, cfg.BaseImage.Image)
 	fmt.Fprintf(stdout, "Publishing image %s...\n", cfg.BaseImage.Name)

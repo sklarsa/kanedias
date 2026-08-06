@@ -61,30 +61,34 @@ func TestCreateAcceptsDegradedSystemd(t *testing.T) {
 	}
 }
 
-func TestCreateUsesIndependentBoundedContextToCleanOwnedResources(t *testing.T) {
-	requestCtx, cancel := context.WithCancel(context.Background())
+func TestCreateUsesRequestDerivedBoundedContextToCleanOwnedResources(t *testing.T) {
+	const sentinel = "request-value"
+	requestCtx := context.WithValue(context.Background(), requestContextKey{}, sentinel)
+	requestCtx, cancel := context.WithCancel(requestCtx)
 	fake := &recordingClient{startFunc: func(context.Context) error {
 		cancel()
-		return context.Canceled
+		return nil
 	}}
 	deps := testDependencies(fake)
-	deps.cleanupTimeout = 30 * time.Second
 
 	err := create(requestCtx, testConfig(), "demo", io.Discard, io.Discard, deps)
 	if !errors.Is(err, context.Canceled) {
 		t.Fatalf("Create error = %v, want context cancellation", err)
 	}
-	assertCalls(t, fake.calls[len(fake.calls)-2:], []string{"delete-instance", "delete-volume kanedias-workspace-demo"})
-	if len(fake.deleteContextErrs) != 2 {
-		t.Fatalf("cleanup context count = %d, want 2", len(fake.deleteContextErrs))
+	assertCalls(t, fake.calls[len(fake.calls)-3:], []string{"stop", "delete-instance", "delete-volume kanedias-workspace-demo"})
+	if len(fake.cleanupContextErrs) != 3 {
+		t.Fatalf("cleanup context count = %d, want 3", len(fake.cleanupContextErrs))
 	}
-	for i, contextErr := range fake.deleteContextErrs {
+	for i, contextErr := range fake.cleanupContextErrs {
 		if contextErr != nil {
 			t.Fatalf("cleanup used canceled context: %v", contextErr)
 		}
-		deadline := fake.deleteDeadlines[i]
+		deadline := fake.cleanupDeadlines[i]
 		if deadline.IsZero() || time.Until(deadline) > 31*time.Second {
 			t.Fatalf("cleanup context does not have the bounded deadline: %v", deadline)
+		}
+		if got := fake.cleanupContextValues[i]; got != sentinel {
+			t.Fatalf("cleanup context value = %v, want %q", got, sentinel)
 		}
 	}
 }
@@ -103,18 +107,22 @@ func TestCreateDoesNotDeleteInstanceItDidNotCreate(t *testing.T) {
 	}
 }
 
-func TestDestroyDeletesVerifiedInstanceBeforeVolume(t *testing.T) {
+func TestDestroyStopsRunningVerifiedInstanceBeforeDeletingInstanceAndVolume(t *testing.T) {
 	fake := &recordingClient{
-		instance: &api.Instance{InstancePut: api.InstancePut{Devices: map[string]map[string]string{
-			"workspace": {"source": "kanedias-workspace-demo", "type": "disk"},
-		}}},
-		volume: &api.StorageVolume{Name: "kanedias-workspace-demo"},
+		instance: &api.Instance{
+			StatusCode: api.Running,
+			InstancePut: api.InstancePut{Devices: map[string]map[string]string{
+				"workspace": {"source": "kanedias-workspace-demo", "type": "disk"},
+			}},
+		},
+		volume:  &api.StorageVolume{Name: "kanedias-workspace-demo"},
+		running: true,
 	}
 	if err := destroy(context.Background(), testConfig(), "demo", io.Discard, io.Discard, testDependencies(fake)); err != nil {
 		t.Fatal(err)
 	}
-	assertCalls(t, fake.calls[len(fake.calls)-4:], []string{
-		"get-instance", "delete-instance", "get-volume kanedias-workspace-demo", "delete-volume kanedias-workspace-demo",
+	assertCalls(t, fake.calls[len(fake.calls)-5:], []string{
+		"get-instance", "stop", "delete-instance", "get-volume kanedias-workspace-demo", "delete-volume kanedias-workspace-demo",
 	})
 }
 
@@ -161,6 +169,47 @@ func TestDestroyNeverSelectsSeedVolume(t *testing.T) {
 	}
 }
 
+func TestLifecycleCommandsValidateEveryRequiredFieldBeforeSideEffects(t *testing.T) {
+	for _, field := range []struct {
+		name       string
+		invalidate func(*config.Config)
+		want       string
+	}{
+		{name: "name", invalidate: func(cfg *config.Config) { cfg.BaseImage.Name = "" }, want: "base_image.name is required"},
+		{name: "source", invalidate: func(cfg *config.Config) { cfg.BaseImage.Source = "" }, want: "base_image.source is required"},
+		{name: "image", invalidate: func(cfg *config.Config) { cfg.BaseImage.Image = "" }, want: "base_image.image is required"},
+	} {
+		for _, operation := range []struct {
+			name string
+			run  func(context.Context, config.Config, dependencies) error
+		}{
+			{name: "create", run: func(ctx context.Context, cfg config.Config, deps dependencies) error {
+				return create(ctx, cfg, "demo", io.Discard, io.Discard, deps)
+			}},
+			{name: "destroy", run: func(ctx context.Context, cfg config.Config, deps dependencies) error {
+				return destroy(ctx, cfg, "demo", io.Discard, io.Discard, deps)
+			}},
+		} {
+			t.Run(operation.name+"/missing-"+field.name, func(t *testing.T) {
+				cfg := testConfig()
+				field.invalidate(&cfg)
+				connected := false
+				deps := dependencies{connect: func(context.Context) (lifecycleClient, error) {
+					connected = true
+					return nil, errors.New("unexpected connection")
+				}}
+				err := operation.run(context.Background(), cfg, deps)
+				if err == nil || !strings.Contains(err.Error(), field.want) {
+					t.Fatalf("error = %v, want containing %q", err, field.want)
+				}
+				if connected {
+					t.Fatal("connected before validating lifecycle config")
+				}
+			})
+		}
+	}
+}
+
 func TestLifecycleLockIsNonBlockingAndPrivate(t *testing.T) {
 	name := "test-" + strings.ReplaceAll(t.Name(), "/", "-")
 	dir := filepath.Join(os.TempDir(), "kanedias-sandbox-locks-"+fmt.Sprint(os.Getuid()))
@@ -200,8 +249,12 @@ func TestValidateNameMatchesLegacyLifecycleRules(t *testing.T) {
 
 func testConfig() config.Config {
 	return config.Config{
-		Network:   config.Network{IPv4: "10.75.177.1/24"},
-		BaseImage: config.BaseImage{Name: "kanedias-base"},
+		Network: config.Network{IPv4: "10.75.177.1/24"},
+		BaseImage: config.BaseImage{
+			Name:   "kanedias-base",
+			Source: "https://images.linuxcontainers.org",
+			Image:  "debian/13",
+		},
 		Workspace: config.Workspace{Pool: "pool1", Volume: config.DefaultWorkspaceVolume},
 	}
 }
@@ -224,7 +277,6 @@ func testDependencies(client *recordingClient) dependencies {
 			client.calls = append(client.calls, "ensure-network")
 			return nil
 		},
-		cleanupTimeout:   30 * time.Second,
 		readinessTimeout: 60 * time.Second,
 	}
 }
@@ -233,20 +285,24 @@ type nopCloser struct{}
 
 func (nopCloser) Close() error { return nil }
 
+type requestContextKey struct{}
+
 type recordingClient struct {
-	calls             []string
-	createRequest     api.InstancesPost
-	instance          *api.Instance
-	volume            *api.StorageVolume
-	getInstanceErr    error
-	getVolumeErr      error
-	createErr         error
-	startFunc         func(context.Context) error
-	systemdState      string
-	systemdErr        error
-	deleteContextErrs []error
-	deleteDeadlines   []time.Time
-	readinessDeadline time.Time
+	calls                []string
+	createRequest        api.InstancesPost
+	instance             *api.Instance
+	volume               *api.StorageVolume
+	getInstanceErr       error
+	getVolumeErr         error
+	createErr            error
+	startFunc            func(context.Context) error
+	systemdState         string
+	systemdErr           error
+	running              bool
+	cleanupContextErrs   []error
+	cleanupDeadlines     []time.Time
+	cleanupContextValues []any
+	readinessDeadline    time.Time
 }
 
 func (c *recordingClient) Disconnect() {}
@@ -287,7 +343,7 @@ func (c *recordingClient) CopyStorageVolume(_ context.Context, _, source, target
 
 func (c *recordingClient) DeleteStorageVolume(ctx context.Context, _, name string) error {
 	c.calls = append(c.calls, "delete-volume "+name)
-	c.recordDeleteContext(ctx)
+	c.recordCleanupContext(ctx)
 	return nil
 }
 
@@ -304,22 +360,37 @@ func (c *recordingClient) CreateInstance(_ context.Context, request api.Instance
 
 func (c *recordingClient) StartInstance(ctx context.Context, _ string) error {
 	c.calls = append(c.calls, "start")
+	c.running = true
 	if c.startFunc != nil {
 		return c.startFunc(ctx)
 	}
 	return nil
 }
 
-func (c *recordingClient) DeleteInstance(ctx context.Context, _ string) error {
-	c.calls = append(c.calls, "delete-instance")
-	c.recordDeleteContext(ctx)
+func (c *recordingClient) StopInstance(ctx context.Context, _ string, force bool) error {
+	c.calls = append(c.calls, "stop")
+	if !force {
+		return errors.New("sandbox stop was not forced")
+	}
+	c.recordCleanupContext(ctx)
+	c.running = false
 	return nil
 }
 
-func (c *recordingClient) recordDeleteContext(ctx context.Context) {
-	c.deleteContextErrs = append(c.deleteContextErrs, ctx.Err())
+func (c *recordingClient) DeleteInstance(ctx context.Context, _ string) error {
+	c.calls = append(c.calls, "delete-instance")
+	c.recordCleanupContext(ctx)
+	if c.running {
+		return errors.New("cannot delete running instance")
+	}
+	return nil
+}
+
+func (c *recordingClient) recordCleanupContext(ctx context.Context) {
+	c.cleanupContextErrs = append(c.cleanupContextErrs, ctx.Err())
 	deadline, _ := ctx.Deadline()
-	c.deleteDeadlines = append(c.deleteDeadlines, deadline)
+	c.cleanupDeadlines = append(c.cleanupDeadlines, deadline)
+	c.cleanupContextValues = append(c.cleanupContextValues, ctx.Value(requestContextKey{}))
 }
 
 func (c *recordingClient) Exec(ctx context.Context, _ string, request incusclient.ExecRequest) (string, string, error) {
@@ -331,7 +402,13 @@ func (c *recordingClient) Exec(ctx context.Context, _ string, request incusclien
 		if state == "" {
 			state = "running\n"
 		}
+		if err := ctx.Err(); err != nil {
+			return state, "", err
+		}
 		return state, "", c.systemdErr
+	}
+	if err := ctx.Err(); err != nil {
+		return "", "", err
 	}
 	return "", "", nil
 }
