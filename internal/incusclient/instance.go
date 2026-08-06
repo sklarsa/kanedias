@@ -5,6 +5,7 @@ import (
 	"context"
 	"fmt"
 	"io"
+	"math"
 
 	incus "github.com/lxc/incus/v7/client"
 	"github.com/lxc/incus/v7/shared/api"
@@ -94,6 +95,7 @@ type execCall func(api.InstanceExecPost, *incus.InstanceExecArgs) (operationWait
 func exec(ctx context.Context, call execCall, request ExecRequest) (stdout, stderr string, err error) {
 	var stdoutBuffer bytes.Buffer
 	var stderrBuffer bytes.Buffer
+	dataDone := make(chan bool)
 	operation, err := call(api.InstanceExecPost{
 		Command:     request.Command,
 		Environment: request.Environment,
@@ -101,17 +103,49 @@ func exec(ctx context.Context, call execCall, request ExecRequest) (stdout, stde
 		WaitForWS:   true,
 		Interactive: false,
 	}, &incus.InstanceExecArgs{
-		Stdin:  request.Stdin,
-		Stdout: &stdoutBuffer,
-		Stderr: &stderrBuffer,
+		Stdin:    request.Stdin,
+		Stdout:   &stdoutBuffer,
+		Stderr:   &stderrBuffer,
+		DataDone: dataDone,
 	})
 	if err != nil {
 		return "", "", fmt.Errorf("execute command in Incus instance: %w", err)
 	}
-	if err := waitOperation(ctx, operation); err != nil {
-		return stdoutBuffer.String(), stderrBuffer.String(), fmt.Errorf("wait for command in Incus instance: %w", err)
+
+	waitErr := waitOperation(ctx, operation)
+	select {
+	case <-dataDone:
+	case <-ctx.Done():
+		return stdoutBuffer.String(), stderrBuffer.String(), fmt.Errorf("flush command output from Incus instance: %w", ctx.Err())
+	}
+	if waitErr != nil {
+		return stdoutBuffer.String(), stderrBuffer.String(), fmt.Errorf("wait for command in Incus instance: %w", waitErr)
+	}
+
+	status, err := execReturnStatus(operation.Get().Metadata)
+	if err != nil {
+		return stdoutBuffer.String(), stderrBuffer.String(), err
+	}
+	if status != 0 {
+		return stdoutBuffer.String(), stderrBuffer.String(), fmt.Errorf("command in Incus instance exited with exit status %d", status)
 	}
 	return stdoutBuffer.String(), stderrBuffer.String(), nil
+}
+
+func execReturnStatus(metadata map[string]any) (int, error) {
+	raw, ok := metadata["return"]
+	if !ok {
+		return 0, fmt.Errorf("command in Incus instance has missing return metadata")
+	}
+	value, ok := raw.(float64)
+	if !ok || math.IsNaN(value) || math.IsInf(value, 0) || math.Trunc(value) != value {
+		return 0, fmt.Errorf("command in Incus instance has malformed return metadata %v", raw)
+	}
+	status := int(value)
+	if float64(status) != value {
+		return 0, fmt.Errorf("command in Incus instance has out-of-range return metadata %v", raw)
+	}
+	return status, nil
 }
 
 func (c *Client) PushFile(ctx context.Context, name, path string, content []byte, mode int) error {

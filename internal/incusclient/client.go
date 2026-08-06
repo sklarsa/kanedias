@@ -83,6 +83,7 @@ func IsNotFound(err error) bool {
 
 type operationWaiter interface {
 	WaitContext(context.Context) error
+	Get() api.Operation
 }
 
 func waitOperation(ctx context.Context, operation operationWaiter) error {

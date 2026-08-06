@@ -3,6 +3,8 @@ package incusclient
 import (
 	"context"
 	"testing"
+
+	"github.com/lxc/incus/v7/shared/api"
 )
 
 type poolServer struct {
@@ -57,11 +59,16 @@ func TestResolvePoolRequiresExactlyOnePoolWhenUnconfigured(t *testing.T) {
 type fakeOperation struct {
 	waitContext context.Context
 	waitErr     error
+	operation   api.Operation
 }
 
 func (o *fakeOperation) WaitContext(ctx context.Context) error {
 	o.waitContext = ctx
 	return o.waitErr
+}
+
+func (o *fakeOperation) Get() api.Operation {
+	return o.operation
 }
 
 func TestWaitOperationPassesContext(t *testing.T) {
