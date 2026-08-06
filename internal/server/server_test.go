@@ -164,6 +164,33 @@ func TestRunReturnsListenError(t *testing.T) {
 	requireStructuredLog(t, logs, `"msg":"server listen failed"`, `"address":"127.0.0.1:0"`, `"error":"listen failed"`)
 }
 
+func TestRunNormalizesLocalhostBeforeListeningAndLogsRequestedAddress(t *testing.T) {
+	listenErr := errors.New("listen failed")
+	logger, logs := testLogger()
+	listen := func(network, address string) (net.Listener, error) {
+		if network != "tcp" {
+			t.Fatalf("listen network = %q, want tcp", network)
+		}
+		if address != "127.0.0.1:4321" {
+			t.Fatalf("listen address = %q, want literal IPv4 loopback", address)
+		}
+		return nil, listenErr
+	}
+
+	err := run(
+		context.Background(),
+		Options{ListenAddress: "LOCALHOST:4321", Logger: logger},
+		http.NotFoundHandler(),
+		listen,
+		time.Millisecond,
+	)
+	if !errors.Is(err, listenErr) {
+		t.Fatalf("run error = %v, want errors.Is(listenErr)", err)
+	}
+	requireStructuredLog(t, logs, `"msg":"server starting"`, `"requested_address":"LOCALHOST:4321"`)
+	requireStructuredLog(t, logs, `"msg":"server listen failed"`, `"address":"LOCALHOST:4321"`)
+}
+
 func TestRunServesAndGracefullyStopsOnContextCancellation(t *testing.T) {
 	logger, logs := testLogger()
 	ctx, cancel := context.WithCancel(context.Background())
@@ -243,6 +270,68 @@ func TestRunReturnsUnexpectedServeError(t *testing.T) {
 		t.Fatalf("run error = %v, want serve operation context", err)
 	}
 	requireStructuredLog(t, logs, `"msg":"server serve failed"`, `"error":"serve failed"`)
+}
+
+func TestCoordinateServerSimultaneousCancellationJoinsUnexpectedServeResult(t *testing.T) {
+	ctx, cancel := context.WithCancel(context.Background())
+	cancel()
+
+	serveErr := errors.New("serve failed during cancellation")
+	serveResult := make(chan error, 1)
+	serveResult <- serveErr
+
+	shutdownCalled := false
+	shutdown := func(context.Context) error {
+		shutdownCalled = true
+		return nil
+	}
+	forceClose := func() error {
+		t.Fatal("force close called after successful shutdown")
+		return nil
+	}
+
+	shutdownStarted, shutdownErr, closeErr, gotServeErr := coordinateServer(
+		ctx,
+		serveResult,
+		time.Second,
+		shutdown,
+		forceClose,
+	)
+	if !shutdownStarted || !shutdownCalled {
+		t.Fatal("coordinateServer did not prioritize the ready cancellation shutdown path")
+	}
+	if shutdownErr != nil {
+		t.Fatalf("shutdown error = %v, want nil", shutdownErr)
+	}
+	if closeErr != nil {
+		t.Fatalf("close error = %v, want nil", closeErr)
+	}
+	if !errors.Is(gotServeErr, serveErr) {
+		t.Fatalf("serve error = %v, want errors.Is(serveErr)", gotServeErr)
+	}
+	if len(serveResult) != 0 {
+		t.Fatal("Serve result was not drained")
+	}
+}
+
+func TestServerRunErrorClassifiesCancellationResults(t *testing.T) {
+	shutdownErr := errors.New("shutdown failed")
+	serveErr := errors.New("serve failed during cancellation")
+
+	joinedErr := serverRunError(true, shutdownErr, serveErr)
+	if !errors.Is(joinedErr, shutdownErr) {
+		t.Fatalf("serverRunError = %v, want errors.Is(shutdownErr)", joinedErr)
+	}
+	if !errors.Is(joinedErr, serveErr) {
+		t.Fatalf("serverRunError = %v, want errors.Is(serveErr)", joinedErr)
+	}
+
+	if err := serverRunError(true, nil, http.ErrServerClosed); err != nil {
+		t.Fatalf("shutdown-caused ErrServerClosed returned error: %v", err)
+	}
+	if err := serverRunError(false, nil, http.ErrServerClosed); !errors.Is(err, http.ErrServerClosed) {
+		t.Fatalf("non-shutdown ErrServerClosed error = %v, want errors.Is(http.ErrServerClosed)", err)
+	}
 }
 
 func TestRunReturnsShutdownError(t *testing.T) {

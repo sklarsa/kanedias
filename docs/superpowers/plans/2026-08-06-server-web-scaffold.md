@@ -23,7 +23,7 @@
   - Web lane: `internal/server/handler.go`, `internal/server/handler_test.go`, `internal/server/web/**`, `go.mod`, and `go.sum`.
   - Cobra lane: `cmd/server.go`, `cmd/root.go`, and `cmd/root_test.go`.
 - Do not launch task-level or lane reviewers. After integrated verification and curl smoke pass, launch exactly one independent fresh-context final reviewer. The integration/fix writer dispositions findings; do not launch a second reviewer.
-- Keep the server local and offline. Accept only case-insensitive exact `localhost`, IPv4 loopback literals, and IPv6 loopback literals. Reject empty, wildcard, unspecified, private-LAN, public, and arbitrary hostname binds before listening. Permit port `0`.
+- Keep the server local and offline. Accept only case-insensitive exact `localhost`, IPv4 loopback literals, and IPv6 loopback literals. Normalize accepted `localhost` to literal `127.0.0.1` before listening while retaining the requested address for logs. Reject empty, wildcard, unspecified, private-LAN, public, and arbitrary hostname binds before listening. Permit decimal ports from `0` through `65535`.
 - Browser resources must all be flat files below `internal/server/web`: `index.html`, `app.css`, `datastar.js`, `datastar.LICENSE`, and `datastar.PROVENANCE`. Embed with `//go:embed web/*`. Do not create `internal/server/templates` or `internal/server/assets`.
 - Pin `github.com/go-chi/chi/v5` to v5.3.1 and `github.com/starfederation/datastar-go` to v1.2.2. Vendor the official Datastar v1.0.2 browser bundle unchanged and record its verified SHA-256 and upstream license/provenance.
 - Chi v5.3.1 is the existing module graph's MVS floor; do not force it backward with a `replace` directive.
@@ -308,7 +308,7 @@ func newHandler(*slog.Logger) (http.Handler, error) {
 }
 ```
 
-`run` must listen on `tcp`, log requested and actual addresses, call `Serve`, and wait for either the serve result or `ctx.Done()`. On cancellation, derive a fresh timeout from `context.Background()`, call `Shutdown`, call `Close` if shutdown fails, and return the wrapped shutdown error. Treat `http.ErrServerClosed` as normal; log and return every unexpected listener, serve, or shutdown error with operation context. Do not return caller cancellation after successful graceful shutdown.
+`run` must normalize accepted `localhost` to literal `127.0.0.1` before listening on `tcp`, log the original requested and actual addresses, call `Serve`, and wait for either the serve result or `ctx.Done()`. On cancellation, derive a fresh timeout from `context.Background()`, call `Shutdown`, call `Close` if shutdown fails, then join and classify the Serve result. Treat only shutdown-caused `http.ErrServerClosed` as normal; log and return every unexpected listener, serve, or shutdown error with operation context, joining shutdown and unexpected serve errors when both occur. Do not return caller cancellation after successful graceful shutdown.
 
 - [ ] **Step 8: Run foundation GREEN and commit**
 
@@ -501,7 +501,7 @@ curl --fail --location --proto '=https' --tlsv1.2 \
   https://raw.githubusercontent.com/starfederation/datastar/refs/tags/v1.0.2/bundles/datastar.js \
   -o internal/server/web/datastar.js
 curl --fail --location --proto '=https' --tlsv1.2 \
-  https://raw.githubusercontent.com/starfederation/datastar/refs/tags/v1.0.2/LICENSE \
+  https://raw.githubusercontent.com/starfederation/datastar/refs/tags/v1.0.2/LICENSE.md \
   -o internal/server/web/datastar.LICENSE
 DATASTAR_SHA256=$(sha256sum internal/server/web/datastar.js | awk '{print $1}')
 test "${#DATASTAR_SHA256}" -eq 64
@@ -518,7 +518,7 @@ Version: v1.0.2
 Release tag: v1.0.2
 Release archive: https://github.com/starfederation/datastar/archive/refs/tags/v1.0.2.tar.gz
 Bundle source: https://raw.githubusercontent.com/starfederation/datastar/refs/tags/v1.0.2/bundles/datastar.js
-License source: https://raw.githubusercontent.com/starfederation/datastar/refs/tags/v1.0.2/LICENSE
+License source: https://raw.githubusercontent.com/starfederation/datastar/refs/tags/v1.0.2/LICENSE.md
 Vendored path: internal/server/web/datastar.js
 Retrieval date: ${RETRIEVAL_DATE}
 License identifier: MIT

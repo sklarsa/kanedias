@@ -24,6 +24,10 @@ type Options struct {
 
 type listenFunc func(network, address string) (net.Listener, error)
 
+type shutdownFunc func(context.Context) error
+
+type closeFunc func() error
+
 func ValidateListenAddress(address string) error {
 	host, port, err := net.SplitHostPort(address)
 	if err != nil {
@@ -110,9 +114,13 @@ func run(
 
 	logger := normalizedOptions.Logger
 	requestedAddress := normalizedOptions.ListenAddress
+	listenAddress := requestedAddress
+	if host, port, splitErr := net.SplitHostPort(requestedAddress); splitErr == nil && strings.EqualFold(host, "localhost") {
+		listenAddress = net.JoinHostPort("127.0.0.1", port)
+	}
 	logger.InfoContext(ctx, "server starting", "requested_address", requestedAddress)
 
-	listener, err := listen("tcp", requestedAddress)
+	listener, err := listen("tcp", listenAddress)
 	if err != nil {
 		logger.ErrorContext(ctx, "server listen failed", "address", requestedAddress, "error", err)
 		return fmt.Errorf("run server: listen on %q: %w", requestedAddress, err)
@@ -126,58 +134,112 @@ func run(
 		"effective_address", effectiveAddress,
 	)
 
-	httpServer := newHTTPServer(requestedAddress, handler)
+	httpServer := newHTTPServer(listenAddress, handler)
 	serveResult := make(chan error, 1)
 	go func() {
 		serveResult <- httpServer.Serve(listener)
 	}()
 
-	select {
-	case err := <-serveResult:
-		if errors.Is(err, http.ErrServerClosed) {
-			return nil
+	shutdownStarted, shutdownErr, closeErr, serveErr := coordinateServer(
+		ctx,
+		serveResult,
+		shutdownTimeout,
+		func(shutdownCtx context.Context) error {
+			logger.Info(
+				"server shutdown started",
+				"requested_address", requestedAddress,
+				"effective_address", effectiveAddress,
+			)
+			return httpServer.Shutdown(shutdownCtx)
+		},
+		httpServer.Close,
+	)
+
+	if !shutdownStarted {
+		if serveErr != nil {
+			logger.ErrorContext(
+				ctx,
+				"server serve failed",
+				"requested_address", requestedAddress,
+				"effective_address", effectiveAddress,
+				"error", serveErr,
+			)
 		}
-		logger.ErrorContext(
-			ctx,
+		return serverRunError(false, nil, serveErr)
+	}
+
+	if shutdownErr != nil {
+		logger.Error(
+			"server shutdown failed",
+			"requested_address", requestedAddress,
+			"effective_address", effectiveAddress,
+			"error", shutdownErr,
+		)
+	}
+	if closeErr != nil {
+		logger.Error(
+			"server forced close failed",
+			"requested_address", requestedAddress,
+			"effective_address", effectiveAddress,
+			"error", closeErr,
+		)
+	}
+
+	unexpectedServeErr := serveErr
+	if errors.Is(serveErr, http.ErrServerClosed) {
+		unexpectedServeErr = nil
+	}
+	if unexpectedServeErr != nil {
+		logger.Error(
 			"server serve failed",
 			"requested_address", requestedAddress,
 			"effective_address", effectiveAddress,
-			"error", err,
+			"error", unexpectedServeErr,
 		)
-		return fmt.Errorf("run server: serve HTTP: %w", err)
-	case <-ctx.Done():
-		logger.Info(
-			"server shutdown started",
-			"requested_address", requestedAddress,
-			"effective_address", effectiveAddress,
-		)
-
-		shutdownCtx, cancel := context.WithTimeout(context.Background(), shutdownTimeout)
-		shutdownErr := httpServer.Shutdown(shutdownCtx)
-		cancel()
-		if shutdownErr != nil {
-			logger.Error(
-				"server shutdown failed",
-				"requested_address", requestedAddress,
-				"effective_address", effectiveAddress,
-				"error", shutdownErr,
-			)
-			if closeErr := httpServer.Close(); closeErr != nil {
-				logger.Error(
-					"server forced close failed",
-					"requested_address", requestedAddress,
-					"effective_address", effectiveAddress,
-					"error", closeErr,
-				)
-			}
-			return fmt.Errorf("run server: shutdown HTTP: %w", shutdownErr)
-		}
-
+	}
+	if shutdownErr == nil {
 		logger.Info(
 			"server shutdown complete",
 			"requested_address", requestedAddress,
 			"effective_address", effectiveAddress,
 		)
-		return nil
 	}
+
+	return serverRunError(true, shutdownErr, serveErr)
+}
+
+func serverRunError(shutdownStarted bool, shutdownErr, serveErr error) error {
+	var result []error
+	if shutdownErr != nil {
+		result = append(result, fmt.Errorf("run server: shutdown HTTP: %w", shutdownErr))
+	}
+	if serveErr != nil && (!shutdownStarted || !errors.Is(serveErr, http.ErrServerClosed)) {
+		result = append(result, fmt.Errorf("run server: serve HTTP: %w", serveErr))
+	}
+	return errors.Join(result...)
+}
+
+func coordinateServer(
+	ctx context.Context,
+	serveResult <-chan error,
+	shutdownTimeout time.Duration,
+	shutdown shutdownFunc,
+	forceClose closeFunc,
+) (shutdownStarted bool, shutdownErr, closeErr, serveErr error) {
+	if ctx.Err() == nil {
+		select {
+		case serveErr = <-serveResult:
+			return false, nil, nil, serveErr
+		case <-ctx.Done():
+		}
+	}
+
+	shutdownCtx, cancel := context.WithTimeout(context.Background(), shutdownTimeout)
+	shutdownErr = shutdown(shutdownCtx)
+	cancel()
+	if shutdownErr != nil {
+		closeErr = forceClose()
+	}
+	serveErr = <-serveResult
+	return true, shutdownErr, closeErr, serveErr
 }

@@ -22,7 +22,7 @@ There is no authentication in this scaffold because the listener is restricted t
 - an IPv4 address for which `net.IP.IsLoopback` is true;
 - an IPv6 address for which `net.IP.IsLoopback` is true, using normal bracketed host/port syntax such as `[::1]:8080`.
 
-Empty hosts, wildcard addresses, non-loopback IPs, and other hostnames are rejected. Arbitrary hostnames are not accepted by resolving them and checking their current result; this avoids turning DNS into part of the security boundary. The port may be any value accepted by `net.Listen`, including `0` for tests.
+Empty hosts, wildcard addresses, non-loopback IPs, and other hostnames are rejected. Arbitrary hostnames are not accepted by resolving them and checking their current result; this avoids turning DNS into part of the security boundary. Accepted `localhost` is normalized to the literal IPv4 loopback address `127.0.0.1` before binding, so DNS and NSS are not part of the security boundary. The port must be a decimal value from `0` through `65535`, inclusive; port `0` remains available for tests.
 
 ## Package and Asset Boundaries
 
@@ -60,7 +60,7 @@ Every `internal/server` component receives and uses the same injected `*slog.Log
 
 The `http.Server` sets a 5-second read-header timeout and a 60-second idle timeout. It intentionally does not impose a whole-response write timeout that would make future SSE streams invalid. Chi request logging and panic recovery are configured so recovery details flow through the injected `slog.Logger`; a recovered panic produces a generic HTTP 500 response.
 
-Serving and cancellation are coordinated explicitly. Cancellation of the command context stops acceptance of new work and calls `http.Server.Shutdown` with a fresh 10-second bound. A normal `http.ErrServerClosed` during this path is not reported as a serve failure. Timeout, listener, unexpected serve, and shutdown errors are returned with operation context after being logged. Production CLI signal handling cancels the command context for interrupt or termination signals, while tests can cancel it directly.
+Serving and cancellation are coordinated explicitly. Cancellation of the command context stops acceptance of new work and calls `http.Server.Shutdown` with a fresh 10-second bound, then always joins and classifies the Serve result. Only shutdown-caused `http.ErrServerClosed` is normal. Timeout, listener, unexpected serve, and shutdown errors are returned with operation context after being logged; simultaneous shutdown and unexpected serve errors are both retained. Production CLI signal handling cancels the command context for interrupt or termination signals, while tests can cancel it directly.
 
 ## State Model and Future Seam
 
