@@ -56,6 +56,7 @@ apt-get install -y --no-install-recommends \
     gzip \
     hostname \
     htop \
+    incus-base \
     iproute2 \
     iputils-ping \
     jq \
@@ -98,7 +99,7 @@ configure_managed_user() {
         useradd --create-home --shell /usr/bin/zsh "$managed_user"
     fi
 
-    usermod --append --groups sudo "$managed_user"
+    usermod --append --groups sudo,incus-admin "$managed_user"
 
     install -m 0440 /dev/null "/etc/sudoers.d/$managed_user"
     printf '%s ALL=(ALL:ALL) NOPASSWD: ALL\n' "$managed_user" \
