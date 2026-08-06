@@ -1,6 +1,6 @@
 //go:build incus
 
-package main
+package proxy
 
 import (
 	"context"
@@ -33,7 +33,7 @@ func TestLiveClientsThroughProxy(t *testing.T) {
 	}
 	paths := defaultOAuthPaths(configDir, homeDir)
 	if _, err := os.Stat(paths.openAICodex); err != nil {
-		t.Fatalf("OpenAI Codex login is required; run go run ./proxy -login-openai-codex: %v", err)
+		t.Fatalf("OpenAI Codex login is required; run go run . proxy login openai-codex: %v", err)
 	}
 
 	ca, caPEM, _, err := generateCA("kanedias live smoke")

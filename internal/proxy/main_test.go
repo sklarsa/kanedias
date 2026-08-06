@@ -1,4 +1,4 @@
-package main
+package proxy
 
 import (
 	"context"
@@ -391,15 +391,13 @@ func TestProxyTunnelsOtherHostsWithoutChangingRequests(t *testing.T) {
 	}
 }
 
-func TestInitCAFlagCreatesCAAndExits(t *testing.T) {
+func TestInitCAGeneratesValidKeyPair(t *testing.T) {
 	dir := t.TempDir()
 	certPath := filepath.Join(dir, "ca.crt")
 	keyPath := filepath.Join(dir, "ca.key")
 
-	cmd := exec.Command("go", "run", ".", "-init-ca", "-ca-cert", certPath, "-ca-key", keyPath)
-	output, err := cmd.CombinedOutput()
-	if err != nil {
-		t.Fatalf("initialize CA: %v\n%s", err, output)
+	if err := InitCA(certPath, keyPath); err != nil {
+		t.Fatalf("initialize CA: %v", err)
 	}
 
 	certPEM, err := os.ReadFile(certPath)

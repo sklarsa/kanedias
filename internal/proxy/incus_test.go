@@ -1,6 +1,6 @@
 //go:build incus
 
-package main
+package proxy
 
 import (
 	"context"

@@ -1,4 +1,4 @@
-package main
+package proxy
 
 import (
 	"context"
@@ -10,7 +10,6 @@ import (
 	"crypto/x509/pkix"
 	"encoding/pem"
 	"errors"
-	"flag"
 	"fmt"
 	"log/slog"
 	"math/big"
@@ -23,7 +22,6 @@ import (
 	"time"
 
 	"github.com/elazarl/goproxy"
-	"github.com/prometheus/client_golang/prometheus"
 )
 
 type credentials struct {
@@ -41,90 +39,6 @@ var interceptedHosts = map[string]struct{}{
 	"api.anthropic.com":  {},
 	"api.openai.com":     {},
 	"chatgpt.com":        {},
-}
-
-func main() {
-	logger := slog.New(slog.NewTextHandler(os.Stderr, nil))
-	configDir, err := os.UserConfigDir()
-	if err != nil {
-		logger.Error("resolve user config directory", "error", err)
-		os.Exit(1)
-	}
-	homeDir, err := os.UserHomeDir()
-	if err != nil {
-		logger.Error("resolve user home directory", "error", err)
-		os.Exit(1)
-	}
-	paths := defaultOAuthPaths(configDir, homeDir)
-	defaultDir := filepath.Join(configDir, "kanedias-proxy")
-	listen := flag.String("listen", "127.0.0.1:3128", "proxy listen address")
-	metricsListen := flag.String("metrics-listen", "", "Prometheus metrics listen address (disabled when empty)")
-	requestLog := flag.Bool("request-log", false, "log proxy requests using structured text")
-	caCert := flag.String("ca-cert", filepath.Join(defaultDir, "ca.crt"), "proxy CA certificate")
-	caKey := flag.String("ca-key", filepath.Join(defaultDir, "ca.key"), "proxy CA private key")
-	claudeCredentials := flag.String("claude-credentials", paths.claude, "Claude Code OAuth credential file")
-	openAICodexAuth := flag.String("openai-codex-auth", paths.openAICodex, "proxy-owned OpenAI Codex OAuth credential file")
-	loginOpenAICodex := flag.Bool("login-openai-codex", false, "log in to OpenAI Codex and exit")
-	initCA := flag.Bool("init-ca", false, "create the proxy CA if needed and exit")
-	flag.Parse()
-
-	if *loginOpenAICodex {
-		if err := newOpenAICodexOAuthSource(*openAICodexAuth).Login(context.Background(), os.Stdout); err != nil {
-			logger.Error("OpenAI Codex login failed", "error", err)
-			os.Exit(1)
-		}
-		return
-	}
-
-	ca, _, err := loadOrCreateCA(*caCert, *caKey)
-	if err != nil {
-		logger.Error("initialize proxy CA", "error", err)
-		os.Exit(1)
-	}
-	if *initCA {
-		logger.Info("proxy CA initialized", "path", *caCert)
-		return
-	}
-
-	var metrics *proxyMetrics
-	var metricsHandler http.Handler
-	if *metricsListen != "" {
-		var registry *prometheus.Registry
-		metrics, registry = newProxyMetrics()
-		metricsHandler = newMetricsHandler(registry)
-	}
-	var observer *proxyObserver
-	if *requestLog || metrics != nil {
-		observer = newProxyObserver(logger, *requestLog, metrics)
-	}
-	creds := loadCredentials(*claudeCredentials, *openAICodexAuth)
-	proxy := newProxyWithObserver(ca, creds, observer)
-
-	serverErrors := make(chan error, 2)
-	proxyServer := &http.Server{
-		Addr:              *listen,
-		Handler:           proxy,
-		ReadHeaderTimeout: 10 * time.Second,
-	}
-	go func() {
-		serverErrors <- fmt.Errorf("proxy listener: %w", proxyServer.ListenAndServe())
-	}()
-	logger.Info("proxy listening", "address", *listen, "ca_certificate", *caCert, "request_logging", *requestLog)
-
-	if metricsHandler != nil {
-		metricsServer := &http.Server{
-			Addr:              *metricsListen,
-			Handler:           metricsHandler,
-			ReadHeaderTimeout: 10 * time.Second,
-		}
-		go func() {
-			serverErrors <- fmt.Errorf("metrics listener: %w", metricsServer.ListenAndServe())
-		}()
-		logger.Info("Prometheus metrics listening", "address", *metricsListen, "path", "/metrics")
-	}
-
-	logger.Error("proxy stopped", "error", <-serverErrors)
-	os.Exit(1)
 }
 
 type oauthPaths struct {
@@ -364,7 +278,13 @@ func loadOrCreateCA(certPath, keyPath string) (tls.Certificate, []byte, error) {
 	if err := os.WriteFile(keyPath, keyPEM, 0600); err != nil {
 		return tls.Certificate{}, nil, err
 	}
+	if err := os.Chmod(keyPath, 0600); err != nil {
+		return tls.Certificate{}, nil, err
+	}
 	if err := os.WriteFile(certPath, certPEM, 0644); err != nil {
+		return tls.Certificate{}, nil, err
+	}
+	if err := os.Chmod(certPath, 0644); err != nil {
 		return tls.Certificate{}, nil, err
 	}
 	return ca, certPEM, nil
