@@ -1,0 +1,12 @@
+Project: Datastar
+Official repository: https://github.com/starfederation/datastar
+Version: v1.0.2
+Release tag: v1.0.2
+Release archive: https://github.com/starfederation/datastar/archive/refs/tags/v1.0.2.tar.gz
+Bundle source: https://raw.githubusercontent.com/starfederation/datastar/refs/tags/v1.0.2/bundles/datastar.js
+License source: https://raw.githubusercontent.com/starfederation/datastar/refs/tags/v1.0.2/LICENSE.md
+Vendored path: internal/server/web/datastar.js
+Retrieval date: 2026-08-06
+License identifier: MIT
+SHA-256: 2837d87acf6ee0ba8e4e63765926c25a98d63883b02f88be194a86b81d3fd24a
+Modification: Vendored unchanged for offline embedding.
