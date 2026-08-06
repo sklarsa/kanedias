@@ -18,7 +18,7 @@ This is a focused spike toward a future Kanedias server with an integrated crede
 
 Stdout contains only the raw LF-delimited JSON records emitted by Pi RPC. This includes command responses, text and thinking deltas, tool events, and lifecycle events. Kanedias lifecycle progress and errors go to stderr so stdout remains machine-readable.
 
-The existing credential proxy is an external prerequisite for sandbox/session traffic. `kanedias proxy run` must already be listening at the configured sandbox proxy endpoint; the session command does not start or own the proxy. Base-image construction uses direct IPv4 egress through the managed bridge and does not use or require the Kanedias proxy.
+The existing credential proxy is an external prerequisite for workspace synchronization and sandbox/session traffic. `kanedias proxy run` must already be listening at the configured sandbox proxy endpoint before `workspace sync` or `session`; neither command starts or owns the proxy. Base-image construction uses direct IPv4 egress through the managed bridge and does not use or require the Kanedias proxy.
 
 The command sends exactly one RPC request:
 

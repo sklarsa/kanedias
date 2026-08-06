@@ -2,7 +2,6 @@ package proxy
 
 import (
 	"context"
-	"errors"
 	"io"
 	"os"
 	"path/filepath"
@@ -87,7 +86,7 @@ func TestRunRejectsEmptyListenAddress(t *testing.T) {
 	}
 }
 
-func TestRunContextHonorsCanceledContext(t *testing.T) {
+func TestRunContextTreatsCancellationAsCleanShutdown(t *testing.T) {
 	ctx, cancel := context.WithCancel(context.Background())
 	cancel()
 	dir := t.TempDir()
@@ -97,7 +96,7 @@ func TestRunContextHonorsCanceledContext(t *testing.T) {
 		CACertPath:    filepath.Join(dir, "ca.crt"),
 		CAKeyPath:     filepath.Join(dir, "ca.key"),
 	})
-	if !errors.Is(err, context.Canceled) {
-		t.Fatalf("RunContext() error = %v, want context.Canceled", err)
+	if err != nil {
+		t.Fatalf("RunContext() error = %v, want clean shutdown", err)
 	}
 }

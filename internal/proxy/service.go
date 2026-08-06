@@ -128,6 +128,6 @@ func RunContext(ctx context.Context, options Options) error {
 		if metricsServer != nil {
 			shutdownErr = errors.Join(shutdownErr, metricsServer.Shutdown(shutdownCtx))
 		}
-		return errors.Join(ctx.Err(), shutdownErr)
+		return shutdownErr
 	}
 }
