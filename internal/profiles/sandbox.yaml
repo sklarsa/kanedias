@@ -1,8 +1,8 @@
 config:
-  environment.HTTP_PROXY: "http://10.75.177.1:3128"
-  environment.HTTPS_PROXY: "http://10.75.177.1:3128"
-  environment.http_proxy: "http://10.75.177.1:3128"
-  environment.https_proxy: "http://10.75.177.1:3128"
+  environment.HTTP_PROXY: "{{ .ProxyURL }}"
+  environment.HTTPS_PROXY: "{{ .ProxyURL }}"
+  environment.http_proxy: "{{ .ProxyURL }}"
+  environment.https_proxy: "{{ .ProxyURL }}"
   environment.GH_TOKEN: "container-dummy"
   environment.NO_PROXY: "localhost,127.0.0.1,::1"
   environment.no_proxy: "localhost,127.0.0.1,::1"
