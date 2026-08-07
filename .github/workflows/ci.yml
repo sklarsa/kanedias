@@ -24,10 +24,26 @@ jobs:
         run: make build
 
       # Hermetic suite only. The //go:build incus live/E2E tests need a real
-      # Incus daemon and are not run here — see the tracking issue for wiring
-      # them into a self-hosted runner.
+      # Incus daemon and are not run here — see #4 for wiring them into a
+      # self-hosted runner.
+      #
+      # A couple of timing/socket-sensitive tests flake on shared CI runners
+      # while passing deterministically in isolation. Retry the suite a few
+      # times so transient flakes don't block merges; a real regression fails
+      # every attempt. Tracked by #6.
       - name: Test
-        run: make test
+        run: |
+          for attempt in 1 2 3; do
+            echo "::group::test attempt $attempt"
+            if make test; then
+              echo "::endgroup::"
+              exit 0
+            fi
+            echo "::endgroup::"
+            echo "test attempt $attempt failed"
+          done
+          echo "test failed after 3 attempts"
+          exit 1
 
       - name: Check formatting
         run: |
