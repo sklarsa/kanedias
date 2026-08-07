@@ -6,6 +6,7 @@ import (
 	"errors"
 	"io"
 	"os"
+	"os/exec"
 	"path/filepath"
 	"reflect"
 	"slices"
@@ -57,20 +58,71 @@ func TestInstallerIncludesUninitializedContainerOnlyIncus(t *testing.T) {
 	}
 }
 
-func TestInstallerStagesExtensionWithoutActivatingIt(t *testing.T) {
+func TestInstallerActivatesOnlyKanediasDelegationExtensionAndSkills(t *testing.T) {
 	script := string(installer)
 	for _, required := range []string{
 		`install -d -m 0755 /opt/kanedias/pi-extension`,
 		`npm ci --omit=dev --ignore-scripts`,
 		`/usr/lib/tmpfiles.d/kanedias.conf`,
 		`d /run/kanedias 0700 kanedias kanedias -`,
+		`$managed_home/.pi/agent/skills/delegate-session`,
+		`$managed_home/.pi/agent/skills/writer-handoff`,
 	} {
 		if !strings.Contains(script, required) {
-			t.Errorf("installer missing extension staging behavior %q", required)
+			t.Errorf("installer missing extension activation behavior %q", required)
 		}
 	}
-	if strings.Contains(string(piRPCLauncher), " -e ") || strings.Contains(string(piRPCLauncher), "--extension") {
-		t.Error("staged extension was activated before supervisor integration")
+	launcher := string(piRPCLauncher)
+	for _, required := range []string{"args=(--mode rpc)", "args+=(--session \"$session_file\")", "args+=(-e /opt/kanedias/pi-extension/src/index.ts)", "--provider", "--model", "--thinking", `exec pi "${args[@]}"`} {
+		if !strings.Contains(launcher, required) {
+			t.Errorf("launcher missing %q", required)
+		}
+	}
+	if strings.Contains(launcher, "--no-session") || strings.Contains(launcher, "eval") {
+		t.Error("launcher uses ephemeral sessions or eval")
+	}
+	settings, err := os.ReadFile(filepath.Join("..", "..", "assets", "pi-settings.json"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if strings.Contains(script, "pi-subagents") || strings.Contains(string(settings), "pi-subagents") {
+		t.Error("pi-subagents remains installed or configured")
+	}
+}
+
+func TestPiRPCLauncherBuildsFreshAndForkArgumentsWithoutEval(t *testing.T) {
+	dir := t.TempDir()
+	launcher := strings.Replace(string(piRPCLauncher), `source "$NVM_DIR/nvm.sh"`, ":", 1)
+	launcherPath := filepath.Join(dir, "launcher")
+	if err := os.WriteFile(launcherPath, []byte(launcher), 0o700); err != nil {
+		t.Fatal(err)
+	}
+	piPath := filepath.Join(dir, "pi")
+	if err := os.WriteFile(piPath, []byte("#!/bin/sh\nprintf '%s\\n' \"$@\"\n"), 0o700); err != nil {
+		t.Fatal(err)
+	}
+	tests := []struct {
+		name string
+		env  []string
+		want []string
+	}{
+		{name: "root fresh", env: []string{"KANEDIAS_SESSION_KIND=root"}, want: []string{"--mode", "rpc", "-e", "/opt/kanedias/pi-extension/src/index.ts"}},
+		{name: "child fresh", env: []string{"KANEDIAS_SESSION_KIND=read", "KANEDIAS_PI_PROVIDER=provider", "KANEDIAS_PI_MODEL=model", "KANEDIAS_PI_THINKING=high"}, want: []string{"--mode", "rpc", "-e", "/opt/kanedias/pi-extension/src/index.ts", "--provider", "provider", "--model", "model", "--thinking", "high"}},
+		{name: "child fork", env: []string{"KANEDIAS_SESSION_KIND=read", "KANEDIAS_PI_SESSION_FILE=/sessions/branch.jsonl", "KANEDIAS_PI_PROVIDER=provider", "KANEDIAS_PI_MODEL=model", "KANEDIAS_PI_THINKING=xhigh"}, want: []string{"--mode", "rpc", "--session", "/sessions/branch.jsonl", "-e", "/opt/kanedias/pi-extension/src/index.ts", "--provider", "provider", "--model", "model", "--thinking", "xhigh"}},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			command := exec.Command(launcherPath)
+			command.Env = append([]string{"PATH=" + dir + ":/usr/bin:/bin"}, tt.env...)
+			output, err := command.Output()
+			if err != nil {
+				t.Fatal(err)
+			}
+			got := strings.Fields(string(output))
+			if !reflect.DeepEqual(got, tt.want) {
+				t.Fatalf("args = %#v, want %#v", got, tt.want)
+			}
+		})
 	}
 }
 
@@ -178,7 +230,7 @@ func TestCreateRunsImageWorkflowInOrder(t *testing.T) {
 		t.Errorf("pi auth mode = %#o, want 0600", auth.mode)
 	}
 	launcher := client.files["/root/assets/kanedias-pi-rpc"]
-	if !strings.Contains(string(launcher.content), "exec pi --mode rpc --no-session") {
+	if !strings.Contains(string(launcher.content), `exec pi "${args[@]}"`) || !strings.Contains(string(launcher.content), "/opt/kanedias/pi-extension/src/index.ts") {
 		t.Fatalf("launcher = %q", launcher.content)
 	}
 	if launcher.mode != 0o700 {

@@ -58,6 +58,21 @@ func NewRoot(identity Identity, deps Dependencies, broker *EventBroker) (*Node, 
 	if snapshot.Kind != contract.ChildKindRoot || snapshot.SessionID != snapshot.RootID || snapshot.ParentID != "" {
 		return nil, invariantf("NewRoot requires a root identity")
 	}
+	return newNode(identity, deps, broker)
+}
+
+func NewChild(identity Identity, deps Dependencies, broker *EventBroker) (*Node, error) {
+	snapshot := identity.Snapshot()
+	if snapshot.Kind != contract.ChildKindRead && snapshot.Kind != contract.ChildKindWrite {
+		return nil, invariantf("NewChild requires a read or write identity")
+	}
+	if snapshot.ParentID == "" || snapshot.SessionID == snapshot.RootID {
+		return nil, invariantf("NewChild requires a valid descendant identity")
+	}
+	return newNode(identity, deps, broker)
+}
+
+func newNode(identity Identity, deps Dependencies, broker *EventBroker) (*Node, error) {
 	if deps.Provisioner == nil {
 		return nil, invariantf("root provisioner is required")
 	}
@@ -91,11 +106,11 @@ func (node *Node) Start(ctx context.Context) error {
 	node.mu.Lock()
 	if node.started {
 		node.mu.Unlock()
-		return invariantf("root node has already been started")
+		return invariantf("supervisor node has already been started")
 	}
 	if node.stopRequested {
 		node.mu.Unlock()
-		return contract.NewError(contract.ErrorSessionStopping, "root node was stopped before startup")
+		return contract.NewError(contract.ErrorSessionStopping, "supervisor node was stopped before startup")
 	}
 	node.started = true
 	startupCtx, cancel := context.WithCancel(ctx)
@@ -171,7 +186,7 @@ func (node *Node) Start(ctx context.Context) error {
 		if node.startupWasStopped() {
 			return errors.Join(contract.NewError(contract.ErrorSessionStopping, "root startup was cancelled while binding Pi"), err)
 		}
-		node.failStart(ctx, fmt.Errorf("bind root Pi session: %w", err))
+		node.failStart(ctx, fmt.Errorf("bind Pi session: %w", err))
 		return node.finishedError()
 	}
 

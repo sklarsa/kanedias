@@ -2,33 +2,44 @@ package cmd
 
 import (
 	"fmt"
-	"io"
-	"strings"
+	"path/filepath"
 
 	"github.com/spf13/cobra"
 )
 
+type SessionOptions struct {
+	SocketPath string
+	ConfigPath string
+}
+
 func newSessionCommand(service services, configPath func() string) *cobra.Command {
-	return &cobra.Command{
+	var socketPath string
+	command := &cobra.Command{
 		Use:   "session",
-		Short: "Run one prompt in an ephemeral Pi sandbox",
+		Short: "Run a foreground supervised Pi session",
 		Args:  cobra.NoArgs,
+		PreRunE: func(_ *cobra.Command, _ []string) error {
+			if socketPath == "" {
+				return fmt.Errorf("--socket is required")
+			}
+			return nil
+		},
 		RunE: func(cmd *cobra.Command, _ []string) error {
-			prompt, err := io.ReadAll(cmd.InOrStdin())
+			selectedConfig := configPath()
+			absoluteConfig, err := filepath.Abs(selectedConfig)
 			if err != nil {
-				return fmt.Errorf("read session prompt: %w", err)
+				return fmt.Errorf("resolve config path %q: %w", selectedConfig, err)
 			}
-			if strings.TrimSpace(string(prompt)) == "" {
-				return fmt.Errorf("session prompt on stdin is empty")
-			}
-			cfg, err := service.loadConfig(configPath())
+			cfg, err := service.loadConfig(selectedConfig)
 			if err != nil {
 				return err
 			}
-			return service.runSession(
-				cmd.Context(), cfg, string(prompt),
-				cmd.OutOrStdout(), cmd.ErrOrStderr(),
-			)
+			return service.runSupervisor(cmd.Context(), cfg, SessionOptions{
+				SocketPath: socketPath,
+				ConfigPath: absoluteConfig,
+			}, cmd.OutOrStdout())
 		},
 	}
+	command.Flags().StringVar(&socketPath, "socket", "", "host Unix socket path for this root supervisor")
+	return command
 }

@@ -14,7 +14,6 @@ import (
 	"github.com/sklarsa/kanedias/internal/proxy"
 	"github.com/sklarsa/kanedias/internal/sandbox"
 	"github.com/sklarsa/kanedias/internal/server"
-	"github.com/sklarsa/kanedias/internal/session"
 	"github.com/sklarsa/kanedias/internal/supervisor/process"
 	"github.com/sklarsa/kanedias/internal/workspace"
 	"github.com/spf13/cobra"
@@ -30,7 +29,7 @@ type services struct {
 	createImage      func(context.Context, config.Config, io.Writer, io.Writer) error
 	createSandbox    func(context.Context, config.Config, string, io.Writer, io.Writer) error
 	destroySandbox   func(context.Context, config.Config, string, io.Writer, io.Writer) error
-	runSession       func(context.Context, config.Config, string, io.Writer, io.Writer) error
+	runSupervisor    func(context.Context, config.Config, SessionOptions, io.Writer) error
 	syncWorkspace    func(context.Context, config.Config, io.Writer, io.Writer) error
 	runServer        func(context.Context, server.Options) error
 	runSessionChild  process.ChildRunner
@@ -71,15 +70,18 @@ func realServices() services {
 		createImage:      image.Create,
 		createSandbox:    sandbox.Create,
 		destroySandbox:   sandbox.Destroy,
-		runSession:       session.Run,
+		runSupervisor:    runSupervisor,
 		syncWorkspace:    workspace.Sync,
 		runServer:        server.Run,
-		runSessionChild:  unsupportedChildRunner,
+		runSessionChild:  productionChildRunner,
 	}
 }
 
 func newRootCommand(service services, options proxy.Options) *cobra.Command {
-	configPath := "./config.toml"
+	configPath := os.Getenv("KANEDIAS_CONFIG")
+	if configPath == "" {
+		configPath = "./config.toml"
+	}
 	root := &cobra.Command{
 		Use:          "kanedias",
 		Short:        "Incus lifecycle management for Kanedias profiles and proxy",

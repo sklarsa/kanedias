@@ -9,6 +9,7 @@ import (
 	"time"
 
 	"github.com/lxc/incus/v7/shared/api"
+	"github.com/sklarsa/kanedias/internal/config"
 	"github.com/sklarsa/kanedias/internal/incusclient"
 	"github.com/sklarsa/kanedias/internal/supervisor/contract"
 )
@@ -47,6 +48,43 @@ type ChildProvisionOptions struct {
 	WorkspacePool string
 	CheckProxy    func(context.Context) error
 	WaitRPC       func(context.Context, string) (string, error)
+}
+
+type ConfiguredChildProvisioner struct {
+	*IncusChildProvisioner
+	client *incusclient.Client
+}
+
+func NewConfiguredChildProvisioner(ctx context.Context, cfg config.Config) (*ConfiguredChildProvisioner, error) {
+	client, err := incusclient.Connect(ctx)
+	if err != nil {
+		return nil, err
+	}
+	pool, err := client.ResolvePool(ctx, cfg.Workspace.Pool)
+	if err != nil {
+		client.Disconnect()
+		return nil, err
+	}
+	provisioner, err := NewIncusChildProvisioner(client, ChildProvisionOptions{
+		WorkspacePool: pool,
+		CheckProxy: func(ctx context.Context) error {
+			return checkRootProxy(ctx, cfg)
+		},
+		WaitRPC: func(ctx context.Context, instance string) (string, error) {
+			return waitForRootRPCAddress(ctx, client, instance, 60*time.Second, 500*time.Millisecond)
+		},
+	})
+	if err != nil {
+		client.Disconnect()
+		return nil, err
+	}
+	return &ConfiguredChildProvisioner{IncusChildProvisioner: provisioner, client: client}, nil
+}
+
+func (provisioner *ConfiguredChildProvisioner) Close() {
+	if provisioner != nil && provisioner.client != nil {
+		provisioner.client.Disconnect()
+	}
 }
 
 type IncusChildProvisioner struct {
@@ -412,10 +450,9 @@ func applyChildConfig(config api.ConfigMap, request ChildRequest, volumeName str
 	config["environment.KANEDIAS_PI_MODEL"] = request.Worker.Model
 	config["environment.KANEDIAS_PI_THINKING"] = request.Worker.ThinkingLevel
 	config["environment.KANEDIAS_SUPERVISOR_SOCKET"] = guestSupervisorSocket
+	config["environment.KANEDIAS_PI_SESSION_FILE"] = ""
 	if request.Contract.Context == contract.ContextFork && request.Contract.Fork != nil {
 		config["environment.KANEDIAS_PI_SESSION_FILE"] = request.Contract.Fork.SessionFile
-	} else {
-		delete(config, "environment.KANEDIAS_PI_SESSION_FILE")
 	}
 }
 

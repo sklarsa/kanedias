@@ -24,14 +24,18 @@ function boundedText(text: string): string {
   return `${Buffer.from(text).subarray(0, MAX_TOOL_TEXT - 64).toString("utf8")}\n[output truncated by Kanedias]`;
 }
 
-export default function kanediasExtension(pi: ExtensionAPI, options: ExtensionOptions = {}): void {
+export default async function kanediasExtension(pi: ExtensionAPI, options: ExtensionOptions = {}): Promise<void> {
   const env = options.env ?? process.env;
   const client = new SupervisorClient(env.KANEDIAS_SUPERVISOR_SOCKET ?? "/run/kanedias/supervisor.sock");
+  const configuredWorkers = await client.workers();
+  const workerDescription = configuredWorkers
+    .map((worker) => `${worker.workerType}: ${worker.description}`)
+    .join("; ");
 
   pi.registerTool({
     name: "delegate_session",
     label: "Delegate Session",
-    description: "Synchronously run a task in a supervised read or write child session using fresh or forked context.",
+    description: `Synchronously run a task in a supervised read or write child session using fresh or forked context. Configured workers: ${workerDescription}`,
     promptSnippet: "Delegate an independent task to a supervised child session",
     promptGuidelines: ["Use delegate_session only when the task is independent enough to justify a separate supervised session."],
     parameters: delegateSessionSchema,
@@ -46,8 +50,7 @@ export default function kanediasExtension(pi: ExtensionAPI, options: ExtensionOp
         forkSource = await validateForkSource(sessionFile, leafEntryId);
       }
 
-      const workers = await client.workers(signal);
-      const worker = workers.find((candidate) => candidate.workerType === input.workerType);
+      const worker = configuredWorkers.find((candidate) => candidate.workerType === input.workerType);
       if (!worker) throw new Error(`unknown worker type: ${input.workerType}`);
 
       const request: CreateChildRequest = { ...input };

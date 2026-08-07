@@ -12,6 +12,8 @@ import (
 	"net/http"
 	"os"
 	"os/exec"
+	"path/filepath"
+	"strings"
 	"sync"
 	"syscall"
 	"time"
@@ -24,6 +26,7 @@ const defaultProbeInterval = 25 * time.Millisecond
 type Spawner struct {
 	Executable    string
 	ProbeInterval time.Duration
+	ConfigPath    string
 }
 
 type reportEvent struct {
@@ -50,6 +53,9 @@ type Child struct {
 func (spawner Spawner) Spawn(ctx context.Context, bootstrap Bootstrap) (*Child, error) {
 	if err := bootstrap.Validate(); err != nil {
 		return nil, err
+	}
+	if spawner.ConfigPath != "" && (!filepath.IsAbs(spawner.ConfigPath) || filepath.Clean(spawner.ConfigPath) != spawner.ConfigPath) {
+		return nil, fmt.Errorf("child config path must be absolute and clean")
 	}
 	var encoded bytes.Buffer
 	if err := EncodeBootstrap(&encoded, bootstrap); err != nil {
@@ -93,6 +99,9 @@ func (spawner Spawner) Spawn(ctx context.Context, bootstrap Bootstrap) (*Child, 
 
 	command := exec.CommandContext(ctx, executable,
 		"session-child", "--bootstrap-fd", "3", "--liveness-fd", "4", "--report-fd", "5")
+	if spawner.ConfigPath != "" {
+		command.Env = withConfigPath(os.Environ(), spawner.ConfigPath)
+	}
 	// A child supervisor owns its complete descendant process tree. Isolating it
 	// in a process group lets the direct parent escalate without leaving a
 	// grandchild behind.
@@ -143,6 +152,16 @@ func (spawner Spawner) Spawn(ctx context.Context, bootstrap Bootstrap) (*Child, 
 	go child.readReports(reportRead)
 	go func() { child.waitErr = command.Wait(); close(child.waitDone) }()
 	return child, nil
+}
+
+func withConfigPath(environment []string, path string) []string {
+	result := make([]string, 0, len(environment)+1)
+	for _, variable := range environment {
+		if !strings.HasPrefix(variable, "KANEDIAS_CONFIG=") {
+			result = append(result, variable)
+		}
+	}
+	return append(result, "KANEDIAS_CONFIG="+path)
 }
 
 func (child *Child) readReports(reader *os.File) {

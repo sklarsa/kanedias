@@ -1,0 +1,246 @@
+package cmd
+
+import (
+	"context"
+	"crypto/rand"
+	"encoding/hex"
+	"encoding/json"
+	"errors"
+	"fmt"
+	"io"
+	"net"
+	"os"
+	"path/filepath"
+	"time"
+
+	"github.com/sklarsa/kanedias/internal/config"
+	"github.com/sklarsa/kanedias/internal/supervisor"
+	"github.com/sklarsa/kanedias/internal/supervisor/contract"
+	"github.com/sklarsa/kanedias/internal/supervisor/process"
+	"github.com/sklarsa/kanedias/internal/supervisor/provision"
+	"github.com/sklarsa/kanedias/internal/supervisorapi"
+)
+
+const supervisorCleanupTimeout = 30 * time.Second
+
+type configWorkerCatalog struct{ config config.Config }
+
+func (catalog configWorkerCatalog) Resolve(name string) (config.WorkerProfile, error) {
+	profile, err := catalog.config.ResolveWorker(name)
+	if err != nil {
+		return config.WorkerProfile{}, contract.NewError(contract.ErrorUnknownWorkerType, err.Error())
+	}
+	return profile, nil
+}
+
+func (catalog configWorkerCatalog) Summaries() []contract.WorkerSummary {
+	names := catalog.config.WorkerNames()
+	result := make([]contract.WorkerSummary, 0, len(names))
+	for _, name := range names {
+		profile := catalog.config.Workers[name]
+		result = append(result, contract.WorkerSummary{
+			WorkerType: name, Description: profile.Description,
+			Profile: contract.ModelProfile{Provider: profile.Provider, Model: profile.Model, ThinkingLevel: profile.ThinkingLevel},
+		})
+	}
+	return result
+}
+
+type childRootProvisionAdapter struct {
+	provisioner provision.ChildProvisioner
+	request     provision.ChildRequest
+}
+
+func (adapter childRootProvisionAdapter) ProvisionRoot(ctx context.Context, _ provision.RootRequest) (*provision.Resources, error) {
+	return adapter.provisioner.ProvisionChild(ctx, adapter.request)
+}
+func (adapter childRootProvisionAdapter) Destroy(ctx context.Context, resources *provision.Resources) error {
+	return adapter.provisioner.Destroy(ctx, resources)
+}
+
+func runSupervisor(ctx context.Context, cfg config.Config, options SessionOptions, output io.Writer) error {
+	if err := cfg.ValidateSupervisor(); err != nil {
+		return err
+	}
+	if options.ConfigPath == "" || !filepath.IsAbs(options.ConfigPath) || filepath.Clean(options.ConfigPath) != options.ConfigPath {
+		return fmt.Errorf("supervisor config path must be absolute and clean")
+	}
+	socketPath, err := filepath.Abs(options.SocketPath)
+	if err != nil {
+		return fmt.Errorf("resolve supervisor socket path %q: %w", options.SocketPath, err)
+	}
+	sessionID, err := supervisorSessionID()
+	if err != nil {
+		return err
+	}
+	identity, err := supervisor.NewIdentity(supervisor.IdentitySpec{
+		SessionID: sessionID, RootID: sessionID, Kind: contract.ChildKindRoot, Context: contract.ContextRoot,
+	})
+	if err != nil {
+		return err
+	}
+
+	var unixServer *supervisorapi.UnixServer
+	listenerReady := make(chan struct{})
+	closeListener := func(closeCtx context.Context) error {
+		select {
+		case <-listenerReady:
+			return unixServer.Close(closeCtx)
+		case <-closeCtx.Done():
+			return closeCtx.Err()
+		}
+	}
+	spawner := process.Spawner{ConfigPath: options.ConfigPath}
+	node, err := supervisor.NewRoot(identity, supervisor.Dependencies{
+		Provisioner: provision.NewRootProvisioner(cfg),
+		DialRPC:     dialPiRPC,
+		Workers:     configWorkerCatalog{config: cfg},
+		SocketPath:  socketPath,
+		SpawnChild: func(ctx context.Context, bootstrap process.Bootstrap) (supervisor.ChildProcess, error) {
+			return spawner.Spawn(ctx, bootstrap)
+		},
+		DescendantClient: supervisorapi.NewDescendantClient,
+		CloseListener:    closeListener,
+	}, supervisor.NewEventBroker())
+	if err != nil {
+		return err
+	}
+	router := supervisor.NewRouter(node)
+	unixServer, err = supervisorapi.StartUnix(socketPath, supervisorapi.NewHandler(router))
+	if err != nil {
+		return err
+	}
+	close(listenerReady)
+
+	runtimeCtx, cancelRuntime := context.WithCancel(ctx)
+	defer cancelRuntime()
+	go func() { <-unixServer.Done(); cancelRuntime() }()
+	if err := node.Start(runtimeCtx); err != nil {
+		return errors.Join(err, unixServer.Err())
+	}
+	if output != nil {
+		_ = json.NewEncoder(output).Encode(node.Snapshot())
+	}
+
+	select {
+	case <-ctx.Done():
+		cleanupCtx, cancel := context.WithTimeout(context.WithoutCancel(ctx), supervisorCleanupTimeout)
+		defer cancel()
+		return node.Stop(cleanupCtx, supervisor.StopReasonCancelled)
+	case <-node.Done():
+		return node.Stop(context.Background(), supervisor.StopReasonRequested)
+	case <-unixServer.Done():
+		cleanupCtx, cancel := context.WithTimeout(context.Background(), supervisorCleanupTimeout)
+		defer cancel()
+		return errors.Join(unixServer.Err(), node.Stop(cleanupCtx, supervisor.StopReasonRPCFailure))
+	}
+}
+
+func productionChildRunner(ctx context.Context, bootstrap process.Bootstrap, reporter *process.Reporter) (resultErr error) {
+	configPath := os.Getenv("KANEDIAS_CONFIG")
+	if configPath == "" || !filepath.IsAbs(configPath) || filepath.Clean(configPath) != configPath {
+		return contract.NewError(contract.ErrorInvalidRequest, "KANEDIAS_CONFIG must name an absolute clean path")
+	}
+	cfg, err := config.Load(configPath)
+	if err != nil {
+		return err
+	}
+	if err := cfg.ValidateSupervisor(); err != nil {
+		return err
+	}
+	resolvedWorker, err := cfg.ResolveWorker(bootstrap.Request.WorkerType)
+	if err != nil {
+		return contract.NewError(contract.ErrorUnknownWorkerType, err.Error())
+	}
+	if resolvedWorker != bootstrap.Worker {
+		return contract.NewError(contract.ErrorConflict, "child worker profile does not match configured policy")
+	}
+	if bootstrap.Request.Kind != contract.ChildKindRead {
+		return contract.NewError(contract.ErrorConflict, "write child completion is not available in this delivery stage")
+	}
+
+	childProvisioner, err := provision.NewConfiguredChildProvisioner(ctx, cfg)
+	if err != nil {
+		return err
+	}
+	defer childProvisioner.Close()
+	identity, err := supervisor.NewIdentity(supervisor.IdentitySpec{
+		SessionID: bootstrap.SessionID, ParentID: bootstrap.ParentID, RootID: bootstrap.RootID,
+		Kind: bootstrap.Request.Kind, Context: bootstrap.Request.Context, Worker: bootstrap.Request.WorkerType,
+	})
+	if err != nil {
+		return err
+	}
+	adapter := childRootProvisionAdapter{provisioner: childProvisioner, request: provision.ChildRequest{
+		SessionID: bootstrap.SessionID, ParentID: bootstrap.ParentID, RootID: bootstrap.RootID,
+		SourceInstance: bootstrap.SourceInstance, SourceVolume: bootstrap.SourceVolume,
+		HostSocketPath: bootstrap.SocketPath, Worker: bootstrap.Worker, Contract: bootstrap.Request,
+	}}
+
+	var unixServer *supervisorapi.UnixServer
+	listenerReady := make(chan struct{})
+	closeListener := func(closeCtx context.Context) error {
+		select {
+		case <-listenerReady:
+			return unixServer.Close(closeCtx)
+		case <-closeCtx.Done():
+			return closeCtx.Err()
+		}
+	}
+	spawner := process.Spawner{ConfigPath: configPath}
+	node, err := supervisor.NewChild(identity, supervisor.Dependencies{
+		Provisioner: adapter, DialRPC: dialPiRPC, Workers: configWorkerCatalog{config: cfg},
+		SocketPath: bootstrap.SocketPath,
+		SpawnChild: func(ctx context.Context, nested process.Bootstrap) (supervisor.ChildProcess, error) {
+			return spawner.Spawn(ctx, nested)
+		},
+		DescendantClient: supervisorapi.NewDescendantClient,
+		CloseListener:    closeListener,
+	}, supervisor.NewEventBroker())
+	if err != nil {
+		return err
+	}
+	unixServer, err = supervisorapi.StartUnix(bootstrap.SocketPath, supervisorapi.NewHandler(supervisor.NewRouter(node)))
+	if err != nil {
+		return err
+	}
+	close(listenerReady)
+	started := false
+	defer func() {
+		cleanupCtx, cancel := context.WithTimeout(context.WithoutCancel(ctx), supervisorCleanupTimeout)
+		defer cancel()
+		if started {
+			resultErr = errors.Join(resultErr, node.Stop(cleanupCtx, supervisor.StopReasonRequested))
+		} else {
+			resultErr = errors.Join(resultErr, unixServer.Close(cleanupCtx))
+		}
+	}()
+
+	if err := node.Start(ctx); err != nil {
+		return err
+	}
+	started = true
+	if err := reporter.Ready(bootstrap.SocketPath); err != nil {
+		return err
+	}
+	readResult, err := node.RunReadTask(ctx, bootstrap.Request.Task)
+	if err != nil {
+		return err
+	}
+	if err := reporter.Read(readResult); err != nil {
+		return err
+	}
+	return nil
+}
+
+func dialPiRPC(ctx context.Context, address string) (io.ReadWriteCloser, error) {
+	return (&net.Dialer{}).DialContext(ctx, "tcp", address)
+}
+
+func supervisorSessionID() (string, error) {
+	var value [16]byte
+	if _, err := rand.Read(value[:]); err != nil {
+		return "", fmt.Errorf("generate supervisor session ID: %w", err)
+	}
+	return "session-" + hex.EncodeToString(value[:]), nil
+}

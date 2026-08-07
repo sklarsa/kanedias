@@ -157,6 +157,17 @@ func TestRootProvisionerCreatesSocketProxyBeforeStarting(t *testing.T) {
 			t.Errorf("supervisor device[%q] = %q, want %q", key, device[key], value)
 		}
 	}
+	wantEnvironment := map[string]string{
+		"environment.KANEDIAS_SESSION_ID": "root-1", "environment.KANEDIAS_SESSION_KIND": "root",
+		"environment.KANEDIAS_WORKER_TYPE": "", "environment.KANEDIAS_PI_PROVIDER": "",
+		"environment.KANEDIAS_PI_MODEL": "", "environment.KANEDIAS_PI_THINKING": "",
+		"environment.KANEDIAS_PI_SESSION_FILE": "", "environment.KANEDIAS_SUPERVISOR_SOCKET": "/run/kanedias/supervisor.sock",
+	}
+	for key, value := range wantEnvironment {
+		if client.request.Config[key] != value {
+			t.Errorf("root environment %q = %q, want %q", key, client.request.Config[key], value)
+		}
+	}
 	if client.request.Devices["root"]["pool"] != resources.Pool || client.request.Devices["workspace"]["pool"] != resources.Pool {
 		t.Fatalf("root/workspace devices do not use effective pool %q: %#v", resources.Pool, client.request.Devices)
 	}

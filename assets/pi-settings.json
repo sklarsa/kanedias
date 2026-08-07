@@ -6,7 +6,6 @@
   "defaultThinkingLevel": "xhigh",
   "packages": [
     "git:github.com/obra/superpowers",
-    "npm:pi-subagents",
     "npm:pi-web-suite",
     "npm:@diegopetrucci/pi-openai-fast"
   ],

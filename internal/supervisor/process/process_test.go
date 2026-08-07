@@ -13,6 +13,7 @@ import (
 	"os"
 	"os/exec"
 	"path/filepath"
+	"reflect"
 	"strings"
 	"sync/atomic"
 	"syscall"
@@ -31,6 +32,18 @@ func validBootstrap(t *testing.T) Bootstrap {
 		SourceInstance: "session-parent-1", SourceVolume: "workspace-parent-1",
 		Worker:  config.WorkerProfile{Description: "Review code", Provider: "openai-codex", Model: "gpt-5", ThinkingLevel: "high"},
 		Request: contract.CreateChildRequest{WorkerType: "reviewer", Kind: contract.ChildKindRead, Context: contract.ContextFresh, Task: "review this change"},
+	}
+}
+
+func TestSpawnerConfigPathReplacesOnlyKanediasConfig(t *testing.T) {
+	got := withConfigPath([]string{"PATH=/bin", "KANEDIAS_CONFIG=/old/config.toml", "OTHER=value"}, "/custom/config.toml")
+	want := []string{"PATH=/bin", "OTHER=value", "KANEDIAS_CONFIG=/custom/config.toml"}
+	if !reflect.DeepEqual(got, want) {
+		t.Fatalf("environment = %#v, want %#v", got, want)
+	}
+	spawner := Spawner{Executable: "/missing", ConfigPath: "relative.toml"}
+	if _, err := spawner.Spawn(context.Background(), validBootstrap(t)); err == nil || !strings.Contains(err.Error(), "absolute and clean") {
+		t.Fatalf("relative config error = %v", err)
 	}
 }
 
@@ -132,12 +145,13 @@ func TestSpawnerUsesOnlyInheritedProtocolDescriptorsAndProbesSocket(t *testing.T
 	bootstrap := validBootstrap(t)
 	serveTree(t, bootstrap.SocketPath, bootstrap.SessionID, bootstrap.ParentID, bootstrap.RootID)
 	script := filepath.Join(t.TempDir(), "helper.sh")
-	contents := fmt.Sprintf("#!/bin/sh\nset -eu\n[ \"$*\" = 'session-child --bootstrap-fd 3 --liveness-fd 4 --report-fd 5' ]\ncat <&3 >/dev/null\nprintf '%%s\\n' '%s' >&5\ncat <&4 >/dev/null\n", fmt.Sprintf(`{"type":"ready","sessionId":%q,"ready":{"socketPath":%q}}`, bootstrap.SessionID, bootstrap.SocketPath))
+	configPath := filepath.Join(t.TempDir(), "custom.toml")
+	contents := fmt.Sprintf("#!/bin/sh\nset -eu\n[ \"$*\" = 'session-child --bootstrap-fd 3 --liveness-fd 4 --report-fd 5' ]\n[ \"$KANEDIAS_CONFIG\" = %q ]\ncat <&3 >/dev/null\nprintf '%%s\\n' '%s' >&5\ncat <&4 >/dev/null\n", configPath, fmt.Sprintf(`{"type":"ready","sessionId":%q,"ready":{"socketPath":%q}}`, bootstrap.SessionID, bootstrap.SocketPath))
 	if err := os.WriteFile(script, []byte(contents), 0o700); err != nil {
 		t.Fatal(err)
 	}
 
-	child, err := (Spawner{Executable: script, ProbeInterval: 5 * time.Millisecond}).Spawn(context.Background(), bootstrap)
+	child, err := (Spawner{Executable: script, ProbeInterval: 5 * time.Millisecond, ConfigPath: configPath}).Spawn(context.Background(), bootstrap)
 	if err != nil {
 		t.Fatal(err)
 	}

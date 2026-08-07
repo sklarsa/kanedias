@@ -261,7 +261,7 @@ func TestProvisionChildFollowsFailClosedOrderAndReplacesInheritedState(t *testin
 		"environment.KANEDIAS_SESSION_ID": "child-1", "environment.KANEDIAS_SESSION_KIND": "read",
 		"environment.KANEDIAS_WORKER_TYPE": "reviewer", "environment.KANEDIAS_PI_PROVIDER": "anthropic",
 		"environment.KANEDIAS_PI_MODEL": "claude-sonnet-4", "environment.KANEDIAS_PI_THINKING": "high",
-		"environment.KANEDIAS_SUPERVISOR_SOCKET": "/run/kanedias/supervisor.sock",
+		"environment.KANEDIAS_PI_SESSION_FILE": "", "environment.KANEDIAS_SUPERVISOR_SOCKET": "/run/kanedias/supervisor.sock",
 	}
 	if got := kanediasEnvironment(client.instancePut.Config); !reflect.DeepEqual(got, wantEnvironment) {
 		t.Errorf("fresh Kanedias environment = %#v, want exact allowlist %#v", got, wantEnvironment)

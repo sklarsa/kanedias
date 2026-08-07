@@ -472,7 +472,6 @@ npm install --global --ignore-scripts \
 
 pi_binary="$(dirname "$(command -v node)")/pi"
 GIT_TERMINAL_PROMPT=0 "$pi_binary" install git:github.com/obra/superpowers
-"$pi_binary" install npm:pi-subagents
 "$pi_binary" install npm:pi-web-suite
 EOF
 
@@ -508,6 +507,16 @@ install_pi_extension() {
 d /run/kanedias 0700 kanedias kanedias -
 EOF
     systemd-tmpfiles --create /usr/lib/tmpfiles.d/kanedias.conf
+
+    install -d -m 0755 -o "$managed_user" -g "$managed_user" \
+        "$managed_home/.pi/agent/skills/delegate-session" \
+        "$managed_home/.pi/agent/skills/writer-handoff"
+    install -m 0644 -o "$managed_user" -g "$managed_user" \
+        /opt/kanedias/pi-extension/skills/delegate-session/SKILL.md \
+        "$managed_home/.pi/agent/skills/delegate-session/SKILL.md"
+    install -m 0644 -o "$managed_user" -g "$managed_user" \
+        /opt/kanedias/pi-extension/skills/writer-handoff/SKILL.md \
+        "$managed_home/.pi/agent/skills/writer-handoff/SKILL.md"
 }
 
 install_pi_rpc_service() {

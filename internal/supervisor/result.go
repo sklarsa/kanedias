@@ -2,13 +2,140 @@ package supervisor
 
 import (
 	"context"
+	"encoding/json"
 	"errors"
+	"fmt"
+	"strings"
 	"sync"
 
 	"github.com/sklarsa/kanedias/internal/supervisor/contract"
 )
 
 var ErrResultAlreadyCompleted = errors.New("result cell is already completed")
+
+func (node *Node) RunReadTask(ctx context.Context, task string) (contract.ReadChildResult, error) {
+	identity := node.identity.Snapshot()
+	if identity.Kind != contract.ChildKindRead {
+		return contract.ReadChildResult{}, contract.NewError(contract.ErrorConflict, "only read children can produce read results")
+	}
+	if strings.TrimSpace(task) == "" {
+		return contract.ReadChildResult{}, contract.NewError(contract.ErrorInvalidRequest, "read task is required")
+	}
+	node.mu.RLock()
+	local := node.local
+	node.mu.RUnlock()
+	if local == nil {
+		return contract.ReadChildResult{}, contract.NewError(contract.ErrorChildUnavailable, "child Pi RPC is not ready")
+	}
+
+	subscription := node.broker.Subscribe()
+	defer subscription.Close()
+	prompt, err := json.Marshal(map[string]string{"type": "prompt", "message": task})
+	if err != nil {
+		return contract.ReadChildResult{}, err
+	}
+	response, err := local.CallRPC(ctx, prompt)
+	if err != nil {
+		return contract.ReadChildResult{}, childReadFailure(contract.ErrorChildFailed, "submit child task", err)
+	}
+	var accepted struct {
+		Type    string `json:"type"`
+		Command string `json:"command"`
+		Success bool   `json:"success"`
+		Error   string `json:"error"`
+	}
+	if err := json.Unmarshal(response, &accepted); err != nil || accepted.Type != "response" || accepted.Command != "prompt" || !accepted.Success {
+		if accepted.Error == "" {
+			accepted.Error = "Pi rejected the prompt"
+		}
+		return contract.ReadChildResult{}, childReadFailure(contract.ErrorChildFailed, "submit child task", errors.New(accepted.Error))
+	}
+
+	pending := append([]EventEnvelope(nil), subscription.Replay...)
+	var lastStopReason string
+	for {
+		var event EventEnvelope
+		if len(pending) > 0 {
+			event, pending = pending[0], pending[1:]
+		} else {
+			select {
+			case liveEvent, ok := <-subscription.Events:
+				if !ok {
+					return contract.ReadChildResult{}, childReadFailure(contract.ErrorChildFailed, "read event stream ended before settlement", nil)
+				}
+				event = liveEvent
+			case <-local.rpc.Done():
+				return contract.ReadChildResult{}, childReadFailure(contract.ErrorChildFailed, "Pi RPC stream ended before read settlement", local.rpc.Err())
+			case <-ctx.Done():
+				return contract.ReadChildResult{}, ctx.Err()
+			}
+		}
+		if event.SessionID != identity.SessionID || event.Kind != "pi" {
+			continue
+		}
+		var envelope struct {
+			Type    string `json:"type"`
+			Message *struct {
+				Role       string `json:"role"`
+				StopReason string `json:"stopReason"`
+			} `json:"message,omitempty"`
+			Error any `json:"error,omitempty"`
+		}
+		if err := json.Unmarshal(event.Payload, &envelope); err != nil {
+			return contract.ReadChildResult{}, childReadFailure(contract.ErrorChildFailed, "decode Pi completion event", err)
+		}
+		switch envelope.Type {
+		case "extension_error":
+			return contract.ReadChildResult{}, childReadFailure(contract.ErrorChildFailed, "terminal extension error", fmt.Errorf("%v", envelope.Error))
+		case "message_end":
+			if envelope.Message != nil && envelope.Message.Role == "assistant" {
+				lastStopReason = envelope.Message.StopReason
+			}
+		case "agent_settled":
+			switch lastStopReason {
+			case "stop":
+			case "aborted":
+				return contract.ReadChildResult{}, childReadFailure(contract.ErrorChildAborted, "read child was aborted", nil)
+			case "error", "length":
+				return contract.ReadChildResult{}, childReadFailure(contract.ErrorChildFailed, "read child ended with stop reason "+lastStopReason, nil)
+			default:
+				return contract.ReadChildResult{}, childReadFailure(contract.ErrorChildFailed, "read child settled without a successful final assistant message", nil)
+			}
+			output, err := lastAssistantText(ctx, local)
+			if err != nil {
+				return contract.ReadChildResult{}, err
+			}
+			return contract.ReadChildResult{Kind: contract.ChildKindRead, WorkerType: identity.Worker, SessionID: identity.SessionID, Output: output}, nil
+		}
+	}
+}
+
+func lastAssistantText(ctx context.Context, local *LocalSession) (string, error) {
+	response, err := local.CallRPC(ctx, json.RawMessage(`{"type":"get_last_assistant_text"}`))
+	if err != nil {
+		return "", childReadFailure(contract.ErrorChildFailed, "get final assistant text", err)
+	}
+	var decoded struct {
+		Type    string `json:"type"`
+		Command string `json:"command"`
+		Success bool   `json:"success"`
+		Data    struct {
+			Text *string `json:"text"`
+		} `json:"data"`
+		Error string `json:"error"`
+	}
+	if err := json.Unmarshal(response, &decoded); err != nil || decoded.Type != "response" || decoded.Command != "get_last_assistant_text" || !decoded.Success {
+		return "", childReadFailure(contract.ErrorChildFailed, "get final assistant text", errors.New(decoded.Error))
+	}
+	if decoded.Data.Text == nil {
+		return "", childReadFailure(contract.ErrorChildFailed, "get final assistant text", errors.New("Pi returned null final assistant text"))
+	}
+	return *decoded.Data.Text, nil
+}
+
+func childReadFailure(code contract.ErrorCode, message string, cause error) error {
+	return errors.Join(contract.NewError(code, message), cause)
+}
 
 type TerminalResult struct {
 	Read  *contract.ReadChildResult

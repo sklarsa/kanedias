@@ -4,4 +4,46 @@ set -Eeuo pipefail
 export NVM_DIR=/home/kanedias/.nvm
 # shellcheck source=/dev/null
 source "$NVM_DIR/nvm.sh"
-exec pi --mode rpc --no-session
+
+kind=${KANEDIAS_SESSION_KIND:-root}
+session_file=${KANEDIAS_PI_SESSION_FILE:-}
+args=(--mode rpc)
+
+case "$kind" in
+    root)
+        if [[ -n $session_file ]]; then
+            echo "root Pi session must start fresh" >&2
+            exit 1
+        fi
+        ;;
+    read | write)
+        provider=${KANEDIAS_PI_PROVIDER:-}
+        model=${KANEDIAS_PI_MODEL:-}
+        thinking=${KANEDIAS_PI_THINKING:-}
+        if [[ -z $provider || -z $model ]]; then
+            echo "child Pi provider and model are required" >&2
+            exit 1
+        fi
+        if [[ -n $session_file ]]; then
+            args+=(--session "$session_file")
+        fi
+        args+=(-e /opt/kanedias/pi-extension/src/index.ts)
+        args+=(--provider "$provider" --model "$model")
+        if [[ -n $thinking ]]; then
+            case "$thinking" in
+                off | minimal | low | medium | high | xhigh | max) ;;
+                *) echo "invalid child Pi thinking level" >&2; exit 1 ;;
+            esac
+            args+=(--thinking "$thinking")
+        fi
+        ;;
+    *)
+        echo "invalid KANEDIAS_SESSION_KIND: $kind" >&2
+        exit 1
+        ;;
+esac
+
+if [[ $kind == root ]]; then
+    args+=(-e /opt/kanedias/pi-extension/src/index.ts)
+fi
+exec pi "${args[@]}"

@@ -8,66 +8,115 @@ import (
 	"net/http"
 	"os"
 	"path/filepath"
+	"sync"
 	"syscall"
 	"time"
 )
 
 const unixShutdownTimeout = 5 * time.Second
 
-func ServeUnix(ctx context.Context, path string, handler http.Handler) (err error) {
+type UnixServer struct {
+	path     string
+	bound    *unixSocketIdentity
+	listener *net.UnixListener
+	server   *http.Server
+	done     chan struct{}
+
+	closeOnce sync.Once
+	mu        sync.Mutex
+	err       error
+}
+
+// StartUnix binds the mode-0600 socket synchronously before serving. Callers can
+// therefore provision a guest proxy only after the host endpoint is live.
+func StartUnix(path string, handler http.Handler) (*UnixServer, error) {
 	if path == "" || !filepath.IsAbs(path) {
-		return fmt.Errorf("Unix socket path must be absolute")
+		return nil, fmt.Errorf("Unix socket path must be absolute")
 	}
 	if handler == nil {
-		return fmt.Errorf("Unix socket handler is required")
+		return nil, fmt.Errorf("Unix socket handler is required")
 	}
 	if err := prepareUnixPath(path); err != nil {
-		return err
+		return nil, err
 	}
-
 	address, err := net.ResolveUnixAddr("unix", path)
 	if err != nil {
-		return fmt.Errorf("resolve Unix socket %q: %w", path, err)
+		return nil, fmt.Errorf("resolve Unix socket %q: %w", path, err)
 	}
 	listener, err := net.ListenUnix("unix", address)
 	if err != nil {
-		return fmt.Errorf("listen on Unix socket %q: %w", path, err)
+		return nil, fmt.Errorf("listen on Unix socket %q: %w", path, err)
 	}
 	listener.SetUnlinkOnClose(false)
-	defer listener.Close()
 	if err := os.Chmod(path, 0o600); err != nil {
+		_ = listener.Close()
 		_ = safeUnlinkSocket(path, nil)
-		return fmt.Errorf("set Unix socket %q mode 0600: %w", path, err)
+		return nil, fmt.Errorf("set Unix socket %q mode 0600: %w", path, err)
 	}
 	bound, err := socketIdentity(path)
 	if err != nil {
+		_ = listener.Close()
 		_ = safeUnlinkSocket(path, nil)
+		return nil, err
+	}
+	result := &UnixServer{path: path, bound: bound, listener: listener, server: &http.Server{Handler: handler}, done: make(chan struct{})}
+	go func() {
+		serveErr := result.server.Serve(listener)
+		if errors.Is(serveErr, http.ErrServerClosed) {
+			serveErr = nil
+		}
+		closeErr := listener.Close()
+		if errors.Is(closeErr, net.ErrClosed) {
+			closeErr = nil
+		}
+		result.mu.Lock()
+		result.err = errors.Join(serveErr, closeErr, safeUnlinkSocket(path, bound))
+		result.mu.Unlock()
+		close(result.done)
+	}()
+	return result, nil
+}
+
+func (server *UnixServer) Done() <-chan struct{} { return server.done }
+
+func (server *UnixServer) Err() error {
+	<-server.done
+	server.mu.Lock()
+	defer server.mu.Unlock()
+	return server.err
+}
+
+// Close cancels serving and waits for all listener cleanup, including unlink.
+func (server *UnixServer) Close(ctx context.Context) error {
+	var shutdownErr error
+	server.closeOnce.Do(func() {
+		shutdownErr = server.server.Shutdown(ctx)
+		if shutdownErr != nil {
+			shutdownErr = errors.Join(shutdownErr, server.server.Close())
+		}
+	})
+	select {
+	case <-server.done:
+		return errors.Join(shutdownErr, server.Err())
+	case <-ctx.Done():
+		_ = server.server.Close()
+		<-server.done
+		return errors.Join(shutdownErr, ctx.Err(), server.Err())
+	}
+}
+
+func ServeUnix(ctx context.Context, path string, handler http.Handler) error {
+	server, err := StartUnix(path, handler)
+	if err != nil {
 		return err
 	}
-	defer func() { err = errors.Join(err, safeUnlinkSocket(path, bound)) }()
-
-	server := &http.Server{Handler: handler}
-	serveResult := make(chan error, 1)
-	go func() { serveResult <- server.Serve(listener) }()
-
 	select {
-	case serveErr := <-serveResult:
-		if errors.Is(serveErr, http.ErrServerClosed) {
-			return nil
-		}
-		return serveErr
+	case <-server.Done():
+		return server.Err()
 	case <-ctx.Done():
 		shutdownCtx, cancel := context.WithTimeout(context.WithoutCancel(ctx), unixShutdownTimeout)
 		defer cancel()
-		if shutdownErr := server.Shutdown(shutdownCtx); shutdownErr != nil {
-			_ = server.Close()
-			return shutdownErr
-		}
-		serveErr := <-serveResult
-		if serveErr != nil && !errors.Is(serveErr, http.ErrServerClosed) {
-			return serveErr
-		}
-		return nil
+		return server.Close(shutdownCtx)
 	}
 }
 

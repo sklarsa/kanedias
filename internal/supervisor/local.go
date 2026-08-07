@@ -126,10 +126,13 @@ func (session *LocalSession) CallRPC(ctx context.Context, command json.RawMessag
 	}
 
 	var accepted struct {
-		Success bool `json:"success"`
+		Type    string `json:"type"`
+		Command string `json:"command"`
+		Success bool   `json:"success"`
 	}
 	acceptedErr := json.Unmarshal(response, &accepted)
-	if requestType == "get_state" && acceptedErr == nil && accepted.Success {
+	responseAccepted := acceptedErr == nil && accepted.Type == "response" && accepted.Command == requestType && accepted.Success
+	if requestType == "get_state" && responseAccepted {
 		state, err := decodeGetState(response)
 		if err != nil {
 			return nil, err
@@ -143,7 +146,7 @@ func (session *LocalSession) CallRPC(ctx context.Context, command json.RawMessag
 		session.mu.Unlock()
 	}
 
-	if acceptedErr == nil && accepted.Success {
+	if responseAccepted {
 		switch requestType {
 		case "prompt", "follow_up":
 			session.activityMu.Lock()
@@ -295,6 +298,8 @@ func (session *LocalSession) applyActivityLocked(activity string) {
 		switch session.identity.kind {
 		case contract.ChildKindRoot:
 			_ = session.lifecycle.Transition(LifecycleReady)
+		case contract.ChildKindRead:
+			_ = session.lifecycle.Transition(LifecycleCompleted)
 		case contract.ChildKindWrite:
 			_ = session.lifecycle.Transition(LifecycleAwaitingHandoff)
 		}
