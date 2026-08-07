@@ -124,16 +124,16 @@ func TestSubmittedRemoteOperationCanBeAwaitedAfterCancellation(t *testing.T) {
 	}
 }
 
-func TestRemoteOperationWaitHookSynchronizesCancellationAfterSubmission(t *testing.T) {
+func TestRemoteOperationWaitHookObservesWaitEntryBeforeCancellation(t *testing.T) {
 	operation := &fakeRemoteOperation{
 		waitStarted: make(chan struct{}),
 		waitRelease: make(chan struct{}),
 		cancelled:   make(chan struct{}),
 	}
-	hookStarted := make(chan struct{})
+	observationReached := make(chan RemoteOperationWaitObservation, 1)
 	releaseHook := make(chan struct{})
-	ctx, cancel := context.WithCancel(WithRemoteOperationWaitHook(context.Background(), func() {
-		close(hookStarted)
+	ctx, cancel := context.WithCancel(WithRemoteOperationWaitHook(context.Background(), func(observation RemoteOperationWaitObservation) {
+		observationReached <- observation
 		<-releaseHook
 	}))
 	copyDone := make(chan error, 1)
@@ -142,8 +142,18 @@ func TestRemoteOperationWaitHookSynchronizesCancellationAfterSubmission(t *testi
 			return operation, nil
 		})
 	}()
-	<-operation.waitStarted
-	<-hookStarted
+
+	observation := <-observationReached
+	select {
+	case <-observation.WaitEntered():
+	default:
+		t.Fatal("wait hook ran before the remote waiter entered Wait")
+	}
+	select {
+	case <-observation.Done():
+		t.Fatal("remote wait was already terminal before cancellation")
+	default:
+	}
 	cancel()
 	close(releaseHook)
 
@@ -156,6 +166,34 @@ func TestRemoteOperationWaitHookSynchronizesCancellationAfterSubmission(t *testi
 		t.Fatal("in-flight cancellation did not call CancelTarget")
 	}
 	close(operation.waitRelease)
+}
+
+func TestRemoteOperationWaitObservationDetectsAlreadyTerminalScheduling(t *testing.T) {
+	operation := &fakeRemoteOperation{
+		waitStarted: make(chan struct{}),
+		waitRelease: make(chan struct{}),
+		cancelled:   make(chan struct{}),
+	}
+	terminalObserved := make(chan bool, 1)
+	err := submitAndWaitRemoteOperation(WithRemoteOperationWaitHook(context.Background(), func(observation RemoteOperationWaitObservation) {
+		<-operation.waitStarted
+		close(operation.waitRelease)
+		<-observation.Done()
+		select {
+		case <-observation.Done():
+			terminalObserved <- true
+		default:
+			terminalObserved <- false
+		}
+	}), func() (remoteOperationWaiter, error) {
+		return operation, nil
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !<-terminalObserved {
+		t.Fatal("completion channel did not expose already-terminal scheduling")
+	}
 }
 
 func TestImmediateSubmissionFailuresAreNotMarked(t *testing.T) {

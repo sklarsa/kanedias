@@ -167,17 +167,33 @@ func TestLiveBtrfsChildClone(t *testing.T) {
 			cancelID := fmt.Sprintf("%s-c%s", sessionID, scenario.name)
 			cancelRequest := request
 			cancelRequest.SessionID = cancelID
-			waitReached := make(chan struct{})
-			releaseWait := make(chan struct{})
+			waitObserved := make(chan error, 1)
 			waitCount := 0
-			synchronizedCtx := incusclient.WithRemoteOperationWaitHook(ctx, func() {
+			var cancelInFlight context.CancelFunc
+			synchronizedCtx := incusclient.WithRemoteOperationWaitHook(ctx, func(observation incusclient.RemoteOperationWaitObservation) {
 				waitCount++
-				if waitCount == scenario.waitOrdinal {
-					close(waitReached)
-					<-releaseWait
+				if waitCount != scenario.waitOrdinal {
+					return
 				}
+				select {
+				case <-observation.WaitEntered():
+				case <-ctx.Done():
+					cancelInFlight()
+					waitObserved <- fmt.Errorf("await %s copy waiter entry: %w", scenario.name, ctx.Err())
+					return
+				}
+				select {
+				case <-observation.Done():
+					cancelInFlight()
+					waitObserved <- fmt.Errorf("%s copy wait was already terminal before cancellation", scenario.name)
+					return
+				default:
+				}
+				cancelInFlight()
+				waitObserved <- nil
 			})
-			cancelCtx, cancelInFlight := context.WithCancel(synchronizedCtx)
+			cancelCtx, cancel := context.WithCancel(synchronizedCtx)
+			cancelInFlight = cancel
 			defer cancelInFlight()
 			cancelProvisioner, err := NewIncusChildProvisioner(client, options)
 			if err != nil {
@@ -188,18 +204,21 @@ func TestLiveBtrfsChildClone(t *testing.T) {
 				_, provisionErr := cancelProvisioner.ProvisionChild(cancelCtx, cancelRequest)
 				result <- provisionErr
 			}()
+			var observationErr error
 			select {
-			case <-waitReached:
-				cancelInFlight()
-				close(releaseWait)
+			case observationErr = <-waitObserved:
 			case <-ctx.Done():
-				close(releaseWait)
-				t.Fatalf("%s copy did not reach submitted-operation wait: %v", scenario.name, ctx.Err())
+				cancelInFlight()
+				observationErr = fmt.Errorf("%s copy did not reach submitted-operation wait: %w", scenario.name, ctx.Err())
 			}
-			if err := <-result; !errors.Is(err, context.Canceled) {
-				t.Fatalf("cancel during %s copy wait error = %v", scenario.name, err)
-			}
+			provisionErr := <-result
 			assertLiveResourceEventuallyAbsent(t, client, pool, "session-"+cancelID, "workspace-"+cancelID)
+			if observationErr != nil {
+				t.Fatal(observationErr)
+			}
+			if !errors.Is(provisionErr, context.Canceled) {
+				t.Fatalf("cancel during %s copy wait error = %v", scenario.name, provisionErr)
+			}
 		})
 	}
 

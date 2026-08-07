@@ -188,30 +188,62 @@ type remoteOperationWaiter interface {
 }
 
 type submittedRemoteOperation struct {
-	done chan struct{}
-	err  error
+	waitEntered chan struct{}
+	done        chan struct{}
+	err         error
 }
+
+type observableRemoteOperationWaiter struct {
+	remoteOperationWaiter
+	waitEntered chan struct{}
+}
+
+func (o *observableRemoteOperationWaiter) Wait() error {
+	close(o.waitEntered)
+	return o.remoteOperationWaiter.Wait()
+}
+
+// RemoteOperationWaitObservation exposes read-only lifecycle signals for a
+// submitted remote-operation waiter. WaitEntered closes at entry to the
+// observable Wait method; Done closes only after that method returns.
+type RemoteOperationWaitObservation struct {
+	waitEntered <-chan struct{}
+	done        <-chan struct{}
+}
+
+func (o RemoteOperationWaitObservation) WaitEntered() <-chan struct{} { return o.waitEntered }
+func (o RemoteOperationWaitObservation) Done() <-chan struct{}        { return o.done }
 
 type remoteOperationWaitHookKey struct{}
 
 // WithRemoteOperationWaitHook installs a synchronization hook that runs after
-// a remote operation has been submitted and its waiter goroutine has started.
-// It is used by destructive live validation to cancel at the real wait
-// boundary rather than after a copy has completed.
-func WithRemoteOperationWaitHook(ctx context.Context, hook func()) context.Context {
+// a remote operation has been submitted and its waiter has entered Wait. The
+// observation lets destructive live validation reject an already-terminal
+// wait immediately before cancellation.
+func WithRemoteOperationWaitHook(ctx context.Context, hook func(RemoteOperationWaitObservation)) context.Context {
 	return context.WithValue(ctx, remoteOperationWaitHookKey{}, hook)
 }
 
-func runRemoteOperationWaitHook(ctx context.Context) {
-	if hook, ok := ctx.Value(remoteOperationWaitHookKey{}).(func()); ok && hook != nil {
-		hook()
+func runRemoteOperationWaitHook(ctx context.Context, remote *submittedRemoteOperation) {
+	hook, ok := ctx.Value(remoteOperationWaitHookKey{}).(func(RemoteOperationWaitObservation))
+	if !ok || hook == nil {
+		return
 	}
+	<-remote.waitEntered
+	hook(RemoteOperationWaitObservation{waitEntered: remote.waitEntered, done: remote.done})
 }
 
 func startRemoteOperation(operation remoteOperationWaiter) *submittedRemoteOperation {
-	remote := &submittedRemoteOperation{done: make(chan struct{})}
+	remote := &submittedRemoteOperation{
+		waitEntered: make(chan struct{}),
+		done:        make(chan struct{}),
+	}
+	observable := &observableRemoteOperationWaiter{
+		remoteOperationWaiter: operation,
+		waitEntered:           remote.waitEntered,
+	}
 	go func() {
-		remote.err = operation.Wait()
+		remote.err = observable.Wait()
 		close(remote.done)
 	}()
 	return remote
@@ -223,7 +255,7 @@ func submitAndWaitRemoteOperation(ctx context.Context, submit func() (remoteOper
 		return err
 	}
 	remote := startRemoteOperation(operation)
-	runRemoteOperationWaitHook(ctx)
+	runRemoteOperationWaitHook(ctx, remote)
 	if err := waitSubmittedRemoteOperation(ctx, operation, remote); err != nil {
 		return &submittedOperationError{err: err, remote: remote}
 	}
