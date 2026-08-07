@@ -10,6 +10,8 @@ config:
   environment.SSL_CERT_FILE: "/etc/ssl/certs/ca-certificates.crt"
   security.nesting: "true"
   security.privileged: "false"
+  security.syscalls.intercept.mknod: "true"
+  security.syscalls.intercept.setxattr: "true"
 description: Kanedias sandbox with persistent workspace and credential proxy
 devices:
   eth0:
