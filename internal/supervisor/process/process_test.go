@@ -8,7 +8,6 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
-	"io"
 	"net"
 	"net/http"
 	"os"
@@ -16,6 +15,7 @@ import (
 	"path/filepath"
 	"strings"
 	"sync/atomic"
+	"syscall"
 	"testing"
 	"time"
 
@@ -130,7 +130,7 @@ func TestDecodeChildMessageRejectsUnknownFieldsAndPayloadMismatch(t *testing.T) 
 
 func TestSpawnerUsesOnlyInheritedProtocolDescriptorsAndProbesSocket(t *testing.T) {
 	bootstrap := validBootstrap(t)
-	serveTree(t, bootstrap.SocketPath)
+	serveTree(t, bootstrap.SocketPath, bootstrap.SessionID, bootstrap.ParentID, bootstrap.RootID)
 	script := filepath.Join(t.TempDir(), "helper.sh")
 	contents := fmt.Sprintf("#!/bin/sh\nset -eu\n[ \"$*\" = 'session-child --bootstrap-fd 3 --liveness-fd 4 --report-fd 5' ]\ncat <&3 >/dev/null\nprintf '%%s\\n' '%s' >&5\ncat <&4 >/dev/null\n", fmt.Sprintf(`{"type":"ready","sessionId":%q,"ready":{"socketPath":%q}}`, bootstrap.SessionID, bootstrap.SocketPath))
 	if err := os.WriteFile(script, []byte(contents), 0o700); err != nil {
@@ -167,7 +167,7 @@ func TestSpawnerRejectsReadyUntilSessionAndSocketAreVerified(t *testing.T) {
 	} {
 		t.Run(tt.name, func(t *testing.T) {
 			bootstrap := validBootstrap(t)
-			serveTree(t, bootstrap.SocketPath)
+			serveTree(t, bootstrap.SocketPath, bootstrap.SessionID, bootstrap.ParentID, bootstrap.RootID)
 			session := tt.session
 			if session == "valid" {
 				session = bootstrap.SessionID
@@ -192,6 +192,125 @@ func TestSpawnerRejectsReadyUntilSessionAndSocketAreVerified(t *testing.T) {
 				t.Fatal("WaitReady() succeeded")
 			}
 		})
+	}
+}
+
+func TestSpawnerRejectsReadySocketServingStaleTreeIdentity(t *testing.T) {
+	bootstrap := validBootstrap(t)
+	serveTree(t, bootstrap.SocketPath, "stale-child", bootstrap.ParentID, bootstrap.RootID)
+	script := filepath.Join(t.TempDir(), "helper.sh")
+	contents := fmt.Sprintf("#!/bin/sh\ncat <&3 >/dev/null\nprintf '%%s\\n' '%s' >&5\ncat <&4 >/dev/null\n", fmt.Sprintf(`{"type":"ready","sessionId":%q,"ready":{"socketPath":%q}}`, bootstrap.SessionID, bootstrap.SocketPath))
+	if err := os.WriteFile(script, []byte(contents), 0o700); err != nil {
+		t.Fatal(err)
+	}
+	child, err := (Spawner{Executable: script, ProbeInterval: time.Millisecond}).Spawn(context.Background(), bootstrap)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer child.Kill()
+	ctx, cancel := context.WithTimeout(context.Background(), 100*time.Millisecond)
+	defer cancel()
+	if err := child.WaitReady(ctx); err == nil {
+		t.Fatal("WaitReady accepted stale tree identity")
+	}
+}
+
+func TestSuccessfulTerminalReportRemainsProvisionalUntilRealProcessExit(t *testing.T) {
+	bootstrap := validBootstrap(t)
+	serveTree(t, bootstrap.SocketPath, bootstrap.SessionID, bootstrap.ParentID, bootstrap.RootID)
+	script := filepath.Join(t.TempDir(), "helper.sh")
+	ready := fmt.Sprintf(`{"type":"ready","sessionId":%q,"ready":{"socketPath":%q}}`, bootstrap.SessionID, bootstrap.SocketPath)
+	terminal := fmt.Sprintf(`{"type":"read","sessionId":%q,"read":{"kind":"read","workerType":"reviewer","sessionId":%q,"output":"done"}}`, bootstrap.SessionID, bootstrap.SessionID)
+	contents := fmt.Sprintf("#!/bin/sh\ncat <&3 >/dev/null\nprintf '%%s\\n' '%s' >&5\nprintf '%%s\\n' '%s' >&5\nsleep 0.2\n", ready, terminal)
+	if err := os.WriteFile(script, []byte(contents), 0o700); err != nil {
+		t.Fatal(err)
+	}
+	child, err := (Spawner{Executable: script, ProbeInterval: time.Millisecond}).Spawn(context.Background(), bootstrap)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer child.Kill()
+	ctx, cancel := context.WithTimeout(context.Background(), time.Second)
+	defer cancel()
+	if err := child.WaitReady(ctx); err != nil {
+		t.Fatal(err)
+	}
+	message, err := child.NextMessage(ctx)
+	if err != nil || message.Type != MessageRead {
+		t.Fatalf("terminal message = %#v, %v", message, err)
+	}
+	select {
+	case <-child.Done():
+		t.Fatal("real process exited immediately with terminal success")
+	case <-time.After(50 * time.Millisecond):
+	}
+	if err := child.Wait(); err != nil {
+		t.Fatal(err)
+	}
+	if err := child.CloseReports(); err != nil {
+		t.Fatal(err)
+	}
+}
+
+func TestRealProcessGroupEscalatesFromDeadlineThroughTermToKill(t *testing.T) {
+	bootstrap := validBootstrap(t)
+	serveTree(t, bootstrap.SocketPath, bootstrap.SessionID, bootstrap.ParentID, bootstrap.RootID)
+	grandchildPID := filepath.Join(t.TempDir(), "grandchild.pid")
+	script := filepath.Join(t.TempDir(), "helper.sh")
+	ready := fmt.Sprintf(`{"type":"ready","sessionId":%q,"ready":{"socketPath":%q}}`, bootstrap.SessionID, bootstrap.SocketPath)
+	contents := fmt.Sprintf("#!/bin/sh\ntrap '' TERM\ncat <&3 >/dev/null\nprintf '%%s\\n' '%s' >&5\n(sh -c 'trap \"\" TERM; while :; do sleep 1; done') &\necho $! > '%s'\ncat <&4 >/dev/null &\nwait\n", ready, grandchildPID)
+	if err := os.WriteFile(script, []byte(contents), 0o700); err != nil {
+		t.Fatal(err)
+	}
+	child, err := (Spawner{Executable: script, ProbeInterval: time.Millisecond}).Spawn(context.Background(), bootstrap)
+	if err != nil {
+		t.Fatal(err)
+	}
+	ctx, cancel := context.WithTimeout(context.Background(), time.Second)
+	defer cancel()
+	if err := child.WaitReady(ctx); err != nil {
+		t.Fatal(err)
+	}
+	deadline := time.Now().Add(time.Second)
+	var pid int
+	for time.Now().Before(deadline) {
+		data, readErr := os.ReadFile(grandchildPID)
+		if readErr == nil {
+			matched, _ := fmt.Sscanf(strings.TrimSpace(string(data)), "%d", &pid)
+			if matched == 1 {
+				break
+			}
+		}
+		time.Sleep(time.Millisecond)
+	}
+	if pid == 0 {
+		_ = child.Kill()
+		t.Fatal("grandchild PID was not recorded")
+	}
+	if err := child.Terminate(); err != nil {
+		t.Fatal(err)
+	}
+	select {
+	case <-child.Done():
+		t.Fatal("SIGTERM unexpectedly ended the TERM-ignoring process group")
+	case <-time.After(50 * time.Millisecond):
+	}
+	if err := child.Kill(); err != nil {
+		t.Fatal(err)
+	}
+	if err := child.Wait(); err == nil {
+		t.Fatal("process-group SIGKILL did not produce a process exit error")
+	}
+	deadline = time.Now().Add(time.Second)
+	for {
+		err := syscall.Kill(pid, 0)
+		if errors.Is(err, syscall.ESRCH) {
+			break
+		}
+		if time.Now().After(deadline) {
+			t.Fatalf("grandchild %d survived process-group SIGKILL: %v", pid, err)
+		}
+		time.Sleep(time.Millisecond)
 	}
 }
 
@@ -290,7 +409,7 @@ func TestMonitorParentLivenessUsesIdempotentStopPath(t *testing.T) {
 	}
 }
 
-func serveTree(t *testing.T, socket string) {
+func serveTree(t *testing.T, socket, sessionID, parentID, rootID string) {
 	t.Helper()
 	if err := os.MkdirAll(filepath.Dir(socket), 0o700); err != nil {
 		t.Fatal(err)
@@ -305,7 +424,7 @@ func serveTree(t *testing.T, socket string) {
 			return
 		}
 		w.Header().Set("Content-Type", "application/json")
-		_, _ = io.WriteString(w, `{}`)
+		_ = json.NewEncoder(w).Encode(map[string]string{"sessionId": sessionID, "parentSessionId": parentID, "rootSessionId": rootID})
 	})}
 	go func() { _ = server.Serve(listener) }()
 	t.Cleanup(func() { _ = server.Close(); _ = listener.Close() })

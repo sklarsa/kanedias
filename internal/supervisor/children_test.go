@@ -5,6 +5,8 @@ import (
 	"encoding/json"
 	"errors"
 	"io"
+	"net"
+	"path/filepath"
 	"sync"
 	"sync/atomic"
 	"testing"
@@ -129,6 +131,10 @@ func readRequest() contract.CreateChildRequest {
 	return contract.CreateChildRequest{WorkerType: "reviewer", Kind: contract.ChildKindRead, Context: contract.ContextFresh, Task: "review"}
 }
 
+func directChildSnapshot(id string) NodeSnapshot {
+	return NodeSnapshot{SessionID: id, ParentSessionID: "root-1", RootSessionID: "root-1", Kind: contract.ChildKindRead, Context: contract.ContextFresh, WorkerType: "reviewer", Lifecycle: string(LifecycleReady), Questions: []QuestionSummary{}, Children: []NodeSnapshot{}}
+}
+
 func TestCreateChildResolvesWorkerBeforeAnyProcessSideEffect(t *testing.T) {
 	var spawned atomic.Bool
 	node := childCreationNode(t, func(context.Context, process.Bootstrap) (ChildProcess, error) {
@@ -177,7 +183,7 @@ func TestStopDuringSpawnCancelsAdmissionAndWaitsForSpawnCleanup(t *testing.T) {
 func TestCreateChildFailureWaitsForProcessExitBeforeReturningAndRemoval(t *testing.T) {
 	child := newFakeChildProcess()
 	child.messages <- process.ChildMessage{Type: process.MessageFailure, SessionID: "child-1", Error: &process.WireError{Code: contract.ErrorChildFailed, Message: "failed"}}
-	client := &stoppingDescendant{process: child}
+	client := &stoppingDescendant{fakeDescendantClient: fakeDescendantClient{snapshot: directChildSnapshot("child-1")}, process: child}
 	node := childCreationNode(t,
 		func(context.Context, process.Bootstrap) (ChildProcess, error) { return child, nil },
 		func(string) (DescendantClient, error) { return client, nil },
@@ -206,7 +212,7 @@ func TestCreateChildFailureWaitsForProcessExitBeforeReturningAndRemoval(t *testi
 
 func TestCreateChildCancellationStopsAndSynchronouslyCleansChild(t *testing.T) {
 	child := newFakeChildProcess()
-	client := &stoppingDescendant{process: child}
+	client := &stoppingDescendant{fakeDescendantClient: fakeDescendantClient{snapshot: directChildSnapshot("child-cancel")}, process: child}
 	node := childCreationNode(t,
 		func(context.Context, process.Bootstrap) (ChildProcess, error) { return child, nil },
 		func(string) (DescendantClient, error) { return client, nil },
@@ -252,7 +258,11 @@ func TestSiblingChildStartupRunsConcurrently(t *testing.T) {
 			processes.Store(bootstrap.SessionID, child)
 			return child, nil
 		},
-		func(string) (DescendantClient, error) { return &fakeDescendantClient{}, nil },
+		func(socket string) (DescendantClient, error) {
+			id := filepath.Base(socket)
+			id = id[:len(id)-len(filepath.Ext(id))]
+			return &fakeDescendantClient{snapshot: directChildSnapshot(id)}, nil
+		},
 	)
 	node.deps.NewSessionID = func() (string, error) { return "child-" + string(rune('0'+sequence.Add(1))), nil }
 	done := make(chan error, 2)
@@ -308,6 +318,191 @@ func TestStopCascadesToDirectChildrenConcurrentlyAndIdempotently(t *testing.T) {
 	}
 	if len(node.children.snapshot()) != 0 {
 		t.Fatal("children remain after cascade")
+	}
+}
+
+func TestCreateChildSuccessWaitsForProcessExitAndRejectsTerminalContractMismatch(t *testing.T) {
+	tests := []struct {
+		name    string
+		message process.ChildMessage
+	}{
+		{name: "kind", message: process.ChildMessage{Type: process.MessageWrite, SessionID: "child-mismatch", Write: &contract.WriteChildResult{Kind: contract.ChildKindWrite, WorkerType: "reviewer", SessionID: "child-mismatch"}}},
+		{name: "worker", message: process.ChildMessage{Type: process.MessageRead, SessionID: "child-mismatch", Read: &contract.ReadChildResult{Kind: contract.ChildKindRead, WorkerType: "other", SessionID: "child-mismatch", Output: "wrong worker"}}},
+	}
+	for _, test := range tests {
+		t.Run(test.name, func(t *testing.T) {
+			child := newFakeChildProcess()
+			child.messages <- test.message
+			client := &fakeDescendantClient{snapshot: directChildSnapshot("child-mismatch")}
+			node := childCreationNode(t,
+				func(context.Context, process.Bootstrap) (ChildProcess, error) { return child, nil },
+				func(string) (DescendantClient, error) { return client, nil },
+			)
+			node.deps.NewSessionID = func() (string, error) { return "child-mismatch", nil }
+
+			returned := make(chan struct {
+				result TerminalResult
+				err    error
+			}, 1)
+			go func() {
+				result, err := node.CreateChild(context.Background(), "root-1", readRequest())
+				returned <- struct {
+					result TerminalResult
+					err    error
+				}{result, err}
+			}()
+			select {
+			case <-returned:
+				t.Fatal("CreateChild returned before mismatched child process exited")
+			case <-time.After(25 * time.Millisecond):
+			}
+			child.finish()
+			got := <-returned
+			var typed *contract.Error
+			if !errors.As(got.err, &typed) || typed.Code != contract.ErrorChildFailed {
+				t.Fatalf("error = %v, want typed child_failed", got.err)
+			}
+			if got.result.Read != nil || got.result.Write != nil {
+				t.Fatalf("mismatched terminal result leaked as success: %#v", got.result)
+			}
+			if node.children.get("child-mismatch") != nil {
+				t.Fatal("mismatched child remains registered after return")
+			}
+		})
+	}
+}
+
+func TestCreateChildValidatesInstalledDescendantIdentityBeforeReadiness(t *testing.T) {
+	for _, test := range []struct {
+		name string
+		edit func(*NodeSnapshot)
+	}{
+		{name: "stale session", edit: func(snapshot *NodeSnapshot) { snapshot.SessionID = "old-child" }},
+		{name: "wrong parent", edit: func(snapshot *NodeSnapshot) { snapshot.ParentSessionID = "other-parent" }},
+		{name: "wrong root", edit: func(snapshot *NodeSnapshot) { snapshot.RootSessionID = "other-root" }},
+	} {
+		t.Run(test.name, func(t *testing.T) {
+			child := newFakeChildProcess()
+			snapshot := directChildSnapshot("child-identity")
+			test.edit(&snapshot)
+			client := &stoppingDescendant{fakeDescendantClient: fakeDescendantClient{snapshot: snapshot}, process: child}
+			node := childCreationNode(t,
+				func(context.Context, process.Bootstrap) (ChildProcess, error) { return child, nil },
+				func(string) (DescendantClient, error) { return client, nil },
+			)
+			node.deps.NewSessionID = func() (string, error) { return "child-identity", nil }
+			_, err := node.CreateChild(context.Background(), "root-1", readRequest())
+			var typed *contract.Error
+			if !errors.As(err, &typed) || typed.Code != contract.ErrorChildFailed {
+				t.Fatalf("error = %v, want typed child_failed", err)
+			}
+			if node.children.get("child-identity") != nil {
+				t.Fatal("identity-mismatched descendant was installed")
+			}
+		})
+	}
+}
+
+func TestCleanupChildNeverUnlinksChildOwnedReplacementSocket(t *testing.T) {
+	path := filepath.Join(t.TempDir(), "child.sock")
+	replacement, err := net.Listen("unix", path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer replacement.Close()
+	child := newFakeChildProcess()
+	child.finish()
+	node := childCreationNode(t, nil, nil)
+	entry := &childEntry{id: "child-replaced", socket: path, process: child}
+	if err := node.children.add(entry); err != nil {
+		t.Fatal(err)
+	}
+	if err := node.cleanupChild(context.Background(), entry, false); err != nil {
+		t.Fatalf("cleanupChild() error = %v", err)
+	}
+	connection, err := net.Dial("unix", path)
+	if err != nil {
+		t.Fatalf("replacement socket was parent-unlinked: %v", err)
+	}
+	_ = connection.Close()
+}
+
+type deadlineDescendant struct{ deadlineSeen atomic.Bool }
+
+func (client *deadlineDescendant) Snapshot(context.Context) (NodeSnapshot, error) {
+	return NodeSnapshot{}, nil
+}
+func (client *deadlineDescendant) Subscribe(context.Context) (Subscription, error) {
+	return Subscription{}, nil
+}
+func (client *deadlineDescendant) CallRPC(context.Context, string, json.RawMessage) (json.RawMessage, error) {
+	return nil, nil
+}
+func (client *deadlineDescendant) AnswerQuestion(context.Context, string, string, json.RawMessage) error {
+	return nil
+}
+func (client *deadlineDescendant) Stop(ctx context.Context, _ string) error {
+	_, hasDeadline := ctx.Deadline()
+	client.deadlineSeen.Store(hasDeadline)
+	<-ctx.Done()
+	return ctx.Err()
+}
+
+type escalatingChildProcess struct {
+	done       chan struct{}
+	closeOnce  sync.Once
+	terminated atomic.Int32
+	killed     atomic.Int32
+}
+
+func newEscalatingChildProcess() *escalatingChildProcess {
+	return &escalatingChildProcess{done: make(chan struct{})}
+}
+func (*escalatingChildProcess) WaitReady(context.Context) error { return nil }
+func (*escalatingChildProcess) NextMessage(context.Context) (process.ChildMessage, error) {
+	return process.ChildMessage{}, io.EOF
+}
+func (*escalatingChildProcess) CloseLiveness() error        { return nil }
+func (*escalatingChildProcess) CloseReports() error         { return nil }
+func (child *escalatingChildProcess) Done() <-chan struct{} { return child.done }
+func (child *escalatingChildProcess) Wait() error           { <-child.done; return nil }
+func (child *escalatingChildProcess) Terminate() error      { child.terminated.Add(1); return nil }
+func (child *escalatingChildProcess) Kill() error {
+	child.killed.Add(1)
+	child.closeOnce.Do(func() { close(child.done) })
+	return nil
+}
+
+func TestUnexpectedFinishUsesDetachedDeadlineAndEscalatesHangingDescendant(t *testing.T) {
+	node := childCreationNode(t, nil, nil)
+	node.resources = nil
+	node.deps.ChildStopTimeout = 30 * time.Millisecond
+	listenerCalled := atomic.Bool{}
+	node.deps.CloseListener = func(context.Context) error { listenerCalled.Store(true); return nil }
+	client := &deadlineDescendant{}
+	child := newEscalatingChildProcess()
+	if err := node.children.add(&childEntry{id: "child-hanging", client: client, process: child}); err != nil {
+		t.Fatal(err)
+	}
+
+	started := time.Now()
+	node.finish(context.Background(), io.EOF, LifecycleFailed, false)
+	if elapsed := time.Since(started); elapsed > time.Second {
+		t.Fatalf("unexpected finish took %s, want bounded cleanup", elapsed)
+	}
+	if !client.deadlineSeen.Load() {
+		t.Fatal("unexpected descendant Stop did not receive a bounded cleanup context")
+	}
+	if child.terminated.Load() != 1 || child.killed.Load() != 1 {
+		t.Fatalf("escalation TERM=%d KILL=%d, want 1 each", child.terminated.Load(), child.killed.Load())
+	}
+	if !listenerCalled.Load() {
+		t.Fatal("own listener cleanup was skipped after descendant escalation")
+	}
+	select {
+	case <-node.Done():
+	default:
+		t.Fatal("Node.Done remains open after bounded unexpected cleanup")
 	}
 }
 

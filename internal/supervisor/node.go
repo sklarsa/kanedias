@@ -282,6 +282,18 @@ func (node *Node) CreateChild(ctx context.Context, parent string, request contra
 	if err != nil {
 		return TerminalResult{}, node.failChildCreation(ctx, entry, childUnavailable(childID, err))
 	}
+	snapshot, err := client.Snapshot(ctx)
+	if err == nil {
+		err = validateDirectChildSnapshot(snapshot, childID, identity.SessionID, identity.RootID)
+	}
+	if err != nil {
+		var closeErr error
+		if closer, ok := client.(descendantCloser); ok {
+			closeErr = closer.Close()
+		}
+		identityErr := errors.Join(contract.NewError(contract.ErrorChildFailed, "child supervisor socket identity does not match admission"), err, closeErr)
+		return TerminalResult{}, node.failChildCreation(ctx, entry, identityErr)
+	}
 	entry.setClient(client)
 	node.startChildEventForwarder(entry)
 
@@ -296,9 +308,21 @@ func (node *Node) CreateChild(ctx context.Context, parent string, request contra
 	var terminalErr error
 	switch message.Type {
 	case process.MessageRead:
-		result.Read = message.Read
+		if request.Kind != contract.ChildKindRead {
+			terminalErr = contract.NewError(contract.ErrorChildFailed, "child terminal report kind does not match admitted request")
+		} else if message.Read.WorkerType != request.WorkerType {
+			terminalErr = contract.NewError(contract.ErrorChildFailed, "child terminal report worker does not match admitted worker")
+		} else {
+			result.Read = message.Read
+		}
 	case process.MessageWrite:
-		result.Write = message.Write
+		if request.Kind != contract.ChildKindWrite {
+			terminalErr = contract.NewError(contract.ErrorChildFailed, "child terminal report kind does not match admitted request")
+		} else if message.Write.WorkerType != request.WorkerType {
+			terminalErr = contract.NewError(contract.ErrorChildFailed, "child terminal report worker does not match admitted worker")
+		} else {
+			result.Write = message.Write
+		}
 	case process.MessageFailure:
 		terminalErr = contract.NewError(message.Error.Code, message.Error.Message)
 	default:
@@ -317,6 +341,19 @@ func (node *Node) CreateChild(ctx context.Context, parent string, request contra
 	case <-ctx.Done():
 		return TerminalResult{}, node.failChildCreation(ctx, entry, ctx.Err())
 	}
+}
+
+func validateDirectChildSnapshot(snapshot NodeSnapshot, childID, parentID, rootID string) error {
+	if snapshot.SessionID != childID {
+		return fmt.Errorf("child tree session ID %q does not match admitted child %q", snapshot.SessionID, childID)
+	}
+	if snapshot.ParentSessionID != parentID {
+		return fmt.Errorf("child tree parent ID %q does not match direct parent %q", snapshot.ParentSessionID, parentID)
+	}
+	if snapshot.RootSessionID != rootID {
+		return fmt.Errorf("child tree root ID %q does not match admitted root %q", snapshot.RootSessionID, rootID)
+	}
+	return nil
 }
 
 func (node *Node) failChildCreation(requestCtx context.Context, entry *childEntry, primary error) error {
@@ -453,6 +490,11 @@ func (node *Node) markStartupDone() {
 
 func (node *Node) finish(ctx context.Context, primary error, terminal LifecycleState, closeRPC bool) {
 	node.finishOnce.Do(func() {
+		// Every finish trigger, including unexpected transport/identity failure,
+		// receives a detached deadline before any descendant HTTP can run.
+		cleanupCtx, cancel := context.WithTimeout(context.WithoutCancel(ctx), node.childStopTimeout())
+		defer cancel()
+
 		// Closing admission precedes the child snapshot. The registry itself is
 		// never held while child HTTP, process waits, or cleanup runs.
 		node.mu.Lock()
@@ -463,7 +505,7 @@ func (node *Node) finish(ctx context.Context, primary error, terminal LifecycleS
 
 		var cleanupErr error
 		if node.children != nil {
-			cleanupErr = errors.Join(cleanupErr, node.stopChildren(ctx))
+			cleanupErr = errors.Join(cleanupErr, node.stopChildren(cleanupCtx))
 		}
 		if local != nil {
 			if closeRPC {
@@ -474,10 +516,13 @@ func (node *Node) finish(ctx context.Context, primary error, terminal LifecycleS
 			}
 		}
 		if resources != nil {
-			cleanupErr = errors.Join(cleanupErr, node.deps.Provisioner.Destroy(ctx, resources))
+			cleanupErr = errors.Join(cleanupErr, node.deps.Provisioner.Destroy(cleanupCtx, resources))
+		}
+		if node.broker != nil {
+			node.broker.Close()
 		}
 		if node.deps.CloseListener != nil {
-			cleanupErr = errors.Join(cleanupErr, node.deps.CloseListener(ctx))
+			cleanupErr = errors.Join(cleanupErr, node.deps.CloseListener(cleanupCtx))
 		}
 
 		node.mu.Lock()

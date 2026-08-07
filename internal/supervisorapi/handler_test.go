@@ -372,6 +372,48 @@ func TestDescendantClientUsesUnixAPIForSnapshotEventsAndRouting(t *testing.T) {
 	}
 }
 
+func TestActiveParentToChildSSEBrokerCloseAllowsPromptCleanUnixShutdown(t *testing.T) {
+	path := filepath.Join(t.TempDir(), "child.sock")
+	broker := supervisor.NewEventBroker()
+	broker.PublishLocal("child", "pi", json.RawMessage(`{"type":"ready"}`))
+	subscription := broker.Subscribe()
+	service := &fakeService{sub: subscription}
+	ctx, cancel := context.WithCancel(context.Background())
+	serverDone := make(chan error, 1)
+	go func() { serverDone <- ServeUnix(ctx, path, NewHandler(service)) }()
+	waitForSocket(t, path)
+
+	seam, err := NewDescendantClient(path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	parentStream, err := seam.Subscribe(context.Background())
+	if err != nil {
+		t.Fatal(err)
+	}
+	select {
+	case <-parentStream.Events:
+	case <-time.After(time.Second):
+		t.Fatal("active parent-to-child SSE stream was not established")
+	}
+
+	started := time.Now()
+	broker.Close()
+	cancel()
+	select {
+	case err := <-serverDone:
+		if err != nil {
+			t.Fatalf("successful child shutdown was downgraded by listener cleanup: %v", err)
+		}
+	case <-time.After(time.Second):
+		t.Fatal("active SSE forced listener shutdown toward its 5s timeout")
+	}
+	if elapsed := time.Since(started); elapsed > time.Second {
+		t.Fatalf("active SSE shutdown took %s", elapsed)
+	}
+	parentStream.Close()
+}
+
 func TestDescendantClientMapsSocketFailureToGatewayError(t *testing.T) {
 	seam, err := NewDescendantClient(filepath.Join(t.TempDir(), "missing.sock"))
 	if err != nil {
@@ -415,6 +457,32 @@ func TestServeUnixModeAndUnlinkOnShutdown(t *testing.T) {
 	if _, err := os.Lstat(path); !errors.Is(err, os.ErrNotExist) {
 		t.Fatalf("socket remains after shutdown: %v", err)
 	}
+}
+
+func TestServeUnixIdentityCheckedShutdownNeverUnlinksReplacementSocket(t *testing.T) {
+	path := filepath.Join(t.TempDir(), "api.sock")
+	ctx, cancel := context.WithCancel(context.Background())
+	result := make(chan error, 1)
+	go func() { result <- ServeUnix(ctx, path, http.NotFoundHandler()) }()
+	waitForSocket(t, path)
+	if err := os.Remove(path); err != nil {
+		t.Fatal(err)
+	}
+	replacement, err := net.Listen("unix", path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer replacement.Close()
+
+	cancel()
+	if err := <-result; err == nil || !strings.Contains(err.Error(), "refuse unlink of replaced Unix socket") {
+		t.Fatalf("ServeUnix() error = %v, want replacement identity refusal", err)
+	}
+	connection, err := net.Dial("unix", path)
+	if err != nil {
+		t.Fatalf("replacement socket was unlinked: %v", err)
+	}
+	_ = connection.Close()
 }
 
 func TestServeUnixRefusesSymlink(t *testing.T) {

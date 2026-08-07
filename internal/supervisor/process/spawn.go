@@ -4,6 +4,7 @@ import (
 	"bufio"
 	"bytes"
 	"context"
+	"encoding/json"
 	"errors"
 	"fmt"
 	"io"
@@ -209,7 +210,7 @@ func (child *Child) WaitReady(ctx context.Context) error {
 		if message.Ready.SocketPath != child.bootstrap.SocketPath {
 			return fmt.Errorf("child ready socket %q does not match bootstrap %q", message.Ready.SocketPath, child.bootstrap.SocketPath)
 		}
-		return probeTree(ctx, message.Ready.SocketPath, child.probeInterval)
+		return probeTree(ctx, message.Ready.SocketPath, child.bootstrap, child.probeInterval)
 	}
 }
 
@@ -289,7 +290,7 @@ func (child *Child) Kill() error {
 	return errors.Join(err, child.CloseReports())
 }
 
-func probeTree(ctx context.Context, socketPath string, interval time.Duration) error {
+func probeTree(ctx context.Context, socketPath string, expected Bootstrap, interval time.Duration) error {
 	transport := &http.Transport{
 		Proxy: nil,
 		DialContext: func(ctx context.Context, _, _ string) (net.Conn, error) {
@@ -306,12 +307,29 @@ func probeTree(ctx context.Context, socketPath string, interval time.Duration) e
 		}
 		response, err := client.Do(request)
 		if err == nil {
-			_, _ = io.Copy(io.Discard, io.LimitReader(response.Body, MaxRecordBytes+1))
+			body, readErr := io.ReadAll(io.LimitReader(response.Body, MaxRecordBytes+1))
 			closeErr := response.Body.Close()
-			if response.StatusCode == http.StatusOK && closeErr == nil {
-				return nil
+			switch {
+			case response.StatusCode != http.StatusOK:
+				lastErr = fmt.Errorf("GET /v1/tree returned %s", response.Status)
+			case readErr != nil || closeErr != nil:
+				lastErr = fmt.Errorf("read GET /v1/tree response: %w", errors.Join(readErr, closeErr))
+			case len(body) > MaxRecordBytes:
+				lastErr = ErrRecordTooLarge
+			default:
+				var identity struct {
+					SessionID       string `json:"sessionId"`
+					ParentSessionID string `json:"parentSessionId"`
+					RootSessionID   string `json:"rootSessionId"`
+				}
+				if decodeErr := json.Unmarshal(body, &identity); decodeErr != nil {
+					lastErr = fmt.Errorf("decode GET /v1/tree response: %w", decodeErr)
+				} else if identity.SessionID != expected.SessionID || identity.ParentSessionID != expected.ParentID || identity.RootSessionID != expected.RootID {
+					lastErr = fmt.Errorf("GET /v1/tree identity (%q, %q, %q) does not match child bootstrap (%q, %q, %q)", identity.SessionID, identity.ParentSessionID, identity.RootSessionID, expected.SessionID, expected.ParentID, expected.RootID)
+				} else {
+					return nil
+				}
 			}
-			lastErr = fmt.Errorf("GET /v1/tree returned %s", response.Status)
 		} else {
 			lastErr = err
 		}

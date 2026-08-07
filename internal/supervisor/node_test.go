@@ -331,6 +331,8 @@ func TestRootNodeWaitsForBufferedPiEventsBeforeDoneAndCleanup(t *testing.T) {
 		t.Fatal(err)
 	}
 
+	sub := broker.Subscribe()
+	defer sub.Close()
 	broker.mu.Lock()
 	writeDone := make(chan struct{})
 	go func() {
@@ -351,10 +353,13 @@ func TestRootNodeWaitsForBufferedPiEventsBeforeDoneAndCleanup(t *testing.T) {
 	case <-time.After(time.Second):
 		t.Fatal("Node.Done did not close after event drain")
 	}
-	sub := broker.Subscribe()
-	defer sub.Close()
-	if len(sub.Replay) != 1 || !strings.Contains(string(sub.Replay[0].Payload), `"final":true`) {
-		t.Fatalf("final replay = %#v", sub.Replay)
+	select {
+	case event := <-sub.Events:
+		if !strings.Contains(string(event.Payload), `"final":true`) {
+			t.Fatalf("final event = %#v", event)
+		}
+	case <-time.After(time.Second):
+		t.Fatal("final buffered event was not delivered before broker close")
 	}
 	if fake.destroyed != 1 {
 		t.Fatalf("Destroy called %d times", fake.destroyed)
@@ -406,6 +411,42 @@ func TestRootNodeStopIsIdempotentAndClosesPiBeforeDestroy(t *testing.T) {
 	if listenerCalls != 1 || strings.Join(order, ",") != "destroy,listener" {
 		t.Fatalf("shutdown order=%v listener calls=%d", order, listenerCalls)
 	}
+}
+
+func TestRootNodeClosesBrokerBeforeListenerCancellationAndWait(t *testing.T) {
+	path, _ := boundSocket(t)
+	fake := &fakeRootProvisioner{}
+	broker := NewEventBroker()
+	subscription := broker.Subscribe()
+	listenerCalled := atomic.Bool{}
+	node, err := NewRoot(testRootIdentity(t), Dependencies{
+		Provisioner: fake,
+		SocketPath:  path,
+		DialRPC:     func(context.Context, string) (io.ReadWriteCloser, error) { return nil, errors.New("unused") },
+		Workers:     fakeWorkers{},
+		CloseListener: func(context.Context) error {
+			listenerCalled.Store(true)
+			select {
+			case _, open := <-subscription.Events:
+				if open {
+					return errors.New("broker subscriber remained open")
+				}
+				return nil
+			case <-time.After(100 * time.Millisecond):
+				return errors.New("listener waited for active broker subscriber")
+			}
+		},
+	}, broker)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := node.Stop(context.Background(), StopReasonRequested); err != nil {
+		t.Fatalf("Stop() error = %v", err)
+	}
+	if !listenerCalled.Load() {
+		t.Fatal("listener hook was not called")
+	}
+	subscription.Close()
 }
 
 func TestNewRootRequiresListenerLifecycleHook(t *testing.T) {

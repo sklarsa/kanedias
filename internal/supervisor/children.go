@@ -5,7 +5,6 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
-	"os"
 	"sort"
 	"sync"
 	"time"
@@ -240,11 +239,6 @@ func (node *Node) cleanupChild(ctx context.Context, entry *childEntry, requestSt
 		}
 		if closer, ok := client.(descendantCloser); ok {
 			cleanupErr = errors.Join(cleanupErr, closer.Close())
-		}
-		if entry.socket != "" {
-			if err := os.Remove(entry.socket); err != nil && !errors.Is(err, os.ErrNotExist) {
-				cleanupErr = errors.Join(cleanupErr, fmt.Errorf("remove child socket %q: %w", entry.socket, err))
-			}
 		}
 		node.children.remove(entry.id, entry)
 		entry.cleanupErr = cleanupErr

@@ -34,6 +34,7 @@ type EventBroker struct {
 	sourceSeq map[string]uint64
 	nextSubID uint64
 	subs      map[uint64]*eventMailbox
+	closed    bool
 }
 
 type eventMailbox struct {
@@ -72,6 +73,10 @@ func (broker *EventBroker) PublishLocal(sessionID, kind string, payload json.Raw
 
 	event := EventEnvelope{SessionID: sessionID, Kind: kind, Payload: cloneRaw(payload)}
 	broker.mu.Lock()
+	if broker.closed {
+		broker.mu.Unlock()
+		return cloneEnvelope(event)
+	}
 	broker.sourceSeq[sessionID]++
 	event.SourceSeq = broker.sourceSeq[sessionID]
 	event = broker.retainLocked(event)
@@ -93,6 +98,10 @@ func (broker *EventBroker) Forward(source EventEnvelope) EventEnvelope {
 		Payload:   cloneRaw(source.Payload),
 	}
 	broker.mu.Lock()
+	if broker.closed {
+		broker.mu.Unlock()
+		return cloneEnvelope(event)
+	}
 	event = broker.retainLocked(event)
 	subscribers := broker.subscribersLocked()
 	broker.mu.Unlock()
@@ -106,6 +115,13 @@ func (broker *EventBroker) Subscribe() Subscription {
 	// lock across payload cloning or mailbox delivery.
 	broker.publishMu.Lock()
 	broker.mu.Lock()
+	if broker.closed {
+		broker.mu.Unlock()
+		broker.publishMu.Unlock()
+		events := make(chan EventEnvelope)
+		close(events)
+		return Subscription{Replay: []EventEnvelope{}, Events: events, Close: func() {}}
+	}
 	replaySnapshot := append([]EventEnvelope(nil), broker.ring...)
 	broker.nextSubID++
 	id := broker.nextSubID
@@ -124,6 +140,30 @@ func (broker *EventBroker) Subscribe() Subscription {
 				broker.removeSubscriber(id, mailbox)
 			})
 		},
+	}
+}
+
+// Close terminates every active subscription and permanently rejects new
+// subscriptions. It is safe to call concurrently and more than once.
+func (broker *EventBroker) Close() {
+	broker.publishMu.Lock()
+	broker.mu.Lock()
+	if broker.closed {
+		broker.mu.Unlock()
+		broker.publishMu.Unlock()
+		return
+	}
+	broker.closed = true
+	mailboxes := make([]*eventMailbox, 0, len(broker.subs))
+	for _, mailbox := range broker.subs {
+		mailboxes = append(mailboxes, mailbox)
+	}
+	clear(broker.subs)
+	broker.mu.Unlock()
+	broker.publishMu.Unlock()
+
+	for _, mailbox := range mailboxes {
+		mailbox.close()
 	}
 }
 

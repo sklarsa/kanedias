@@ -6,13 +6,18 @@ import (
 	"errors"
 	"io"
 	"os"
+	"os/exec"
+	"path/filepath"
 	"reflect"
 	"strings"
+	"syscall"
 	"testing"
+	"time"
 
 	"github.com/sklarsa/kanedias/internal/config"
 	"github.com/sklarsa/kanedias/internal/proxy"
 	"github.com/sklarsa/kanedias/internal/server"
+	"github.com/sklarsa/kanedias/internal/supervisor/contract"
 	"github.com/sklarsa/kanedias/internal/supervisor/process"
 	"github.com/spf13/cobra"
 	"github.com/spf13/pflag"
@@ -144,6 +149,69 @@ func TestSessionChildCommandIsHiddenAndUsesFixedDescriptorFlags(t *testing.T) {
 	if err := root.Execute(); err == nil || !strings.Contains(err.Error(), "fixed descriptors") {
 		t.Fatalf("remapped descriptor error = %v", err)
 	}
+}
+
+func TestHiddenSessionChildMarksProtocolDescriptorsCloseOnExec(t *testing.T) {
+	if os.Getenv("KANEDIAS_CLOEXEC_HELPER") == "1" {
+		service := stubServices()
+		service.runSessionChild = func(context.Context, process.Bootstrap, *process.Reporter) error {
+			return syscall.Exec("/bin/sh", []string{"sh", "-c", `for fd in 3 4 5; do [ ! -e /proc/self/fd/$fd ] || exit $fd; done`}, os.Environ())
+		}
+		root := newRootCommand(service, testProxyOptions())
+		root.SetArgs([]string{"session-child", "--bootstrap-fd", "3", "--liveness-fd", "4", "--report-fd", "5"})
+		if err := root.Execute(); err != nil {
+			t.Fatal(err)
+		}
+		return
+	}
+
+	bootstrapRead, bootstrapWrite, err := os.Pipe()
+	if err != nil {
+		t.Fatal(err)
+	}
+	livenessRead, livenessWrite, err := os.Pipe()
+	if err != nil {
+		t.Fatal(err)
+	}
+	reportRead, reportWrite, err := os.Pipe()
+	if err != nil {
+		t.Fatal(err)
+	}
+	bootstrap := process.Bootstrap{
+		SessionID: "child-1", ParentID: "parent-1", RootID: "root-1",
+		SocketPath: filepath.Join(t.TempDir(), "child.sock"), SourceInstance: "instance", SourceVolume: "volume",
+		Worker:  config.WorkerProfile{Description: "review", Provider: "provider", Model: "model"},
+		Request: contract.CreateChildRequest{WorkerType: "reviewer", Kind: contract.ChildKindRead, Context: contract.ContextFresh, Task: "review"},
+	}
+	command := exec.Command(os.Args[0], "-test.run=TestHiddenSessionChildMarksProtocolDescriptorsCloseOnExec", "--")
+	command.Env = append(os.Environ(), "KANEDIAS_CLOEXEC_HELPER=1")
+	command.ExtraFiles = []*os.File{bootstrapRead, livenessRead, reportWrite}
+	var stderr bytes.Buffer
+	command.Stderr = &stderr
+	if err := command.Start(); err != nil {
+		t.Fatal(err)
+	}
+	_ = bootstrapRead.Close()
+	_ = livenessRead.Close()
+	_ = reportWrite.Close()
+	if err := process.EncodeBootstrap(bootstrapWrite, bootstrap); err != nil {
+		t.Fatal(err)
+	}
+	_ = bootstrapWrite.Close()
+
+	done := make(chan error, 1)
+	go func() { done <- command.Wait() }()
+	select {
+	case err := <-done:
+		if err != nil {
+			t.Fatalf("hidden command CLOEXEC helper: %v: %s", err, stderr.String())
+		}
+	case <-time.After(3 * time.Second):
+		_ = command.Process.Kill()
+		t.Fatal("hidden command did not exec descriptor-check helper")
+	}
+	_ = livenessWrite.Close()
+	_ = reportRead.Close()
 }
 
 func TestSessionReadsPromptFromStdinAndDelegates(t *testing.T) {

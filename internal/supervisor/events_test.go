@@ -310,3 +310,70 @@ func TestEventBrokerNeverBlocksPublisherOnUnreadSubscriber(t *testing.T) {
 		t.Fatal("publishing 10,000 events blocked on unread subscriber")
 	}
 }
+
+func TestEventBrokerCloseIsSafeWithConcurrentPublishAndSubscribe(t *testing.T) {
+	broker := newEventBroker(128, 128)
+	start := make(chan struct{})
+	var group sync.WaitGroup
+	for range 128 {
+		group.Add(2)
+		go func() {
+			defer group.Done()
+			<-start
+			broker.PublishLocal("root", "pi", json.RawMessage(`{}`))
+		}()
+		go func() {
+			defer group.Done()
+			<-start
+			subscription := broker.Subscribe()
+			subscription.Close()
+		}()
+	}
+	group.Add(2)
+	go func() { defer group.Done(); <-start; broker.Close() }()
+	go func() { defer group.Done(); <-start; broker.Close() }()
+	close(start)
+	group.Wait()
+
+	rejected := broker.Subscribe()
+	select {
+	case _, open := <-rejected.Events:
+		if open {
+			t.Fatal("concurrent broker close admitted a final subscriber")
+		}
+	case <-time.After(time.Second):
+		t.Fatal("concurrent broker close left final subscriber open")
+	}
+}
+
+func TestEventBrokerCloseIsIdempotentClosesSubscribersAndRejectsNewOnes(t *testing.T) {
+	broker := newEventBroker(8, 2)
+	existing := broker.Subscribe()
+
+	broker.Close()
+	broker.Close()
+
+	select {
+	case _, open := <-existing.Events:
+		if open {
+			t.Fatal("existing subscription remained open after broker close")
+		}
+	case <-time.After(time.Second):
+		t.Fatal("broker close did not close existing subscriber mailbox")
+	}
+
+	rejected := broker.Subscribe()
+	if len(rejected.Replay) != 0 {
+		t.Fatalf("closed broker replay = %#v, want none", rejected.Replay)
+	}
+	select {
+	case _, open := <-rejected.Events:
+		if open {
+			t.Fatal("closed broker admitted a new subscription")
+		}
+	case <-time.After(time.Second):
+		t.Fatal("subscription to closed broker was not rejected promptly")
+	}
+	existing.Close()
+	rejected.Close()
+}
