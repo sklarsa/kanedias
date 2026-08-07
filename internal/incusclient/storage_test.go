@@ -4,7 +4,9 @@ import (
 	"context"
 	"errors"
 	"reflect"
+	"strings"
 	"testing"
+	"time"
 
 	incus "github.com/lxc/incus/v7/client"
 	"github.com/lxc/incus/v7/shared/api"
@@ -43,6 +45,36 @@ func (s *storageAdapterServer) UpdateStoragePoolVolume(pool, volumeType, name st
 	s.updatedPut = put
 	s.updatedETag = etag
 	return nil
+}
+
+type fakeStoragePoolGetter struct {
+	name string
+	pool *api.StoragePool
+	err  error
+}
+
+func (f *fakeStoragePoolGetter) GetStoragePool(name string) (*api.StoragePool, string, error) {
+	f.name = name
+	return f.pool, "etag", f.err
+}
+
+func TestGetStoragePool(t *testing.T) {
+	fake := &fakeStoragePoolGetter{pool: &api.StoragePool{Name: "pool1", Driver: "btrfs"}}
+	pool, err := getStoragePool(fake, "pool1")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if fake.name != "pool1" || pool.Driver != "btrfs" {
+		t.Fatalf("GetStoragePool() = %#v after name %q", pool, fake.name)
+	}
+}
+
+func TestGetStoragePoolWrapsError(t *testing.T) {
+	sentinel := errors.New("storage unavailable")
+	_, err := getStoragePool(&fakeStoragePoolGetter{err: sentinel}, "pool1")
+	if !errors.Is(err, sentinel) || !strings.Contains(err.Error(), `storage pool "pool1"`) {
+		t.Fatalf("getStoragePool() error = %v", err)
+	}
 }
 
 func TestGetStoragePoolUsesRequestContext(t *testing.T) {
@@ -111,11 +143,13 @@ func (o *fakeRemoteOperation) CancelTarget() error {
 	return o.cancelErr
 }
 
-func TestRemoteVolumeWaitCancelsTargetWithContext(t *testing.T) {
+func TestRemoteVolumeWaitCancelsTargetButWaitsForTerminalResult(t *testing.T) {
+	waitErr := errors.New("remote operation cancelled")
 	op := &fakeRemoteOperation{
 		waitStarted: make(chan struct{}),
 		waitRelease: make(chan struct{}),
 		cancelled:   make(chan struct{}),
+		waitErr:     waitErr,
 	}
 	ctx, cancel := context.WithCancel(context.Background())
 	done := make(chan error, 1)
@@ -123,13 +157,19 @@ func TestRemoteVolumeWaitCancelsTargetWithContext(t *testing.T) {
 	<-op.waitStarted
 	cancel()
 
-	if err := <-done; !errors.Is(err, context.Canceled) {
-		t.Fatalf("waitRemoteOperation() error = %v, want context.Canceled", err)
-	}
 	select {
 	case <-op.cancelled:
-	default:
+	case <-time.After(time.Second):
 		t.Fatal("CancelTarget was not called")
 	}
+	select {
+	case err := <-done:
+		t.Fatalf("waitRemoteOperation returned before the remote operation was terminal: %v", err)
+	default:
+	}
+
 	close(op.waitRelease)
+	if err := <-done; !errors.Is(err, context.Canceled) || !errors.Is(err, waitErr) {
+		t.Fatalf("waitRemoteOperation() error = %v, want context.Canceled joined with remote wait error", err)
+	}
 }

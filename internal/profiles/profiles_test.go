@@ -41,6 +41,16 @@ func TestRenderSandboxUsesLifecycleDevicesAndDefaultProxyCA(t *testing.T) {
 	}
 
 	rendered := output.String()
+	for _, want := range []string{
+		`  security.nesting: "true"`,
+		`  security.privileged: "false"`,
+		`  security.syscalls.intercept.mknod: "true"`,
+		`  security.syscalls.intercept.setxattr: "true"`,
+	} {
+		if !strings.Contains(rendered, want) {
+			t.Errorf("rendered sandbox missing %q", want)
+		}
+	}
 	if want := "  eth0:\n    name: eth0\n    network: kanedias\n    type: nic\n"; !strings.Contains(rendered, want) {
 		t.Errorf("rendered sandbox missing managed NIC:\n%s", want)
 	}

@@ -10,12 +10,20 @@ import (
 
 const customVolumeType = "custom"
 
-func (c *Client) GetStoragePool(ctx context.Context, name string) (*api.StoragePool, error) {
-	pool, _, err := c.server.WithContext(ctx).GetStoragePool(name)
+type storagePoolGetter interface {
+	GetStoragePool(string) (*api.StoragePool, string, error)
+}
+
+func getStoragePool(server storagePoolGetter, name string) (*api.StoragePool, error) {
+	pool, _, err := server.GetStoragePool(name)
 	if err != nil {
 		return nil, fmt.Errorf("get Incus storage pool %q: %w", name, err)
 	}
 	return pool, nil
+}
+
+func (c *Client) GetStoragePool(ctx context.Context, name string) (*api.StoragePool, error) {
+	return getStoragePool(c.server.WithContext(ctx), name)
 }
 
 func (c *Client) GetStorageVolume(ctx context.Context, pool, name string) (*api.StorageVolume, error) {
@@ -54,6 +62,14 @@ func (c *Client) CreateStorageVolume(ctx context.Context, pool, name string) err
 	return nil
 }
 
+func (c *Client) DeleteStorageVolume(ctx context.Context, pool, name string) error {
+	server := c.server.WithContext(ctx)
+	if err := server.DeleteStoragePoolVolume(pool, customVolumeType, name); err != nil && !IsNotFound(err) {
+		return fmt.Errorf("delete Incus storage volume %q in pool %q: %w", name, pool, err)
+	}
+	return nil
+}
+
 func (c *Client) CopyStorageVolume(ctx context.Context, pool, source, target string) error {
 	server := c.server.WithContext(ctx)
 	volume, _, err := server.GetStoragePoolVolume(pool, customVolumeType, source)
@@ -67,15 +83,7 @@ func (c *Client) CopyStorageVolume(ctx context.Context, pool, source, target str
 			Mode: "pull",
 		})
 	}); err != nil {
-		return fmt.Errorf("copy Incus storage volume %q to %q: %w", source, target, err)
-	}
-	return nil
-}
-
-func (c *Client) DeleteStorageVolume(ctx context.Context, pool, name string) error {
-	server := c.server.WithContext(ctx)
-	if err := server.DeleteStoragePoolVolume(pool, customVolumeType, name); err != nil {
-		return fmt.Errorf("delete Incus storage volume %q in pool %q: %w", name, pool, err)
+		return fmt.Errorf("copy Incus storage volume %q to %q in pool %q: %w", source, target, pool, err)
 	}
 	return nil
 }
