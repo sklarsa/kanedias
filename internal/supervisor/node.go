@@ -27,18 +27,20 @@ type Node struct {
 	deps     Dependencies
 	broker   *EventBroker
 
-	mu            sync.RWMutex
-	started       bool
-	stopRequested bool
-	startupCancel context.CancelFunc
-	startupDone   chan struct{}
-	local         *LocalSession
-	resources     *provision.Resources
-	state         LifecycleState
+	mu              sync.RWMutex
+	started         bool
+	stopRequested   bool
+	startupCancel   context.CancelFunc
+	startupDone     chan struct{}
+	startupDoneOnce sync.Once
+	local           *LocalSession
+	resources       *provision.Resources
+	state           LifecycleState
 
-	finishOnce sync.Once
-	finishErr  error
-	done       chan struct{}
+	stopFinalizerOnce sync.Once
+	finishOnce        sync.Once
+	finishErr         error
+	done              chan struct{}
 }
 
 func NewRoot(identity Identity, deps Dependencies, broker *EventBroker) (*Node, error) {
@@ -61,7 +63,14 @@ func NewRoot(identity Identity, deps Dependencies, broker *EventBroker) (*Node, 
 	if broker == nil {
 		broker = NewEventBroker()
 	}
-	return &Node{identity: identity, deps: deps, broker: broker, state: LifecycleProvisioning, done: make(chan struct{})}, nil
+	return &Node{
+		identity:    identity,
+		deps:        deps,
+		broker:      broker,
+		state:       LifecycleProvisioning,
+		startupDone: make(chan struct{}),
+		done:        make(chan struct{}),
+	}, nil
 }
 
 func (node *Node) Start(ctx context.Context) error {
@@ -77,12 +86,10 @@ func (node *Node) Start(ctx context.Context) error {
 	node.started = true
 	startupCtx, cancel := context.WithCancel(ctx)
 	node.startupCancel = cancel
-	node.startupDone = make(chan struct{})
-	startupDone := node.startupDone
 	node.mu.Unlock()
 	defer func() {
 		cancel()
-		close(startupDone)
+		node.markStartupDone()
 	}()
 
 	if err := validateBoundSupervisorSocket(node.deps.SocketPath); err != nil {
@@ -258,9 +265,9 @@ func (node *Node) startupWasStopped() bool {
 	return node.stopRequested
 }
 
-func (node *Node) requestStop() <-chan struct{} {
+func (node *Node) requestStop(ctx context.Context) {
 	node.mu.Lock()
-	defer node.mu.Unlock()
+	firstRequest := !node.stopRequested
 	node.stopRequested = true
 	if node.state != LifecycleStopped && node.state != LifecycleFailed {
 		node.state = LifecycleStopping
@@ -268,7 +275,21 @@ func (node *Node) requestStop() <-chan struct{} {
 	if node.startupCancel != nil {
 		node.startupCancel()
 	}
-	return node.startupDone
+	if !node.started {
+		node.markStartupDone()
+	}
+	node.mu.Unlock()
+
+	if firstRequest {
+		detached := context.WithoutCancel(ctx)
+		node.stopFinalizerOnce.Do(func() {
+			go node.finalizeStop(detached)
+		})
+	}
+}
+
+func (node *Node) markStartupDone() {
+	node.startupDoneOnce.Do(func() { close(node.startupDone) })
 }
 
 func (node *Node) finish(ctx context.Context, primary error, terminal LifecycleState, closeRPC bool) {

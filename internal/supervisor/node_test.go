@@ -21,16 +21,18 @@ import (
 )
 
 type fakeRootProvisioner struct {
-	mu               sync.Mutex
-	calls            int
-	request          provision.RootRequest
-	resources        *provision.Resources
-	provisionErr     error
-	destroyErr       error
-	destroyed        int
-	onDestroy        func()
-	provisionStarted chan struct{}
-	provisionRelease chan struct{}
+	mu                 sync.Mutex
+	calls              int
+	request            provision.RootRequest
+	resources          *provision.Resources
+	provisionErr       error
+	destroyErr         error
+	destroyed          int
+	destroyContextErr  error
+	destroyHasDeadline bool
+	onDestroy          func()
+	provisionStarted   chan struct{}
+	provisionRelease   chan struct{}
 }
 
 func (fake *fakeRootProvisioner) ProvisionRoot(_ context.Context, request provision.RootRequest) (*provision.Resources, error) {
@@ -48,10 +50,12 @@ func (fake *fakeRootProvisioner) ProvisionRoot(_ context.Context, request provis
 	}
 	return resources, err
 }
-func (fake *fakeRootProvisioner) Destroy(context.Context, *provision.Resources) error {
+func (fake *fakeRootProvisioner) Destroy(ctx context.Context, _ *provision.Resources) error {
 	fake.mu.Lock()
 	defer fake.mu.Unlock()
 	fake.destroyed++
+	fake.destroyContextErr = ctx.Err()
+	_, fake.destroyHasDeadline = ctx.Deadline()
 	if fake.onDestroy != nil {
 		fake.onDestroy()
 	}
@@ -455,6 +459,68 @@ func TestRootNodeStopWhileProvisioningDestroysLateResourcesWithoutDialing(t *tes
 	case <-node.Done():
 	default:
 		t.Fatal("Done remains open after joined cleanup")
+	}
+}
+
+func TestRootNodeExpiredStopStillFinalizesLateProvisioning(t *testing.T) {
+	path, _ := boundSocket(t)
+	started := make(chan struct{})
+	release := make(chan struct{})
+	fake := &fakeRootProvisioner{
+		resources:        &provision.Resources{SessionID: "root-1", Instance: "late-instance", Volume: "late-volume", RPCAddr: "rpc"},
+		provisionStarted: started,
+		provisionRelease: release,
+	}
+	var dialed atomic.Bool
+	node, err := NewRoot(testRootIdentity(t), Dependencies{
+		Provisioner: fake, SocketPath: path,
+		DialRPC: func(context.Context, string) (io.ReadWriteCloser, error) {
+			dialed.Store(true)
+			return nil, errors.New("unexpected Pi dial")
+		}, Workers: fakeWorkers{},
+	}, nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	startDone := make(chan error, 1)
+	go func() { startDone <- node.Start(context.Background()) }()
+	<-started
+
+	stopCtx, cancel := context.WithCancel(context.Background())
+	cancel()
+	if err := node.Stop(stopCtx, StopReasonRequested); !errors.Is(err, context.Canceled) {
+		t.Fatalf("Stop() error = %v, want context.Canceled", err)
+	}
+	select {
+	case <-node.Done():
+		t.Fatal("Done closed before late provisioning returned ownership")
+	default:
+	}
+
+	close(release)
+	if err := <-startDone; err == nil {
+		t.Fatal("Start() succeeded after durable stop intent")
+	}
+	select {
+	case <-node.Done():
+	case <-time.After(time.Second):
+		t.Fatal("Done remained open without a second Stop call")
+	}
+
+	fake.mu.Lock()
+	destroyed := fake.destroyed
+	destroyContextErr := fake.destroyContextErr
+	destroyHasDeadline := fake.destroyHasDeadline
+	fake.mu.Unlock()
+	if destroyed != 1 {
+		t.Fatalf("Destroy called %d times, want exactly once", destroyed)
+	}
+	if destroyContextErr != nil || !destroyHasDeadline {
+		t.Fatalf("Destroy context: err=%v deadline=%v, want detached bounded context", destroyContextErr, destroyHasDeadline)
+	}
+	if dialed.Load() {
+		t.Fatal("Pi was dialed after Stop intent")
 	}
 }
 

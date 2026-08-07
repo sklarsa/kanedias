@@ -25,6 +25,7 @@ type Subscription struct {
 }
 
 type EventBroker struct {
+	publishMu sync.Mutex
 	mu        sync.Mutex
 	ring      []EventEnvelope
 	ringCap   int
@@ -39,6 +40,11 @@ type eventMailbox struct {
 	mu     sync.Mutex
 	events chan EventEnvelope
 	closed bool
+}
+
+type eventSubscriber struct {
+	id      uint64
+	mailbox *eventMailbox
 }
 
 func NewEventBroker() *EventBroker {
@@ -61,42 +67,53 @@ func newEventBroker(ringCapacity, mailboxCapacity int) *EventBroker {
 }
 
 func (broker *EventBroker) PublishLocal(sessionID, kind string, payload json.RawMessage) EventEnvelope {
+	broker.publishMu.Lock()
+	defer broker.publishMu.Unlock()
+
+	event := EventEnvelope{SessionID: sessionID, Kind: kind, Payload: cloneRaw(payload)}
 	broker.mu.Lock()
 	broker.sourceSeq[sessionID]++
-	event := EventEnvelope{
-		SessionID: sessionID,
-		SourceSeq: broker.sourceSeq[sessionID],
-		Kind:      kind,
-		Payload:   cloneRaw(payload),
-	}
+	event.SourceSeq = broker.sourceSeq[sessionID]
 	event = broker.retainLocked(event)
-	broker.deliverLocked(event)
+	subscribers := broker.subscribersLocked()
 	broker.mu.Unlock()
+
+	broker.deliver(event, subscribers)
 	return cloneEnvelope(event)
 }
 
 func (broker *EventBroker) Forward(source EventEnvelope) EventEnvelope {
-	broker.mu.Lock()
+	broker.publishMu.Lock()
+	defer broker.publishMu.Unlock()
+
 	event := EventEnvelope{
 		SessionID: source.SessionID,
 		SourceSeq: source.SourceSeq,
 		Kind:      source.Kind,
 		Payload:   cloneRaw(source.Payload),
 	}
+	broker.mu.Lock()
 	event = broker.retainLocked(event)
-	broker.deliverLocked(event)
+	subscribers := broker.subscribersLocked()
 	broker.mu.Unlock()
+
+	broker.deliver(event, subscribers)
 	return cloneEnvelope(event)
 }
 
 func (broker *EventBroker) Subscribe() Subscription {
+	// Serialize the replay/live cut with publication without extending the state
+	// lock across payload cloning or mailbox delivery.
+	broker.publishMu.Lock()
 	broker.mu.Lock()
-	replay := cloneEnvelopes(broker.ring)
+	replaySnapshot := append([]EventEnvelope(nil), broker.ring...)
 	broker.nextSubID++
 	id := broker.nextSubID
 	mailbox := &eventMailbox{events: make(chan EventEnvelope, broker.mailCap)}
 	broker.subs[id] = mailbox
 	broker.mu.Unlock()
+	replay := cloneEnvelopes(replaySnapshot)
+	broker.publishMu.Unlock()
 
 	var once sync.Once
 	return Subscription{
@@ -124,13 +141,35 @@ func (broker *EventBroker) retainLocked(event EventEnvelope) EventEnvelope {
 	return event
 }
 
-func (broker *EventBroker) deliverLocked(event EventEnvelope) {
+func (broker *EventBroker) subscribersLocked() []eventSubscriber {
+	subscribers := make([]eventSubscriber, 0, len(broker.subs))
 	for id, mailbox := range broker.subs {
-		if mailbox.send(cloneEnvelope(event)) {
+		subscribers = append(subscribers, eventSubscriber{id: id, mailbox: mailbox})
+	}
+	return subscribers
+}
+
+func (broker *EventBroker) deliver(event EventEnvelope, subscribers []eventSubscriber) {
+	var overflowed []eventSubscriber
+	for _, subscriber := range subscribers {
+		if subscriber.mailbox.send(cloneEnvelope(event)) {
 			continue
 		}
-		delete(broker.subs, id)
-		mailbox.close()
+		overflowed = append(overflowed, subscriber)
+	}
+	if len(overflowed) == 0 {
+		return
+	}
+
+	broker.mu.Lock()
+	for _, subscriber := range overflowed {
+		if broker.subs[subscriber.id] == subscriber.mailbox {
+			delete(broker.subs, subscriber.id)
+		}
+	}
+	broker.mu.Unlock()
+	for _, subscriber := range overflowed {
+		subscriber.mailbox.close()
 	}
 }
 

@@ -1,6 +1,9 @@
 package supervisor
 
-import "context"
+import (
+	"context"
+	"time"
+)
 
 type StopReason string
 
@@ -9,16 +12,23 @@ const (
 	StopReasonParent     StopReason = "parent_stopped"
 	StopReasonCancelled  StopReason = "cancelled"
 	StopReasonRPCFailure StopReason = "rpc_failure"
+
+	stopCleanupTimeout = 30 * time.Second
 )
 
 func (node *Node) Stop(ctx context.Context, _ StopReason) error {
-	if startupDone := node.requestStop(); startupDone != nil {
-		select {
-		case <-startupDone:
-		case <-ctx.Done():
-			return ctx.Err()
-		}
+	node.requestStop(ctx)
+	select {
+	case <-node.done:
+		return node.finishedError()
+	case <-ctx.Done():
+		return ctx.Err()
 	}
-	node.finish(ctx, nil, LifecycleStopped, true)
-	return node.finishedError()
+}
+
+func (node *Node) finalizeStop(detached context.Context) {
+	<-node.startupDone
+	cleanupCtx, cancel := context.WithTimeout(detached, stopCleanupTimeout)
+	defer cancel()
+	node.finish(cleanupCtx, nil, LifecycleStopped, true)
 }

@@ -2,6 +2,7 @@ package supervisor
 
 import (
 	"encoding/json"
+	"runtime"
 	"sync"
 	"testing"
 	"time"
@@ -163,6 +164,130 @@ func TestEventBrokerConcurrentPublishersDeliverMonotonicSequence(t *testing.T) {
 		case <-time.After(time.Second):
 			t.Fatalf("timed out waiting for sequence %d", want)
 		}
+	}
+}
+
+func TestEventBrokerStateMutexIsReleasedBeforeMailboxDelivery(t *testing.T) {
+	broker := newEventBroker(1, 1)
+	subscription := broker.Subscribe()
+	defer subscription.Close()
+
+	broker.mu.Lock()
+	var mailbox *eventMailbox
+	for _, candidate := range broker.subs {
+		mailbox = candidate
+	}
+	broker.mu.Unlock()
+	if mailbox == nil {
+		t.Fatal("subscriber mailbox was not registered")
+	}
+
+	mailbox.mu.Lock()
+	published := make(chan struct{})
+	go func() {
+		broker.PublishLocal("root", "pi", json.RawMessage(`{"large":"payload"}`))
+		close(published)
+	}()
+
+	deadline := time.Now().Add(200 * time.Millisecond)
+	stateVisible := false
+	for time.Now().Before(deadline) {
+		if broker.mu.TryLock() {
+			stateVisible = broker.nextSeq == 1
+			broker.mu.Unlock()
+			if stateVisible {
+				break
+			}
+		}
+		runtime.Gosched()
+	}
+	mailbox.mu.Unlock()
+	<-published
+	if !stateVisible {
+		t.Fatal("EventBroker state mutex remained held while delivery waited on a mailbox")
+	}
+}
+
+func TestEventBrokerConcurrentSubscribeHasSingleReplayLiveCut(t *testing.T) {
+	const eventCount = 256
+	broker := newEventBroker(eventCount, eventCount)
+	start := make(chan struct{})
+	published := make(chan struct{})
+	go func() {
+		defer close(published)
+		<-start
+		for n := 0; n < eventCount; n++ {
+			broker.PublishLocal("root", "pi", json.RawMessage(`{}`))
+		}
+	}()
+
+	close(start)
+	subscription := broker.Subscribe()
+	defer subscription.Close()
+	<-published
+
+	combined := append([]EventEnvelope(nil), subscription.Replay...)
+	for len(combined) < eventCount {
+		select {
+		case event, ok := <-subscription.Events:
+			if !ok {
+				t.Fatalf("subscription closed after %d of %d events", len(combined), eventCount)
+			}
+			combined = append(combined, event)
+		case <-time.After(time.Second):
+			t.Fatalf("timed out after %d of %d events", len(combined), eventCount)
+		}
+	}
+	for index, event := range combined {
+		want := uint64(index + 1)
+		if event.Seq != want {
+			t.Fatalf("combined[%d].Seq = %d, want exactly-once monotonic %d", index, event.Seq, want)
+		}
+	}
+}
+
+func TestEventBrokerConcurrentCloseAndSubscribe(t *testing.T) {
+	const iterations = 100
+	broker := newEventBroker(iterations, iterations)
+	var group sync.WaitGroup
+	start := make(chan struct{})
+	for n := 0; n < iterations; n++ {
+		subscription := broker.Subscribe()
+		group.Add(4)
+		go func() {
+			defer group.Done()
+			<-start
+			broker.PublishLocal("root", "pi", json.RawMessage(`{}`))
+		}()
+		go func() {
+			defer group.Done()
+			<-start
+			subscription.Close()
+		}()
+		go func() {
+			defer group.Done()
+			<-start
+			subscription.Close()
+		}()
+		go func() {
+			defer group.Done()
+			<-start
+			concurrent := broker.Subscribe()
+			concurrent.Close()
+		}()
+	}
+	close(start)
+	group.Wait()
+
+	final := broker.Subscribe()
+	final.Close()
+	select {
+	case _, ok := <-final.Events:
+		if ok {
+			t.Fatal("closed subscription produced an event")
+		}
+	case <-time.After(time.Second):
+		t.Fatal("closed subscription channel remained open")
 	}
 }
 
