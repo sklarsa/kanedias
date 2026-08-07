@@ -80,7 +80,6 @@ volume = "nested-state"
 images = ["images:debian/13", "images:ubuntu/24.04"]
 ```
 
-```go
 Update the existing full `Workspace` expectation so it includes:
 
 ```go
@@ -96,7 +95,7 @@ Keep a focused assertion as well:
 if got := cfg.Workspace.Incus.Volume; got != "nested-state" {
     t.Errorf("Workspace.Incus.Volume = %q, want nested-state", got)
 }
-``````
+```
 
 Extend `TestLoadLifecycleDefaultsAndPaths`:
 
