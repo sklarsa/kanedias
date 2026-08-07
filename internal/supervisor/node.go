@@ -20,16 +20,18 @@ import (
 )
 
 type Dependencies struct {
-	Provisioner      provision.RootProvisioner
-	DialRPC          func(context.Context, string) (io.ReadWriteCloser, error)
-	Workers          WorkerCatalog
-	SocketPath       string
-	SpawnChild       ChildSpawner
-	DescendantClient DescendantClientFactory
-	NewSessionID     func() (string, error)
-	ChildStopTimeout time.Duration
-	CloseListener    func(context.Context) error
-	ReportWrite      func(contract.WriteChildResult) error
+	Provisioner            provision.RootProvisioner
+	DialRPC                func(context.Context, string) (io.ReadWriteCloser, error)
+	Workers                WorkerCatalog
+	SocketPath             string
+	SpawnChild             ChildSpawner
+	DescendantClient       DescendantClientFactory
+	NewSessionID           func() (string, error)
+	ChildStopTimeout       time.Duration
+	CloseListener          func(context.Context) error
+	ReportWrite            func(contract.WriteChildResult) error
+	ExpectedPiBinding      *PiBinding
+	HandoffShutdownTimeout time.Duration
 }
 
 type Node struct {
@@ -53,10 +55,11 @@ type Node struct {
 	handoffComplete bool
 	reportWrite     func(contract.WriteChildResult) error
 
-	stopFinalizerOnce sync.Once
-	finishOnce        sync.Once
-	finishErr         error
-	done              chan struct{}
+	stopFinalizerOnce   sync.Once
+	handoffWatchdogOnce sync.Once
+	finishOnce          sync.Once
+	finishErr           error
+	done                chan struct{}
 }
 
 func NewRoot(identity Identity, deps Dependencies, broker *EventBroker) (*Node, error) {
@@ -189,7 +192,7 @@ func (node *Node) Start(ctx context.Context) error {
 
 	// A successful transport dial is not readiness. Bind performs the correlated
 	// get_state handshake and moves the local session to ready only on success.
-	if err := local.Bind(startupCtx); err != nil {
+	if err := local.BindExpected(startupCtx, node.deps.ExpectedPiBinding); err != nil {
 		if node.startupWasStopped() {
 			return errors.Join(contract.NewError(contract.ErrorSessionStopping, "root startup was cancelled while binding Pi"), err)
 		}
@@ -205,6 +208,28 @@ func (node *Node) Start(ctx context.Context) error {
 	}
 	go node.watchRPC(rpc, local)
 	return nil
+}
+
+func (node *Node) handoffShutdownTimeout() time.Duration {
+	if node.deps.HandoffShutdownTimeout > 0 {
+		return node.deps.HandoffShutdownTimeout
+	}
+	return 5 * time.Second
+}
+
+func (node *Node) armHandoffShutdownWatchdog() {
+	node.handoffWatchdogOnce.Do(func() {
+		go func() {
+			timer := time.NewTimer(node.handoffShutdownTimeout())
+			defer timer.Stop()
+			select {
+			case <-node.done:
+				return
+			case <-timer.C:
+				node.finish(context.Background(), nil, LifecycleCompleted, true)
+			}
+		}()
+	})
 }
 
 func (node *Node) childStopTimeout() time.Duration {

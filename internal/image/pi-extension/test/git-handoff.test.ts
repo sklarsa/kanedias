@@ -1,6 +1,6 @@
 import assert from "node:assert/strict";
 import { execFile } from "node:child_process";
-import { mkdtemp, mkdir, rm, symlink, writeFile } from "node:fs/promises";
+import { cp, mkdtemp, mkdir, rename, rm, symlink, writeFile } from "node:fs/promises";
 import os from "node:os";
 import path from "node:path";
 import { promisify } from "node:util";
@@ -103,6 +103,47 @@ test("rejects path escape and symlink before invoking git", async (t) => {
     }, { workspaceRoot: workspace }), /workspace|symlink|outside/i);
     assert.deepEqual(calls, []);
   }
+});
+
+test("rejects a symlinked workspace root before invoking git", async (t) => {
+  const root = await mkdtemp(path.join(os.tmpdir(), "kanedias-handoff-root-link-"));
+  t.after(() => rm(root, { recursive: true, force: true }));
+  const actualRoot = path.join(root, "actual");
+  const linkedRoot = path.join(root, "repos");
+  await mkdir(actualRoot);
+  await symlink(actualRoot, linkedRoot);
+  const calls: string[][] = [];
+  await assert.rejects(verifyHandoff(executingPi(calls), {
+    repositories: [], summary: "done", verification: [],
+  }, { workspaceRoot: linkedRoot }), /workspace root.*trusted literal|canonical/i);
+  assert.deepEqual(calls, []);
+});
+
+test("fails closed when a checkout path is swapped during Git verification", async (t) => {
+  const root = await mkdtemp(path.join(os.tmpdir(), "kanedias-handoff-swap-"));
+  t.after(() => rm(root, { recursive: true, force: true }));
+  const repo = await repository(root, "owner/repo", "feature");
+  const moved = `${repo.checkout}-original`;
+  const replacement = `${repo.checkout}-replacement`;
+  await cp(repo.checkout, replacement, { recursive: true });
+  let swapped = false;
+  const calls: string[][] = [];
+  const pi = {
+    async exec(command: string, args: string[]) {
+      calls.push([command, ...args]);
+      const result = await executingPi([]).exec(command, args);
+      if (!swapped) {
+        swapped = true;
+        await rename(repo.checkout, moved);
+        await rename(replacement, repo.checkout);
+      }
+      return result;
+    },
+  } as any;
+  await assert.rejects(verifyHandoff(pi, inputFor(repo, "owner/repo", "feature"), {
+    workspaceRoot: path.join(root, "repos"),
+  }), /changed|symlink|identity/i);
+  assert.equal(calls.length, 1);
 });
 
 test("rejects repository mismatch, local head mismatch, invalid or absent branch, and remote tip mismatch", async (t) => {

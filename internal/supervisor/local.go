@@ -64,6 +64,13 @@ func NewLocalSession(identity Identity, rpc *pirpc.Client, events *EventBroker) 
 }
 
 func (session *LocalSession) Bind(ctx context.Context) error {
+	return session.BindExpected(ctx, nil)
+}
+
+// BindExpected admits the first persisted Pi binding. Fork children require an
+// exact match with the branch prepared by their parent; roots and fresh children
+// pass nil and accept any first nonempty persisted binding.
+func (session *LocalSession) BindExpected(ctx context.Context, expected *PiBinding) error {
 	session.bindMu.Lock()
 	defer session.bindMu.Unlock()
 
@@ -84,6 +91,14 @@ func (session *LocalSession) Bind(ctx context.Context) error {
 	}
 	if err := validatePiBinding(state.Data.SessionID, state.Data.SessionFile); err != nil {
 		return err
+	}
+	if expected != nil {
+		if state.Data.SessionID != expected.SessionID {
+			return invariantf("fork Pi session ID %q does not match admitted session ID %q", state.Data.SessionID, expected.SessionID)
+		}
+		if state.Data.SessionFile != expected.SessionFile {
+			return invariantf("fork Pi session file %q does not match admitted session file %q", state.Data.SessionFile, expected.SessionFile)
+		}
 	}
 
 	model := modelFromGetState(state.Data)

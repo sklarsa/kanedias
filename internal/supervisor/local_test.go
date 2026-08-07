@@ -78,6 +78,31 @@ func TestLocalSessionRejectsEmptyOrChangedPiBinding(t *testing.T) {
 	})
 }
 
+func TestLocalSessionForkBindingMustMatchAdmittedSessionBeforeReadiness(t *testing.T) {
+	for _, test := range []struct {
+		name, sessionID, sessionFile string
+	}{
+		{name: "session ID mismatch", sessionID: "wrong-pi", sessionFile: "/sessions/fork.jsonl"},
+		{name: "session file mismatch", sessionID: "expected-pi", sessionFile: "/sessions/wrong.jsonl"},
+	} {
+		t.Run(test.name, func(t *testing.T) {
+			local, peer, _ := newTestLocalSession(t, writerIdentity(t))
+			result := make(chan error, 1)
+			go func() {
+				result <- local.BindExpected(context.Background(), &PiBinding{SessionID: "expected-pi", SessionFile: "/sessions/fork.jsonl"})
+			}()
+			request := readObject(t, peer)
+			writeGetStateResponse(t, peer, request.ID, test.sessionID, test.sessionFile, false)
+			if err := <-result; !errors.Is(err, ErrInvariant) {
+				t.Fatalf("BindExpected() error = %v, want ErrInvariant", err)
+			}
+			if got := local.Snapshot().Lifecycle; got == string(LifecycleReady) {
+				t.Fatalf("mismatched fork binding reached ready")
+			}
+		})
+	}
+}
+
 func TestLocalSessionRootSettlementReturnsRunningSessionToReady(t *testing.T) {
 	local, peer, _ := newTestLocalSession(t, rootIdentity(t))
 	bindTestLocal(t, local, peer, "pi-root", "/sessions/pi-root.jsonl", false)
@@ -112,9 +137,28 @@ func TestLocalSessionWriterSettlementAwaitsHandoffAndFollowUpResumes(t *testing.
 	writeLine(t, peer, `{"type":"agent_settled"}`)
 	waitFor(t, func() bool { return local.Snapshot().Lifecycle == string(LifecycleAwaitingHandoff) }, "writer settlement to await handoff")
 
+	for _, command := range []struct {
+		raw, name string
+	}{
+		{`{"type":"get_messages"}`, "get_messages"},
+		{`{"type":"abort"}`, "abort"},
+	} {
+		callRPCSuccess(t, local, peer, command.raw, command.name)
+		if got := local.Snapshot().Lifecycle; got != string(LifecycleAwaitingHandoff) {
+			t.Fatalf("Lifecycle after %s = %q, want awaiting_handoff", command.name, got)
+		}
+	}
+
 	callRPCSuccess(t, local, peer, `{"type":"follow_up","message":"finish handoff"}`, "follow_up")
 	if got := local.Snapshot().Lifecycle; got != string(LifecycleRunning) {
 		t.Fatalf("Lifecycle after follow_up = %q, want running", got)
+	}
+	writeLine(t, peer, `{"type":"agent_settled"}`)
+	waitFor(t, func() bool { return local.Snapshot().Lifecycle == string(LifecycleAwaitingHandoff) }, "second writer settlement to await handoff")
+
+	callRPCSuccess(t, local, peer, `{"type":"prompt","message":"one more change"}`, "prompt")
+	if got := local.Snapshot().Lifecycle; got != string(LifecycleRunning) {
+		t.Fatalf("Lifecycle after second prompt = %q, want running", got)
 	}
 }
 

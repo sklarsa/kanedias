@@ -125,6 +125,41 @@ func startPiPeer(t *testing.T, peer net.Conn, beforeResponse json.RawMessage) <-
 	return done
 }
 
+func TestForkChildBindingMismatchFailsBeforeReadyAndCleansEverything(t *testing.T) {
+	socket, listener := boundSocket(t)
+	clientConn, peer := net.Pipe()
+	t.Cleanup(func() { _ = peer.Close() })
+	connection := &trackedConn{ReadWriteCloser: clientConn}
+	fake := &fakeRootProvisioner{resources: &provision.Resources{SessionID: "writer", Instance: "instance", Volume: "volume", RPCAddr: "rpc"}}
+	listenerClosed := false
+	node, err := NewChild(writerIdentity(t), Dependencies{
+		Provisioner: fake, SocketPath: socket,
+		DialRPC: func(context.Context, string) (io.ReadWriteCloser, error) { return connection, nil },
+		Workers: fakeWorkers{}, ExpectedPiBinding: &PiBinding{SessionID: "admitted-pi", SessionFile: "/tmp/admitted.jsonl"},
+		CloseListener: func(context.Context) error { listenerClosed = true; return listener.Close() },
+	}, NewEventBroker())
+	if err != nil {
+		t.Fatal(err)
+	}
+	peerDone := startPiPeer(t, peer, nil)
+	if err := node.Start(context.Background()); !errors.Is(err, ErrInvariant) {
+		t.Fatalf("Start() error = %v, want fork binding invariant", err)
+	}
+	<-peerDone
+	if node.Snapshot().Lifecycle != string(LifecycleFailed) {
+		t.Fatalf("lifecycle = %s, want failed", node.Snapshot().Lifecycle)
+	}
+	if !connection.closed.Load() {
+		t.Fatal("Pi RPC was not closed")
+	}
+	if fake.destroyed != 1 {
+		t.Fatalf("destroy calls = %d, want 1", fake.destroyed)
+	}
+	if !listenerClosed {
+		t.Fatal("listener was not closed")
+	}
+}
+
 func TestNewRootRejectsSocketThatIsNotReadyBeforeProvisioning(t *testing.T) {
 	for _, test := range []struct {
 		name    string

@@ -251,6 +251,9 @@ func (node *Node) Handoff(_ context.Context, request WriteHandoffRequest) (Hando
 	if local != nil {
 		local.completeHandoff()
 	}
+	if node.done != nil {
+		node.armHandoffShutdownWatchdog()
+	}
 	return HandoffAcceptance{Accepted: true, SessionID: identity.SessionID}, nil
 }
 

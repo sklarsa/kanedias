@@ -45,7 +45,7 @@ export default async function kanediasExtension(pi: ExtensionAPI, options: Exten
       const input = params as DelegateSessionInput;
       let forkSource: ForkSourceSnapshot | undefined;
       if (input.context === "fork") {
-        const sessionFile = env.KANEDIAS_PI_SESSION_FILE ?? ctx.sessionManager.getSessionFile();
+        const sessionFile = env.KANEDIAS_PI_SESSION_FILE || ctx.sessionManager.getSessionFile();
         const leafEntryId = ctx.sessionManager.getLeafId();
         if (!sessionFile || !leafEntryId) throw new Error("fork requires a persisted current session and leaf");
         forkSource = await validateForkSource(sessionFile, leafEntryId);

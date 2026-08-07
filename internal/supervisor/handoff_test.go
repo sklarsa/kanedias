@@ -5,10 +5,15 @@ import (
 	"context"
 	"encoding/json"
 	"errors"
+	"io"
+	"net"
 	"sync"
+	"sync/atomic"
 	"testing"
+	"time"
 
 	"github.com/sklarsa/kanedias/internal/supervisor/contract"
+	"github.com/sklarsa/kanedias/internal/supervisor/provision"
 )
 
 func TestRunWriteTaskPromptsExactlyAndLeavesWriterLiveUntilHandoff(t *testing.T) {
@@ -98,6 +103,90 @@ func TestWriterHandoffRecordsAndForwardsExactlyOnceBeforeAcceptance(t *testing.T
 	defer mu.Unlock()
 	if len(forwarded) != 1 {
 		t.Fatalf("duplicate forwarded %d results", len(forwarded))
+	}
+}
+
+func TestAcceptedHandoffWatchdogForcesCleanupWhenPiDoesNotEOF(t *testing.T) {
+	identity := writerIdentity(t)
+	socket, listener := boundSocket(t)
+	clientConn, peer := net.Pipe()
+	t.Cleanup(func() { _ = peer.Close() })
+	tracked := &trackedConn{ReadWriteCloser: clientConn}
+	resources := &provision.Resources{Instance: "writer-instance", Volume: "writer-volume", RPCAddr: "rpc"}
+	provisioner := &fakeRootProvisioner{resources: resources}
+	var listenerClosed atomic.Bool
+	node, err := NewChild(identity, Dependencies{
+		Provisioner: provisioner,
+		DialRPC:     func(context.Context, string) (io.ReadWriteCloser, error) { return tracked, nil },
+		Workers:     fakeWorkers{}, SocketPath: socket,
+		CloseListener:          func(context.Context) error { listenerClosed.Store(true); return listener.Close() },
+		ReportWrite:            func(contract.WriteChildResult) error { return nil },
+		HandoffShutdownTimeout: 30 * time.Millisecond,
+	}, NewEventBroker())
+	if err != nil {
+		t.Fatal(err)
+	}
+	peerDone := startPiPeer(t, peer, nil)
+	if err := node.Start(context.Background()); err != nil {
+		t.Fatal(err)
+	}
+	unfinished := newFakeChildProcess()
+	descendant := &stoppingDescendant{process: unfinished}
+	entry := &childEntry{id: "unfinished-descendant", socket: "/tmp/unfinished.sock"}
+	entry.init()
+	entry.setProcess(unfinished)
+	entry.setClient(descendant)
+	if err := node.children.add(entry); err != nil {
+		t.Fatal(err)
+	}
+	parentReturned := make(chan struct{})
+	go func() { <-node.Done(); close(parentReturned) }()
+
+	destroyCount := func() int {
+		provisioner.mu.Lock()
+		defer provisioner.mu.Unlock()
+		return provisioner.destroyed
+	}
+	accepted, err := node.Handoff(context.Background(), WriteHandoffRequest{
+		Repositories: []contract.RepositoryHandoff{{Repository: "owner/repo", BaseCommit: "base", Branch: "feature", HeadCommit: "head"}},
+		Summary:      "done",
+	})
+	if err != nil || !accepted.Accepted {
+		t.Fatalf("Handoff() = %#v, %v", accepted, err)
+	}
+	if tracked.closed.Load() || listenerClosed.Load() || destroyCount() != 0 {
+		t.Fatal("cleanup began before handoff acceptance returned")
+	}
+
+	select {
+	case <-node.Done():
+	case <-time.After(time.Second):
+		t.Fatal("accepted handoff watchdog did not complete node")
+	}
+	if !tracked.closed.Load() {
+		t.Fatal("watchdog did not close Pi RPC")
+	}
+	if !listenerClosed.Load() {
+		t.Fatal("watchdog did not close listener")
+	}
+	if got := destroyCount(); got != 1 {
+		t.Fatalf("destroy calls = %d, want 1", got)
+	}
+	descendant.mu.Lock()
+	stops := append([]string(nil), descendant.stops...)
+	descendant.mu.Unlock()
+	if len(stops) != 1 || stops[0] != "unfinished-descendant" {
+		t.Fatalf("descendant stops = %#v, want unfinished descendant cancellation", stops)
+	}
+	select {
+	case <-parentReturned:
+	case <-time.After(time.Second):
+		t.Fatal("parent waiter did not return after forced cleanup")
+	}
+	select {
+	case <-peerDone:
+	case <-time.After(time.Second):
+		t.Fatal("Pi peer did not observe forced close")
 	}
 }
 

@@ -184,15 +184,22 @@ func productionChildRunner(ctx context.Context, bootstrap process.Bootstrap, rep
 		}
 	}
 	spawner := process.Spawner{ConfigPath: configPath}
+	var expectedPiBinding *supervisor.PiBinding
+	if bootstrap.Request.Context == contract.ContextFork && bootstrap.Request.Fork != nil {
+		expectedPiBinding = &supervisor.PiBinding{
+			SessionID: bootstrap.Request.Fork.PiSessionID, SessionFile: bootstrap.Request.Fork.SessionFile,
+		}
+	}
 	node, err := supervisor.NewChild(identity, supervisor.Dependencies{
 		Provisioner: adapter, DialRPC: dialPiRPC, Workers: configWorkerCatalog{config: cfg},
 		SocketPath: bootstrap.SocketPath,
 		SpawnChild: func(ctx context.Context, nested process.Bootstrap) (supervisor.ChildProcess, error) {
 			return spawner.Spawn(ctx, nested)
 		},
-		DescendantClient: supervisorapi.NewDescendantClient,
-		CloseListener:    closeListener,
-		ReportWrite:      reporter.Write,
+		DescendantClient:  supervisorapi.NewDescendantClient,
+		CloseListener:     closeListener,
+		ReportWrite:       reporter.Write,
+		ExpectedPiBinding: expectedPiBinding,
 	}, supervisor.NewEventBroker())
 	if err != nil {
 		return err
