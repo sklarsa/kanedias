@@ -2,7 +2,7 @@ import type { ExtensionAPI, ExtensionContext } from "@earendil-works/pi-coding-a
 import { Value } from "typebox/value";
 import { prepareFork, validateForkSource } from "./fork.ts";
 import type { ForkSourceSnapshot } from "./fork.ts";
-import { durableHandoff } from "./git-handoff.ts";
+import { verifyHandoff } from "./git-handoff.ts";
 import { delegateSessionSchema, handoffSchema } from "./schemas.ts";
 import { SupervisorClient } from "./supervisor-client.ts";
 import type { CreateChildRequest, DelegateSessionInput, HandoffInput } from "./types.ts";
@@ -11,6 +11,7 @@ const MAX_TOOL_TEXT = 64 * 1024;
 
 interface ExtensionOptions {
   env?: Record<string, string | undefined>;
+  workspaceRoot?: string;
 }
 
 function requiredEnvironment(env: Record<string, string | undefined>, name: string): string {
@@ -76,11 +77,19 @@ export default async function kanediasExtension(pi: ExtensionAPI, options: Exten
       if (env.KANEDIAS_SESSION_KIND !== "write") throw new Error("handoff is available only in a supervised write session");
       if (!Value.Check(handoffSchema, params)) throw new Error("invalid handoff arguments");
       const input = params as HandoffInput;
-      await client.handoff(durableHandoff(input), signal);
+      const durable = await verifyHandoff(pi, input, {
+        ...(signal ? { signal } : {}),
+        ...(options.workspaceRoot ? { workspaceRoot: options.workspaceRoot } : {}),
+      });
+      const acceptance = await client.handoff(durable, signal);
+      const ownSessionID = requiredEnvironment(env, "KANEDIAS_SESSION_ID");
+      if (!acceptance || acceptance.accepted !== true || acceptance.sessionId !== ownSessionID) {
+        throw new Error("supervisor returned an invalid handoff acceptance");
+      }
       ctx.shutdown();
       return {
         content: [{ type: "text" as const, text: "Handoff accepted. Shutting down the writer session." }],
-        details: durableHandoff(input),
+        details: durable,
         terminate: true,
       };
     },

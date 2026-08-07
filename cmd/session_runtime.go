@@ -155,10 +155,6 @@ func productionChildRunner(ctx context.Context, bootstrap process.Bootstrap, rep
 	if resolvedWorker != bootstrap.Worker {
 		return contract.NewError(contract.ErrorConflict, "child worker profile does not match configured policy")
 	}
-	if bootstrap.Request.Kind != contract.ChildKindRead {
-		return contract.NewError(contract.ErrorConflict, "write child completion is not available in this delivery stage")
-	}
-
 	childProvisioner, err := provision.NewConfiguredChildProvisioner(ctx, cfg)
 	if err != nil {
 		return err
@@ -196,6 +192,7 @@ func productionChildRunner(ctx context.Context, bootstrap process.Bootstrap, rep
 		},
 		DescendantClient: supervisorapi.NewDescendantClient,
 		CloseListener:    closeListener,
+		ReportWrite:      reporter.Write,
 	}, supervisor.NewEventBroker())
 	if err != nil {
 		return err
@@ -223,14 +220,26 @@ func productionChildRunner(ctx context.Context, bootstrap process.Bootstrap, rep
 	if err := reporter.Ready(bootstrap.SocketPath); err != nil {
 		return err
 	}
-	readResult, err := node.RunReadTask(ctx, bootstrap.Request.Task)
-	if err != nil {
-		return err
+	switch bootstrap.Request.Kind {
+	case contract.ChildKindRead:
+		readResult, err := node.RunReadTask(ctx, bootstrap.Request.Task)
+		if err != nil {
+			return err
+		}
+		return reporter.Read(readResult)
+	case contract.ChildKindWrite:
+		if err := node.RunWriteTask(ctx, bootstrap.Request.Task); err != nil {
+			return err
+		}
+		select {
+		case <-node.Done():
+			return node.Stop(context.Background(), supervisor.StopReasonRequested)
+		case <-ctx.Done():
+			return ctx.Err()
+		}
+	default:
+		return contract.NewError(contract.ErrorConflict, "unsupported child kind")
 	}
-	if err := reporter.Read(readResult); err != nil {
-		return err
-	}
-	return nil
 }
 
 func dialPiRPC(ctx context.Context, address string) (io.ReadWriteCloser, error) {

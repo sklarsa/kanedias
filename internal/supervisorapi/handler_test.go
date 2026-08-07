@@ -36,6 +36,8 @@ type fakeService struct {
 	childResult    supervisor.TerminalResult
 	childStarted   chan struct{}
 	childRelease   <-chan struct{}
+	handoffRequest supervisor.WriteHandoffRequest
+	handoffResult  supervisor.HandoffAcceptance
 	err            error
 }
 

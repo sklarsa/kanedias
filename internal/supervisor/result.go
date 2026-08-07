@@ -137,6 +137,129 @@ func childReadFailure(code contract.ErrorCode, message string, cause error) erro
 	return errors.Join(contract.NewError(code, message), cause)
 }
 
+func (node *Node) RunWriteTask(ctx context.Context, task string) error {
+	identity := node.identity.Snapshot()
+	if identity.Kind != contract.ChildKindWrite {
+		return contract.NewError(contract.ErrorConflict, "only write children can run write tasks")
+	}
+	if strings.TrimSpace(task) == "" {
+		return contract.NewError(contract.ErrorInvalidRequest, "write task is required")
+	}
+	node.mu.RLock()
+	local := node.local
+	node.mu.RUnlock()
+	if local == nil {
+		return contract.NewError(contract.ErrorChildUnavailable, "child Pi RPC is not ready")
+	}
+	prompt, err := json.Marshal(map[string]string{"type": "prompt", "message": task})
+	if err != nil {
+		return err
+	}
+	response, err := local.CallRPC(ctx, prompt)
+	if err != nil {
+		return childReadFailure(contract.ErrorChildFailed, "submit child task", err)
+	}
+	var accepted struct {
+		Type    string `json:"type"`
+		Command string `json:"command"`
+		Success bool   `json:"success"`
+		Error   string `json:"error"`
+	}
+	if err := json.Unmarshal(response, &accepted); err != nil || accepted.Type != "response" || accepted.Command != "prompt" || !accepted.Success {
+		if accepted.Error == "" {
+			accepted.Error = "Pi rejected the prompt"
+		}
+		return childReadFailure(contract.ErrorChildFailed, "submit child task", errors.New(accepted.Error))
+	}
+	return nil
+}
+
+type WriteHandoffRequest struct {
+	Repositories []contract.RepositoryHandoff `json:"repositories"`
+	Summary      string                       `json:"summary"`
+	Verification []string                     `json:"verification"`
+}
+
+type HandoffAcceptance struct {
+	Accepted  bool   `json:"accepted"`
+	SessionID string `json:"sessionId"`
+}
+
+func (request WriteHandoffRequest) validate() error {
+	if len(request.Repositories) == 0 {
+		return contract.NewError(contract.ErrorInvalidRequest, "handoff requires at least one repository")
+	}
+	if strings.TrimSpace(request.Summary) == "" {
+		return contract.NewError(contract.ErrorInvalidRequest, "handoff summary is required")
+	}
+	seen := make(map[string]struct{}, len(request.Repositories))
+	for _, repository := range request.Repositories {
+		for field, value := range map[string]string{
+			"repository": repository.Repository, "baseCommit": repository.BaseCommit,
+			"branch": repository.Branch, "headCommit": repository.HeadCommit,
+		} {
+			if strings.TrimSpace(value) == "" {
+				return contract.NewError(contract.ErrorInvalidRequest, "handoff repository "+field+" is required")
+			}
+		}
+		if _, duplicate := seen[repository.Repository]; duplicate {
+			return contract.NewError(contract.ErrorInvalidRequest, "handoff repositories must be unique")
+		}
+		seen[repository.Repository] = struct{}{}
+	}
+	for _, evidence := range request.Verification {
+		if strings.TrimSpace(evidence) == "" {
+			return contract.NewError(contract.ErrorInvalidRequest, "handoff verification entries must be nonempty")
+		}
+	}
+	return nil
+}
+
+func (node *Node) Handoff(_ context.Context, request WriteHandoffRequest) (HandoffAcceptance, error) {
+	identity := node.identity.Snapshot()
+	if identity.Kind != contract.ChildKindWrite {
+		return HandoffAcceptance{}, contract.NewError(contract.ErrorConflict, "handoff is accepted only by the owning write session")
+	}
+	if err := request.validate(); err != nil {
+		return HandoffAcceptance{}, err
+	}
+
+	node.handoffMu.Lock()
+	defer node.handoffMu.Unlock()
+	if node.handoffComplete {
+		return HandoffAcceptance{}, contract.NewError(contract.ErrorConflict, "writer handoff is already complete")
+	}
+	if node.reportWrite == nil {
+		return HandoffAcceptance{}, contract.NewError(contract.ErrorConflict, "writer handoff reporter is unavailable")
+	}
+	result := contract.WriteChildResult{
+		Kind: contract.ChildKindWrite, WorkerType: identity.Worker, SessionID: identity.SessionID,
+		Repositories: append([]contract.RepositoryHandoff(nil), request.Repositories...),
+		Summary:      request.Summary, Verification: append([]string(nil), request.Verification...),
+	}
+	// Record before forwarding. If the synchronous report write is rejected,
+	// roll the tentative record back so the writer remains live and retryable.
+	node.handoffResult = &result
+	if err := node.reportWrite(result); err != nil {
+		node.handoffResult = nil
+		return HandoffAcceptance{}, contract.NewError(contract.ErrorChildUnavailable, "forward writer handoff to parent: "+err.Error())
+	}
+	node.handoffComplete = true
+	node.mu.RLock()
+	local := node.local
+	node.mu.RUnlock()
+	if local != nil {
+		local.completeHandoff()
+	}
+	return HandoffAcceptance{Accepted: true, SessionID: identity.SessionID}, nil
+}
+
+func (node *Node) handoffAccepted() bool {
+	node.handoffMu.Lock()
+	defer node.handoffMu.Unlock()
+	return node.handoffComplete
+}
+
 type TerminalResult struct {
 	Read  *contract.ReadChildResult
 	Write *contract.WriteChildResult

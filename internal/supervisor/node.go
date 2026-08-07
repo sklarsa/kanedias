@@ -29,6 +29,7 @@ type Dependencies struct {
 	NewSessionID     func() (string, error)
 	ChildStopTimeout time.Duration
 	CloseListener    func(context.Context) error
+	ReportWrite      func(contract.WriteChildResult) error
 }
 
 type Node struct {
@@ -46,6 +47,11 @@ type Node struct {
 	resources       *provision.Resources
 	state           LifecycleState
 	children        *childRegistry
+
+	handoffMu       sync.Mutex
+	handoffResult   *contract.WriteChildResult
+	handoffComplete bool
+	reportWrite     func(contract.WriteChildResult) error
 
 	stopFinalizerOnce sync.Once
 	finishOnce        sync.Once
@@ -97,6 +103,7 @@ func newNode(identity Identity, deps Dependencies, broker *EventBroker) (*Node, 
 		broker:      broker,
 		state:       LifecycleProvisioning,
 		children:    newChildRegistry(),
+		reportWrite: deps.ReportWrite,
 		startupDone: make(chan struct{}),
 		done:        make(chan struct{}),
 	}, nil
@@ -436,6 +443,10 @@ func (node *Node) watchRPC(rpc *pirpc.Client, local *LocalSession) {
 	<-rpc.Done()
 	<-local.DrainDone()
 	if node.startupWasStopped() {
+		return
+	}
+	if node.handoffAccepted() {
+		node.finish(context.Background(), nil, LifecycleCompleted, false)
 		return
 	}
 	err := rpc.Err()

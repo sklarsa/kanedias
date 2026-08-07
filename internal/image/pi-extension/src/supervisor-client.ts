@@ -56,8 +56,12 @@ export class SupervisorClient {
     return result as ChildResult;
   }
 
-  async handoff(input: { repositories: RepositoryHandoff[]; summary: string; verification: string[] }, signal?: AbortSignal): Promise<unknown> {
-    return await this.#request("POST", "/v1/handoff", input, signal, this.#boundedTimeoutMs);
+  async handoff(input: { repositories: RepositoryHandoff[]; summary: string; verification: string[] }, signal?: AbortSignal): Promise<{ accepted: boolean; sessionId: string }> {
+    const result = await this.#request("POST", "/v1/handoff", input, signal, this.#boundedTimeoutMs) as { accepted?: unknown; sessionId?: unknown };
+    if (!result || result.accepted !== true || typeof result.sessionId !== "string" || result.sessionId.length === 0) {
+      throw new Error("supervisor returned an invalid handoff acceptance");
+    }
+    return { accepted: true, sessionId: result.sessionId };
   }
 
   async #request(method: string, requestPath: string, body: unknown, signal?: AbortSignal, timeoutMs?: number): Promise<unknown> {

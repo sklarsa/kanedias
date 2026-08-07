@@ -24,6 +24,7 @@ type Service interface {
 	AnswerQuestion(context.Context, string, string, json.RawMessage) error
 	Subscribe(context.Context) (supervisor.Subscription, error)
 	CreateChild(context.Context, string, contract.CreateChildRequest) (supervisor.TerminalResult, error)
+	Handoff(context.Context, supervisor.WriteHandoffRequest) (supervisor.HandoffAcceptance, error)
 	Stop(context.Context, string) error
 }
 
@@ -86,6 +87,19 @@ func NewHandler(service Service) http.Handler {
 		default:
 			writeError(w, errors.New("service returned an invalid terminal child result"))
 		}
+	})
+	router.Post("/v1/handoff", func(w http.ResponseWriter, request *http.Request) {
+		var handoff supervisor.WriteHandoffRequest
+		if err := decodeStrictJSONBody(w, request, &handoff); err != nil {
+			writeError(w, err)
+			return
+		}
+		accepted, err := service.Handoff(request.Context(), handoff)
+		if err != nil {
+			writeError(w, err)
+			return
+		}
+		writeJSON(w, http.StatusOK, accepted)
 	})
 	router.Post("/v1/sessions/{sessionID}/questions/{questionID}/response", func(w http.ResponseWriter, request *http.Request) {
 		body, err := readJSONBody(w, request)

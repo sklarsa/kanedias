@@ -306,6 +306,15 @@ func (session *LocalSession) applyActivityLocked(activity string) {
 	}
 }
 
+func (session *LocalSession) completeHandoff() {
+	session.activityMu.Lock()
+	defer session.activityMu.Unlock()
+	switch session.lifecycle.State() {
+	case LifecycleRunning, LifecycleAwaitingHandoff:
+		_ = session.lifecycle.Transition(LifecycleCompleted)
+	}
+}
+
 func (session *LocalSession) failTerminalInvariant() {
 	session.activityMu.Lock()
 	switch session.lifecycle.State() {

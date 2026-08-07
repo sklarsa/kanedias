@@ -18,12 +18,14 @@ For every modified repository:
 3. Commit the intended changes. Do not report uncommitted work as delivered.
 4. Push the branch to the named repository remote.
 5. Resolve and record:
-   - local checkout `path` used for verification;
+   - absolute local checkout `path` under `/workspace/repos` used for verification (never a symlink);
    - `repository` remote identity;
    - exact `baseCommit` the work builds on;
    - pushed `branch` name;
    - exact `headCommit` at that remote branch.
 6. Verify that the remote branch resolves to `headCommit`; include this evidence with test results.
+
+The handoff tool independently verifies each checkout with argument-array Git execution in this order: repository top level, local `HEAD`, branch format, `origin` URL, and exact `ls-remote` branch tip. The checkout must be contained under `/workspace/repos`, its `origin` slug must match `repository`, local `HEAD` must equal `headCommit`, and the remote branch tip must equal that same commit. Local checkout paths are removed before the durable result is sent to the supervisor.
 
 Git cleanliness is discipline, not an automatic handoff gate. Inspect ignored, untracked, and modified files yourself. If unrelated local state remains, do not silently include or discard it; make the delivered commit boundary and residual state explicit.
 
@@ -47,7 +49,8 @@ A rejected handoff is non-terminal. Correct the refs or evidence and retry. An a
 ## Common Mistakes
 
 - Calling handoff before push completes.
-- Reporting local `HEAD` without checking the remote ref.
+- Reporting local `HEAD` without checking the remote ref, or naming a repository that does not match `origin`.
+- Passing a symlink, nested directory, or checkout outside `/workspace/repos` as `path`.
 - Assuming a clean tree is supervisor-enforced.
 - Omitting the base commit or using symbolic names where an exact commit is required.
 - Calling another tool beside the terminal handoff.

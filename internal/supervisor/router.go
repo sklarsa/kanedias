@@ -151,3 +151,7 @@ func (router *Router) Stop(ctx context.Context, target string) error {
 func (router *Router) CreateChild(ctx context.Context, parent string, request contract.CreateChildRequest) (TerminalResult, error) {
 	return router.node.CreateChild(ctx, parent, request)
 }
+
+func (router *Router) Handoff(ctx context.Context, request WriteHandoffRequest) (HandoffAcceptance, error) {
+	return router.node.Handoff(ctx, request)
+}

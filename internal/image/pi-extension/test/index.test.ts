@@ -1,6 +1,6 @@
 import assert from "node:assert/strict";
 import { spawn } from "node:child_process";
-import { chmod, mkdtemp, readFile, rm, writeFile } from "node:fs/promises";
+import { chmod, mkdir, mkdtemp, readFile, rm, writeFile } from "node:fs/promises";
 import http from "node:http";
 import os from "node:os";
 import path from "node:path";
@@ -92,12 +92,28 @@ test("unknown workers fail before child provisioning", async (t) => {
   assert.equal(childCalls, 0);
 });
 
-test("handoff strips checkout paths, shuts down only after acceptance, and terminates", async (t) => {
+test("handoff verifies refs, strips checkout paths, shuts down only after acceptance, and terminates", async (t) => {
+  const workspace = await mkdtemp(path.join(os.tmpdir(), "kanedias-index-handoff-"));
+  const checkout = path.join(workspace, "owner", "repo");
+  await mkdir(checkout, { recursive: true });
+  t.after(() => rm(workspace, { recursive: true, force: true }));
   let body: any; let accepted = true;
-  const fixture = await server((req, res) => { res.setHeader("content-type", "application/json"); if (req.method === "GET") return res.end("[]"); let raw = ""; req.on("data", (c) => raw += c); req.on("end", () => { body = JSON.parse(raw); res.statusCode = accepted ? 200 : 409; res.end(accepted ? "{}" : JSON.stringify({ error: "rejected" })); }); }); t.after(fixture.close);
-  const tools: Tool[] = []; await extension({ registerTool: (tool: Tool) => tools.push(tool) } as any, { env: { KANEDIAS_SESSION_ID: "writer", KANEDIAS_SESSION_KIND: "write", KANEDIAS_SUPERVISOR_SOCKET: fixture.socket } });
+  const fixture = await server((req, res) => { res.setHeader("content-type", "application/json"); if (req.method === "GET") return res.end("[]"); let raw = ""; req.on("data", (c) => raw += c); req.on("end", () => { body = JSON.parse(raw); res.statusCode = accepted ? 200 : 409; res.end(accepted ? JSON.stringify({ accepted: true, sessionId: "writer" }) : JSON.stringify({ error: "rejected" })); }); }); t.after(fixture.close);
+  const tools: Tool[] = [];
+  const pi = {
+    registerTool: (tool: Tool) => tools.push(tool),
+    exec: async (_command: string, args: string[]) => {
+      const operation = args.slice(2).join(" ");
+      const stdout = operation === "rev-parse --show-toplevel" ? `${checkout}\n`
+        : operation === "rev-parse HEAD" ? "def\n"
+        : operation === "remote get-url origin" ? "git@github.com:owner/repo.git\n"
+        : operation.startsWith("ls-remote") ? "def\trefs/heads/feature\n" : "";
+      return { stdout, stderr: "", code: 0, killed: false };
+    },
+  } as any;
+  await extension(pi, { env: { KANEDIAS_SESSION_ID: "writer", KANEDIAS_SESSION_KIND: "write", KANEDIAS_SUPERVISOR_SOCKET: fixture.socket }, workspaceRoot: workspace });
   let shutdowns = 0;
-  const args = { repositories: [{ path: "/workspace/repo", repository: "owner/repo", baseCommit: "abc", branch: "feature", headCommit: "def" }], summary: "done", verification: ["npm test"] };
+  const args = { repositories: [{ path: checkout, repository: "owner/repo", baseCommit: "abc", branch: "feature", headCommit: "def" }], summary: "done", verification: ["npm test"] };
   const result = await tools[1]!.execute("call", args, undefined, undefined, { shutdown: () => shutdowns++ });
   assert.equal(JSON.stringify(body).includes("path"), false);
   assert.deepEqual(body.repositories[0], { repository: "owner/repo", baseCommit: "abc", branch: "feature", headCommit: "def" });
