@@ -9,6 +9,7 @@ import (
 	"fmt"
 	"io"
 	"net"
+	"runtime"
 	"strings"
 	"sync"
 	"sync/atomic"
@@ -61,45 +62,40 @@ func TestClientCorrelatesOutOfOrderResponses(t *testing.T) {
 	defer client.Close()
 	defer peer.Close()
 
-	type result struct {
-		raw json.RawMessage
-		err error
-	}
-	results := make(chan result, 2)
-	for _, command := range []string{`{"type":"get_state"}`, `{"type":"get_messages"}`} {
-		go func(command string) {
-			raw, err := client.Call(context.Background(), json.RawMessage(command))
-			results <- result{raw: raw, err: err}
-		}(command)
-	}
+	stateResult := make(chan rpcCallResult, 1)
+	messagesResult := make(chan rpcCallResult, 1)
+	go func() {
+		raw, err := client.Call(context.Background(), json.RawMessage(`{"type":"get_state"}`))
+		stateResult <- rpcCallResult{raw: raw, err: err}
+	}()
+	go func() {
+		raw, err := client.Call(context.Background(), json.RawMessage(`{"type":"get_messages"}`))
+		messagesResult <- rpcCallResult{raw: raw, err: err}
+	}()
 
+	commands := make(map[string]wireCommand, 2)
 	reader := bufio.NewReader(peer)
-	first := readCommand(t, reader)
-	second := readCommand(t, reader)
-	if first.ID == second.ID || first.ID == "" || second.ID == "" {
-		t.Fatalf("private IDs = %q, %q", first.ID, second.ID)
-	}
-	writeJSONLine(t, peer, fmt.Sprintf(`{"id":%q,"type":"response","command":%q,"success":true,"data":{"marker":%q}}`, second.ID, second.Type, second.Type))
-	writeJSONLine(t, peer, fmt.Sprintf(`{"id":%q,"type":"response","command":%q,"success":true,"data":{"marker":%q}}`, first.ID, first.Type, first.Type))
-
 	for range 2 {
-		got := <-results
-		if got.err != nil {
-			t.Fatalf("Call() error = %v", got.err)
+		command := readCommand(t, reader)
+		if command.ID == "" {
+			t.Fatal("private ID is empty")
 		}
-		var response struct {
-			Command string `json:"command"`
-			Data    struct {
-				Marker string `json:"marker"`
-			} `json:"data"`
+		if _, duplicate := commands[command.Type]; duplicate {
+			t.Fatalf("duplicate command type %q", command.Type)
 		}
-		if err := json.Unmarshal(got.raw, &response); err != nil {
-			t.Fatal(err)
-		}
-		if response.Command != response.Data.Marker {
-			t.Fatalf("response crossed calls: %#v", response)
-		}
+		commands[command.Type] = command
 	}
+	if commands["get_state"].ID == commands["get_messages"].ID {
+		t.Fatalf("private IDs = %q, %q", commands["get_state"].ID, commands["get_messages"].ID)
+	}
+
+	messages := commands["get_messages"]
+	state := commands["get_state"]
+	writeJSONLine(t, peer, fmt.Sprintf(`{"id":%q,"type":"response","command":"get_messages","success":true,"data":{"marker":"messages-response"}}`, messages.ID))
+	writeJSONLine(t, peer, fmt.Sprintf(`{"id":%q,"type":"response","command":"get_state","success":true,"data":{"marker":"state-response"}}`, state.ID))
+
+	assertCallResponse(t, <-stateResult, "get_state", "state-response")
+	assertCallResponse(t, <-messagesResult, "get_messages", "messages-response")
 }
 
 func TestClientDrainsEventBeforeFirstCommand(t *testing.T) {
@@ -238,8 +234,12 @@ func TestClientCancellationRemovesPendingCall(t *testing.T) {
 
 func TestClientCancellationWhileWriteQueuedKeepsTransport(t *testing.T) {
 	clientConn, peer := net.Pipe()
-	writeStarted := make(chan struct{})
-	client := NewClient(&writeStartProbe{ReadWriteCloser: clientConn, started: writeStarted})
+	probe := &blockingFirstWriteProbe{
+		ReadWriteCloser: clientConn,
+		started:         make(chan struct{}),
+		release:         make(chan struct{}),
+	}
+	client := NewClient(probe)
 	defer client.Close()
 	defer peer.Close()
 
@@ -248,7 +248,7 @@ func TestClientCancellationWhileWriteQueuedKeepsTransport(t *testing.T) {
 		_, err := client.Call(context.Background(), json.RawMessage(`{"type":"get_state"}`))
 		firstDone <- err
 	}()
-	<-writeStarted
+	<-probe.started
 
 	ctx, cancel := context.WithCancel(context.Background())
 	secondDone := make(chan error, 1)
@@ -256,17 +256,38 @@ func TestClientCancellationWhileWriteQueuedKeepsTransport(t *testing.T) {
 		_, err := client.Call(ctx, json.RawMessage(`{"type":"get_messages"}`))
 		secondDone <- err
 	}()
-	// The first call holds the serialized write lock until the peer starts reading.
-	time.Sleep(20 * time.Millisecond)
+	waitForPendingCount(t, client, 2)
 	cancel()
 
-	command := readCommand(t, bufio.NewReader(peer))
-	writeJSONLine(t, peer, fmt.Sprintf(`{"id":%q,"type":"response","command":"get_state","success":true}`, command.ID))
-	if err := <-secondDone; !errors.Is(err, context.Canceled) {
-		t.Fatalf("queued Call() error = %v, want context.Canceled", err)
+	var secondErr error
+	cancelledBeforeRelease := false
+	select {
+	case secondErr = <-secondDone:
+		cancelledBeforeRelease = true
+		if !errors.Is(secondErr, context.Canceled) {
+			t.Errorf("queued Call() error = %v, want context.Canceled", secondErr)
+		}
+		if got := pendingCount(client); got != 1 {
+			t.Errorf("pending calls after queued cancellation = %d, want 1", got)
+		}
+	case <-time.After(100 * time.Millisecond):
 	}
+
+	close(probe.release)
+	command := readCommand(t, bufio.NewReader(peer))
+	if command.Type != "get_state" {
+		t.Errorf("written command = %q, want get_state", command.Type)
+	}
+	writeJSONLine(t, peer, fmt.Sprintf(`{"id":%q,"type":"response","command":"get_state","success":true}`, command.ID))
 	if err := <-firstDone; err != nil {
 		t.Fatalf("first Call() error = %v; queued cancellation terminated transport", err)
+	}
+	if !cancelledBeforeRelease {
+		secondErr = <-secondDone
+		if !errors.Is(secondErr, context.Canceled) {
+			t.Errorf("queued Call() error = %v, want context.Canceled", secondErr)
+		}
+		t.Error("queued Call() did not return until the blocked first write was released")
 	}
 }
 
@@ -415,6 +436,36 @@ func TestClientSendRejectsSessionReplacementWithoutWriting(t *testing.T) {
 	}
 }
 
+func TestClientCloseClosesUnderlyingConnectionExactlyOnce(t *testing.T) {
+	firstCloseErr := errors.New("first close failed")
+	secondCloseErr := errors.New("second close failed")
+	tests := []struct {
+		name      string
+		closeErrs []error
+		wantErr   error
+	}{
+		{name: "second close failure is irrelevant", closeErrs: []error{nil, secondCloseErr}, wantErr: nil},
+		{name: "first close failure is returned", closeErrs: []error{firstCloseErr}, wantErr: firstCloseErr},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			clientConn, peer := net.Pipe()
+			probe := &closeResultProbe{ReadWriteCloser: clientConn, results: tt.closeErrs}
+			client := NewClient(probe)
+			defer peer.Close()
+
+			err := client.Close()
+			if !errors.Is(err, tt.wantErr) {
+				t.Fatalf("Close() error = %v, want %v", err, tt.wantErr)
+			}
+			if got := probe.calls.Load(); got != 1 {
+				t.Fatalf("underlying Close() calls = %d, want 1", got)
+			}
+		})
+	}
+}
+
 func TestClientCloseUnblocksEventBackpressure(t *testing.T) {
 	clientConn, peer := net.Pipe()
 	client := NewClient(clientConn)
@@ -477,6 +528,30 @@ type wireCommand struct {
 	Type string `json:"type"`
 }
 
+type rpcCallResult struct {
+	raw json.RawMessage
+	err error
+}
+
+func assertCallResponse(t *testing.T, got rpcCallResult, wantCommand, wantMarker string) {
+	t.Helper()
+	if got.err != nil {
+		t.Fatalf("Call() error = %v", got.err)
+	}
+	var response struct {
+		Command string `json:"command"`
+		Data    struct {
+			Marker string `json:"marker"`
+		} `json:"data"`
+	}
+	if err := json.Unmarshal(got.raw, &response); err != nil {
+		t.Fatal(err)
+	}
+	if response.Command != wantCommand || response.Data.Marker != wantMarker {
+		t.Fatalf("Call() response = %#v, want command %q and marker %q", response, wantCommand, wantMarker)
+	}
+}
+
 func readCommand(t *testing.T, reader *bufio.Reader) wireCommand {
 	t.Helper()
 	line, err := reader.ReadBytes('\n')
@@ -514,15 +589,54 @@ func writeJSONLineAsync(t *testing.T, writer io.Writer, record string) {
 	}
 }
 
-type writeStartProbe struct {
+func waitForPendingCount(t *testing.T, client *Client, want int) {
+	t.Helper()
+	deadline := time.Now().Add(time.Second)
+	for {
+		if pendingCount(client) == want {
+			return
+		}
+		if time.Now().After(deadline) {
+			t.Fatalf("pending calls = %d, want %d", pendingCount(client), want)
+		}
+		runtime.Gosched()
+	}
+}
+
+func pendingCount(client *Client) int {
+	client.mu.Lock()
+	defer client.mu.Unlock()
+	return len(client.pending)
+}
+
+type blockingFirstWriteProbe struct {
 	io.ReadWriteCloser
 	started chan struct{}
+	release chan struct{}
 	once    sync.Once
 }
 
-func (probe *writeStartProbe) Write(p []byte) (int, error) {
-	probe.once.Do(func() { close(probe.started) })
+func (probe *blockingFirstWriteProbe) Write(p []byte) (int, error) {
+	probe.once.Do(func() {
+		close(probe.started)
+		<-probe.release
+	})
 	return probe.ReadWriteCloser.Write(p)
+}
+
+type closeResultProbe struct {
+	io.ReadWriteCloser
+	results []error
+	calls   atomic.Int32
+}
+
+func (probe *closeResultProbe) Close() error {
+	call := int(probe.calls.Add(1))
+	baseErr := probe.ReadWriteCloser.Close()
+	if call <= len(probe.results) && probe.results[call-1] != nil {
+		return probe.results[call-1]
+	}
+	return baseErr
 }
 
 type concurrentWriteProbe struct {

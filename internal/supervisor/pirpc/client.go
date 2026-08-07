@@ -39,19 +39,20 @@ type Client struct {
 	events chan Event
 	done   chan struct{}
 
-	writeMu sync.Mutex
-	mu      sync.Mutex
-	pending map[string]chan callResult
-	err     error
-	closed  bool
+	writeGate chan struct{}
+	mu        sync.Mutex
+	pending   map[string]chan callResult
+	err       error
+	closed    bool
 }
 
 func NewClient(conn io.ReadWriteCloser) *Client {
 	client := &Client{
-		conn:    conn,
-		events:  make(chan Event, 128),
-		done:    make(chan struct{}),
-		pending: make(map[string]chan callResult),
+		conn:      conn,
+		events:    make(chan Event, 128),
+		done:      make(chan struct{}),
+		writeGate: make(chan struct{}, 1),
+		pending:   make(map[string]chan callResult),
 	}
 	go client.readLoop()
 	return client
@@ -142,8 +143,7 @@ func (client *Client) Err() error {
 }
 
 func (client *Client) Close() error {
-	client.terminate(io.ErrClosedPipe)
-	return client.conn.Close()
+	return client.terminate(io.ErrClosedPipe)
 }
 
 func (client *Client) readLoop() {
@@ -207,8 +207,12 @@ func (client *Client) removePending(id string) {
 }
 
 func (client *Client) write(ctx context.Context, record []byte) error {
-	client.writeMu.Lock()
-	defer client.writeMu.Unlock()
+	select {
+	case client.writeGate <- struct{}{}:
+		defer func() { <-client.writeGate }()
+	case <-ctx.Done():
+		return ctx.Err()
+	}
 	if err := ctx.Err(); err != nil {
 		return err
 	}
@@ -225,11 +229,11 @@ func (client *Client) write(ctx context.Context, record []byte) error {
 	return nil
 }
 
-func (client *Client) terminate(err error) {
+func (client *Client) terminate(err error) error {
 	client.mu.Lock()
 	if client.closed {
 		client.mu.Unlock()
-		return
+		return nil
 	}
 	client.closed = true
 	client.err = err
@@ -241,7 +245,7 @@ func (client *Client) terminate(err error) {
 	for _, result := range pending {
 		result <- callResult{err: err}
 	}
-	_ = client.conn.Close()
+	return client.conn.Close()
 }
 
 func parseCommandType(command json.RawMessage) (string, error) {
