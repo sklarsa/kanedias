@@ -28,9 +28,8 @@ const (
 
 type cleanDescendantEventEOF struct{ err error }
 
-func (streamErr cleanDescendantEventEOF) Error() string  { return streamErr.err.Error() }
-func (streamErr cleanDescendantEventEOF) Unwrap() error  { return streamErr.err }
-func (streamErr cleanDescendantEventEOF) CleanEOF() bool { return true }
+func (streamErr cleanDescendantEventEOF) Error() string { return streamErr.err.Error() }
+func (streamErr cleanDescendantEventEOF) Unwrap() error { return streamErr.err }
 
 type DescendantClient struct {
 	socketPath   string

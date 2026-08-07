@@ -68,17 +68,23 @@ func (client *Client) Call(ctx context.Context, command json.RawMessage) (json.R
 	return raw, err
 }
 
+// guardCommand enforces the forbidden-command policy and honors context
+// cancellation before a command is written to the Pi transport.
+func guardCommand(ctx context.Context, command json.RawMessage) error {
+	commandType, err := parseCommandType(command)
+	if err != nil {
+		return err
+	}
+	if isForbidden(commandType) {
+		return fmt.Errorf("%w: %s", ErrForbiddenCommand, commandType)
+	}
+	return ctx.Err()
+}
+
 // CallWithSequence returns the response and its monotonic position on the Pi
 // transport so owners can reconcile responses with asynchronously drained events.
 func (client *Client) CallWithSequence(ctx context.Context, command json.RawMessage) (json.RawMessage, uint64, error) {
-	commandType, err := parseCommandType(command)
-	if err != nil {
-		return nil, 0, err
-	}
-	if isForbidden(commandType) {
-		return nil, 0, fmt.Errorf("%w: %s", ErrForbiddenCommand, commandType)
-	}
-	if err := ctx.Err(); err != nil {
+	if err := guardCommand(ctx, command); err != nil {
 		return nil, 0, err
 	}
 
@@ -120,14 +126,7 @@ func (client *Client) CallWithSequence(ctx context.Context, command json.RawMess
 }
 
 func (client *Client) Send(ctx context.Context, command json.RawMessage) error {
-	commandType, err := parseCommandType(command)
-	if err != nil {
-		return err
-	}
-	if isForbidden(commandType) {
-		return fmt.Errorf("%w: %s", ErrForbiddenCommand, commandType)
-	}
-	if err := ctx.Err(); err != nil {
+	if err := guardCommand(ctx, command); err != nil {
 		return err
 	}
 	var compact bytes.Buffer

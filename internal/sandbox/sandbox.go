@@ -271,6 +271,9 @@ func waitForSystemd(ctx context.Context, client lifecycleClient, name string, ti
 	var lastState string
 	var lastStderr string
 	var lastErr error
+	timeoutErr := func() error {
+		return fmt.Errorf("wait for systemd in sandbox %q: %w (last state %q, stderr %q, exec error %v)", name, readyCtx.Err(), lastState, lastStderr, lastErr)
+	}
 	for {
 		stdout, stderr, err := client.Exec(readyCtx, name, incusclient.ExecRequest{
 			Command: []string{"systemctl", "is-system-running", "--wait"},
@@ -284,7 +287,7 @@ func waitForSystemd(ctx context.Context, client lifecycleClient, name string, ti
 		lastErr = err
 
 		if readyCtx.Err() != nil {
-			return fmt.Errorf("wait for systemd in sandbox %q: %w (last state %q, stderr %q, exec error %v)", name, readyCtx.Err(), lastState, lastStderr, lastErr)
+			return timeoutErr()
 		}
 
 		timer := time.NewTimer(pollInterval)
@@ -293,7 +296,7 @@ func waitForSystemd(ctx context.Context, client lifecycleClient, name string, ti
 			if !timer.Stop() {
 				<-timer.C
 			}
-			return fmt.Errorf("wait for systemd in sandbox %q: %w (last state %q, stderr %q, exec error %v)", name, readyCtx.Err(), lastState, lastStderr, lastErr)
+			return timeoutErr()
 		case <-timer.C:
 		}
 	}

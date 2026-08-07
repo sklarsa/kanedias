@@ -67,6 +67,8 @@ type IncusRootProvisioner struct {
 	deps   rootDependencies
 }
 
+var _ RootProvisioner = (*IncusRootProvisioner)(nil)
+
 // NewRootProvisioner returns the production root provisioner.
 func NewRootProvisioner(cfg config.Config) *IncusRootProvisioner {
 	return newRootProvisioner(cfg, defaultRootDependencies())

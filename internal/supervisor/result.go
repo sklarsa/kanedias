@@ -34,25 +34,8 @@ func (node *Node) RunReadTask(ctx context.Context, task string) (contract.ReadCh
 	// this delegated generation. Capture the local source boundary immediately
 	// before constructing/submitting the exact admitted prompt.
 	boundary := node.broker.SourceBoundary(identity.SessionID)
-	prompt, err := json.Marshal(map[string]string{"type": "prompt", "message": task})
-	if err != nil {
+	if err := submitPrompt(ctx, local, task); err != nil {
 		return contract.ReadChildResult{}, err
-	}
-	response, err := local.CallRPC(ctx, prompt)
-	if err != nil {
-		return contract.ReadChildResult{}, childFailure(contract.ErrorChildFailed, "submit child task", err)
-	}
-	var accepted struct {
-		Type    string `json:"type"`
-		Command string `json:"command"`
-		Success bool   `json:"success"`
-		Error   string `json:"error"`
-	}
-	if err := json.Unmarshal(response, &accepted); err != nil || accepted.Type != "response" || accepted.Command != "prompt" || !accepted.Success {
-		if accepted.Error == "" {
-			accepted.Error = "Pi rejected the prompt"
-		}
-		return contract.ReadChildResult{}, childFailure(contract.ErrorChildFailed, "submit child task", errors.New(accepted.Error))
 	}
 
 	pending := append([]EventEnvelope(nil), subscription.Replay...)
@@ -141,20 +124,9 @@ func childFailure(code contract.ErrorCode, message string, cause error) error {
 	return errors.Join(contract.NewError(code, message), cause)
 }
 
-func (node *Node) RunWriteTask(ctx context.Context, task string) error {
-	identity := node.identity.Snapshot()
-	if identity.Kind != contract.ChildKindWrite {
-		return contract.NewError(contract.ErrorConflict, "only write children can run write tasks")
-	}
-	if strings.TrimSpace(task) == "" {
-		return contract.NewError(contract.ErrorInvalidRequest, "write task is required")
-	}
-	node.mu.RLock()
-	local := node.local
-	node.mu.RUnlock()
-	if local == nil {
-		return contract.NewError(contract.ErrorChildUnavailable, "child Pi RPC is not ready")
-	}
+// submitPrompt marshals task as a Pi prompt command, sends it over the child's
+// RPC transport, and validates that Pi accepted the prompt.
+func submitPrompt(ctx context.Context, local *LocalSession, task string) error {
 	prompt, err := json.Marshal(map[string]string{"type": "prompt", "message": task})
 	if err != nil {
 		return err
@@ -176,6 +148,23 @@ func (node *Node) RunWriteTask(ctx context.Context, task string) error {
 		return childFailure(contract.ErrorChildFailed, "submit child task", errors.New(accepted.Error))
 	}
 	return nil
+}
+
+func (node *Node) RunWriteTask(ctx context.Context, task string) error {
+	identity := node.identity.Snapshot()
+	if identity.Kind != contract.ChildKindWrite {
+		return contract.NewError(contract.ErrorConflict, "only write children can run write tasks")
+	}
+	if strings.TrimSpace(task) == "" {
+		return contract.NewError(contract.ErrorInvalidRequest, "write task is required")
+	}
+	node.mu.RLock()
+	local := node.local
+	node.mu.RUnlock()
+	if local == nil {
+		return contract.NewError(contract.ErrorChildUnavailable, "child Pi RPC is not ready")
+	}
+	return submitPrompt(ctx, local, task)
 }
 
 type WriteHandoffRequest struct {

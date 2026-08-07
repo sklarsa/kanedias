@@ -1,40 +1,10 @@
 package provision
 
 import (
-	"context"
 	"reflect"
 	"sync"
 	"testing"
-
-	"github.com/sklarsa/kanedias/internal/config"
-	"github.com/sklarsa/kanedias/internal/supervisor/contract"
 )
-
-func TestProvisionContractsCarryIndependentRootAndChildInputs(t *testing.T) {
-	root := RootRequest{SessionID: "root-1", SocketPath: "/run/kanedias/root.sock"}
-	if root.SessionID != "root-1" || root.SocketPath != "/run/kanedias/root.sock" {
-		t.Fatalf("RootRequest = %#v", root)
-	}
-
-	child := ChildRequest{
-		SessionID: "child-1", ParentID: "parent-1", RootID: "root-1",
-		SourceInstance: "instance-parent", SourceVolume: "volume-parent",
-		HostSocketPath: "/run/kanedias/child.sock",
-		Worker:         config.WorkerProfile{Description: "Review.", Provider: "provider", Model: "model", ThinkingLevel: "high"},
-		Contract:       contract.CreateChildRequest{WorkerType: "reviewer", Kind: contract.ChildKindRead, Context: contract.ContextFresh, Task: "Review."},
-	}
-	if got, want := child.Contract.Kind, contract.ChildKindRead; got != want {
-		t.Fatalf("ChildRequest.Contract.Kind = %q, want %q", got, want)
-	}
-
-	resources := Resources{SessionID: "child-1", Pool: "default", Instance: "instance-child", Volume: "volume-child", RPCAddr: "10.0.0.2:4444"}
-	if resources.Instance != "instance-child" || resources.Volume != "volume-child" {
-		t.Fatalf("Resources = %#v", resources)
-	}
-
-	var _ RootProvisioner = rootProvisionerStub{}
-	var _ ChildProvisioner = childProvisionerStub{}
-}
 
 func TestOwnershipRecordsSubmissionBeforeConfirmation(t *testing.T) {
 	var ownership Ownership
@@ -83,17 +53,3 @@ func TestOwnershipSnapshotIsRaceSafeAndIndependent(t *testing.T) {
 		t.Fatalf("resource operation names were conflated: %#v", got)
 	}
 }
-
-type rootProvisionerStub struct{}
-
-func (rootProvisionerStub) ProvisionRoot(context.Context, RootRequest) (*Resources, error) {
-	return nil, nil
-}
-func (rootProvisionerStub) Destroy(context.Context, *Resources) error { return nil }
-
-type childProvisionerStub struct{}
-
-func (childProvisionerStub) ProvisionChild(context.Context, ChildRequest) (*Resources, error) {
-	return nil, nil
-}
-func (childProvisionerStub) Destroy(context.Context, *Resources) error { return nil }

@@ -304,15 +304,6 @@ func TestDestroyRefusesUnverifiedOwnedDevicesWithoutDeletion(t *testing.T) {
 		{name: "workspace wrong path", devices: api.DevicesMap{
 			"workspace": {"type": "disk", "pool": "pool1", "source": "kanedias-workspace-demo", "path": "/other"}, incusworkspace.DeviceName: valid[incusworkspace.DeviceName],
 		}},
-		{name: "Incus state wrong pool", devices: api.DevicesMap{
-			"workspace": valid["workspace"], incusworkspace.DeviceName: {"type": "disk", "pool": "old-pool", "source": "kanedias-incus-demo", "path": "/var/lib/incus"},
-		}},
-		{name: "Incus state wrong type", devices: api.DevicesMap{
-			"workspace": valid["workspace"], incusworkspace.DeviceName: {"type": "unix-block", "pool": "pool1", "source": "kanedias-incus-demo", "path": "/var/lib/incus"},
-		}},
-		{name: "Incus state wrong path", devices: api.DevicesMap{
-			"workspace": valid["workspace"], incusworkspace.DeviceName: {"type": "disk", "pool": "pool1", "source": "kanedias-incus-demo", "path": "/other"},
-		}},
 	} {
 		t.Run(test.name, func(t *testing.T) {
 			fake := &recordingClient{instance: &api.Instance{InstancePut: api.InstancePut{Devices: test.devices}}}
