@@ -507,6 +507,10 @@ func (h *liveAcceptance) exerciseForkedWrite(root supervisor.NodeSnapshot, socke
 	client := unixHTTPClient(socket)
 	rootInstance := h.instanceForSession(root.SessionID)
 	checkout := "/workspace/repos/" + h.repository
+	checkoutOrigin := h.execInstance(rootInstance, "git", "-C", checkout, "config", "--get", "remote.origin.url")
+	if err := preflightCheckoutOrigin(h.ctx, h.repository, h.remote, checkoutOrigin, resolveGitRemoteHEAD); err != nil {
+		h.t.Fatalf("actual writer checkout origin rejected before model prompt or push: %v", err)
+	}
 	beforeSize := h.execInstance(rootInstance, "stat", "-c", "%s", root.SessionFile)
 	beforeHash := strings.Fields(h.execInstance(rootInstance, "sha256sum", root.SessionFile))[0]
 	base := h.execInstance(rootInstance, "git", "-C", checkout, "rev-parse", "HEAD")
@@ -876,15 +880,12 @@ func (h *liveAcceptance) assertSessionMetadata(node supervisor.NodeSnapshot) {
 	if len(instances) != 1 || len(volumes) != 1 {
 		h.t.Fatalf("session %s resource pair count: instances=%d volumes=%d", node.SessionID, len(instances), len(volumes))
 	}
-	wantInstance := "session-" + node.SessionID
-	wantVolume := "workspace-" + node.SessionID
-	if instances[0].Name != wantInstance || volumes[0].Name != wantVolume {
-		h.t.Fatalf("session %s deterministic resource names: instance=%q volume=%q", node.SessionID, instances[0].Name, volumes[0].Name)
+	wantInstance, wantVolume, want, err := expectedLiveResourceAssertion(node, instances[0].Name, h.prefix)
+	if err != nil {
+		h.t.Fatalf("session %s resource identity: %v", node.SessionID, err)
 	}
-	want := map[string]string{
-		metadataSession: node.SessionID, metadataParent: node.ParentSessionID, metadataRoot: node.RootSessionID,
-		metadataKind: string(node.Kind), metadataContext: string(node.Context), metadataWorker: node.WorkerType,
-		metadataVolume: wantVolume, metadataRun: h.prefix,
+	if instances[0].Name != wantInstance || volumes[0].Name != wantVolume {
+		h.t.Fatalf("session %s resource names: instance=%q volume=%q, want instance=%q volume=%q", node.SessionID, instances[0].Name, volumes[0].Name, wantInstance, wantVolume)
 	}
 	for _, record := range []resourceRecord{instances[0], volumes[0]} {
 		for key, value := range want {
@@ -893,6 +894,38 @@ func (h *liveAcceptance) assertSessionMetadata(node supervisor.NodeSnapshot) {
 			}
 		}
 	}
+}
+
+func expectedLiveResourceAssertion(node supervisor.NodeSnapshot, observedInstance, run string) (string, string, map[string]string, error) {
+	if strings.TrimSpace(observedInstance) == "" {
+		return "", "", nil, fmt.Errorf("observed instance name is empty")
+	}
+	var instance, volume string
+	switch node.Kind {
+	case contract.ChildKindRoot:
+		if node.ParentSessionID != "" || node.RootSessionID != node.SessionID || node.Context != contract.ContextRoot || node.WorkerType != "" {
+			return "", "", nil, fmt.Errorf("root snapshot identity is inconsistent")
+		}
+		if observedInstance == "session-"+node.SessionID {
+			return "", "", nil, fmt.Errorf("root instance incorrectly uses child deterministic session name")
+		}
+		instance = observedInstance
+		volume = "kanedias-workspace-" + observedInstance
+	case contract.ChildKindRead, contract.ChildKindWrite:
+		instance = "session-" + node.SessionID
+		if observedInstance != instance {
+			return "", "", nil, fmt.Errorf("child instance %q, want %q", observedInstance, instance)
+		}
+		volume = "workspace-" + node.SessionID
+	default:
+		return "", "", nil, fmt.Errorf("unsupported session kind %q", node.Kind)
+	}
+	metadata := map[string]string{
+		metadataSession: node.SessionID, metadataParent: node.ParentSessionID, metadataRoot: node.RootSessionID,
+		metadataKind: string(node.Kind), metadataContext: string(node.Context), metadataWorker: node.WorkerType,
+		metadataVolume: volume, metadataRun: run,
+	}
+	return instance, volume, metadata, nil
 }
 
 func (h *liveAcceptance) assertTreeMetadata(tree supervisor.NodeSnapshot) {
@@ -1333,32 +1366,56 @@ func descendantPIDs(root int) []int {
 	return descendants
 }
 
+type remoteHEADResolver func(context.Context, string) (string, error)
+
+func resolveGitRemoteHEAD(ctx context.Context, remote string) (string, error) {
+	command := exec.CommandContext(ctx, "git", "ls-remote", "--exit-code", remote, "HEAD")
+	output, err := command.Output()
+	if err != nil {
+		return "", err
+	}
+	fields := strings.Fields(string(output))
+	if len(fields) != 2 || fields[1] != "HEAD" {
+		return "", fmt.Errorf("remote returned no unique HEAD")
+	}
+	return fields[0], nil
+}
+
 func preflightDisposableRemote(ctx context.Context, repository, remote string) error {
 	if githubRemoteSlug(remote) != repository {
 		return fmt.Errorf("explicit remote does not identify trusted github.com/%s", repository)
 	}
-	resolve := func(value string) (string, error) {
-		command := exec.CommandContext(ctx, "git", "ls-remote", "--exit-code", value, "HEAD")
-		output, err := command.Output()
-		if err != nil {
-			return "", err
-		}
-		fields := strings.Fields(string(output))
-		if len(fields) != 2 || fields[1] != "HEAD" {
-			return "", fmt.Errorf("remote returned no unique HEAD")
-		}
-		return fields[0], nil
-	}
-	explicitHead, err := resolve(remote)
+	explicitHead, err := resolveGitRemoteHEAD(ctx, remote)
 	if err != nil {
 		return fmt.Errorf("resolve explicit remote HEAD: %w", err)
 	}
-	trustedHead, err := resolve("https://github.com/" + repository + ".git")
+	trustedHead, err := resolveGitRemoteHEAD(ctx, "https://github.com/"+repository+".git")
 	if err != nil {
 		return fmt.Errorf("resolve trusted canonical remote HEAD: %w", err)
 	}
 	if explicitHead != trustedHead {
 		return fmt.Errorf("explicit remote HEAD differs from trusted canonical repository")
+	}
+	return nil
+}
+
+func preflightCheckoutOrigin(ctx context.Context, repository, authorizedRemote, checkoutOrigin string, resolve remoteHEADResolver) error {
+	if githubRemoteSlug(authorizedRemote) != repository {
+		return fmt.Errorf("authorized remote does not identify trusted github.com/%s", repository)
+	}
+	if githubRemoteSlug(checkoutOrigin) != repository {
+		return fmt.Errorf("checkout origin %q does not identify authorized github.com/%s", checkoutOrigin, repository)
+	}
+	authorizedHead, err := resolve(ctx, authorizedRemote)
+	if err != nil {
+		return fmt.Errorf("resolve authorized disposable remote HEAD: %w", err)
+	}
+	checkoutHead, err := resolve(ctx, checkoutOrigin)
+	if err != nil {
+		return fmt.Errorf("resolve actual checkout origin HEAD: %w", err)
+	}
+	if checkoutHead != authorizedHead {
+		return fmt.Errorf("actual checkout origin HEAD differs from authorized disposable remote")
 	}
 	return nil
 }

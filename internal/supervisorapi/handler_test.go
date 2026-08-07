@@ -590,6 +590,67 @@ func TestDescendantSSEAcceptsPiSizedEnvelopeAndSurfacesStreamErrors(t *testing.T
 	}
 }
 
+func TestDescendantSSECleanEOFIsOwnedFailureUnlessParentCloses(t *testing.T) {
+	path := filepath.Join(t.TempDir(), "clean-eof.sock")
+	ctx, cancel := context.WithCancel(context.Background())
+	serverDone := make(chan error, 1)
+	go func() {
+		serverDone <- ServeUnix(ctx, path, http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
+			w.Header().Set("Content-Type", "text/event-stream")
+			w.WriteHeader(http.StatusOK)
+			w.(http.Flusher).Flush()
+		}))
+	}()
+	waitForSocket(t, path)
+	seam, err := NewDescendantClient(path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	sub, err := seam.Subscribe(context.Background())
+	if err != nil {
+		t.Fatal(err)
+	}
+	for range sub.Events {
+	}
+	var typed *contract.Error
+	if sub.Err == nil || !errors.As(sub.Err(), &typed) || typed.Code != contract.ErrorChildUnavailable {
+		t.Fatalf("clean active EOF error = %v, want child_unavailable", sub.Err())
+	}
+
+	parentCtx, parentCancel := context.WithCancel(context.Background())
+	parentPath := filepath.Join(t.TempDir(), "parent-close.sock")
+	parentDone := make(chan error, 1)
+	go func() {
+		parentDone <- ServeUnix(parentCtx, parentPath, http.HandlerFunc(func(w http.ResponseWriter, request *http.Request) {
+			w.Header().Set("Content-Type", "text/event-stream")
+			w.WriteHeader(http.StatusOK)
+			w.(http.Flusher).Flush()
+			<-request.Context().Done()
+		}))
+	}()
+	waitForSocket(t, parentPath)
+	parentSeam, _ := NewDescendantClient(parentPath)
+	parentSub, err := parentSeam.Subscribe(context.Background())
+	if err != nil {
+		t.Fatal(err)
+	}
+	parentSub.Close()
+	for range parentSub.Events {
+	}
+	if parentSub.Err != nil && parentSub.Err() != nil {
+		t.Fatalf("parent close became stream failure: %v", parentSub.Err())
+	}
+
+	parentCancel()
+	if err := <-parentDone; err != nil {
+		t.Fatal(err)
+	}
+	cancel()
+	if err := <-serverDone; err != nil {
+		t.Fatal(err)
+	}
+}
+
 func TestDescendantUnaryOperationsHaveInternalDeadline(t *testing.T) {
 	path := filepath.Join(t.TempDir(), "stall.sock")
 	ctx, cancel := context.WithCancel(context.Background())

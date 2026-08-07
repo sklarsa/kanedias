@@ -224,9 +224,14 @@ func (client *DescendantClient) Subscribe(ctx context.Context) (supervisor.Subsc
 				data.WriteString(strings.TrimSpace(strings.TrimPrefix(line, "data:")))
 			}
 		}
-		if err := scanner.Err(); err != nil && streamCtx.Err() == nil {
-			setStreamErr(contract.NewError(contract.ErrorChildUnavailable, "read child event stream: "+err.Error()))
+		if streamCtx.Err() != nil {
+			return
 		}
+		if err := scanner.Err(); err != nil {
+			setStreamErr(contract.NewError(contract.ErrorChildUnavailable, "read child event stream: "+err.Error()))
+			return
+		}
+		setStreamErr(contract.NewError(contract.ErrorChildUnavailable, "child event stream ended unexpectedly"))
 	}()
 	return supervisor.Subscription{
 		Replay: []supervisor.EventEnvelope{}, Events: events, Close: closeStream,

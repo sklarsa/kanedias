@@ -319,7 +319,7 @@ There is one branch and exact head commit per modified repository. Read-only chi
 
 If a writer agent settles without handoff, the session enters an `awaiting_handoff` state. It remains live so a client can inspect its transcript, send a new prompt or follow-up asking it to finish the handoff, or cancel it. V1 does not enforce repository cleanliness or manufacture commits.
 
-Before accepting handoff, the extension verifies that every reported branch exists on its stated Git remote and resolves to the reported head commit. This verifies durability without imposing a clean-working-tree policy. A missing or mismatched remote ref leaves the writer live and returns a tool error.
+Before submitting handoff, the extension checks the guest checkout origin and reported refs as a defense-in-depth preflight. Guest checks do not establish durability or authority: the guest and its same-UID socket caller are untrusted. Before accepting handoff, the host supervisor derives the canonical GitHub remote only from its configured repository allowlist and runs bounded `git ls-remote` verification for each exact reported branch and head. That host-configured canonical check is authoritative. A missing, ambiguous, or mismatched remote ref leaves the writer live and returns a tool error without imposing a clean-working-tree policy.
 
 A successful handoff is terminal. Any unfinished descendants of that writer are cancelled as part of subtree teardown.
 
@@ -330,7 +330,7 @@ COW storage and GitHub have separate purposes:
 - COW cloning transfers the starting filesystem state into an independent sandbox quickly.
 - GitHub refs transfer completed writer changes back to the parent after the child disappears.
 
-The supervisor does not require a clean Git state before spawning a writer. The handoff skill instructs the agent to establish an appropriate commit boundary and push its work. The handoff tool checks remote reachability and exact head identity, after which the parent receives immutable commit identities and decides whether to inspect, merge, or cherry-pick them.
+The supervisor does not require a clean Git state before spawning a writer. The handoff skill instructs the agent to establish an appropriate commit boundary and push its work. Extension-side Git checks are preflight only. The host supervisor checks remote reachability and exact head identity against its configured canonical GitHub remote, after which the parent receives immutable commit identities and decides whether to inspect, merge, or cherry-pick them.
 
 Branch integration is deliberately outside the supervisor. Normal Git conflicts are handled as normal Git conflicts by the parent session or user.
 
@@ -362,7 +362,9 @@ Parent ownership is strict in v1:
 - each child recursively cancels its descendants;
 - every child monitors an inherited parent-liveness pipe and begins cascading shutdown when that pipe reaches EOF;
 - graceful shutdown is attempted before forced termination;
-- each supervisor removes only the resources it created;
+- each supervisor normally removes only the resources it created;
+- after an admitted direct child process has definitely exited, its direct parent has one narrow recovery exception: it may delete only the deterministic instance, volume, and socket named in that child's exact pre-published ownership ticket after pool, complete identity metadata, workspace name, run attribution, and socket device/inode all match;
+- recovery never scans for resources, discovers unrelated sessions, adopts a child, or acts before the exact child process exits;
 - no child is detached or adopted;
 - a successfully delivered Git handoff remains valid even after the child sandbox is deleted.
 
@@ -420,7 +422,7 @@ Cancelling the extension tool cancels the corresponding child subtree.
 
 ### Handoff
 
-`POST /v1/handoff` is called by the extension in a writer child after its remote-ref checks pass. It records and forwards the terminal result upward before acknowledging the extension.
+`POST /v1/handoff` is called by the extension in a writer child after guest-side remote preflight. The host then performs the authoritative bounded `ls-remote` check using the configured canonical GitHub remote, records and forwards the verified terminal result upward, and only then writes and flushes acknowledgement to the extension.
 
 ### Stop
 

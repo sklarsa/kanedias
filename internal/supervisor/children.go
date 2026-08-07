@@ -56,10 +56,11 @@ type childEntry struct {
 	eventCancel context.CancelFunc
 	recovery    *provision.RecoveryTicket
 
-	cleanupOnce sync.Once
-	cleanupDone chan struct{}
-	cleanupErr  error
-	streamErr   error
+	cleanupOnce        sync.Once
+	cleanupDone        chan struct{}
+	cleanupErr         error
+	streamErr          error
+	eventCloseExpected bool
 }
 
 func (entry *childEntry) init() {
@@ -110,6 +111,22 @@ func (entry *childEntry) setStreamError(err error) {
 	entry.mu.Lock()
 	entry.streamErr = err
 	entry.mu.Unlock()
+}
+
+func (entry *childEntry) expectEventStreamClose() {
+	entry.mu.Lock()
+	entry.eventCloseExpected = true
+	cancel := entry.eventCancel
+	entry.mu.Unlock()
+	if cancel != nil {
+		cancel()
+	}
+}
+
+func (entry *childEntry) eventStreamCloseIsExpected() bool {
+	entry.mu.RLock()
+	defer entry.mu.RUnlock()
+	return entry.eventCloseExpected
 }
 
 type childRegistry struct {
@@ -193,6 +210,9 @@ func (node *Node) forwardChildEvents(ctx context.Context, cancel context.CancelF
 			return
 		case event, ok := <-subscription.Events:
 			if !ok {
+				if entry.eventStreamCloseIsExpected() || ctx.Err() != nil {
+					return
+				}
 				if subscription.Err != nil {
 					if streamErr := subscription.Err(); streamErr != nil {
 						entry.setStreamError(streamErr)
