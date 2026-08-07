@@ -2,3 +2,5 @@
 .worktrees
 config.toml
 bin/
+.env
+.claude
