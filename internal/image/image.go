@@ -3,7 +3,7 @@ package image
 import (
 	"bytes"
 	"context"
-	_ "embed"
+	"embed"
 	"errors"
 	"fmt"
 	"io"
@@ -31,6 +31,22 @@ var piRPCService []byte
 
 //go:embed kanedias-pi-rpc
 var piRPCLauncher []byte
+
+//go:embed pi-extension/package-lock.json pi-extension/package.json pi-extension/skills/*/SKILL.md pi-extension/src/*.ts
+var piExtension embed.FS
+
+var piExtensionFiles = []string{
+	"pi-extension/package-lock.json",
+	"pi-extension/package.json",
+	"pi-extension/skills/delegate-session/SKILL.md",
+	"pi-extension/skills/writer-handoff/SKILL.md",
+	"pi-extension/src/fork.ts",
+	"pi-extension/src/git-handoff.ts",
+	"pi-extension/src/index.ts",
+	"pi-extension/src/schemas.ts",
+	"pi-extension/src/supervisor-client.ts",
+	"pi-extension/src/types.ts",
+}
 
 type imageClient interface {
 	ResolvePool(context.Context, string) (string, error)
@@ -193,6 +209,21 @@ func createWithClient(ctx context.Context, client imageClient, cfg config.Config
 			return fmt.Errorf("upload image build input %q: %w", file.path, err)
 		}
 	}
+	if _, _, err := client.Exec(ctx, instanceName, incusclient.ExecRequest{
+		Command: []string{"install", "-d", "/root/assets/pi-extension/skills/delegate-session", "/root/assets/pi-extension/skills/writer-handoff", "/root/assets/pi-extension/src"},
+	}); err != nil {
+		return fmt.Errorf("create Pi extension asset directories: %w", err)
+	}
+	for _, embeddedPath := range piExtensionFiles {
+		content, err := piExtension.ReadFile(embeddedPath)
+		if err != nil {
+			return fmt.Errorf("read embedded Pi extension file %q: %w", embeddedPath, err)
+		}
+		destination := "/root/assets/" + embeddedPath
+		if err := client.PushFile(ctx, instanceName, destination, content, 0o644); err != nil {
+			return fmt.Errorf("upload image build input %q: %w", destination, err)
+		}
+	}
 
 	fmt.Fprintln(stdout, "Running image installer...")
 	execStdout, execStderr, execErr := client.Exec(ctx, instanceName, incusclient.ExecRequest{
@@ -202,6 +233,11 @@ func createWithClient(ctx context.Context, client imageClient, cfg config.Config
 	_, _ = io.WriteString(stderr, execStderr)
 	if execErr != nil {
 		return fmt.Errorf("run image installer: %w", execErr)
+	}
+	if _, _, err := client.Exec(ctx, instanceName, incusclient.ExecRequest{
+		Command: []string{"test", "-d", "/opt/kanedias/pi-extension/node_modules/typebox"},
+	}); err != nil {
+		return fmt.Errorf("verify Pi extension production dependencies: %w", err)
 	}
 
 	fmt.Fprintf(stdout, "Stopping temporary instance %s...\n", instanceName)

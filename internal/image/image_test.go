@@ -57,6 +57,23 @@ func TestInstallerIncludesUninitializedContainerOnlyIncus(t *testing.T) {
 	}
 }
 
+func TestInstallerStagesExtensionWithoutActivatingIt(t *testing.T) {
+	script := string(installer)
+	for _, required := range []string{
+		`install -d -m 0755 /opt/kanedias/pi-extension`,
+		`npm ci --omit=dev --ignore-scripts`,
+		`/usr/lib/tmpfiles.d/kanedias.conf`,
+		`d /run/kanedias 0700 kanedias kanedias -`,
+	} {
+		if !strings.Contains(script, required) {
+			t.Errorf("installer missing extension staging behavior %q", required)
+		}
+	}
+	if strings.Contains(string(piRPCLauncher), " -e ") || strings.Contains(string(piRPCLauncher), "--extension") {
+		t.Error("staged extension was activated before supervisor integration")
+	}
+}
+
 func TestCreateRunsImageWorkflowInOrder(t *testing.T) {
 	cfg := imageConfig(t, []string{"github.com", "gitlab.com"})
 	client := &recordingClient{files: make(map[string]uploadedFile)}
@@ -86,7 +103,19 @@ func TestCreateRunsImageWorkflowInOrder(t *testing.T) {
 		"push /root/assets/kanedias-pi.socket",
 		"push /root/assets/kanedias-pi@.service",
 		"push /root/assets/kanedias-pi-rpc",
+		"exec install -d /root/assets/pi-extension/skills/delegate-session /root/assets/pi-extension/skills/writer-handoff /root/assets/pi-extension/src",
+		"push /root/assets/pi-extension/package-lock.json",
+		"push /root/assets/pi-extension/package.json",
+		"push /root/assets/pi-extension/skills/delegate-session/SKILL.md",
+		"push /root/assets/pi-extension/skills/writer-handoff/SKILL.md",
+		"push /root/assets/pi-extension/src/fork.ts",
+		"push /root/assets/pi-extension/src/git-handoff.ts",
+		"push /root/assets/pi-extension/src/index.ts",
+		"push /root/assets/pi-extension/src/schemas.ts",
+		"push /root/assets/pi-extension/src/supervisor-client.ts",
+		"push /root/assets/pi-extension/src/types.ts",
 		"exec bash /root/install.sh",
+		"exec test -d /opt/kanedias/pi-extension/node_modules/typebox",
 		"stop",
 		"publish",
 		"cleanup-delete-instance",
@@ -162,6 +191,23 @@ func TestCreateRunsImageWorkflowInOrder(t *testing.T) {
 		if client.files[path].mode != 0o644 {
 			t.Errorf("%s mode = %#o, want 0644", path, client.files[path].mode)
 		}
+	}
+	for path, file := range client.files {
+		if !strings.HasPrefix(path, "/root/assets/pi-extension/") {
+			continue
+		}
+		if file.mode != 0o644 {
+			t.Errorf("%s mode = %#o, want 0644", path, file.mode)
+		}
+		contents := string(file.content)
+		for _, forbidden := range []string{"ANTHROPIC_API_KEY", "OPENAI_API_KEY", "api-key=", "Bearer sk-"} {
+			if strings.Contains(contents, forbidden) {
+				t.Errorf("%s contains credential marker %q", path, forbidden)
+			}
+		}
+	}
+	if _, present := client.files["/root/assets/pi-extension/node_modules/typebox"]; present {
+		t.Error("development node_modules was uploaded instead of installed in the image")
 	}
 	if got, want := client.publishAlias, cfg.BaseImage.Name; got != want {
 		t.Errorf("published alias = %q, want %q", got, want)

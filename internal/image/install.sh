@@ -25,6 +25,7 @@ tmux_config_file="$assets_dir/tmux.conf"
 pi_rpc_socket_file="$assets_dir/kanedias-pi.socket"
 pi_rpc_service_file="$assets_dir/kanedias-pi@.service"
 pi_rpc_launcher_file="$assets_dir/kanedias-pi-rpc"
+pi_extension_dir="$assets_dir/pi-extension"
 
 for required_file in \
     "$authorized_hosts_file" "$pi_settings_file" "$pi_auth_file" \
@@ -35,6 +36,10 @@ for required_file in \
         exit 1
     fi
 done
+if [[ ! -d $pi_extension_dir ]]; then
+    echo "missing install input: $pi_extension_dir" >&2
+    exit 1
+fi
 
 export DEBIAN_FRONTEND=noninteractive
 
@@ -481,6 +486,30 @@ EOF
         "$pi_theme_file" "$managed_home/.pi/agent/themes/cobalt-ember.json"
 }
 
+install_pi_extension() {
+    rm -rf /opt/kanedias/pi-extension
+    install -d -m 0755 /opt/kanedias/pi-extension
+    cp -a "$pi_extension_dir/." /opt/kanedias/pi-extension/
+    chown -R root:root /opt/kanedias/pi-extension
+    find /opt/kanedias/pi-extension -type d -exec chmod 0755 {} +
+    find /opt/kanedias/pi-extension -type f -exec chmod 0644 {} +
+
+    (
+        export NVM_DIR="$managed_home/.nvm"
+        # shellcheck source=/dev/null
+        source "$NVM_DIR/nvm.sh"
+        nvm use --silent default
+        cd /opt/kanedias/pi-extension
+        npm ci --omit=dev --ignore-scripts
+    )
+
+    install -d -m 0755 /usr/lib/tmpfiles.d
+    cat > /usr/lib/tmpfiles.d/kanedias.conf <<EOF
+d /run/kanedias 0700 kanedias kanedias -
+EOF
+    systemd-tmpfiles --create /usr/lib/tmpfiles.d/kanedias.conf
+}
+
 install_pi_rpc_service() {
     install -d -m 0755 /usr/local/libexec
     install -m 0755 "$assets_dir/kanedias-pi-rpc" \
@@ -503,4 +532,5 @@ install_uv
 install_tfenv
 install_nvm
 install_pi
+install_pi_extension
 install_pi_rpc_service
