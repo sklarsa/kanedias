@@ -87,6 +87,9 @@ authorized_hosts = ["github.com", "gitlab.com"]
 pool = "default"
 volume = "workspace"
 repos = ["owner/repo", "other/project"]
+[workspace.incus]
+volume = "nested-state"
+images = ["images:debian/13", "images:ubuntu/24.04"]
 `)
 
 	cfg, err := Load(path)
@@ -106,8 +109,15 @@ repos = ["owner/repo", "other/project"]
 		Pool:   "default",
 		Volume: "workspace",
 		Repos:  []string{"owner/repo", "other/project"},
+		Incus: IncusWorkspace{
+			Volume: "nested-state",
+			Images: []string{"images:debian/13", "images:ubuntu/24.04"},
+		},
 	}); !reflect.DeepEqual(got, want) {
 		t.Errorf("Workspace = %#v, want %#v", got, want)
+	}
+	if got := cfg.Workspace.Incus.Volume; got != "nested-state" {
+		t.Errorf("Workspace.Incus.Volume = %q, want nested-state", got)
 	}
 }
 
@@ -135,6 +145,12 @@ repos = []
 	}
 	if cfg.Workspace.Volume != DefaultWorkspaceVolume {
 		t.Fatalf("Workspace.Volume = %q, want %q", cfg.Workspace.Volume, DefaultWorkspaceVolume)
+	}
+	if got := cfg.Workspace.Incus.Volume; got != DefaultIncusWorkspaceVolume {
+		t.Fatalf("Workspace.Incus.Volume = %q, want %q", got, DefaultIncusWorkspaceVolume)
+	}
+	if cfg.Workspace.Incus.Images != nil {
+		t.Fatalf("Workspace.Incus.Images = %#v, want nil", cfg.Workspace.Incus.Images)
 	}
 	wantDir, err := filepath.Abs(filepath.Dir(path))
 	if err != nil {

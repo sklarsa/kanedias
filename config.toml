@@ -1,0 +1,39 @@
+[network]
+ipv4 = "10.76.111.1/24"
+ipv6 = "fd42:28e2:2375:7000::1/64"
+
+[base_image]
+name = "sandbox"
+source = "https://images.linuxcontainers.org"
+image = "debian/13"
+authorized_hosts = [
+    "ssh-ed25519 AAAAC3NzaC1lZDI1NTE5AAAAINmUKR1hA7Ry2zntw2qxEiJJvcjLaFptB/Rci+SJzsnA sklarsa@gmail.com"
+]
+
+[workspace]
+repos = [
+    "questdb/questdb",
+    "questdb/questdb-enterprise",
+    "questdb/questdb-enterprise-operator",
+    "questdb/byoc",
+    "questdb/byoc-prod",
+    "questdb/azure-ci-runners",
+    "questdb/benchmark-runner",
+    "questdb/c-questdb-client",
+    "questdb/distribution",
+    "questdb/go-questdb-client",
+    "questdb/java-questdb-client",
+    "questdb/net-questdb-client",
+    "questdb/nodejs-questdb-client",
+    "questdb/py-questdb-client",
+    "questdb/tsbs",
+    "questdb/zfs-builds",
+    "sklarsa/incus-azure-pipelines",
+    "sklarsa/kanedias"
+]
+
+[workspace.incus]
+volume = "kanedias-incus-seed"
+images = [
+    "images:debian/13",
+]

@@ -24,12 +24,21 @@ type BaseImage struct {
 }
 
 type Workspace struct {
-	Pool   string   `toml:"pool"`
-	Volume string   `toml:"volume"`
-	Repos  []string `toml:"repos"`
+	Pool   string         `toml:"pool"`
+	Volume string         `toml:"volume"`
+	Repos  []string       `toml:"repos"`
+	Incus  IncusWorkspace `toml:"incus"`
 }
 
-const DefaultWorkspaceVolume = "kanedias-workspace-seed"
+type IncusWorkspace struct {
+	Volume string   `toml:"volume"`
+	Images []string `toml:"images"`
+}
+
+const (
+	DefaultWorkspaceVolume      = "kanedias-workspace-seed"
+	DefaultIncusWorkspaceVolume = "kanedias-incus-seed"
+)
 
 type Network struct {
 	IPv4 string `toml:"ipv4"`
@@ -53,6 +62,9 @@ func Load(path string) (Config, error) {
 	cfg.Dir = filepath.Dir(absPath)
 	if cfg.Workspace.Volume == "" {
 		cfg.Workspace.Volume = DefaultWorkspaceVolume
+	}
+	if cfg.Workspace.Incus.Volume == "" {
+		cfg.Workspace.Incus.Volume = DefaultIncusWorkspaceVolume
 	}
 	if _, err := cfg.Network.IPv4Prefix(); err != nil {
 		return Config{}, err
