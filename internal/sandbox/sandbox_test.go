@@ -16,6 +16,7 @@ import (
 	"github.com/sklarsa/kanedias/internal/config"
 	"github.com/sklarsa/kanedias/internal/incusclient"
 	"github.com/sklarsa/kanedias/internal/proxy"
+	incusworkspace "github.com/sklarsa/kanedias/internal/workspace/incus"
 )
 
 func TestCreateOrdersLifecycleAndBuildsOwnedWorkspaceDevice(t *testing.T) {
@@ -28,8 +29,14 @@ func TestCreateOrdersLifecycleAndBuildsOwnedWorkspaceDevice(t *testing.T) {
 
 	wantCalls := []string{
 		"resolve-pool", "lock", "init-ca", "ensure-network", "ensure-profile sandbox",
-		"get-volume kanedias-workspace-seed", "copy-volume kanedias-workspace-seed kanedias-workspace-demo",
-		"create-instance", "start", "exec systemctl is-system-running --wait", "exec update-ca-certificates",
+		"get-volume kanedias-workspace-seed",
+		"copy-volume kanedias-workspace-seed kanedias-workspace-demo",
+		"clone-incus kanedias-incus-seed kanedias-incus-demo",
+		"create-instance", "start",
+		"exec systemctl is-system-running --wait",
+		"exec update-ca-certificates",
+		"exec incus admin waitready --timeout 60",
+		"exec incus query /1.0/storage-pools/default",
 	}
 	assertCalls(t, fake.calls, wantCalls)
 
@@ -48,6 +55,12 @@ func TestCreateOrdersLifecycleAndBuildsOwnedWorkspaceDevice(t *testing.T) {
 	}
 	if got := request.Devices["workspace"]; !equalStringMap(got, wantDevice) {
 		t.Fatalf("workspace device = %#v, want %#v", got, wantDevice)
+	}
+	wantIncusDevice := map[string]string{
+		"type": "disk", "pool": "pool1", "source": "kanedias-incus-demo", "path": "/var/lib/incus",
+	}
+	if got := request.Devices[incusworkspace.DeviceName]; !equalStringMap(got, wantIncusDevice) {
+		t.Fatalf("Incus-state device = %#v, want %#v", got, wantIncusDevice)
 	}
 	wantRoot := map[string]string{"type": "disk", "pool": "pool1", "path": "/"}
 	if got := request.Devices["root"]; !equalStringMap(got, wantRoot) {
@@ -115,6 +128,80 @@ func TestWaitForSystemdStopsOnRequestCancellation(t *testing.T) {
 	}
 }
 
+func TestCreateRepositoryCopyFailureDoesNotCloneIncusState(t *testing.T) {
+	fake := &recordingClient{copyErr: errors.New("copy failed")}
+	err := create(context.Background(), testConfig(), "demo", io.Discard, io.Discard, testDependencies(fake))
+	if err == nil {
+		t.Fatal("Create succeeded after repository copy failure")
+	}
+	if containsCallPrefix(fake.calls, "clone-incus ") {
+		t.Fatalf("Incus state clone attempted after repository copy failure: %v", fake.calls)
+	}
+}
+
+func TestCreateIncusCloneFailureCleansAmbiguousIncusAndRepositoryClones(t *testing.T) {
+	fake := &recordingClient{
+		cloneIncusResult: incusworkspace.CloneResult{Name: "kanedias-incus-demo", Created: true},
+		cloneIncusErr:    errors.New("clone wait failed"),
+	}
+	err := create(context.Background(), testConfig(), "demo", io.Discard, io.Discard, testDependencies(fake))
+	if err == nil {
+		t.Fatal("Create succeeded after Incus-state clone failure")
+	}
+	assertCalls(t, fake.calls[len(fake.calls)-2:], []string{
+		"delete-volume kanedias-incus-demo", "delete-volume kanedias-workspace-demo",
+	})
+}
+
+func TestCreatePreSubmissionFailureDeletesBothClonesButNotCollidingInstance(t *testing.T) {
+	fake := &recordingClient{createErr: errors.New("name collision")}
+	err := create(context.Background(), testConfig(), "demo", io.Discard, io.Discard, testDependencies(fake))
+	if err == nil {
+		t.Fatal("Create succeeded after instance collision")
+	}
+	if containsCall(fake.calls, "delete-instance") {
+		t.Fatalf("calls include deletion of unowned instance: %v", fake.calls)
+	}
+	assertCalls(t, fake.calls[len(fake.calls)-2:], []string{
+		"delete-volume kanedias-incus-demo", "delete-volume kanedias-workspace-demo",
+	})
+}
+
+func TestCreateSubmittedCreationFailureDeletesDeterministicInstanceAndBothClones(t *testing.T) {
+	submitted := errors.New("submitted create failed")
+	fake := &recordingClient{createErr: submitted, submittedErr: submitted}
+	err := create(context.Background(), testConfig(), "demo", io.Discard, io.Discard, testDependencies(fake))
+	if err == nil {
+		t.Fatal("Create succeeded after submitted creation failure")
+	}
+	assertCalls(t, fake.calls[len(fake.calls)-3:], []string{
+		"delete-instance", "delete-volume kanedias-incus-demo", "delete-volume kanedias-workspace-demo",
+	})
+}
+
+func TestCreateSubmittedStartFailureForceStopsBeforeDeletingOwnedResources(t *testing.T) {
+	submitted := errors.New("submitted start failed")
+	fake := &recordingClient{startErr: submitted, submittedErr: submitted}
+	err := create(context.Background(), testConfig(), "demo", io.Discard, io.Discard, testDependencies(fake))
+	if err == nil {
+		t.Fatal("Create succeeded after submitted start failure")
+	}
+	assertCalls(t, fake.calls[len(fake.calls)-4:], []string{
+		"stop", "delete-instance", "delete-volume kanedias-incus-demo", "delete-volume kanedias-workspace-demo",
+	})
+}
+
+func TestCreateNestedReadinessFailureCleansInstanceThenBothClones(t *testing.T) {
+	fake := &recordingClient{nestedWaitErr: errors.New("nested Incus unavailable")}
+	err := create(context.Background(), testConfig(), "demo", io.Discard, io.Discard, testDependencies(fake))
+	if err == nil {
+		t.Fatal("Create succeeded after nested Incus readiness failure")
+	}
+	assertCalls(t, fake.calls[len(fake.calls)-4:], []string{
+		"stop", "delete-instance", "delete-volume kanedias-incus-demo", "delete-volume kanedias-workspace-demo",
+	})
+}
+
 func TestCreateUsesRequestDerivedBoundedContextToCleanOwnedResources(t *testing.T) {
 	const sentinel = "request-value"
 	requestCtx := context.WithValue(context.Background(), requestContextKey{}, sentinel)
@@ -129,9 +216,11 @@ func TestCreateUsesRequestDerivedBoundedContextToCleanOwnedResources(t *testing.
 	if !errors.Is(err, context.Canceled) {
 		t.Fatalf("Create error = %v, want context cancellation", err)
 	}
-	assertCalls(t, fake.calls[len(fake.calls)-3:], []string{"stop", "delete-instance", "delete-volume kanedias-workspace-demo"})
-	if len(fake.cleanupContextErrs) != 3 {
-		t.Fatalf("cleanup context count = %d, want 3", len(fake.cleanupContextErrs))
+	assertCalls(t, fake.calls[len(fake.calls)-4:], []string{
+		"stop", "delete-instance", "delete-volume kanedias-incus-demo", "delete-volume kanedias-workspace-demo",
+	})
+	if len(fake.cleanupContextErrs) != 4 {
+		t.Fatalf("cleanup context count = %d, want 4", len(fake.cleanupContextErrs))
 	}
 	for i, contextErr := range fake.cleanupContextErrs {
 		if contextErr != nil {
@@ -147,46 +236,35 @@ func TestCreateUsesRequestDerivedBoundedContextToCleanOwnedResources(t *testing.
 	}
 }
 
-func TestCreateDoesNotDeleteInstanceItDidNotCreate(t *testing.T) {
-	fake := &recordingClient{createErr: errors.New("name collision")}
-	err := create(context.Background(), testConfig(), "demo", io.Discard, io.Discard, testDependencies(fake))
-	if err == nil {
-		t.Fatal("Create succeeded after instance collision")
-	}
-	if containsCall(fake.calls, "delete-instance") {
-		t.Fatalf("calls include deletion of unowned instance: %v", fake.calls)
-	}
-	if !containsCall(fake.calls, "delete-volume kanedias-workspace-demo") {
-		t.Fatalf("owned volume was not cleaned up: %v", fake.calls)
-	}
-}
-
-func TestDestroyStopsRunningVerifiedInstanceBeforeDeletingInstanceAndVolume(t *testing.T) {
+func TestDestroyStopsRunningVerifiedInstanceBeforeDeletingInstanceAndVolumes(t *testing.T) {
 	fake := &recordingClient{
-		instance: &api.Instance{
-			StatusCode: api.Running,
-			InstancePut: api.InstancePut{Devices: map[string]map[string]string{
-				"workspace": {"source": "kanedias-workspace-demo", "type": "disk"},
-			}},
-		},
-		volume:  &api.StorageVolume{Name: "kanedias-workspace-demo"},
-		running: true,
+		instance: verifiedInstance(api.Running),
+		running:  true,
 	}
 	if err := destroy(context.Background(), testConfig(), "demo", io.Discard, io.Discard, testDependencies(fake)); err != nil {
 		t.Fatal(err)
 	}
-	assertCalls(t, fake.calls[len(fake.calls)-5:], []string{
-		"get-instance", "stop", "delete-instance", "get-volume kanedias-workspace-demo", "delete-volume kanedias-workspace-demo",
+	assertCalls(t, fake.calls[len(fake.calls)-7:], []string{
+		"get-instance", "stop", "delete-instance",
+		"get-volume kanedias-incus-demo", "delete-volume kanedias-incus-demo",
+		"get-volume kanedias-workspace-demo", "delete-volume kanedias-workspace-demo",
 	})
 }
 
-func TestDestroyRefusesUnverifiedWorkspaceWithoutDeletion(t *testing.T) {
+func TestDestroyRefusesUnverifiedOwnedDevicesWithoutDeletion(t *testing.T) {
+	valid := verifiedInstance(api.Stopped).Devices
 	for _, test := range []struct {
 		name    string
-		devices map[string]map[string]string
+		devices api.DevicesMap
 	}{
-		{name: "missing", devices: map[string]map[string]string{}},
-		{name: "mismatched", devices: map[string]map[string]string{"workspace": {"source": "someone-elses-volume"}}},
+		{name: "missing workspace", devices: api.DevicesMap{incusworkspace.DeviceName: valid[incusworkspace.DeviceName]}},
+		{name: "mismatched workspace", devices: api.DevicesMap{
+			"workspace": {"source": "someone-elses-volume"}, incusworkspace.DeviceName: valid[incusworkspace.DeviceName],
+		}},
+		{name: "missing Incus state", devices: api.DevicesMap{"workspace": valid["workspace"]}},
+		{name: "mismatched Incus state", devices: api.DevicesMap{
+			"workspace": valid["workspace"], incusworkspace.DeviceName: {"source": "someone-elses-incus"},
+		}},
 	} {
 		t.Run(test.name, func(t *testing.T) {
 			fake := &recordingClient{instance: &api.Instance{InstancePut: api.InstancePut{Devices: test.devices}}}
@@ -194,11 +272,37 @@ func TestDestroyRefusesUnverifiedWorkspaceWithoutDeletion(t *testing.T) {
 			if err == nil {
 				t.Fatal("Destroy succeeded without ownership proof")
 			}
-			if containsCall(fake.calls, "delete-instance") || containsCall(fake.calls, "delete-volume kanedias-workspace-demo") {
+			if containsCall(fake.calls, "delete-instance") || containsCallPrefix(fake.calls, "delete-volume ") {
 				t.Fatalf("Destroy attempted deletion: %v", fake.calls)
 			}
 		})
 	}
+}
+
+func TestDestroyRemovesBothOrphanedCloneVolumes(t *testing.T) {
+	missing := api.StatusErrorf(http.StatusNotFound, "missing")
+	fake := &recordingClient{getInstanceErr: missing}
+	if err := destroy(context.Background(), testConfig(), "demo", io.Discard, io.Discard, testDependencies(fake)); err != nil {
+		t.Fatal(err)
+	}
+	assertOrderedCalls(t, fake.calls, []string{
+		"get-instance",
+		"get-volume kanedias-incus-demo", "delete-volume kanedias-incus-demo",
+		"get-volume kanedias-workspace-demo", "delete-volume kanedias-workspace-demo",
+	})
+}
+
+func TestDestroyAttemptsBothVolumeDeletionsAndJoinsErrors(t *testing.T) {
+	incusErr := errors.New("delete Incus state")
+	workspaceErr := errors.New("delete workspace")
+	fake := &recordingClient{getInstanceErr: api.StatusErrorf(http.StatusNotFound, "missing"), deleteVolumeErrs: map[string]error{
+		"kanedias-incus-demo": incusErr, "kanedias-workspace-demo": workspaceErr,
+	}}
+	err := destroy(context.Background(), testConfig(), "demo", io.Discard, io.Discard, testDependencies(fake))
+	if !errors.Is(err, incusErr) || !errors.Is(err, workspaceErr) {
+		t.Fatalf("Destroy error = %v, want both deletion errors", err)
+	}
+	assertOrderedCalls(t, fake.calls, []string{"delete-volume kanedias-incus-demo", "delete-volume kanedias-workspace-demo"})
 }
 
 func TestDestroySucceedsWhenResourcesAreAbsent(t *testing.T) {
@@ -207,19 +311,51 @@ func TestDestroySucceedsWhenResourcesAreAbsent(t *testing.T) {
 	if err := destroy(context.Background(), testConfig(), "demo", io.Discard, io.Discard, testDependencies(fake)); err != nil {
 		t.Fatal(err)
 	}
-	if containsCall(fake.calls, "delete-instance") || containsCall(fake.calls, "delete-volume kanedias-workspace-demo") {
+	if containsCall(fake.calls, "delete-instance") || containsCallPrefix(fake.calls, "delete-volume ") {
 		t.Fatalf("Destroy attempted deletion: %v", fake.calls)
 	}
 }
 
-func TestDestroyNeverSelectsSeedVolume(t *testing.T) {
-	fake := &recordingClient{}
-	err := destroy(context.Background(), testConfig(), "seed", io.Discard, io.Discard, testDependencies(fake))
-	if err == nil {
-		t.Fatal("Destroy accepted a name whose owned volume would be the seed")
+func TestDestroyNeverSelectsSeedVolumes(t *testing.T) {
+	for _, test := range []struct {
+		name string
+		cfg  config.Config
+	}{
+		{name: "workspace seed", cfg: func() config.Config {
+			cfg := testConfig()
+			cfg.Workspace.Incus.Volume = "other-incus-seed"
+			return cfg
+		}()},
+		{name: "Incus seed", cfg: func() config.Config {
+			cfg := testConfig()
+			cfg.Workspace.Volume = "other-workspace-seed"
+			return cfg
+		}()},
+	} {
+		t.Run(test.name, func(t *testing.T) {
+			fake := &recordingClient{}
+			err := destroy(context.Background(), test.cfg, "seed", io.Discard, io.Discard, testDependencies(fake))
+			if err == nil {
+				t.Fatal("Destroy accepted a name whose owned volume would be a seed")
+			}
+			if containsCallPrefix(fake.calls, "delete-volume ") {
+				t.Fatalf("Destroy selected seed volume: %v", fake.calls)
+			}
+		})
 	}
-	if containsCall(fake.calls, "delete-volume kanedias-workspace-seed") {
-		t.Fatalf("Destroy selected seed volume: %v", fake.calls)
+}
+
+func verifiedInstance(status api.StatusCode) *api.Instance {
+	return &api.Instance{
+		StatusCode: status,
+		InstancePut: api.InstancePut{Devices: api.DevicesMap{
+			"workspace": {
+				"type": "disk", "source": "kanedias-workspace-demo", "path": "/workspace",
+			},
+			incusworkspace.DeviceName: {
+				"type": "disk", "source": "kanedias-incus-demo", "path": "/var/lib/incus",
+			},
+		}},
 	}
 }
 
@@ -331,6 +467,21 @@ func testDependencies(client *recordingClient) dependencies {
 			client.calls = append(client.calls, "ensure-network")
 			return nil
 		},
+		cloneIncusState: func(_ context.Context, _ incusworkspace.VolumeClient, _, seed, sandbox string) (incusworkspace.CloneResult, error) {
+			result := client.cloneIncusResult
+			if result.Name == "" {
+				result = incusworkspace.CloneResult{Name: incusworkspace.SandboxVolume(sandbox), Created: true}
+			}
+			client.calls = append(client.calls, "clone-incus "+seed+" "+result.Name)
+			return result, client.cloneIncusErr
+		},
+		waitNestedIncus: func(ctx context.Context, executor incusworkspace.Executor, instance string, timeout time.Duration) error {
+			return incusworkspace.WaitReady(ctx, executor, instance, timeout)
+		},
+		verifyNestedIncus: func(ctx context.Context, executor incusworkspace.Executor, instance string) error {
+			return incusworkspace.VerifyNativeBtrfs(ctx, executor, instance)
+		},
+		operationWasSubmitted: func(err error) bool { return client.submittedErr != nil && errors.Is(err, client.submittedErr) },
 		readinessTimeout:      60 * time.Second,
 		readinessPollInterval: time.Nanosecond,
 	}
@@ -355,8 +506,16 @@ type recordingClient struct {
 	volume               *api.StorageVolume
 	getInstanceErr       error
 	getVolumeErr         error
+	copyErr              error
+	deleteVolumeErrs     map[string]error
+	cloneIncusResult     incusworkspace.CloneResult
+	cloneIncusErr        error
 	createErr            error
+	submittedErr         error
+	startErr             error
 	startFunc            func(context.Context) error
+	nestedWaitErr        error
+	nestedVerifyErr      error
 	systemdState         string
 	systemdErr           error
 	systemdResponses     []execResponse
@@ -401,13 +560,13 @@ func (c *recordingClient) GetStorageVolume(_ context.Context, _, name string) (*
 
 func (c *recordingClient) CopyStorageVolume(_ context.Context, _, source, target string) error {
 	c.calls = append(c.calls, "copy-volume "+source+" "+target)
-	return nil
+	return c.copyErr
 }
 
 func (c *recordingClient) DeleteStorageVolume(ctx context.Context, _, name string) error {
 	c.calls = append(c.calls, "delete-volume "+name)
 	c.recordCleanupContext(ctx)
-	return nil
+	return c.deleteVolumeErrs[name]
 }
 
 func (c *recordingClient) GetInstance(context.Context, string) (*api.Instance, string, error) {
@@ -427,7 +586,7 @@ func (c *recordingClient) StartInstance(ctx context.Context, _ string) error {
 	if c.startFunc != nil {
 		return c.startFunc(ctx)
 	}
-	return nil
+	return c.startErr
 }
 
 func (c *recordingClient) StopInstance(ctx context.Context, _ string, force bool) error {
@@ -486,6 +645,15 @@ func (c *recordingClient) Exec(ctx context.Context, _ string, request incusclien
 	if err := ctx.Err(); err != nil {
 		return "", "", err
 	}
+	switch command {
+	case "incus admin waitready --timeout 60":
+		return "", "", c.nestedWaitErr
+	case "incus query /1.0/storage-pools/default":
+		if c.nestedVerifyErr != nil {
+			return "", "", c.nestedVerifyErr
+		}
+		return `{"driver":"btrfs","config":{"source":"/var/lib/incus/storage-pools/default"}}`, "", nil
+	}
 	return "", "", nil
 }
 
@@ -522,6 +690,15 @@ func countCall(calls []string, want string) int {
 func containsCall(calls []string, want string) bool {
 	for _, call := range calls {
 		if call == want {
+			return true
+		}
+	}
+	return false
+}
+
+func containsCallPrefix(calls []string, prefix string) bool {
+	for _, call := range calls {
+		if strings.HasPrefix(call, prefix) {
 			return true
 		}
 	}

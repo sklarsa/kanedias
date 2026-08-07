@@ -15,6 +15,7 @@ import (
 	"github.com/sklarsa/kanedias/internal/network"
 	"github.com/sklarsa/kanedias/internal/profiles"
 	"github.com/sklarsa/kanedias/internal/proxy"
+	incusworkspace "github.com/sklarsa/kanedias/internal/workspace/incus"
 )
 
 const (
@@ -47,6 +48,10 @@ type dependencies struct {
 	defaultProxyOptions   func() (proxy.Options, error)
 	initCA                func(string, string) error
 	ensureNetwork         func(context.Context, lifecycleClient, config.Config) error
+	cloneIncusState       func(context.Context, incusworkspace.VolumeClient, string, string, string) (incusworkspace.CloneResult, error)
+	waitNestedIncus       func(context.Context, incusworkspace.Executor, string, time.Duration) error
+	verifyNestedIncus     func(context.Context, incusworkspace.Executor, string) error
+	operationWasSubmitted func(error) bool
 	readinessTimeout      time.Duration
 	readinessPollInterval time.Duration
 }
@@ -62,6 +67,10 @@ func defaultDependencies() dependencies {
 		ensureNetwork: func(ctx context.Context, client lifecycleClient, cfg config.Config) error {
 			return network.EnsureWithClient(ctx, client, cfg)
 		},
+		cloneIncusState:       incusworkspace.Clone,
+		waitNestedIncus:       incusworkspace.WaitReady,
+		verifyNestedIncus:     incusworkspace.VerifyNativeBtrfs,
+		operationWasSubmitted: incusclient.OperationWasSubmitted,
 		readinessTimeout:      60 * time.Second,
 		readinessPollInterval: time.Second,
 	}
@@ -125,7 +134,10 @@ func create(ctx context.Context, cfg config.Config, name string, stdout, stderr 
 	}
 
 	volume := workspaceVolume(name)
+	incusSeed := incusworkspace.SeedVolume(cfg)
+	incusVolume := incusworkspace.SandboxVolume(name)
 	volumeCreated := false
+	incusVolumeCreated := false
 	instanceCreated := false
 	instanceRunning := false
 	defer func() {
@@ -147,6 +159,12 @@ func create(ctx context.Context, cfg config.Config, name string, stdout, stderr 
 				cleanupErr = errors.Join(cleanupErr, deleteErr)
 			}
 		}
+		if incusVolumeCreated {
+			fmt.Fprintf(stderr, "Deleting failed nested Incus state %s...\n", incusVolume)
+			if deleteErr := incusworkspace.Delete(cleanupCtx, client, pool, incusSeed, incusVolume); deleteErr != nil && !incusclient.IsNotFound(deleteErr) {
+				cleanupErr = errors.Join(cleanupErr, deleteErr)
+			}
+		}
 		if volumeCreated {
 			fmt.Fprintf(stderr, "Deleting failed workspace %s...\n", volume)
 			if deleteErr := client.DeleteStorageVolume(cleanupCtx, pool, volume); deleteErr != nil && !incusclient.IsNotFound(deleteErr) {
@@ -164,6 +182,13 @@ func create(ctx context.Context, cfg config.Config, name string, stdout, stderr 
 	}
 	volumeCreated = true
 
+	fmt.Fprintf(stdout, "Cloning nested Incus state %s to %s...\n", incusSeed, incusVolume)
+	clone, cloneErr := deps.cloneIncusState(ctx, client, pool, incusSeed, name)
+	incusVolumeCreated = clone.Created
+	if cloneErr != nil {
+		return cloneErr
+	}
+
 	request := api.InstancesPost{
 		Name: name,
 		InstancePut: api.InstancePut{
@@ -180,18 +205,25 @@ func create(ctx context.Context, cfg config.Config, name string, stdout, stderr 
 					"source": volume,
 					"path":   workspacePath,
 				},
+				incusworkspace.DeviceName: incusworkspace.Device(pool, clone.Name),
 			},
 		},
 		Source: api.InstanceSource{Type: "image", Alias: cfg.BaseImage.Name},
 	}
 	fmt.Fprintf(stdout, "Creating sandbox %s...\n", name)
 	if err := client.CreateInstance(ctx, request); err != nil {
+		if deps.operationWasSubmitted(err) {
+			instanceCreated = true
+		}
 		return err
 	}
 	instanceCreated = true
 
 	fmt.Fprintf(stdout, "Starting sandbox %s...\n", name)
 	if err := client.StartInstance(ctx, name); err != nil {
+		if deps.operationWasSubmitted(err) {
+			instanceRunning = true
+		}
 		return err
 	}
 	instanceRunning = true
@@ -204,6 +236,13 @@ func create(ctx context.Context, cfg config.Config, name string, stdout, stderr 
 	fmt.Fprintf(stdout, "Updating trusted CA certificates in %s...\n", name)
 	if _, _, err := client.Exec(ctx, name, incusclient.ExecRequest{Command: []string{"update-ca-certificates"}}); err != nil {
 		return fmt.Errorf("update trusted CA certificates in sandbox %q: %w", name, err)
+	}
+	fmt.Fprintf(stdout, "Waiting for nested Incus in %s...\n", name)
+	if err := deps.waitNestedIncus(ctx, client, name, deps.readinessTimeout); err != nil {
+		return err
+	}
+	if err := deps.verifyNestedIncus(ctx, client, name); err != nil {
+		return err
 	}
 	fmt.Fprintf(stdout, "Sandbox %s is ready.\n", name)
 	return nil
@@ -257,8 +296,14 @@ func destroy(ctx context.Context, cfg config.Config, name string, stdout, _ io.W
 		return err
 	}
 	volume := workspaceVolume(name)
-	if volume == seedVolume(cfg) {
+	seed := seedVolume(cfg)
+	if volume == seed {
 		return fmt.Errorf("refusing to remove protected workspace volume %q", volume)
+	}
+	incusVolume := incusworkspace.SandboxVolume(name)
+	incusSeed := incusworkspace.SeedVolume(cfg)
+	if incusVolume == incusSeed {
+		return fmt.Errorf("refusing to remove protected nested Incus state volume %q", incusVolume)
 	}
 
 	client, err := deps.connect(ctx)
@@ -290,6 +335,13 @@ func destroy(ctx context.Context, cfg config.Config, name string, stdout, _ io.W
 		if workspace["source"] != volume {
 			return fmt.Errorf("refusing to remove %q: workspace source is %q, expected %q", name, workspace["source"], volume)
 		}
+		incusState, ok := instance.Devices[incusworkspace.DeviceName]
+		if !ok || incusState["source"] == "" {
+			return fmt.Errorf("refusing to remove %q: local nested Incus state device is missing", name)
+		}
+		if incusState["source"] != incusVolume {
+			return fmt.Errorf("refusing to remove %q: nested Incus state source is %q, expected %q", name, incusState["source"], incusVolume)
+		}
 		if instance.StatusCode == api.Running {
 			fmt.Fprintf(stdout, "Stopping sandbox %s...\n", name)
 			if err := client.StopInstance(ctx, name, true); err != nil {
@@ -302,21 +354,32 @@ func destroy(ctx context.Context, cfg config.Config, name string, stdout, _ io.W
 		}
 	}
 
-	_, err = client.GetStorageVolume(ctx, pool, volume)
-	if incusclient.IsNotFound(err) {
-		if !instanceExists {
-			fmt.Fprintf(stdout, "Sandbox %s and workspace %s are already absent.\n", name, volume)
+	deleteVolume := func(volume, seed, description string, delete func(context.Context, incusworkspace.VolumeClient, string, string, string) error) error {
+		_, err := client.GetStorageVolume(ctx, pool, volume)
+		if incusclient.IsNotFound(err) {
+			return nil
+		}
+		if err != nil {
+			return err
+		}
+		fmt.Fprintf(stdout, "Deleting %s %s...\n", description, volume)
+		if err := delete(ctx, client, pool, seed, volume); err != nil && !incusclient.IsNotFound(err) {
+			return err
 		}
 		return nil
 	}
-	if err != nil {
-		return err
+	deleteIncusState := func(ctx context.Context, client incusworkspace.VolumeClient, pool, seed, volume string) error {
+		return incusworkspace.Delete(ctx, client, pool, seed, volume)
 	}
-	fmt.Fprintf(stdout, "Deleting workspace %s...\n", volume)
-	if err := client.DeleteStorageVolume(ctx, pool, volume); err != nil {
-		return err
+	deleteWorkspace := func(ctx context.Context, client incusworkspace.VolumeClient, pool, _, volume string) error {
+		return client.DeleteStorageVolume(ctx, pool, volume)
 	}
-	return nil
+	incusErr := deleteVolume(incusVolume, incusSeed, "nested Incus state", deleteIncusState)
+	workspaceErr := deleteVolume(volume, seed, "workspace", deleteWorkspace)
+	if !instanceExists && incusErr == nil && workspaceErr == nil {
+		fmt.Fprintf(stdout, "Sandbox %s and its volumes are absent.\n", name)
+	}
+	return errors.Join(incusErr, workspaceErr)
 }
 
 func seedVolume(cfg config.Config) string {
