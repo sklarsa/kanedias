@@ -625,6 +625,11 @@ func (c *recordingClient) CopyStorageVolume(_ context.Context, _, source, target
 	return c.copyErr
 }
 
+func (c *recordingClient) CopyStorageVolumeUntilTerminal(_ context.Context, _, source, target string) error {
+	c.calls = append(c.calls, "copy-volume-terminal "+source+" "+target)
+	return c.copyErr
+}
+
 func (c *recordingClient) DeleteStorageVolume(ctx context.Context, _, name string) error {
 	c.calls = append(c.calls, "delete-volume "+name)
 	c.recordCleanupContext(ctx)

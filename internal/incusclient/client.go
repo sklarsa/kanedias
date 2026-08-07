@@ -262,8 +262,24 @@ func submitAndWaitRemoteOperation(ctx context.Context, submit func() (remoteOper
 	return nil
 }
 
-func waitRemoteOperation(ctx context.Context, operation remoteOperationWaiter) error {
+func submitAndWaitRemoteOperationUntilTerminal(ctx context.Context, submit func() (remoteOperationWaiter, error)) error {
+	operation, err := submit()
+	if err != nil {
+		return err
+	}
 	remote := startRemoteOperation(operation)
+	runRemoteOperationWaitHook(ctx, remote)
+	if err := waitRemoteOperationUntilTerminal(ctx, operation, remote); err != nil {
+		return &submittedOperationError{err: err, remote: remote}
+	}
+	return nil
+}
+
+func waitRemoteOperation(ctx context.Context, operation remoteOperationWaiter) error {
+	return waitRemoteOperationUntilTerminal(ctx, operation, startRemoteOperation(operation))
+}
+
+func waitRemoteOperationUntilTerminal(ctx context.Context, operation remoteOperationWaiter, remote *submittedRemoteOperation) error {
 	select {
 	case <-remote.done:
 		return remote.err

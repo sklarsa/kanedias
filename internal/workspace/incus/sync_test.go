@@ -84,6 +84,9 @@ func (f *syncFakeClient) DeleteStorageVolume(ctx context.Context, _, name string
 func (f *syncFakeClient) CopyStorageVolume(context.Context, string, string, string) error {
 	return errors.New("unexpected CopyStorageVolume call")
 }
+func (f *syncFakeClient) CopyStorageVolumeUntilTerminal(context.Context, string, string, string) error {
+	return errors.New("unexpected CopyStorageVolumeUntilTerminal call")
+}
 func (f *syncFakeClient) GetNetwork(context.Context, string) (*api.Network, error) {
 	return nil, errors.New("unexpected direct GetNetwork call")
 }

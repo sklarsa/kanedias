@@ -33,6 +33,7 @@ type lifecycleClient interface {
 	EnsureProfile(context.Context, string, []byte) error
 	GetStorageVolume(context.Context, string, string) (*api.StorageVolume, error)
 	CopyStorageVolume(context.Context, string, string, string) error
+	CopyStorageVolumeUntilTerminal(context.Context, string, string, string) error
 	DeleteStorageVolume(context.Context, string, string) error
 	GetInstance(context.Context, string) (*api.Instance, string, error)
 	CreateInstance(context.Context, api.InstancesPost) error

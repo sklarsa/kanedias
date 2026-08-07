@@ -70,20 +70,41 @@ func (c *Client) DeleteStorageVolume(ctx context.Context, pool, name string) err
 	return nil
 }
 
-func (c *Client) CopyStorageVolume(ctx context.Context, pool, source, target string) error {
+type remoteOperationWaitStrategy func(context.Context, func() (remoteOperationWaiter, error)) error
+
+func (c *Client) storageVolumeCopySubmission(ctx context.Context, pool, source, target string) (func() (remoteOperationWaiter, error), error) {
 	server := c.server.WithContext(ctx)
 	volume, _, err := server.GetStoragePoolVolume(pool, customVolumeType, source)
 	if err != nil {
-		return fmt.Errorf("get source Incus storage volume %q in pool %q: %w", source, pool, err)
+		return nil, fmt.Errorf("get source Incus storage volume %q in pool %q: %w", source, pool, err)
 	}
-
-	if err := submitAndWaitRemoteOperation(ctx, func() (remoteOperationWaiter, error) {
+	return func() (remoteOperationWaiter, error) {
 		return server.CopyStoragePoolVolume(pool, server, pool, *volume, &incus.StoragePoolVolumeCopyArgs{
 			Name: target,
 			Mode: "pull",
 		})
-	}); err != nil {
+	}, nil
+}
+
+func (c *Client) copyStorageVolume(ctx context.Context, pool, source, target string, wait remoteOperationWaitStrategy) error {
+	submit, err := c.storageVolumeCopySubmission(ctx, pool, source, target)
+	if err != nil {
+		return err
+	}
+	if err := wait(ctx, submit); err != nil {
 		return fmt.Errorf("copy Incus storage volume %q to %q in pool %q: %w", source, target, pool, err)
 	}
 	return nil
+}
+
+// CopyStorageVolume returns promptly on caller cancellation while retaining the
+// submitted operation for detached, bounded cleanup by supervisor callers.
+func (c *Client) CopyStorageVolume(ctx context.Context, pool, source, target string) error {
+	return c.copyStorageVolume(ctx, pool, source, target, submitAndWaitRemoteOperation)
+}
+
+// CopyStorageVolumeUntilTerminal cancels the remote target on caller
+// cancellation but does not return until the submitted copy is terminal.
+func (c *Client) CopyStorageVolumeUntilTerminal(ctx context.Context, pool, source, target string) error {
+	return c.copyStorageVolume(ctx, pool, source, target, submitAndWaitRemoteOperationUntilTerminal)
 }

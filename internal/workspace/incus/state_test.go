@@ -25,8 +25,12 @@ func (client *recordingVolumeClient) GetStorageVolume(_ context.Context, pool, v
 	return client.volume, client.getErr
 }
 
-func (client *recordingVolumeClient) CopyStorageVolume(ctx context.Context, pool, source, target string) error {
-	client.calls = append(client.calls, "copy "+pool+" "+source+" "+target)
+func (client *recordingVolumeClient) CopyStorageVolume(context.Context, string, string, string) error {
+	return errors.New("unexpected retained-submission copy")
+}
+
+func (client *recordingVolumeClient) CopyStorageVolumeUntilTerminal(ctx context.Context, pool, source, target string) error {
+	client.calls = append(client.calls, "copy-terminal "+pool+" "+source+" "+target)
 	if client.onCopy != nil {
 		client.onCopy(ctx)
 	}
@@ -71,7 +75,7 @@ func TestCloneReturnsWrappedSeedLookupErrorWithoutCopy(t *testing.T) {
 	if err == getErr {
 		t.Fatal("Clone() returned seed lookup error without context")
 	}
-	if strings.Contains(strings.Join(client.calls, "\n"), "copy ") {
+	if strings.Contains(strings.Join(client.calls, "\n"), "copy-terminal ") {
 		t.Fatalf("calls = %v, want no copy", client.calls)
 	}
 }
@@ -84,7 +88,7 @@ func TestCloneRejectsAttachedSeedWithoutCopy(t *testing.T) {
 	if err == nil || err.Error() != want {
 		t.Fatalf("Clone() error = %v, want %q", err, want)
 	}
-	if strings.Contains(strings.Join(client.calls, "\n"), "copy ") {
+	if strings.Contains(strings.Join(client.calls, "\n"), "copy-terminal ") {
 		t.Fatalf("calls = %v, want no copy", client.calls)
 	}
 }
@@ -154,7 +158,7 @@ func TestCloneGetsThenCopiesWhileHoldingSharedLock(t *testing.T) {
 	if _, err := Clone(context.Background(), client, pool, seed, "demo"); err != nil {
 		t.Fatal(err)
 	}
-	want := []string{"get " + pool + " seed", "copy " + pool + " seed kanedias-incus-demo"}
+	want := []string{"get " + pool + " seed", "copy-terminal " + pool + " seed kanedias-incus-demo"}
 	if !reflect.DeepEqual(client.calls, want) {
 		t.Fatalf("calls = %v, want %v", client.calls, want)
 	}
