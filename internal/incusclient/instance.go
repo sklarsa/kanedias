@@ -54,6 +54,25 @@ func (c *Client) CreateInstance(ctx context.Context, request api.InstancesPost) 
 	return nil
 }
 
+func (c *Client) CopyInstance(ctx context.Context, source, target string) error {
+	server := c.server.WithContext(ctx)
+	instance, _, err := server.GetInstance(source)
+	if err != nil {
+		return fmt.Errorf("get source Incus instance %q: %w", source, err)
+	}
+	if err := submitAndWaitRemoteOperation(ctx, func() (remoteOperationWaiter, error) {
+		return server.CopyInstance(server, *instance, &incus.InstanceCopyArgs{
+			Name:         target,
+			Mode:         "pull",
+			InstanceOnly: true,
+			Live:         false,
+		})
+	}); err != nil {
+		return fmt.Errorf("copy Incus instance %q to %q: %w", source, target, err)
+	}
+	return nil
+}
+
 func (c *Client) UpdateInstance(ctx context.Context, name string, request api.InstancePut, etag string) error {
 	server := c.server.WithContext(ctx)
 	operation, err := server.UpdateInstance(name, request, etag)

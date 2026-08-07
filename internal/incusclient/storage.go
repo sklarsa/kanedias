@@ -10,6 +10,14 @@ import (
 
 const customVolumeType = "custom"
 
+func (c *Client) GetStoragePool(ctx context.Context, name string) (*api.StoragePool, error) {
+	pool, _, err := c.server.WithContext(ctx).GetStoragePool(name)
+	if err != nil {
+		return nil, fmt.Errorf("get Incus storage pool %q: %w", name, err)
+	}
+	return pool, nil
+}
+
 func (c *Client) GetStorageVolume(ctx context.Context, pool, name string) (*api.StorageVolume, error) {
 	server := c.server.WithContext(ctx)
 	volume, _, err := server.GetStoragePoolVolume(pool, customVolumeType, name)
@@ -17,6 +25,21 @@ func (c *Client) GetStorageVolume(ctx context.Context, pool, name string) (*api.
 		return nil, fmt.Errorf("get Incus storage volume %q in pool %q: %w", name, pool, err)
 	}
 	return volume, nil
+}
+
+func (c *Client) GetStorageVolumeWithETag(ctx context.Context, pool, name string) (*api.StorageVolume, string, error) {
+	volume, etag, err := c.server.WithContext(ctx).GetStoragePoolVolume(pool, customVolumeType, name)
+	if err != nil {
+		return nil, "", fmt.Errorf("get Incus storage volume %q in pool %q: %w", name, pool, err)
+	}
+	return volume, etag, nil
+}
+
+func (c *Client) UpdateStorageVolume(ctx context.Context, pool, name string, request api.StorageVolumePut, etag string) error {
+	if err := c.server.WithContext(ctx).UpdateStoragePoolVolume(pool, customVolumeType, name, request, etag); err != nil {
+		return fmt.Errorf("update Incus storage volume %q in pool %q: %w", name, pool, err)
+	}
+	return nil
 }
 
 func (c *Client) CreateStorageVolume(ctx context.Context, pool, name string) error {
