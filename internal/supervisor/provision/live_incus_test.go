@@ -153,26 +153,54 @@ func TestLiveBtrfsChildClone(t *testing.T) {
 		t.Fatal("child did not reach its replacement supervisor socket")
 	}
 
-	// Cancellation immediately after each completed remote clone exercises the
-	// partial-ownership cleanup paths against real named resources.
-	for _, cancelAfter := range []string{"copy child workspace volume", "copy stopped child instance"} {
-		cancelID := fmt.Sprintf("%s-c%d", sessionID, len(cancelAfter))
-		cancelRequest := request
-		cancelRequest.SessionID = cancelID
-		cancelProvisioner, err := NewIncusChildProvisioner(client, options)
-		if err != nil {
-			t.Fatal(err)
-		}
-		cancelProvisioner.afterStep = func(step string) error {
-			if step == cancelAfter {
-				return context.Canceled
+	// Synchronize at the real submitted-operation wait boundary, cancel while
+	// that waiter is held in flight, and require cleanup to observe the
+	// operation's terminal state before proving both deterministic names absent.
+	for _, scenario := range []struct {
+		name        string
+		waitOrdinal int
+	}{
+		{name: "volume", waitOrdinal: 1},
+		{name: "instance", waitOrdinal: 2},
+	} {
+		t.Run("cancel in-flight "+scenario.name+" copy", func(t *testing.T) {
+			cancelID := fmt.Sprintf("%s-c%s", sessionID, scenario.name)
+			cancelRequest := request
+			cancelRequest.SessionID = cancelID
+			waitReached := make(chan struct{})
+			releaseWait := make(chan struct{})
+			waitCount := 0
+			synchronizedCtx := incusclient.WithRemoteOperationWaitHook(ctx, func() {
+				waitCount++
+				if waitCount == scenario.waitOrdinal {
+					close(waitReached)
+					<-releaseWait
+				}
+			})
+			cancelCtx, cancelInFlight := context.WithCancel(synchronizedCtx)
+			defer cancelInFlight()
+			cancelProvisioner, err := NewIncusChildProvisioner(client, options)
+			if err != nil {
+				t.Fatal(err)
 			}
-			return nil
-		}
-		if _, err := cancelProvisioner.ProvisionChild(ctx, cancelRequest); !errors.Is(err, context.Canceled) {
-			t.Fatalf("cancel after %q error = %v", cancelAfter, err)
-		}
-		assertLiveResourceAbsent(t, ctx, client, pool, "session-"+cancelID, "workspace-"+cancelID)
+			result := make(chan error, 1)
+			go func() {
+				_, provisionErr := cancelProvisioner.ProvisionChild(cancelCtx, cancelRequest)
+				result <- provisionErr
+			}()
+			select {
+			case <-waitReached:
+				cancelInFlight()
+				close(releaseWait)
+			case <-ctx.Done():
+				close(releaseWait)
+				t.Fatalf("%s copy did not reach submitted-operation wait: %v", scenario.name, ctx.Err())
+			}
+			if err := <-result; !errors.Is(err, context.Canceled) {
+				t.Fatalf("cancel during %s copy wait error = %v", scenario.name, err)
+			}
+			assertLiveResourceEventuallyAbsent(t, client, pool, "session-"+cancelID, "workspace-"+cancelID)
+		})
 	}
 
 	// A closed configured listener must fail before either clone is submitted.
@@ -202,7 +230,7 @@ func TestLiveBtrfsChildClone(t *testing.T) {
 	if !errors.As(err, &contractErr) || contractErr.Code != contract.ErrorProxyUnavailable {
 		t.Fatalf("closed proxy error = %v, want proxy_unavailable", err)
 	}
-	assertLiveResourceAbsent(t, ctx, client, pool, "session-"+proxyID, "workspace-"+proxyID)
+	assertLiveResourceEventuallyAbsent(t, client, pool, "session-"+proxyID, "workspace-"+proxyID)
 
 	if err := provisioner.Destroy(ctx, resources); err != nil {
 		t.Fatal(err)
@@ -225,12 +253,21 @@ func requireLiveEnv(t *testing.T, name string) string {
 	return value
 }
 
-func assertLiveResourceAbsent(t *testing.T, ctx context.Context, client *incusclient.Client, pool, instance, volume string) {
+func assertLiveResourceEventuallyAbsent(t *testing.T, client *incusclient.Client, pool, instance, volume string) {
 	t.Helper()
-	if _, _, err := client.GetInstance(ctx, instance); err == nil || !incusclient.IsNotFound(err) {
-		t.Fatalf("instance %q leaked: %v", instance, err)
-	}
-	if _, _, err := client.GetStorageVolumeWithETag(ctx, pool, volume); err == nil || !incusclient.IsNotFound(err) {
-		t.Fatalf("volume %q leaked: %v", volume, err)
+	probeCtx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
+	defer cancel()
+	var instanceErr, volumeErr error
+	for {
+		_, _, instanceErr = client.GetInstance(probeCtx, instance)
+		_, _, volumeErr = client.GetStorageVolumeWithETag(probeCtx, pool, volume)
+		if incusclient.IsNotFound(instanceErr) && incusclient.IsNotFound(volumeErr) {
+			return
+		}
+		select {
+		case <-time.After(100 * time.Millisecond):
+		case <-probeCtx.Done():
+			t.Fatalf("resources did not become absent: instance %q: %v; volume %q: %v", instance, instanceErr, volume, volumeErr)
+		}
 	}
 }

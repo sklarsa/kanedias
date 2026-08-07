@@ -50,10 +50,11 @@ type ChildProvisionOptions struct {
 }
 
 type IncusChildProvisioner struct {
-	client                childIncusClient
-	options               ChildProvisionOptions
-	afterStep             func(string) error
-	operationWasSubmitted func(error) bool
+	client                        childIncusClient
+	options                       ChildProvisionOptions
+	afterStep                     func(string) error
+	operationWasSubmitted         func(error) bool
+	awaitSubmittedRemoteOperation func(context.Context, error) error
 }
 
 func NewIncusChildProvisioner(client childIncusClient, options ChildProvisionOptions) (*IncusChildProvisioner, error) {
@@ -70,9 +71,10 @@ func NewIncusChildProvisioner(client childIncusClient, options ChildProvisionOpt
 		return nil, fmt.Errorf("RPC readiness check is required")
 	}
 	return &IncusChildProvisioner{
-		client:                client,
-		options:               options,
-		operationWasSubmitted: incusclient.OperationWasSubmitted,
+		client:                        client,
+		options:                       options,
+		operationWasSubmitted:         incusclient.OperationWasSubmitted,
+		awaitSubmittedRemoteOperation: incusclient.AwaitSubmittedRemoteOperation,
 	}, nil
 }
 
@@ -85,12 +87,18 @@ func (p *IncusChildProvisioner) ProvisionChild(ctx context.Context, request Chil
 
 	var ownership Ownership
 	var cleanupResources *Resources
+	var submittedRemoteErrors []error
 	defer func() {
 		if resultErr == nil {
 			return
 		}
 		cleanupCtx, cancel := context.WithTimeout(context.Background(), childCleanupTimeout)
 		defer cancel()
+		for _, submittedErr := range submittedRemoteErrors {
+			if awaitErr := p.awaitSubmittedRemoteOperation(cleanupCtx, submittedErr); awaitErr != nil {
+				resultErr = errors.Join(resultErr, awaitErr)
+			}
+		}
 		if cleanupErr := p.cleanupOwned(cleanupCtx, cleanupResources, request.SessionID, ownership.Snapshot()); cleanupErr != nil {
 			resultErr = errors.Join(resultErr, cleanupErr)
 		}
@@ -159,6 +167,7 @@ func (p *IncusChildProvisioner) ProvisionChild(ctx context.Context, request Chil
 	if err := p.client.CopyStorageVolume(ctx, poolName, request.SourceVolume, volumeName); err != nil {
 		if p.operationWasSubmitted(err) {
 			ownership.RecordVolumeSubmitted(volumeName)
+			submittedRemoteErrors = append(submittedRemoteErrors, err)
 		}
 		return nil, fmt.Errorf("copy child workspace volume: %w", err)
 	}
@@ -171,6 +180,7 @@ func (p *IncusChildProvisioner) ProvisionChild(ctx context.Context, request Chil
 	if err := p.client.CopyInstance(ctx, request.SourceInstance, instanceName); err != nil {
 		if p.operationWasSubmitted(err) {
 			ownership.RecordInstanceSubmitted(instanceName)
+			submittedRemoteErrors = append(submittedRemoteErrors, err)
 		}
 		return nil, fmt.Errorf("copy stopped child instance: %w", err)
 	}
@@ -389,6 +399,11 @@ func applyChildMetadata(config api.ConfigMap, request ChildRequest, volumeName s
 }
 
 func applyChildConfig(config api.ConfigMap, request ChildRequest, volumeName string) {
+	for key := range config {
+		if strings.HasPrefix(key, "environment.KANEDIAS_") {
+			delete(config, key)
+		}
+	}
 	applyChildMetadata(config, request, volumeName)
 	config["environment.KANEDIAS_SESSION_ID"] = request.SessionID
 	config["environment.KANEDIAS_SESSION_KIND"] = string(request.Contract.Kind)

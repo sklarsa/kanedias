@@ -10,6 +10,7 @@ import (
 
 	"github.com/lxc/incus/v7/shared/api"
 	"github.com/sklarsa/kanedias/internal/config"
+	"github.com/sklarsa/kanedias/internal/incusclient"
 	"github.com/sklarsa/kanedias/internal/supervisor/contract"
 )
 
@@ -53,9 +54,11 @@ func newRecordingChildClient() *recordingChildClient {
 			Name: "session-parent",
 			InstancePut: api.InstancePut{
 				Config: api.ConfigMap{
-					"security.nesting":                     "true",
-					"environment.KANEDIAS_SESSION_ID":      "parent",
-					"environment.KANEDIAS_PI_SESSION_FILE": "/parent/session.jsonl",
+					"security.nesting":                             "true",
+					"environment.KANEDIAS_SESSION_ID":              "parent",
+					"environment.KANEDIAS_PI_SESSION_FILE":         "/parent/session.jsonl",
+					"environment.KANEDIAS_PARENT_SESSION_ID":       "parent",
+					"environment.KANEDIAS_UNAPPROVED_LAUNCH_STATE": "must-not-survive",
 				},
 				Devices: api.DevicesMap{
 					"workspace":  {"type": "disk", "pool": "default", "source": "workspace-parent", "path": "/workspace", "readonly": "true"},
@@ -254,8 +257,14 @@ func TestProvisionChildFollowsFailClosedOrderAndReplacesInheritedState(t *testin
 			t.Errorf("instance config %q = %q, want %q", key, got, want)
 		}
 	}
-	if _, inherited := client.instancePut.Config["environment.KANEDIAS_PI_SESSION_FILE"]; inherited {
-		t.Error("fresh child inherited KANEDIAS_PI_SESSION_FILE")
+	wantEnvironment := map[string]string{
+		"environment.KANEDIAS_SESSION_ID": "child-1", "environment.KANEDIAS_SESSION_KIND": "read",
+		"environment.KANEDIAS_WORKER_TYPE": "reviewer", "environment.KANEDIAS_PI_PROVIDER": "anthropic",
+		"environment.KANEDIAS_PI_MODEL": "claude-sonnet-4", "environment.KANEDIAS_PI_THINKING": "high",
+		"environment.KANEDIAS_SUPERVISOR_SOCKET": "/run/kanedias/supervisor.sock",
+	}
+	if got := kanediasEnvironment(client.instancePut.Config); !reflect.DeepEqual(got, wantEnvironment) {
+		t.Errorf("fresh Kanedias environment = %#v, want exact allowlist %#v", got, wantEnvironment)
 	}
 	if got := client.instancePut.Config["security.nesting"]; got != "true" {
 		t.Errorf("unrelated instance config = %q, want preserved", got)
@@ -267,7 +276,7 @@ func TestProvisionChildFollowsFailClosedOrderAndReplacesInheritedState(t *testin
 	}
 }
 
-func TestProvisionChildSetsForkSessionFile(t *testing.T) {
+func TestProvisionChildSetsExactForkEnvironmentAllowlist(t *testing.T) {
 	client := newRecordingChildClient()
 	request := validChildRequest()
 	request.Contract.Context = contract.ContextFork
@@ -275,9 +284,26 @@ func TestProvisionChildSetsForkSessionFile(t *testing.T) {
 	if _, err := newTestChildProvisioner(t, client).ProvisionChild(context.Background(), request); err != nil {
 		t.Fatal(err)
 	}
-	if got := client.instancePut.Config["environment.KANEDIAS_PI_SESSION_FILE"]; got != "/workspace/.pi/child.jsonl" {
-		t.Fatalf("KANEDIAS_PI_SESSION_FILE = %q", got)
+	want := map[string]string{
+		"environment.KANEDIAS_SESSION_ID": "child-1", "environment.KANEDIAS_SESSION_KIND": "read",
+		"environment.KANEDIAS_WORKER_TYPE": "reviewer", "environment.KANEDIAS_PI_PROVIDER": "anthropic",
+		"environment.KANEDIAS_PI_MODEL": "claude-sonnet-4", "environment.KANEDIAS_PI_THINKING": "high",
+		"environment.KANEDIAS_SUPERVISOR_SOCKET": "/run/kanedias/supervisor.sock",
+		"environment.KANEDIAS_PI_SESSION_FILE":   "/workspace/.pi/child.jsonl",
 	}
+	if got := kanediasEnvironment(client.instancePut.Config); !reflect.DeepEqual(got, want) {
+		t.Fatalf("fork Kanedias environment = %#v, want exact allowlist %#v", got, want)
+	}
+}
+
+func kanediasEnvironment(config api.ConfigMap) map[string]string {
+	result := make(map[string]string)
+	for key, value := range config {
+		if strings.HasPrefix(key, "environment.KANEDIAS_") {
+			result[key] = value
+		}
+	}
+	return result
 }
 
 func TestProvisionChildRejectsCrossPoolAndUnsupportedStorageBeforeCopies(t *testing.T) {
@@ -413,6 +439,51 @@ func TestProvisionChildAmbiguousCopyProbesMetadataBeforeCleanup(t *testing.T) {
 				if instanceProbe < 0 || instanceDelete < instanceProbe || volumeDelete < instanceDelete {
 					t.Fatalf("ambiguous instance cleanup order is unsafe:\n%s", calls)
 				}
+			}
+		})
+	}
+}
+
+func TestProvisionChildAwaitsAmbiguousCopyBeforeFinalProbeAndDelete(t *testing.T) {
+	for _, resource := range []string{"volume", "instance"} {
+		t.Run(resource, func(t *testing.T) {
+			client := newRecordingChildClient()
+			ambiguous := errors.New("submitted copy request cancelled")
+			if resource == "volume" {
+				client.copyVolumeErr = ambiguous
+			} else {
+				client.copyInstanceErr = ambiguous
+			}
+			provisioner := newTestChildProvisioner(t, client)
+			provisioner.operationWasSubmitted = func(err error) bool { return errors.Is(err, ambiguous) }
+			provisioner.awaitSubmittedRemoteOperation = func(_ context.Context, err error) error {
+				if !errors.Is(err, ambiguous) {
+					t.Fatalf("await error = %v, want ambiguous copy error", err)
+				}
+				if resource == "volume" {
+					if _, _, probeErr := client.GetStorageVolumeWithETag(context.Background(), "default", "workspace-child-1"); !incusclient.IsNotFound(probeErr) {
+						t.Fatalf("initial volume probe error = %v, want not found", probeErr)
+					}
+					client.childVolume = &api.StorageVolume{Name: "workspace-child-1"}
+				} else {
+					if _, _, probeErr := client.GetInstance(context.Background(), "session-child-1"); !incusclient.IsNotFound(probeErr) {
+						t.Fatalf("initial instance probe error = %v, want not found", probeErr)
+					}
+					client.child = &api.Instance{Name: "session-child-1", Status: "Stopped", StatusCode: api.Stopped}
+				}
+				return nil
+			}
+
+			if _, err := provisioner.ProvisionChild(context.Background(), validChildRequest()); !errors.Is(err, ambiguous) {
+				t.Fatalf("ProvisionChild() error = %v, want ambiguous copy error", err)
+			}
+			calls := strings.Join(client.calls, "\n")
+			if resource == "volume" {
+				if !strings.Contains(calls, "get volume workspace-child-1\nget volume workspace-child-1\ndelete volume workspace-child-1") {
+					t.Fatalf("late volume was not re-probed and deleted after terminal wait:\n%s", calls)
+				}
+			} else if !strings.Contains(calls, "get instance session-child-1\nget instance session-child-1\ndelete instance session-child-1") {
+				t.Fatalf("late instance was not re-probed and deleted after terminal wait:\n%s", calls)
 			}
 		})
 	}

@@ -93,6 +93,7 @@ type fakeRemoteOperation struct {
 	waitRelease chan struct{}
 	cancelled   chan struct{}
 	waitErr     error
+	cancelErr   error
 }
 
 func (o *fakeRemoteOperation) Wait() error {
@@ -107,7 +108,7 @@ func (o *fakeRemoteOperation) CancelTarget() error {
 	default:
 		close(o.cancelled)
 	}
-	return nil
+	return o.cancelErr
 }
 
 func TestRemoteVolumeWaitCancelsTargetWithContext(t *testing.T) {

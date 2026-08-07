@@ -148,7 +148,8 @@ func IsNotFound(err error) bool {
 }
 
 type submittedOperationError struct {
-	err error
+	err    error
+	remote *submittedRemoteOperation
 }
 
 func (e *submittedOperationError) Error() string { return e.err.Error() }
@@ -185,28 +186,83 @@ type remoteOperationWaiter interface {
 	CancelTarget() error
 }
 
+type submittedRemoteOperation struct {
+	done chan struct{}
+	err  error
+}
+
+type remoteOperationWaitHookKey struct{}
+
+// WithRemoteOperationWaitHook installs a synchronization hook that runs after
+// a remote operation has been submitted and its waiter goroutine has started.
+// It is used by destructive live validation to cancel at the real wait
+// boundary rather than after a copy has completed.
+func WithRemoteOperationWaitHook(ctx context.Context, hook func()) context.Context {
+	return context.WithValue(ctx, remoteOperationWaitHookKey{}, hook)
+}
+
+func runRemoteOperationWaitHook(ctx context.Context) {
+	if hook, ok := ctx.Value(remoteOperationWaitHookKey{}).(func()); ok && hook != nil {
+		hook()
+	}
+}
+
+func startRemoteOperation(operation remoteOperationWaiter) *submittedRemoteOperation {
+	remote := &submittedRemoteOperation{done: make(chan struct{})}
+	go func() {
+		remote.err = operation.Wait()
+		close(remote.done)
+	}()
+	return remote
+}
+
 func submitAndWaitRemoteOperation(ctx context.Context, submit func() (remoteOperationWaiter, error)) error {
 	operation, err := submit()
 	if err != nil {
 		return err
 	}
-	if err := waitRemoteOperation(ctx, operation); err != nil {
-		return &submittedOperationError{err: err}
+	remote := startRemoteOperation(operation)
+	runRemoteOperationWaitHook(ctx)
+	if err := waitSubmittedRemoteOperation(ctx, operation, remote); err != nil {
+		return &submittedOperationError{err: err, remote: remote}
 	}
 	return nil
 }
 
 func waitRemoteOperation(ctx context.Context, operation remoteOperationWaiter) error {
-	result := make(chan error, 1)
-	go func() {
-		result <- operation.Wait()
-	}()
+	return waitSubmittedRemoteOperation(ctx, operation, startRemoteOperation(operation))
+}
 
-	select {
-	case err := <-result:
-		return err
-	case <-ctx.Done():
-		_ = operation.CancelTarget()
+func waitSubmittedRemoteOperation(ctx context.Context, operation remoteOperationWaiter, remote *submittedRemoteOperation) error {
+	if ctx.Err() != nil {
+		if cancelErr := operation.CancelTarget(); cancelErr != nil {
+			return errors.Join(ctx.Err(), fmt.Errorf("cancel submitted Incus target: %w", cancelErr))
+		}
 		return ctx.Err()
+	}
+	select {
+	case <-remote.done:
+		return remote.err
+	case <-ctx.Done():
+		if cancelErr := operation.CancelTarget(); cancelErr != nil {
+			return errors.Join(ctx.Err(), fmt.Errorf("cancel submitted Incus target: %w", cancelErr))
+		}
+		return ctx.Err()
+	}
+}
+
+// AwaitSubmittedRemoteOperation waits for a previously submitted remote copy
+// to reach a terminal state. It is intended for bounded cleanup after the
+// request context used to submit the copy has been cancelled.
+func AwaitSubmittedRemoteOperation(ctx context.Context, err error) error {
+	var submitted *submittedOperationError
+	if !errors.As(err, &submitted) || submitted.remote == nil {
+		return fmt.Errorf("error does not retain a submitted remote operation")
+	}
+	select {
+	case <-submitted.remote.done:
+		return nil
+	case <-ctx.Done():
+		return fmt.Errorf("await submitted Incus remote operation: %w", ctx.Err())
 	}
 }

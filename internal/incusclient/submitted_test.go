@@ -41,6 +41,81 @@ func TestSubmittedVolumeCopyWaitFailureIsMarked(t *testing.T) {
 	}
 }
 
+func TestSubmittedRemoteOperationCanBeAwaitedAfterCancellation(t *testing.T) {
+	cancelErr := errors.New("target cancellation unsupported")
+	operation := &fakeRemoteOperation{
+		waitStarted: make(chan struct{}),
+		waitRelease: make(chan struct{}),
+		cancelled:   make(chan struct{}),
+		cancelErr:   cancelErr,
+	}
+	requestCtx, cancelRequest := context.WithCancel(context.Background())
+	copyDone := make(chan error, 1)
+	go func() {
+		copyDone <- submitAndWaitRemoteOperation(requestCtx, func() (remoteOperationWaiter, error) {
+			return operation, nil
+		})
+	}()
+	<-operation.waitStarted
+	cancelRequest()
+
+	copyErr := <-copyDone
+	if !errors.Is(copyErr, context.Canceled) || !OperationWasSubmitted(copyErr) {
+		t.Fatalf("copy error = %v, want submitted context cancellation", copyErr)
+	}
+	if !errors.Is(copyErr, cancelErr) {
+		t.Fatalf("copy error = %v, want surfaced CancelTarget failure", copyErr)
+	}
+
+	awaitDone := make(chan error, 1)
+	go func() {
+		awaitDone <- AwaitSubmittedRemoteOperation(context.Background(), copyErr)
+	}()
+	select {
+	case err := <-awaitDone:
+		t.Fatalf("await returned before operation became terminal: %v", err)
+	default:
+	}
+	close(operation.waitRelease)
+	if err := <-awaitDone; err != nil {
+		t.Fatalf("AwaitSubmittedRemoteOperation() error = %v, want terminal success", err)
+	}
+}
+
+func TestRemoteOperationWaitHookSynchronizesCancellationAfterSubmission(t *testing.T) {
+	operation := &fakeRemoteOperation{
+		waitStarted: make(chan struct{}),
+		waitRelease: make(chan struct{}),
+		cancelled:   make(chan struct{}),
+	}
+	hookStarted := make(chan struct{})
+	releaseHook := make(chan struct{})
+	ctx, cancel := context.WithCancel(WithRemoteOperationWaitHook(context.Background(), func() {
+		close(hookStarted)
+		<-releaseHook
+	}))
+	copyDone := make(chan error, 1)
+	go func() {
+		copyDone <- submitAndWaitRemoteOperation(ctx, func() (remoteOperationWaiter, error) {
+			return operation, nil
+		})
+	}()
+	<-operation.waitStarted
+	<-hookStarted
+	cancel()
+	close(releaseHook)
+
+	if err := <-copyDone; !errors.Is(err, context.Canceled) {
+		t.Fatalf("copy error = %v, want cancellation while remote wait was in flight", err)
+	}
+	select {
+	case <-operation.cancelled:
+	default:
+		t.Fatal("in-flight cancellation did not call CancelTarget")
+	}
+	close(operation.waitRelease)
+}
+
 func TestImmediateSubmissionFailuresAreNotMarked(t *testing.T) {
 	submitErr := errors.New("submission rejected")
 	for _, test := range []struct {
