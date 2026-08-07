@@ -1,0 +1,31 @@
+package cmd
+
+import (
+	"context"
+
+	"github.com/sklarsa/kanedias/internal/supervisor/contract"
+	"github.com/sklarsa/kanedias/internal/supervisor/process"
+	"github.com/spf13/cobra"
+)
+
+func newSessionChildCommand(runner process.ChildRunner) *cobra.Command {
+	bootstrapFD := process.BootstrapFD
+	livenessFD := process.LivenessFD
+	reportFD := process.ReportFD
+	command := &cobra.Command{
+		Use:    "session-child",
+		Hidden: true,
+		Args:   cobra.NoArgs,
+		RunE: func(command *cobra.Command, _ []string) error {
+			return process.RunInheritedChild(command.Context(), bootstrapFD, livenessFD, reportFD, runner)
+		},
+	}
+	command.Flags().IntVar(&bootstrapFD, "bootstrap-fd", process.BootstrapFD, "inherited bootstrap descriptor")
+	command.Flags().IntVar(&livenessFD, "liveness-fd", process.LivenessFD, "inherited parent-liveness descriptor")
+	command.Flags().IntVar(&reportFD, "report-fd", process.ReportFD, "inherited child-report descriptor")
+	return command
+}
+
+func unsupportedChildRunner(context.Context, process.Bootstrap, *process.Reporter) error {
+	return contract.NewError(contract.ErrorInternal, "child supervisor runtime is not available in this delivery stage")
+}

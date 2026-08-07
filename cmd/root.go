@@ -15,6 +15,7 @@ import (
 	"github.com/sklarsa/kanedias/internal/sandbox"
 	"github.com/sklarsa/kanedias/internal/server"
 	"github.com/sklarsa/kanedias/internal/session"
+	"github.com/sklarsa/kanedias/internal/supervisor/process"
 	"github.com/sklarsa/kanedias/internal/workspace"
 	"github.com/spf13/cobra"
 )
@@ -32,6 +33,7 @@ type services struct {
 	runSession       func(context.Context, config.Config, string, io.Writer, io.Writer) error
 	syncWorkspace    func(context.Context, config.Config, io.Writer, io.Writer) error
 	runServer        func(context.Context, server.Options) error
+	runSessionChild  process.ChildRunner
 }
 
 // Execute runs the Kanedias command-line interface.
@@ -72,6 +74,7 @@ func realServices() services {
 		runSession:       session.Run,
 		syncWorkspace:    workspace.Sync,
 		runServer:        server.Run,
+		runSessionChild:  unsupportedChildRunner,
 	}
 }
 
@@ -90,6 +93,7 @@ func newRootCommand(service services, options proxy.Options) *cobra.Command {
 		newProxyCommand(service, getConfigPath, options),
 		newSandboxCommand(service, getConfigPath),
 		newServerCommand(service),
+		newSessionChildCommand(service.runSessionChild),
 		newSessionCommand(service, getConfigPath),
 		newWorkspaceCommand(service, getConfigPath),
 	)

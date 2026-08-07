@@ -13,6 +13,7 @@ import (
 	"github.com/sklarsa/kanedias/internal/config"
 	"github.com/sklarsa/kanedias/internal/proxy"
 	"github.com/sklarsa/kanedias/internal/server"
+	"github.com/sklarsa/kanedias/internal/supervisor/process"
 	"github.com/spf13/cobra"
 	"github.com/spf13/pflag"
 )
@@ -112,6 +113,36 @@ func TestCommandHierarchyAndFlags(t *testing.T) {
 		if len(localFlags) != 0 {
 			t.Errorf("%s local flags = %q, want none", command.CommandPath(), localFlags)
 		}
+	}
+}
+
+func TestSessionChildCommandIsHiddenAndUsesFixedDescriptorFlags(t *testing.T) {
+	root := newRootCommand(stubServices(), testProxyOptions())
+	child, remaining, err := root.Find([]string{"session-child"})
+	if err != nil || len(remaining) != 0 {
+		t.Fatalf("find session-child = (%v, %q, %v)", child, remaining, err)
+	}
+	if !child.Hidden {
+		t.Fatal("session-child command is visible")
+	}
+	for name, want := range map[string]string{"bootstrap-fd": "3", "liveness-fd": "4", "report-fd": "5"} {
+		flag := child.Flags().Lookup(name)
+		if flag == nil || flag.DefValue != want {
+			t.Errorf("--%s = %#v, want default %s", name, flag, want)
+		}
+	}
+
+	service := stubServices()
+	service.runSessionChild = func(context.Context, process.Bootstrap, *process.Reporter) error {
+		t.Fatal("runSessionChild called with remapped descriptors")
+		return nil
+	}
+	root = newRootCommand(service, testProxyOptions())
+	root.SetOut(io.Discard)
+	root.SetErr(io.Discard)
+	root.SetArgs([]string{"session-child", "--bootstrap-fd", "6"})
+	if err := root.Execute(); err == nil || !strings.Contains(err.Error(), "fixed descriptors") {
+		t.Fatalf("remapped descriptor error = %v", err)
 	}
 }
 
@@ -648,6 +679,9 @@ func stubServices() services {
 			return nil
 		},
 		runServer: func(context.Context, server.Options) error { return nil },
+		runSessionChild: func(context.Context, process.Bootstrap, *process.Reporter) error {
+			return nil
+		},
 	}
 }
 
@@ -750,7 +784,9 @@ func assertChildCommands(t *testing.T, command *cobra.Command, names ...string) 
 	t.Helper()
 	var got []string
 	for _, child := range command.Commands() {
-		got = append(got, child.Name())
+		if !child.Hidden {
+			got = append(got, child.Name())
+		}
 	}
 	if !reflect.DeepEqual(got, names) {
 		t.Errorf("%s child commands = %q, want %q", command.CommandPath(), got, names)
