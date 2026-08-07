@@ -17,7 +17,7 @@ type recordingVolumeClient struct {
 	copyErr   error
 	deleteErr error
 	calls     []string
-	onCopy    func()
+	onCopy    func(context.Context)
 }
 
 func (client *recordingVolumeClient) GetStorageVolume(_ context.Context, pool, volume string) (*api.StorageVolume, error) {
@@ -25,10 +25,10 @@ func (client *recordingVolumeClient) GetStorageVolume(_ context.Context, pool, v
 	return client.volume, client.getErr
 }
 
-func (client *recordingVolumeClient) CopyStorageVolume(_ context.Context, pool, source, target string) error {
+func (client *recordingVolumeClient) CopyStorageVolume(ctx context.Context, pool, source, target string) error {
 	client.calls = append(client.calls, "copy "+pool+" "+source+" "+target)
 	if client.onCopy != nil {
-		client.onCopy()
+		client.onCopy(ctx)
 	}
 	return client.copyErr
 }
@@ -141,7 +141,7 @@ func TestCloneGetsThenCopiesWhileHoldingSharedLock(t *testing.T) {
 	lockHeld := false
 	client := &recordingVolumeClient{
 		volume: &api.StorageVolume{},
-		onCopy: func() {
+		onCopy: func(context.Context) {
 			writer, err := acquireSeedLock(pool, seed, true)
 			if err != nil {
 				lockHeld = true
@@ -164,6 +164,50 @@ func TestCloneGetsThenCopiesWhileHoldingSharedLock(t *testing.T) {
 	writer, err := acquireSeedLock(pool, seed, true)
 	if err != nil {
 		t.Fatalf("shared seed lock was not released: %v", err)
+	}
+	_ = writer.Close()
+}
+
+func TestCloneCancellationKeepsSharedLockUntilCopyIsTerminal(t *testing.T) {
+	pool := "pool-" + strings.ReplaceAll(t.Name(), "/", "-")
+	seed := "seed"
+	copyStarted := make(chan struct{})
+	copyTerminal := make(chan struct{})
+	client := &recordingVolumeClient{
+		volume: &api.StorageVolume{},
+		onCopy: func(ctx context.Context) {
+			close(copyStarted)
+			<-ctx.Done()
+			<-copyTerminal
+		},
+		copyErr: context.Canceled,
+	}
+	ctx, cancel := context.WithCancel(context.Background())
+	result := make(chan error, 1)
+	go func() {
+		_, err := Clone(ctx, client, pool, seed, "demo")
+		result <- err
+	}()
+	<-copyStarted
+	cancel()
+
+	if writer, err := acquireSeedLock(pool, seed, true); err == nil {
+		_ = writer.Close()
+		t.Fatal("exclusive seed lock succeeded before the copy became terminal")
+	}
+	select {
+	case err := <-result:
+		t.Fatalf("Clone returned before copy became terminal: %v", err)
+	default:
+	}
+
+	close(copyTerminal)
+	if err := <-result; !errors.Is(err, context.Canceled) {
+		t.Fatalf("Clone error = %v, want context.Canceled", err)
+	}
+	writer, err := acquireSeedLock(pool, seed, true)
+	if err != nil {
+		t.Fatalf("exclusive seed lock remained held after Clone returned: %v", err)
 	}
 	_ = writer.Close()
 }

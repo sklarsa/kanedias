@@ -85,6 +85,17 @@ func (cfg Config) ValidateLifecycle() error {
 	if cfg.BaseImage.Image == "" {
 		return fmt.Errorf("base_image.image is required")
 	}
+	workspaceSeed := cfg.Workspace.Volume
+	if workspaceSeed == "" {
+		workspaceSeed = DefaultWorkspaceVolume
+	}
+	incusSeed := cfg.Workspace.Incus.Volume
+	if incusSeed == "" {
+		incusSeed = DefaultIncusWorkspaceVolume
+	}
+	if workspaceSeed == incusSeed {
+		return fmt.Errorf("workspace.volume and workspace.incus.volume must be different")
+	}
 	return nil
 }
 

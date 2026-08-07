@@ -29,6 +29,7 @@ type syncFakeClient struct {
 	createRequest  api.InstancesPost
 	errors         map[string]error
 	execResults    map[string]syncExecResult
+	execSequences  map[string][]syncExecResult
 	cancelOnImage  context.CancelFunc
 	cleanupCtxSeen bool
 	forcedStops    []bool
@@ -37,9 +38,10 @@ type syncFakeClient struct {
 
 func newSyncFake() *syncFakeClient {
 	return &syncFakeClient{
-		pool:        &api.StoragePool{Name: "pool1", Driver: "btrfs"},
-		errors:      map[string]error{},
-		execResults: map[string]syncExecResult{},
+		pool:          &api.StoragePool{Name: "pool1", Driver: "btrfs"},
+		errors:        map[string]error{},
+		execResults:   map[string]syncExecResult{},
+		execSequences: map[string][]syncExecResult{},
 	}
 }
 
@@ -139,12 +141,19 @@ func (f *syncFakeClient) Exec(ctx context.Context, _ string, request incusclient
 		f.cancelOnImage()
 		return "", "", context.Canceled
 	}
+	if sequence := f.execSequences[command]; len(sequence) > 0 {
+		result := sequence[0]
+		f.execSequences[command] = sequence[1:]
+		return result.stdout, result.stderr, result.err
+	}
 	if result, ok := f.execResults[command]; ok {
 		return result.stdout, result.stderr, result.err
 	}
 	switch command {
 	case "systemctl is-system-running --wait":
 		return "running\n", "", nil
+	case "incus query /1.0/storage-pools?recursion=1":
+		return `[]`, "", nil
 	case "incus query /1.0/storage-pools/default":
 		return `{"driver":"btrfs","config":{"source":"/var/lib/incus/storage-pools/default"}}`, "", nil
 	case "systemctl show --property=ActiveState --value incus.socket", "systemctl show --property=ActiveState --value incus.service":
@@ -205,6 +214,7 @@ func TestSyncNewSeedSuccessLifecycle(t *testing.T) {
 		"exec update-ca-certificates",
 		"exec getent ahosts images.linuxcontainers.org",
 		"exec incus admin waitready --timeout 60",
+		"exec incus query /1.0/storage-pools?recursion=1",
 		"exec incus admin init --minimal",
 		"exec incus admin waitready --timeout 60",
 		"exec incus query /1.0/storage-pools/default",
@@ -246,9 +256,10 @@ func TestSyncRejectsNonBtrfsPoolBeforeSeedLookup(t *testing.T) {
 	}
 }
 
-func TestSyncExistingColdSeedSkipsCreationAndInitialization(t *testing.T) {
+func TestSyncExistingInitializedSeedSkipsCreationAndInitialization(t *testing.T) {
 	fake := newSyncFake()
 	fake.volume = &api.StorageVolume{Name: config.DefaultIncusWorkspaceVolume}
+	fake.execResults["incus query /1.0/storage-pools?recursion=1"] = syncExecResult{stdout: `[{"name":"default","driver":"btrfs"}]`}
 	if err := syncWithDependencies(context.Background(), syncTestConfig(), io.Discard, io.Discard, syncTestDependencies(fake)); err != nil {
 		t.Fatal(err)
 	}
@@ -258,10 +269,31 @@ func TestSyncExistingColdSeedSkipsCreationAndInitialization(t *testing.T) {
 			t.Fatalf("unexpected call containing %q:\n%s", forbidden, joined)
 		}
 	}
-	for _, required := range []string{"exec incus query /1.0/storage-pools/default", "exec incus image copy images:debian/13"} {
+	for _, required := range []string{"exec incus query /1.0/storage-pools?recursion=1", "exec incus query /1.0/storage-pools/default", "exec incus image copy images:debian/13"} {
 		if !strings.Contains(joined, required) {
 			t.Fatalf("missing call containing %q", required)
 		}
+	}
+}
+
+func TestSyncExistingUninitializedSeedInitializesThenValidates(t *testing.T) {
+	fake := newSyncFake()
+	fake.volume = &api.StorageVolume{Name: config.DefaultIncusWorkspaceVolume}
+	if err := syncWithDependencies(context.Background(), syncTestConfig(), io.Discard, io.Discard, syncTestDependencies(fake)); err != nil {
+		t.Fatal(err)
+	}
+	joined := strings.Join(fake.calls, "\n")
+	for _, required := range []string{
+		"exec incus query /1.0/storage-pools?recursion=1",
+		"exec incus admin init --minimal",
+		"exec incus query /1.0/storage-pools/default",
+	} {
+		if !strings.Contains(joined, required) {
+			t.Fatalf("missing call %q:\n%s", required, joined)
+		}
+	}
+	if strings.Contains(joined, "create-volume") {
+		t.Fatalf("existing volume was recreated:\n%s", joined)
 	}
 }
 
@@ -308,6 +340,46 @@ func TestSyncCancellationUsesBoundedNonCancelledCleanupContext(t *testing.T) {
 	}
 	if !fake.cleanupCtxSeen {
 		t.Fatal("cleanup did not observe a live context with a cleanup deadline")
+	}
+}
+
+func TestWaitForDNSRetriesUntilSuccess(t *testing.T) {
+	fake := newSyncFake()
+	command := "getent ahosts images.linuxcontainers.org"
+	fake.execSequences[command] = []syncExecResult{
+		{stderr: "temporary failure", err: errors.New("lookup failed")},
+		{},
+	}
+	if err := waitForDNS(context.Background(), fake, "maintenance", time.Second, time.Millisecond); err != nil {
+		t.Fatal(err)
+	}
+	if got := countExactCall(fake.calls, "exec "+command); got != 2 {
+		t.Fatalf("DNS attempts = %d, want 2", got)
+	}
+}
+
+func TestWaitForDNSStopsAtTimeout(t *testing.T) {
+	fake := newSyncFake()
+	command := "getent ahosts images.linuxcontainers.org"
+	fake.execResults[command] = syncExecResult{stderr: "temporary failure", err: errors.New("lookup failed")}
+	err := waitForDNS(context.Background(), fake, "maintenance", 10*time.Millisecond, time.Millisecond)
+	if !errors.Is(err, context.DeadlineExceeded) {
+		t.Fatalf("waitForDNS error = %v, want deadline exceeded", err)
+	}
+	if got := countExactCall(fake.calls, "exec "+command); got < 2 {
+		t.Fatalf("DNS attempts = %d, want retries", got)
+	}
+}
+
+func TestWaitForDNSStopsOnCallerCancellation(t *testing.T) {
+	fake := newSyncFake()
+	command := "getent ahosts images.linuxcontainers.org"
+	fake.execResults[command] = syncExecResult{stderr: "temporary failure", err: errors.New("lookup failed")}
+	ctx, cancel := context.WithCancel(context.Background())
+	cancel()
+	err := waitForDNS(ctx, fake, "maintenance", time.Minute, time.Millisecond)
+	if !errors.Is(err, context.Canceled) {
+		t.Fatalf("waitForDNS error = %v, want context canceled", err)
 	}
 }
 
@@ -410,6 +482,16 @@ func assertCallBefore(t *testing.T, calls []string, first, second string) {
 	if firstIndex == -1 || secondIndex == -1 || firstIndex >= secondIndex {
 		t.Fatalf("want %q before %q, calls: %v", first, second, calls)
 	}
+}
+
+func countExactCall(calls []string, wanted string) int {
+	count := 0
+	for _, call := range calls {
+		if call == wanted {
+			count++
+		}
+	}
+	return count
 }
 
 func containsCall(calls []string, wanted string) bool {

@@ -191,7 +191,7 @@ func syncWithDependencies(ctx context.Context, cfg config.Config, stdout, stderr
 	if err := execAndWrite(ctx, incus, name, stdout, stderr, []string{"update-ca-certificates"}); err != nil {
 		return err
 	}
-	if err := waitForDNS(ctx, incus, name); err != nil {
+	if err := waitForDNS(ctx, incus, name, dnsTimeout, time.Second); err != nil {
 		return err
 	}
 	if err := initialize(ctx, incus, name, seedCreated, systemdTimeout); err != nil {
@@ -232,17 +232,35 @@ func waitForSystemd(ctx context.Context, incus client, name string) error {
 	return nil
 }
 
-func waitForDNS(ctx context.Context, incus client, name string) error {
-	dnsCtx, cancel := context.WithTimeout(ctx, dnsTimeout)
+func waitForDNS(ctx context.Context, incus client, name string, timeout, pollInterval time.Duration) error {
+	dnsCtx, cancel := context.WithTimeout(ctx, timeout)
 	defer cancel()
 
-	_, stderr, err := incus.Exec(dnsCtx, name, incusclient.ExecRequest{
-		Command: []string{"getent", "ahosts", "images.linuxcontainers.org"},
-	})
-	if err != nil {
-		return fmt.Errorf("wait for DNS in maintenance instance %q (stderr %q): %w", name, strings.TrimSpace(stderr), err)
+	var lastStderr string
+	var lastErr error
+	for {
+		if err := dnsCtx.Err(); err != nil {
+			return fmt.Errorf("wait for DNS in maintenance instance %q (last stderr %q, last error %v): %w", name, lastStderr, lastErr, err)
+		}
+		_, stderr, err := incus.Exec(dnsCtx, name, incusclient.ExecRequest{
+			Command: []string{"getent", "ahosts", "images.linuxcontainers.org"},
+		})
+		if err == nil {
+			return nil
+		}
+		lastStderr = strings.TrimSpace(stderr)
+		lastErr = err
+
+		timer := time.NewTimer(pollInterval)
+		select {
+		case <-dnsCtx.Done():
+			if !timer.Stop() {
+				<-timer.C
+			}
+			return fmt.Errorf("wait for DNS in maintenance instance %q (last stderr %q, last error %v): %w", name, lastStderr, lastErr, dnsCtx.Err())
+		case <-timer.C:
+		}
 	}
-	return nil
 }
 
 func execAndWrite(ctx context.Context, incus client, name string, stdout, stderr io.Writer, command []string) error {

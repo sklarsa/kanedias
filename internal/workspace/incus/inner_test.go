@@ -99,27 +99,39 @@ func TestWaitReady(t *testing.T) {
 	}
 }
 
-func TestInitializeNewSeed(t *testing.T) {
+func TestInitializeUninitializedNewSeed(t *testing.T) {
+	testInitializeUninitializedSeed(t, true)
+}
+
+func TestInitializeUninitializedExistingSeed(t *testing.T) {
+	testInitializeUninitializedSeed(t, false)
+}
+
+func testInitializeUninitializedSeed(t *testing.T, newSeed bool) {
+	t.Helper()
 	executor := &recordingExecutor{results: []execResult{
 		{},
+		{stdout: `[]`},
 		{},
 		{},
 		{stdout: `{"name":"default","driver":"btrfs","config":{"source":"/var/lib/incus/storage-pools/default"}}`},
 	}}
-	if err := initialize(context.Background(), executor, "workspace", true, 60*time.Second); err != nil {
+	if err := initialize(context.Background(), executor, "workspace", newSeed, 60*time.Second); err != nil {
 		t.Fatal(err)
 	}
 	assertCommands(t, executor, [][]string{
 		{"incus", "admin", "waitready", "--timeout", "60"},
+		{"incus", "query", "/1.0/storage-pools?recursion=1"},
 		{"incus", "admin", "init", "--minimal"},
 		{"incus", "admin", "waitready", "--timeout", "60"},
 		{"incus", "query", "/1.0/storage-pools/default"},
 	})
 }
 
-func TestInitializeExistingSeed(t *testing.T) {
+func TestInitializeExistingInitializedSeedDoesNotReinitialize(t *testing.T) {
 	executor := &recordingExecutor{results: []execResult{
 		{},
+		{stdout: `[{"name":"default","driver":"btrfs"}]`},
 		{stdout: `{"name":"default","driver":"btrfs","config":{"source":"/var/lib/incus/storage-pools/default"}}`},
 	}}
 	if err := initialize(context.Background(), executor, "workspace", false, 60*time.Second); err != nil {
@@ -127,8 +139,23 @@ func TestInitializeExistingSeed(t *testing.T) {
 	}
 	assertCommands(t, executor, [][]string{
 		{"incus", "admin", "waitready", "--timeout", "60"},
+		{"incus", "query", "/1.0/storage-pools?recursion=1"},
 		{"incus", "query", "/1.0/storage-pools/default"},
 	})
+}
+
+func TestInitializeDoesNotReinitializeWhenInitializationProbeFails(t *testing.T) {
+	probeErr := errors.New("query failed")
+	executor := &recordingExecutor{results: []execResult{{}, {stderr: "boom", err: probeErr}}}
+	err := initialize(context.Background(), executor, "workspace", false, 60*time.Second)
+	if !errors.Is(err, probeErr) {
+		t.Fatalf("initialize error = %v, want probe error", err)
+	}
+	for _, command := range executor.commands {
+		if strings.Join(command, " ") == "incus admin init --minimal" {
+			t.Fatal("initialized seed was reinitialized after an ambiguous probe failure")
+		}
+	}
 }
 
 func TestSyncImages(t *testing.T) {

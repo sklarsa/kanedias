@@ -22,6 +22,7 @@ type Executor interface {
 }
 
 type innerStoragePool struct {
+	Name   string            `json:"name"`
 	Driver string            `json:"driver"`
 	Config map[string]string `json:"config"`
 }
@@ -64,11 +65,15 @@ func VerifyNativeBtrfs(ctx context.Context, executor Executor, instance string) 
 	return nil
 }
 
-func initialize(ctx context.Context, executor Executor, instance string, newSeed bool, timeout time.Duration) error {
+func initialize(ctx context.Context, executor Executor, instance string, _ bool, timeout time.Duration) error {
 	if err := WaitReady(ctx, executor, instance, timeout); err != nil {
 		return err
 	}
-	if newSeed {
+	initialized, err := isInitialized(ctx, executor, instance)
+	if err != nil {
+		return err
+	}
+	if !initialized {
 		_, stderr, err := executor.Exec(ctx, instance, incusclient.ExecRequest{
 			Command: []string{"incus", "admin", "init", "--minimal"},
 		})
@@ -80,6 +85,25 @@ func initialize(ctx context.Context, executor Executor, instance string, newSeed
 		}
 	}
 	return VerifyNativeBtrfs(ctx, executor, instance)
+}
+
+func isInitialized(ctx context.Context, executor Executor, instance string) (bool, error) {
+	stdout, stderr, err := executor.Exec(ctx, instance, incusclient.ExecRequest{
+		Command: []string{"incus", "query", "/1.0/storage-pools?recursion=1"},
+	})
+	if err != nil {
+		return false, fmt.Errorf("query nested Incus initialization in instance %q (stderr %q): %w", instance, strings.TrimSpace(stderr), err)
+	}
+	var pools []innerStoragePool
+	if err := json.Unmarshal([]byte(stdout), &pools); err != nil {
+		return false, fmt.Errorf("decode nested Incus storage pools: %w", err)
+	}
+	for _, pool := range pools {
+		if pool.Name == "default" {
+			return true, nil
+		}
+	}
+	return false, nil
 }
 
 func syncImages(ctx context.Context, executor Executor, instance string, images []string) error {

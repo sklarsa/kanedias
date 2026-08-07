@@ -177,8 +177,9 @@ func create(ctx context.Context, cfg config.Config, name string, stdout, stderr 
 	}()
 
 	fmt.Fprintf(stdout, "Cloning workspace %s to %s...\n", seed, volume)
-	if err := client.CopyStorageVolume(ctx, pool, seed, volume); err != nil {
-		return err
+	if copyErr := client.CopyStorageVolume(ctx, pool, seed, volume); copyErr != nil {
+		volumeCreated = deps.operationWasSubmitted(copyErr)
+		return copyErr
 	}
 	volumeCreated = true
 
@@ -297,13 +298,14 @@ func destroy(ctx context.Context, cfg config.Config, name string, stdout, _ io.W
 	}
 	volume := workspaceVolume(name)
 	seed := seedVolume(cfg)
-	if volume == seed {
-		return fmt.Errorf("refusing to remove protected workspace volume %q", volume)
-	}
 	incusVolume := incusworkspace.SandboxVolume(name)
 	incusSeed := incusworkspace.SeedVolume(cfg)
-	if incusVolume == incusSeed {
-		return fmt.Errorf("refusing to remove protected nested Incus state volume %q", incusVolume)
+	for _, clone := range []string{volume, incusVolume} {
+		for _, protectedSeed := range []string{seed, incusSeed} {
+			if clone == protectedSeed {
+				return fmt.Errorf("refusing to remove protected seed volume %q", clone)
+			}
+		}
 	}
 
 	client, err := deps.connect(ctx)
@@ -329,18 +331,18 @@ func destroy(ctx context.Context, cfg config.Config, name string, stdout, _ io.W
 	}
 	if instanceExists {
 		workspace, ok := instance.Devices[workspaceDevice]
-		if !ok || workspace["source"] == "" {
+		if !ok {
 			return fmt.Errorf("refusing to remove %q: local workspace device is missing", name)
 		}
-		if workspace["source"] != volume {
-			return fmt.Errorf("refusing to remove %q: workspace source is %q, expected %q", name, workspace["source"], volume)
+		if err := verifyOwnedDevice(workspace, pool, volume, workspacePath); err != nil {
+			return fmt.Errorf("refusing to remove %q: workspace device: %w", name, err)
 		}
 		incusState, ok := instance.Devices[incusworkspace.DeviceName]
-		if !ok || incusState["source"] == "" {
+		if !ok {
 			return fmt.Errorf("refusing to remove %q: local nested Incus state device is missing", name)
 		}
-		if incusState["source"] != incusVolume {
-			return fmt.Errorf("refusing to remove %q: nested Incus state source is %q, expected %q", name, incusState["source"], incusVolume)
+		if err := verifyOwnedDevice(incusState, pool, incusVolume, incusworkspace.MountPath); err != nil {
+			return fmt.Errorf("refusing to remove %q: nested Incus state device: %w", name, err)
 		}
 		if instance.StatusCode == api.Running {
 			fmt.Fprintf(stdout, "Stopping sandbox %s...\n", name)
@@ -380,6 +382,16 @@ func destroy(ctx context.Context, cfg config.Config, name string, stdout, _ io.W
 		fmt.Fprintf(stdout, "Sandbox %s and its volumes are absent.\n", name)
 	}
 	return errors.Join(incusErr, workspaceErr)
+}
+
+func verifyOwnedDevice(device map[string]string, pool, source, path string) error {
+	want := map[string]string{"type": "disk", "pool": pool, "source": source, "path": path}
+	for _, key := range []string{"type", "pool", "source", "path"} {
+		if device[key] != want[key] {
+			return fmt.Errorf("%s is %q, expected %q", key, device[key], want[key])
+		}
+	}
+	return nil
 }
 
 func seedVolume(cfg config.Config) string {

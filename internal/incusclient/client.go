@@ -206,7 +206,8 @@ func waitRemoteOperation(ctx context.Context, operation remoteOperationWaiter) e
 	case err := <-result:
 		return err
 	case <-ctx.Done():
-		_ = operation.CancelTarget()
-		return ctx.Err()
+		cancelErr := operation.CancelTarget()
+		waitErr := <-result
+		return errors.Join(ctx.Err(), cancelErr, waitErr)
 	}
 }

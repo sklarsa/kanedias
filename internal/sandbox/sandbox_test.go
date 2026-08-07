@@ -139,6 +139,21 @@ func TestCreateRepositoryCopyFailureDoesNotCloneIncusState(t *testing.T) {
 	}
 }
 
+func TestCreateSubmittedRepositoryCopyFailureRollsBackOwnedCloneWithoutIncusClone(t *testing.T) {
+	submitted := errors.New("submitted repository copy failed")
+	fake := &recordingClient{copyErr: submitted, submittedErr: submitted}
+	err := create(context.Background(), testConfig(), "demo", io.Discard, io.Discard, testDependencies(fake))
+	if !errors.Is(err, submitted) {
+		t.Fatalf("Create error = %v, want submitted copy error", err)
+	}
+	if containsCallPrefix(fake.calls, "clone-incus ") {
+		t.Fatalf("Incus state clone attempted after repository copy failure: %v", fake.calls)
+	}
+	if !containsCall(fake.calls, "delete-volume kanedias-workspace-demo") {
+		t.Fatalf("ambiguous repository clone was not rolled back: %v", fake.calls)
+	}
+}
+
 func TestCreateIncusCloneFailureCleansAmbiguousIncusAndRepositoryClones(t *testing.T) {
 	fake := &recordingClient{
 		cloneIncusResult: incusworkspace.CloneResult{Name: "kanedias-incus-demo", Created: true},
@@ -265,6 +280,27 @@ func TestDestroyRefusesUnverifiedOwnedDevicesWithoutDeletion(t *testing.T) {
 		{name: "mismatched Incus state", devices: api.DevicesMap{
 			"workspace": valid["workspace"], incusworkspace.DeviceName: {"source": "someone-elses-incus"},
 		}},
+		{name: "workspace missing pool", devices: api.DevicesMap{
+			"workspace": {"type": "disk", "source": "kanedias-workspace-demo", "path": "/workspace"}, incusworkspace.DeviceName: valid[incusworkspace.DeviceName],
+		}},
+		{name: "workspace wrong pool", devices: api.DevicesMap{
+			"workspace": {"type": "disk", "pool": "old-pool", "source": "kanedias-workspace-demo", "path": "/workspace"}, incusworkspace.DeviceName: valid[incusworkspace.DeviceName],
+		}},
+		{name: "workspace wrong type", devices: api.DevicesMap{
+			"workspace": {"type": "unix-block", "pool": "pool1", "source": "kanedias-workspace-demo", "path": "/workspace"}, incusworkspace.DeviceName: valid[incusworkspace.DeviceName],
+		}},
+		{name: "workspace wrong path", devices: api.DevicesMap{
+			"workspace": {"type": "disk", "pool": "pool1", "source": "kanedias-workspace-demo", "path": "/other"}, incusworkspace.DeviceName: valid[incusworkspace.DeviceName],
+		}},
+		{name: "Incus state wrong pool", devices: api.DevicesMap{
+			"workspace": valid["workspace"], incusworkspace.DeviceName: {"type": "disk", "pool": "old-pool", "source": "kanedias-incus-demo", "path": "/var/lib/incus"},
+		}},
+		{name: "Incus state wrong type", devices: api.DevicesMap{
+			"workspace": valid["workspace"], incusworkspace.DeviceName: {"type": "unix-block", "pool": "pool1", "source": "kanedias-incus-demo", "path": "/var/lib/incus"},
+		}},
+		{name: "Incus state wrong path", devices: api.DevicesMap{
+			"workspace": valid["workspace"], incusworkspace.DeviceName: {"type": "disk", "pool": "pool1", "source": "kanedias-incus-demo", "path": "/other"},
+		}},
 	} {
 		t.Run(test.name, func(t *testing.T) {
 			fake := &recordingClient{instance: &api.Instance{InstancePut: api.InstancePut{Devices: test.devices}}}
@@ -318,23 +354,34 @@ func TestDestroySucceedsWhenResourcesAreAbsent(t *testing.T) {
 
 func TestDestroyNeverSelectsSeedVolumes(t *testing.T) {
 	for _, test := range []struct {
-		name string
-		cfg  config.Config
+		name    string
+		sandbox string
+		cfg     config.Config
 	}{
-		{name: "workspace seed", cfg: func() config.Config {
+		{name: "workspace seed as workspace clone", sandbox: "seed", cfg: func() config.Config {
 			cfg := testConfig()
 			cfg.Workspace.Incus.Volume = "other-incus-seed"
 			return cfg
 		}()},
-		{name: "Incus seed", cfg: func() config.Config {
+		{name: "Incus seed as Incus clone", sandbox: "seed", cfg: func() config.Config {
 			cfg := testConfig()
 			cfg.Workspace.Volume = "other-workspace-seed"
+			return cfg
+		}()},
+		{name: "Incus seed as workspace clone", sandbox: "demo", cfg: func() config.Config {
+			cfg := testConfig()
+			cfg.Workspace.Incus.Volume = "kanedias-workspace-demo"
+			return cfg
+		}()},
+		{name: "workspace seed as Incus clone", sandbox: "demo", cfg: func() config.Config {
+			cfg := testConfig()
+			cfg.Workspace.Volume = "kanedias-incus-demo"
 			return cfg
 		}()},
 	} {
 		t.Run(test.name, func(t *testing.T) {
 			fake := &recordingClient{}
-			err := destroy(context.Background(), test.cfg, "seed", io.Discard, io.Discard, testDependencies(fake))
+			err := destroy(context.Background(), test.cfg, test.sandbox, io.Discard, io.Discard, testDependencies(fake))
 			if err == nil {
 				t.Fatal("Destroy accepted a name whose owned volume would be a seed")
 			}
@@ -350,10 +397,10 @@ func verifiedInstance(status api.StatusCode) *api.Instance {
 		StatusCode: status,
 		InstancePut: api.InstancePut{Devices: api.DevicesMap{
 			"workspace": {
-				"type": "disk", "source": "kanedias-workspace-demo", "path": "/workspace",
+				"type": "disk", "pool": "pool1", "source": "kanedias-workspace-demo", "path": "/workspace",
 			},
 			incusworkspace.DeviceName: {
-				"type": "disk", "source": "kanedias-incus-demo", "path": "/var/lib/incus",
+				"type": "disk", "pool": "pool1", "source": "kanedias-incus-demo", "path": "/var/lib/incus",
 			},
 		}},
 	}

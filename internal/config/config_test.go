@@ -208,6 +208,19 @@ func TestValidateLifecycleRequiredFields(t *testing.T) {
 	}
 }
 
+func TestValidateLifecycleRejectsIdenticalWorkspaceSeeds(t *testing.T) {
+	cfg := Config{
+		BaseImage: BaseImage{Name: "sandbox", Source: "images:", Image: "debian/13"},
+		Workspace: Workspace{
+			Volume: "shared-seed",
+			Incus:  IncusWorkspace{Volume: "shared-seed"},
+		},
+	}
+	if err := cfg.ValidateLifecycle(); err == nil || !strings.Contains(err.Error(), "must be different") {
+		t.Fatalf("ValidateLifecycle() error = %v, want distinct seed validation", err)
+	}
+}
+
 func TestValidateLifecycleAllowsEmptyLists(t *testing.T) {
 	cfg := Config{
 		BaseImage: BaseImage{
