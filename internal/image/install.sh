@@ -137,6 +137,11 @@ configure_managed_user() {
 
 configure_managed_user
 
+if [[ $(id -u "$managed_user") != 1000 || $(id -g "$managed_user") != 1000 ]]; then
+    printf 'managed user %s must have numeric UID/GID 1000 for Incus proxy mappings\n' "$managed_user" >&2
+    exit 1
+fi
+
 install_cloud_apt_packages() {
     local architecture
     architecture=$(dpkg --print-architecture)

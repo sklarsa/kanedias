@@ -26,11 +26,15 @@ type Dependencies struct {
 	SocketPath             string
 	SpawnChild             ChildSpawner
 	DescendantClient       DescendantClientFactory
+	DirectChildRecoverer   provision.DirectChildRecoverer
 	NewSessionID           func() (string, error)
 	ChildStopTimeout       time.Duration
 	CloseListener          func(context.Context) error
 	ReportWrite            func(contract.WriteChildResult) error
 	ExpectedPiBinding      *PiBinding
+	HandoffVerifier        HandoffVerifier
+	ResourcePublished      func(*provision.Resources) error
+	RunAttribution         string
 	HandoffShutdownTimeout time.Duration
 }
 
@@ -138,8 +142,9 @@ func (node *Node) Start(ctx context.Context) error {
 
 	identity := node.identity.Snapshot()
 	resources, err := node.deps.Provisioner.ProvisionRoot(startupCtx, provision.RootRequest{
-		SessionID:  identity.SessionID,
-		SocketPath: node.deps.SocketPath,
+		SessionID:      identity.SessionID,
+		SocketPath:     node.deps.SocketPath,
+		RunAttribution: node.deps.RunAttribution,
 	})
 	node.mu.Lock()
 	if resources != nil {
@@ -160,6 +165,12 @@ func (node *Node) Start(ctx context.Context) error {
 	if resources == nil {
 		node.failStart(ctx, invariantf("root provisioner returned nil resources"))
 		return node.finishedError()
+	}
+	if node.deps.ResourcePublished != nil {
+		if err := node.deps.ResourcePublished(resources); err != nil {
+			node.failStart(ctx, fmt.Errorf("publish direct-child resource ownership: %w", err))
+			return node.finishedError()
+		}
 	}
 
 	connection, err := node.deps.DialRPC(startupCtx, resources.RPCAddr)
@@ -314,7 +325,7 @@ func (node *Node) CreateChild(ctx context.Context, parent string, request contra
 	bootstrap := process.Bootstrap{
 		SessionID: childID, ParentID: identity.SessionID, RootID: identity.RootID,
 		SocketPath: childSocket, SourceInstance: resources.Instance, SourceVolume: resources.Volume,
-		Worker: worker, Request: request,
+		Worker: worker, Request: request, RunAttribution: node.deps.RunAttribution,
 	}
 	child, err := node.deps.SpawnChild(spawnCtx, bootstrap)
 	if err != nil {
@@ -322,8 +333,16 @@ func (node *Node) CreateChild(ctx context.Context, parent string, request contra
 		return TerminalResult{}, errors.Join(contract.NewError(contract.ErrorChildFailed, "start child supervisor failed"), node.failChildCreation(ctx, entry, err))
 	}
 	entry.setProcess(child)
-	if err := child.WaitReady(ctx); err != nil {
-		return TerminalResult{}, node.failChildCreation(ctx, entry, err)
+	readyErr := child.WaitReady(ctx)
+	ticket, ok := child.RecoveryTicket()
+	if ok {
+		entry.setRecovery(ticket)
+	}
+	if readyErr != nil {
+		return TerminalResult{}, node.failChildCreation(ctx, entry, readyErr)
+	}
+	if !ok {
+		return TerminalResult{}, node.failChildCreation(ctx, entry, fmt.Errorf("child did not publish a direct-parent recovery ticket"))
 	}
 	client, err := node.deps.DescendantClient(childSocket)
 	if err != nil {

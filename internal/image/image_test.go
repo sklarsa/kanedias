@@ -42,6 +42,9 @@ func TestInstallerIncludesUninitializedContainerOnlyIncus(t *testing.T) {
 	if !strings.Contains(script, `usermod --append --groups sudo,incus-admin "$managed_user"`) {
 		t.Error("managed user is not added to incus-admin")
 	}
+	if !strings.Contains(script, `[[ $(id -u "$managed_user") != 1000 || $(id -g "$managed_user") != 1000 ]]`) {
+		t.Error("managed user numeric UID/GID 1000 is not asserted before image publication")
+	}
 	if strings.Contains(script, "incus admin init") {
 		t.Error("installer initializes Incus")
 	}

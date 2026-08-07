@@ -25,6 +25,7 @@ type Service interface {
 	Subscribe(context.Context) (supervisor.Subscription, error)
 	CreateChild(context.Context, string, contract.CreateChildRequest) (supervisor.TerminalResult, error)
 	Handoff(context.Context, supervisor.WriteHandoffRequest) (supervisor.HandoffAcceptance, error)
+	AcknowledgeHandoff(context.Context) error
 	Stop(context.Context, string) error
 }
 
@@ -99,7 +100,15 @@ func NewHandler(service Service) http.Handler {
 			writeError(w, err)
 			return
 		}
-		writeJSON(w, http.StatusOK, accepted)
+		if err := writeJSONChecked(w, http.StatusOK, accepted); err != nil {
+			return
+		}
+		flusher, ok := w.(http.Flusher)
+		if !ok {
+			return
+		}
+		flusher.Flush()
+		_ = service.AcknowledgeHandoff(context.WithoutCancel(request.Context()))
 	})
 	router.Post("/v1/sessions/{sessionID}/questions/{questionID}/response", func(w http.ResponseWriter, request *http.Request) {
 		body, err := readJSONBody(w, request)
@@ -202,9 +211,13 @@ func writeError(w http.ResponseWriter, err error) {
 }
 
 func writeJSON(w http.ResponseWriter, status int, value any) {
+	_ = writeJSONChecked(w, status, value)
+}
+
+func writeJSONChecked(w http.ResponseWriter, status int, value any) error {
 	w.Header().Set("Content-Type", "application/json")
 	w.WriteHeader(status)
-	_ = json.NewEncoder(w).Encode(value)
+	return json.NewEncoder(w).Encode(value)
 }
 
 func writeRawJSON(w http.ResponseWriter, status int, raw json.RawMessage) {

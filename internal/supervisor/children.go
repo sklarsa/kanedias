@@ -11,6 +11,7 @@ import (
 
 	"github.com/sklarsa/kanedias/internal/supervisor/contract"
 	"github.com/sklarsa/kanedias/internal/supervisor/process"
+	"github.com/sklarsa/kanedias/internal/supervisor/provision"
 )
 
 // DescendantClient is the acyclic parent-to-child control seam. Implementations
@@ -29,6 +30,7 @@ type descendantCloser interface{ Close() error }
 
 type ChildProcess interface {
 	WaitReady(context.Context) error
+	RecoveryTicket() (provision.RecoveryTicket, bool)
 	NextMessage(context.Context) (process.ChildMessage, error)
 	CloseLiveness() error
 	CloseReports() error
@@ -52,10 +54,12 @@ type childEntry struct {
 	spawnDone   chan struct{}
 	spawnOnce   sync.Once
 	eventCancel context.CancelFunc
+	recovery    *provision.RecoveryTicket
 
 	cleanupOnce sync.Once
 	cleanupDone chan struct{}
 	cleanupErr  error
+	streamErr   error
 }
 
 func (entry *childEntry) init() {
@@ -78,6 +82,12 @@ func (entry *childEntry) markSpawnDone() {
 	entry.spawnOnce.Do(func() { close(entry.spawnDone) })
 }
 
+func (entry *childEntry) setRecovery(ticket provision.RecoveryTicket) {
+	entry.mu.Lock()
+	entry.recovery = &ticket
+	entry.mu.Unlock()
+}
+
 func (entry *childEntry) setClient(client DescendantClient) {
 	entry.mu.Lock()
 	entry.client = client
@@ -93,6 +103,12 @@ func (entry *childEntry) values() (DescendantClient, ChildProcess, context.Cance
 func (entry *childEntry) setEventCancel(cancel context.CancelFunc) {
 	entry.mu.Lock()
 	entry.eventCancel = cancel
+	entry.mu.Unlock()
+}
+
+func (entry *childEntry) setStreamError(err error) {
+	entry.mu.Lock()
+	entry.streamErr = err
 	entry.mu.Unlock()
 }
 
@@ -177,6 +193,15 @@ func (node *Node) forwardChildEvents(ctx context.Context, cancel context.CancelF
 			return
 		case event, ok := <-subscription.Events:
 			if !ok {
+				if subscription.Err != nil {
+					if streamErr := subscription.Err(); streamErr != nil {
+						entry.setStreamError(streamErr)
+						_, child, _ := entry.values()
+						if child != nil {
+							_ = child.CloseLiveness()
+						}
+					}
+				}
 				return
 			}
 			node.broker.Forward(event)
@@ -227,6 +252,14 @@ func (node *Node) cleanupChild(ctx context.Context, entry *childEntry, requestSt
 				}
 			}
 			cleanupErr = errors.Join(cleanupErr, child.Wait(), child.CloseLiveness(), child.CloseReports())
+			entry.mu.RLock()
+			ticket := entry.recovery
+			entry.mu.RUnlock()
+			if ticket != nil && node.deps.DirectChildRecoverer != nil {
+				recoveryCtx, cancelRecovery := context.WithTimeout(context.Background(), node.childStopTimeout())
+				cleanupErr = errors.Join(cleanupErr, node.deps.DirectChildRecoverer.RecoverDirectChild(recoveryCtx, *ticket))
+				cancelRecovery()
+			}
 		}
 		entry.mu.RLock()
 		spawnCancel := entry.spawnCancel
@@ -240,6 +273,10 @@ func (node *Node) cleanupChild(ctx context.Context, entry *childEntry, requestSt
 		if closer, ok := client.(descendantCloser); ok {
 			cleanupErr = errors.Join(cleanupErr, closer.Close())
 		}
+		entry.mu.RLock()
+		streamErr := entry.streamErr
+		entry.mu.RUnlock()
+		cleanupErr = errors.Join(cleanupErr, streamErr)
 		node.children.remove(entry.id, entry)
 		entry.cleanupErr = cleanupErr
 	})

@@ -150,3 +150,28 @@ func boundReadNodeForContext(t *testing.T, mode contract.ContextMode) (*Node, ne
 	}
 	return &Node{identity: identity, broker: broker, local: local, state: LifecycleReady}, peer
 }
+
+func TestRunReadTaskIgnoresSuccessfulRetainedGenerationBeforeExactPrompt(t *testing.T) {
+	node, peer := boundReadNode(t)
+	defer peer.Close()
+	_, _ = peer.Write([]byte(`{"type":"message_end","message":{"role":"assistant","stopReason":"stop"}}` + "\n" + `{"type":"agent_settled"}` + "\n"))
+	waitFor(t, func() bool { return node.broker.SourceBoundary("child-1") >= 2 }, "old generation replay")
+	go func() {
+		reader := bufio.NewReader(peer)
+		prompt := readRPCCommand(t, reader)
+		if prompt.Type != "prompt" || prompt.Message != "new exact task" {
+			t.Errorf("prompt = %#v", prompt)
+		}
+		writeRPCResponse(t, peer, prompt.ID, "prompt", true, nil)
+		_, _ = peer.Write([]byte(`{"type":"message_end","message":{"role":"assistant","stopReason":"stop"}}` + "\n" + `{"type":"agent_settled"}` + "\n"))
+		last := readRPCCommand(t, reader)
+		writeRPCResponse(t, peer, last.ID, "get_last_assistant_text", true, map[string]any{"text": "new answer"})
+	}()
+	result, err := node.RunReadTask(context.Background(), "new exact task")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if result.Output != "new answer" {
+		t.Fatalf("result = %#v", result)
+	}
+}

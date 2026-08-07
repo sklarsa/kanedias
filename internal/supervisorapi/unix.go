@@ -11,6 +11,8 @@ import (
 	"sync"
 	"syscall"
 	"time"
+
+	"golang.org/x/sys/unix"
 )
 
 const unixShutdownTimeout = 5 * time.Second
@@ -36,30 +38,59 @@ func StartUnix(path string, handler http.Handler) (*UnixServer, error) {
 	if handler == nil {
 		return nil, fmt.Errorf("Unix socket handler is required")
 	}
+	if len(path) >= len(syscall.RawSockaddrUnix{}.Path) {
+		return nil, fmt.Errorf("Unix socket path %q exceeds platform address bound", path)
+	}
 	if err := prepareUnixPath(path); err != nil {
 		return nil, err
 	}
-	address, err := net.ResolveUnixAddr("unix", path)
+	// Bind below a private 0700 directory, harden the socket, then atomically
+	// publish it without replacement. The public API path is never connectable
+	// with broader permissions.
+	temporaryDir, err := privateUnixBindDirectory(path)
 	if err != nil {
-		return nil, fmt.Errorf("resolve Unix socket %q: %w", path, err)
+		return nil, err
+	}
+	temporaryPath := filepath.Join(temporaryDir, "s")
+	cleanupTemporary := func() { _ = os.RemoveAll(temporaryDir) }
+	address, err := net.ResolveUnixAddr("unix", temporaryPath)
+	if err != nil {
+		cleanupTemporary()
+		return nil, fmt.Errorf("resolve temporary Unix socket %q: %w", temporaryPath, err)
 	}
 	listener, err := net.ListenUnix("unix", address)
 	if err != nil {
-		return nil, fmt.Errorf("listen on Unix socket %q: %w", path, err)
+		cleanupTemporary()
+		return nil, fmt.Errorf("listen on temporary Unix socket %q: %w", temporaryPath, err)
 	}
 	listener.SetUnlinkOnClose(false)
-	if err := os.Chmod(path, 0o600); err != nil {
+	temporaryIdentity, identityErr := socketIdentity(temporaryPath)
+	if identityErr != nil {
 		_ = listener.Close()
-		_ = safeUnlinkSocket(path, nil)
+		cleanupTemporary()
+		return nil, identityErr
+	}
+	failBound := func() {
+		_ = listener.Close()
+		_ = safeUnlinkSocket(temporaryPath, temporaryIdentity)
+		cleanupTemporary()
+	}
+	if err := os.Chmod(temporaryPath, 0o600); err != nil {
+		failBound()
 		return nil, fmt.Errorf("set Unix socket %q mode 0600: %w", path, err)
 	}
+	if err := unix.Renameat2(unix.AT_FDCWD, temporaryPath, unix.AT_FDCWD, path, unix.RENAME_NOREPLACE); err != nil {
+		failBound()
+		return nil, fmt.Errorf("publish Unix socket %q atomically: %w", path, err)
+	}
+	cleanupTemporary()
 	bound, err := socketIdentity(path)
 	if err != nil {
 		_ = listener.Close()
-		_ = safeUnlinkSocket(path, nil)
+		_ = safeUnlinkSocket(path, temporaryIdentity)
 		return nil, err
 	}
-	result := &UnixServer{path: path, bound: bound, listener: listener, server: &http.Server{Handler: handler}, done: make(chan struct{})}
+	result := &UnixServer{path: path, bound: bound, listener: listener, server: &http.Server{Handler: handler, ReadHeaderTimeout: 5 * time.Second}, done: make(chan struct{})}
 	go func() {
 		serveErr := result.server.Serve(listener)
 		if errors.Is(serveErr, http.ErrServerClosed) {
@@ -120,6 +151,39 @@ func ServeUnix(ctx context.Context, path string, handler http.Handler) error {
 	}
 }
 
+func privateUnixBindDirectory(finalPath string) (string, error) {
+	parent := filepath.Dir(finalPath)
+	parentInfo, err := os.Stat(parent)
+	if err != nil {
+		return "", fmt.Errorf("inspect Unix socket parent %q: %w", parent, err)
+	}
+	parentStat, ok := parentInfo.Sys().(*syscall.Stat_t)
+	if !ok {
+		return "", fmt.Errorf("inspect Unix socket parent %q device", parent)
+	}
+	var lastErr error
+	for candidate := parent; ; candidate = filepath.Dir(candidate) {
+		info, err := os.Stat(candidate)
+		if err == nil {
+			if stat, ok := info.Sys().(*syscall.Stat_t); ok && stat.Dev == parentStat.Dev {
+				directory, mkdirErr := os.MkdirTemp(candidate, ".k-")
+				if mkdirErr == nil {
+					if len(filepath.Join(directory, "s")) < len(syscall.RawSockaddrUnix{}.Path) {
+						return directory, nil
+					}
+					_ = os.RemoveAll(directory)
+				} else {
+					lastErr = mkdirErr
+				}
+			}
+		}
+		if candidate == filepath.Dir(candidate) {
+			break
+		}
+	}
+	return "", fmt.Errorf("create same-filesystem private Unix bind directory for %q: %w", finalPath, lastErr)
+}
+
 func prepareUnixPath(path string) error {
 	info, err := os.Lstat(path)
 	if errors.Is(err, os.ErrNotExist) {
@@ -146,7 +210,11 @@ func prepareUnixPath(path string) error {
 	if !errors.Is(dialErr, syscall.ECONNREFUSED) && !errors.Is(dialErr, os.ErrNotExist) {
 		return fmt.Errorf("refuse to replace unverifiably stale Unix socket %q: %w", path, dialErr)
 	}
-	if err := os.Remove(path); err != nil {
+	expected, err := identityFromInfo(info)
+	if err != nil {
+		return fmt.Errorf("inspect stale Unix socket %q identity: %w", path, err)
+	}
+	if err := safeUnlinkSocket(path, expected); err != nil {
 		return fmt.Errorf("remove stale Unix socket %q: %w", path, err)
 	}
 	return nil
@@ -157,6 +225,14 @@ type unixSocketIdentity struct {
 	inode  uint64
 }
 
+func identityFromInfo(info os.FileInfo) (*unixSocketIdentity, error) {
+	stat, ok := info.Sys().(*syscall.Stat_t)
+	if !ok {
+		return nil, fmt.Errorf("socket identity is unavailable")
+	}
+	return &unixSocketIdentity{device: uint64(stat.Dev), inode: stat.Ino}, nil
+}
+
 func socketIdentity(path string) (*unixSocketIdentity, error) {
 	info, err := os.Lstat(path)
 	if err != nil {
@@ -165,11 +241,11 @@ func socketIdentity(path string) (*unixSocketIdentity, error) {
 	if info.Mode()&os.ModeSymlink != 0 || info.Mode()&os.ModeSocket == 0 {
 		return nil, fmt.Errorf("bound Unix path %q is not a socket", path)
 	}
-	stat, ok := info.Sys().(*syscall.Stat_t)
-	if !ok {
-		return nil, fmt.Errorf("inspect bound Unix socket %q identity", path)
+	identity, err := identityFromInfo(info)
+	if err != nil {
+		return nil, fmt.Errorf("inspect bound Unix socket %q identity: %w", path, err)
 	}
-	return &unixSocketIdentity{device: uint64(stat.Dev), inode: stat.Ino}, nil
+	return identity, nil
 }
 
 func safeUnlinkSocket(path string, expected *unixSocketIdentity) error {

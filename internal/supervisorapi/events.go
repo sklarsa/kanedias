@@ -28,6 +28,7 @@ func serveEvents(w http.ResponseWriter, request *http.Request, service Service) 
 	w.Header().Set("Cache-Control", "no-cache")
 	w.Header().Set("X-Content-Type-Options", "nosniff")
 	w.WriteHeader(http.StatusOK)
+	flusher.Flush()
 
 	write := func(event supervisor.EventEnvelope) error {
 		wire, err := json.Marshal(event)

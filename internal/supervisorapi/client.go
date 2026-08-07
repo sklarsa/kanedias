@@ -13,17 +13,24 @@ import (
 	"net/url"
 	"strings"
 	"sync"
+	"time"
 
 	"github.com/sklarsa/kanedias/internal/supervisor"
 	"github.com/sklarsa/kanedias/internal/supervisor/contract"
+	"github.com/sklarsa/kanedias/internal/supervisor/pirpc"
 )
 
-const maxDescendantResponseBytes = 1 << 20
+const (
+	maxDescendantResponseBytes = 1 << 20
+	maxDescendantSSELineBytes  = pirpc.MaxRecordBytes + (1 << 20)
+	defaultUnaryTimeout        = 10 * time.Second
+)
 
 type DescendantClient struct {
-	socketPath string
-	client     *http.Client
-	transport  *http.Transport
+	socketPath   string
+	client       *http.Client
+	transport    *http.Transport
+	unaryTimeout time.Duration
 }
 
 func NewDescendantClient(socketPath string) (supervisor.DescendantClient, error) {
@@ -36,7 +43,7 @@ func NewDescendantClient(socketPath string) (supervisor.DescendantClient, error)
 			return (&net.Dialer{}).DialContext(ctx, "unix", socketPath)
 		},
 	}
-	return &DescendantClient{socketPath: socketPath, client: &http.Client{Transport: transport}, transport: transport}, nil
+	return &DescendantClient{socketPath: socketPath, client: &http.Client{Transport: transport}, transport: transport, unaryTimeout: defaultUnaryTimeout}, nil
 }
 
 func (client *DescendantClient) request(ctx context.Context, method, path string, body json.RawMessage) (*http.Response, error) {
@@ -86,7 +93,13 @@ func readDescendantJSON(response *http.Response, target any) error {
 	return nil
 }
 
+func (client *DescendantClient) unaryContext(ctx context.Context) (context.Context, context.CancelFunc) {
+	return context.WithTimeout(ctx, client.unaryTimeout)
+}
+
 func (client *DescendantClient) Snapshot(ctx context.Context) (supervisor.NodeSnapshot, error) {
+	ctx, cancel := client.unaryContext(ctx)
+	defer cancel()
 	response, err := client.request(ctx, http.MethodGet, "/v1/tree", nil)
 	if err != nil {
 		return supervisor.NodeSnapshot{}, err
@@ -109,6 +122,8 @@ func (client *DescendantClient) Probe(ctx context.Context) error {
 }
 
 func (client *DescendantClient) CallRPC(ctx context.Context, sessionID string, command json.RawMessage) (json.RawMessage, error) {
+	ctx, cancel := client.unaryContext(ctx)
+	defer cancel()
 	response, err := client.request(ctx, http.MethodPost, "/v1/sessions/"+url.PathEscape(sessionID)+"/rpc", command)
 	if err != nil {
 		return nil, err
@@ -121,6 +136,8 @@ func (client *DescendantClient) CallRPC(ctx context.Context, sessionID string, c
 }
 
 func (client *DescendantClient) AnswerQuestion(ctx context.Context, sessionID, questionID string, answer json.RawMessage) error {
+	ctx, cancel := client.unaryContext(ctx)
+	defer cancel()
 	response, err := client.request(ctx, http.MethodPost, "/v1/sessions/"+url.PathEscape(sessionID)+"/questions/"+url.PathEscape(questionID)+"/response", answer)
 	if err != nil {
 		return err
@@ -133,6 +150,8 @@ func (client *DescendantClient) AnswerQuestion(ctx context.Context, sessionID, q
 }
 
 func (client *DescendantClient) Stop(ctx context.Context, sessionID string) error {
+	ctx, cancel := client.unaryContext(ctx)
+	defer cancel()
 	response, err := client.request(ctx, http.MethodDelete, "/v1/sessions/"+url.PathEscape(sessionID), nil)
 	if err != nil {
 		return err
@@ -165,12 +184,19 @@ func (client *DescendantClient) Subscribe(ctx context.Context) (supervisor.Subsc
 
 	events := make(chan supervisor.EventEnvelope, supervisor.DefaultSubscriberMailboxCapacity)
 	var closeOnce sync.Once
+	var errMu sync.Mutex
+	var streamErr error
+	setStreamErr := func(err error) {
+		errMu.Lock()
+		streamErr = err
+		errMu.Unlock()
+	}
 	closeStream := func() { closeOnce.Do(func() { cancel(); _ = response.Body.Close() }) }
 	go func() {
 		defer close(events)
 		defer closeStream()
 		scanner := bufio.NewScanner(response.Body)
-		scanner.Buffer(make([]byte, 64*1024), maxDescendantResponseBytes)
+		scanner.Buffer(make([]byte, 64*1024), maxDescendantSSELineBytes)
 		var data strings.Builder
 		for scanner.Scan() {
 			line := scanner.Text()
@@ -179,7 +205,8 @@ func (client *DescendantClient) Subscribe(ctx context.Context) (supervisor.Subsc
 					continue
 				}
 				var event supervisor.EventEnvelope
-				if json.Unmarshal([]byte(data.String()), &event) != nil {
+				if err := json.Unmarshal([]byte(data.String()), &event); err != nil {
+					setStreamErr(contract.NewError(contract.ErrorChildUnavailable, "decode child event stream: "+err.Error()))
 					return
 				}
 				data.Reset()
@@ -197,8 +224,14 @@ func (client *DescendantClient) Subscribe(ctx context.Context) (supervisor.Subsc
 				data.WriteString(strings.TrimSpace(strings.TrimPrefix(line, "data:")))
 			}
 		}
+		if err := scanner.Err(); err != nil && streamCtx.Err() == nil {
+			setStreamErr(contract.NewError(contract.ErrorChildUnavailable, "read child event stream: "+err.Error()))
+		}
 	}()
-	return supervisor.Subscription{Replay: []supervisor.EventEnvelope{}, Events: events, Close: closeStream}, nil
+	return supervisor.Subscription{
+		Replay: []supervisor.EventEnvelope{}, Events: events, Close: closeStream,
+		Err: func() error { errMu.Lock(); defer errMu.Unlock(); return streamErr },
+	}, nil
 }
 
 var _ supervisor.DescendantClient = (*DescendantClient)(nil)

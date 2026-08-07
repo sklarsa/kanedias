@@ -153,13 +153,13 @@ Every tree node records:
 - Incus instance and volume names;
 - lifecycle state.
 
-Every session-owned instance and custom workspace volume records its Kanedias session ID in `user.kanedias.session_id`; child resources additionally record parent/root, kind, context, worker, and workspace metadata. These keys support exact leak accounting and operator cleanup after abnormal process death. They are recovery metadata only; v1 does not adopt them.
+Every session-owned instance and custom workspace volume records exact session, parent/root, kind, context, worker, and workspace metadata. Authorized live acceptance resources additionally carry a unique run-attribution value. These keys support exact leak accounting and direct-parent recovery after confirmed child-process death; they never enable discovery, adoption, or a global registry.
 
 ## Resource Provisioning and COW Clones
 
 ### Root session
 
-A root supervisor creates its instance from the configured base image and clones the configured seed workspace volume, as the current session spike does.
+A root supervisor clones the configured seed workspace volume and creates its instance directly from the configured base image.
 
 ### Child session
 

@@ -663,3 +663,54 @@ func (probe *concurrentWriteProbe) Write(p []byte) (int, error) {
 	time.Sleep(time.Millisecond)
 	return probe.ReadWriteCloser.Write(p)
 }
+
+type blockedWriteConn struct {
+	entered chan struct{}
+	closed  chan struct{}
+	once    sync.Once
+}
+
+func newBlockedWriteConn() *blockedWriteConn {
+	return &blockedWriteConn{entered: make(chan struct{}), closed: make(chan struct{})}
+}
+func (conn *blockedWriteConn) Read([]byte) (int, error) { <-conn.closed; return 0, io.ErrClosedPipe }
+func (conn *blockedWriteConn) Write([]byte) (int, error) {
+	conn.once.Do(func() { close(conn.entered) })
+	<-conn.closed
+	return 0, io.ErrClosedPipe
+}
+func (conn *blockedWriteConn) Close() error {
+	select {
+	case <-conn.closed:
+	default:
+		close(conn.closed)
+	}
+	return nil
+}
+
+func TestClientCancellationClosesTransportDuringActiveBlockedWrite(t *testing.T) {
+	conn := newBlockedWriteConn()
+	client := NewClient(conn)
+	ctx, cancel := context.WithCancel(context.Background())
+	result := make(chan error, 1)
+	go func() { _, err := client.Call(ctx, json.RawMessage(`{"type":"get_state"}`)); result <- err }()
+	select {
+	case <-conn.entered:
+	case <-time.After(time.Second):
+		t.Fatal("write did not become active")
+	}
+	cancel()
+	select {
+	case err := <-result:
+		if !errors.Is(err, context.Canceled) {
+			t.Fatalf("Call() error = %v", err)
+		}
+	case <-time.After(time.Second):
+		t.Fatal("active write cancellation did not return promptly")
+	}
+	select {
+	case <-client.Done():
+	case <-time.After(time.Second):
+		t.Fatal("ambiguous connection was not terminated")
+	}
+}

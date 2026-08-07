@@ -108,7 +108,7 @@ test("handoff verifies refs, strips checkout paths, shuts down only after accept
       const operation = args.slice(2).join(" ");
       const stdout = operation === "rev-parse --show-toplevel" ? `${checkout}\n`
         : operation === "rev-parse HEAD" ? "def\n"
-        : operation === "remote get-url origin" ? "git@github.com:owner/repo.git\n"
+        : operation === "config --get remote.origin.url" ? "git@github.com:owner/repo.git\n"
         : operation.startsWith("ls-remote") ? "def\trefs/heads/feature\n" : "";
       return { stdout, stderr: "", code: 0, killed: false };
     },
@@ -150,6 +150,9 @@ test("Pi 0.83.0 invokes the real extension tools against a fake Unix supervisor"
         releaseCancellation?.();
         return;
       }
+      if (body.kind === "write") {
+        return res.end(JSON.stringify({ kind: "write", workerType: "reviewer", sessionId: `child-${childPosts.length}`, repositories: [{ repository: "owner/repo", baseCommit: "a".repeat(40), branch: "feature/parent", headCommit: "b".repeat(40) }], summary: "write-through-real-pi", verification: ["tests"] }));
+      }
       res.end(JSON.stringify({ kind: "read", workerType: "reviewer", sessionId: `child-${childPosts.length}`, output: "read-through-real-pi" }));
     });
   });
@@ -174,7 +177,7 @@ test("Pi 0.83.0 invokes the real extension tools against a fake Unix supervisor"
         const tool = prompt.includes("handoff") ? "handoff" : "delegate_session";
         const args = tool === "handoff"
           ? writerHandoffArgs
-          : { workerType: "reviewer", kind: "read", context: prompt.includes("fork") ? "fork" : "fresh", task: prompt.includes("cancel") ? "cancel through Pi" : `real Pi ${prompt.includes("fork") ? "fork" : "fresh"}` };
+          : { workerType: "reviewer", kind: prompt.includes("parent write") ? "write" : "read", context: prompt.includes("fork") ? "fork" : "fresh", task: prompt.includes("cancel") ? "cancel through Pi" : `real Pi ${prompt.includes("parent write") ? "write" : prompt.includes("fork") ? "fork" : "fresh"}` };
         delta = { role: "assistant", tool_calls: [{ index: 0, id: `call-${providerRequests.length}`, type: "function", function: { name: tool, arguments: JSON.stringify(args) } }] };
       }
       res.writeHead(200, { "content-type": "text/event-stream" });
@@ -194,7 +197,7 @@ test("Pi 0.83.0 invokes the real extension tools against a fake Unix supervisor"
     "--mode", "rpc", "--no-builtin-tools", "--provider", "kanedias-test", "--model", "deterministic",
     "-e", path.resolve("test/fixtures/deterministic-provider.ts"), "-e", path.resolve("test/fixtures/kanedias-test-entry.ts"),
   ], {
-    env: { ...process.env, HOME: home, KANEDIAS_TEST_PROVIDER_URL: `http://127.0.0.1:${address.port}/v1`, KANEDIAS_SESSION_ID: "root-real", KANEDIAS_SESSION_KIND: "root", KANEDIAS_SUPERVISOR_SOCKET: fixture.socket, KANEDIAS_PI_SESSION_FILE: "" },
+    env: { ...process.env, HOME: home, KANEDIAS_TEST_PROVIDER_URL: `http://127.0.0.1:${address.port}/v1`, KANEDIAS_SESSION_ID: "root-real", KANEDIAS_SESSION_KIND: "root", KANEDIAS_SUPERVISOR_SOCKET: fixture.socket, KANEDIAS_PI_SESSION_FILE: "", KANEDIAS_E2E_RUN_ID: "real-pi", KANEDIAS_E2E_QUESTION_TIMEOUT_MS: "5000" },
     stdio: ["pipe", "pipe", "pipe"],
   });
   let stderr = "";
@@ -230,6 +233,10 @@ test("Pi 0.83.0 invokes the real extension tools against a fake Unix supervisor"
   };
   t.after(stopChild);
 
+  const question = await waitForMessage((message) => message.type === "extension_ui_request" && message.method === "input", "controlled real-Pi question");
+  child.stdin.write(JSON.stringify({ type: "extension_ui_response", id: question.id, value: "deterministic-answer" }) + "\n");
+  await waitForMessage((message) => message.type === "extension_ui_request" && message.method === "notify" && message.message === "KANEDIAS_E2E_QUESTION_ANSWER:deterministic-answer", "real-Pi question response receipt");
+
   const state = await command({ type: "get_state" });
   assert.equal(state.success, true);
   const parentFile = state.data.sessionFile as string;
@@ -251,6 +258,14 @@ test("Pi 0.83.0 invokes the real extension tools against a fake Unix supervisor"
   assert.notEqual(childPosts[1].fork.sessionFile, parentFile);
   const parentAfterFork = await readFile(parentFile);
   assert.deepEqual(parentAfterFork.subarray(0, parentPrefix.length), parentPrefix);
+
+  assert.equal((await command({ type: "prompt", message: "delegate parent write" })).success, true);
+  await waitIdle();
+  const mappedWriteResult = providerRequests.find((request) => {
+    const tool = request.messages.at(-1);
+    return tool?.role === "tool" && JSON.stringify(tool).includes("feature/parent");
+  });
+  assert.match(JSON.stringify(mappedWriteResult.messages.at(-1)), /owner\/repo base=a{40} branch=feature\/parent head=b{40}/);
 
   assert.equal((await command({ type: "prompt", message: "delegate cancel" })).success, true);
   await childRequestStarted;
@@ -276,7 +291,9 @@ test("Pi 0.83.0 invokes the real extension tools against a fake Unix supervisor"
   await runFile("git", ["-C", checkout, "add", "file.txt"]);
   await runFile("git", ["-C", checkout, "commit", "-m", "writer"]);
   await runFile("git", ["-C", checkout, "switch", "-c", "feature"]);
-  await runFile("git", ["-C", checkout, "remote", "add", "origin", remote]);
+  const githubOrigin = "https://github.com/owner/repo.git";
+  await runFile("git", ["-C", checkout, "config", `url.${remote}.insteadOf`, githubOrigin]);
+  await runFile("git", ["-C", checkout, "remote", "add", "origin", githubOrigin]);
   await runFile("git", ["-C", checkout, "push", "-u", "origin", "feature"]);
   const head = (await runFile("git", ["-C", checkout, "rev-parse", "HEAD"])).stdout.trim();
   writerHandoffArgs = { repositories: [{ path: checkout, repository: "owner/repo", baseCommit: head, branch: "feature", headCommit: head }], summary: "done", verification: ["tests"] };

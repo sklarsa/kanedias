@@ -12,6 +12,7 @@ import (
 
 	"github.com/sklarsa/kanedias/internal/config"
 	"github.com/sklarsa/kanedias/internal/supervisor/contract"
+	"github.com/sklarsa/kanedias/internal/supervisor/provision"
 )
 
 const MaxRecordBytes = 1 << 20
@@ -27,6 +28,7 @@ type Bootstrap struct {
 	SourceVolume   string                      `json:"sourceVolume"`
 	Worker         config.WorkerProfile        `json:"worker"`
 	Request        contract.CreateChildRequest `json:"request"`
+	RunAttribution string                      `json:"runAttribution,omitempty"`
 }
 
 type ReadyMessage struct {
@@ -41,6 +43,7 @@ type WireError struct {
 type ChildMessage struct {
 	Type      string                     `json:"type"`
 	SessionID string                     `json:"sessionId"`
+	Ownership *provision.RecoveryTicket  `json:"ownership,omitempty"`
 	Ready     *ReadyMessage              `json:"ready,omitempty"`
 	Read      *contract.ReadChildResult  `json:"read,omitempty"`
 	Write     *contract.WriteChildResult `json:"write,omitempty"`
@@ -48,10 +51,11 @@ type ChildMessage struct {
 }
 
 const (
-	MessageReady   = "ready"
-	MessageRead    = "read"
-	MessageWrite   = "write"
-	MessageFailure = "failure"
+	MessageOwnership = "ownership"
+	MessageReady     = "ready"
+	MessageRead      = "read"
+	MessageWrite     = "write"
+	MessageFailure   = "failure"
 )
 
 func EncodeBootstrap(writer io.Writer, bootstrap Bootstrap) error {
@@ -148,7 +152,7 @@ func (message ChildMessage) Validate() error {
 		return fmt.Errorf("sessionId is required")
 	}
 	payloads := 0
-	for _, present := range []bool{message.Ready != nil, message.Read != nil, message.Write != nil, message.Error != nil} {
+	for _, present := range []bool{message.Ownership != nil, message.Ready != nil, message.Read != nil, message.Write != nil, message.Error != nil} {
 		if present {
 			payloads++
 		}
@@ -157,8 +161,15 @@ func (message ChildMessage) Validate() error {
 		return fmt.Errorf("child message must contain exactly one payload")
 	}
 	switch message.Type {
+	case MessageOwnership:
+		if message.Ownership == nil || message.Ready != nil || message.Read != nil || message.Write != nil || message.Error != nil {
+			return fmt.Errorf("ownership message has the wrong payload")
+		}
+		if message.Ownership.SessionID != message.SessionID {
+			return fmt.Errorf("ownership session ID does not match envelope")
+		}
 	case MessageReady:
-		if message.Ready == nil || message.Read != nil || message.Write != nil || message.Error != nil {
+		if message.Ready == nil || message.Ownership != nil || message.Read != nil || message.Write != nil || message.Error != nil {
 			return fmt.Errorf("ready message has the wrong payload")
 		}
 		if !filepath.IsAbs(message.Ready.SocketPath) || filepath.Clean(message.Ready.SocketPath) != message.Ready.SocketPath {
@@ -228,6 +239,10 @@ type Reporter struct {
 
 func NewReporter(writer io.Writer, sessionID string) *Reporter {
 	return &Reporter{writer: writer, sessionID: sessionID}
+}
+
+func (reporter *Reporter) Ownership(ticket provision.RecoveryTicket) error {
+	return reporter.send(ChildMessage{Type: MessageOwnership, SessionID: reporter.sessionID, Ownership: &ticket})
 }
 
 func (reporter *Reporter) Ready(socketPath string) error {

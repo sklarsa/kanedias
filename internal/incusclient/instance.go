@@ -75,11 +75,9 @@ func (c *Client) CopyInstance(ctx context.Context, source, target string) error 
 
 func (c *Client) UpdateInstance(ctx context.Context, name string, request api.InstancePut, etag string) error {
 	server := c.server.WithContext(ctx)
-	operation, err := server.UpdateInstance(name, request, etag)
-	if err != nil {
-		return fmt.Errorf("update Incus instance %q: %w", name, err)
-	}
-	if err := waitOperation(ctx, operation); err != nil {
+	if err := submitAndWaitOperation(ctx, func() (operationWaiter, error) {
+		return server.UpdateInstance(name, request, etag)
+	}); err != nil {
 		return fmt.Errorf("update Incus instance %q: %w", name, err)
 	}
 	return nil

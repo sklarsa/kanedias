@@ -33,6 +33,20 @@ export default async function kanediasExtension(pi: ExtensionAPI, options: Exten
     .map((worker) => `${worker.workerType}: ${worker.description}`)
     .join("; ");
 
+  if (env.KANEDIAS_E2E_RUN_ID && env.KANEDIAS_SESSION_KIND === "root") {
+    pi.on("session_start", (event, ctx) => {
+      if (event.reason !== "startup") return;
+      // Do not block extension startup: RPC input must be live before the
+      // controlled dialog can receive its routed response.
+      setTimeout(async () => {
+        const configuredTimeout = Number(env.KANEDIAS_E2E_QUESTION_TIMEOUT_MS ?? "60000");
+        const timeout = Number.isFinite(configuredTimeout) && configuredTimeout > 0 && configuredTimeout <= 60_000 ? configuredTimeout : 60_000;
+        const answer = await ctx.ui.input(`Kanedias E2E controlled question ${env.KANEDIAS_E2E_RUN_ID}`, "deterministic answer", { timeout });
+        ctx.ui.notify(`KANEDIAS_E2E_QUESTION_ANSWER:${answer ?? "cancelled"}`, "info");
+      }, 0);
+    });
+  }
+
   pi.registerTool({
     name: "delegate_session",
     label: "Delegate Session",
@@ -60,7 +74,19 @@ export default async function kanediasExtension(pi: ExtensionAPI, options: Exten
       }
 
       const result = await client.createChild(requiredEnvironment(env, "KANEDIAS_SESSION_ID"), request, signal);
-      const text = result.kind === "read" ? result.output : `${result.summary}\n\nVerification:\n${result.verification.join("\n")}`;
+      const text = result.kind === "read"
+        ? result.output
+        : [
+            "Repositories:",
+            ...result.repositories.map((repository) =>
+              `${repository.repository} base=${repository.baseCommit} branch=${repository.branch} head=${repository.headCommit}`),
+            "",
+            "Summary:",
+            result.summary,
+            "",
+            "Verification:",
+            ...result.verification,
+          ].join("\n");
       return { content: [{ type: "text" as const, text: boundedText(text) }], details: result };
     },
   });

@@ -377,3 +377,59 @@ func TestEventBrokerCloseIsIdempotentClosesSubscribersAndRejectsNewOnes(t *testi
 	existing.Close()
 	rejected.Close()
 }
+
+func TestEventBrokerEvictsOldestUntilCountAndByteBudgetsHold(t *testing.T) {
+	broker := newEventBrokerWithByteCapacity(10, 2, 100)
+	for index := 0; index < 4; index++ {
+		broker.PublishLocal("root", "pi", json.RawMessage(`{"payload":"12345678901234567890"}`))
+	}
+	sub := broker.Subscribe()
+	defer sub.Close()
+	if len(sub.Replay) == 0 || len(sub.Replay) >= 4 {
+		t.Fatalf("byte-bounded replay length = %d, want partial retained tail", len(sub.Replay))
+	}
+	for index := 1; index < len(sub.Replay); index++ {
+		if sub.Replay[index].Seq != sub.Replay[index-1].Seq+1 {
+			t.Fatalf("replay is not the monotonic newest tail: %#v", sub.Replay)
+		}
+	}
+}
+
+func TestEventBrokerSubscribeDoesNotHoldPublicationGateWhileCloningReplay(t *testing.T) {
+	broker := newEventBroker(8, 8)
+	broker.PublishLocal("root", "pi", json.RawMessage(`{"old":true}`))
+	cloneEntered := make(chan struct{})
+	cloneRelease := make(chan struct{})
+	broker.cloneReplay = func(events []EventEnvelope) []EventEnvelope {
+		close(cloneEntered)
+		<-cloneRelease
+		return cloneEnvelopes(events)
+	}
+	subscribed := make(chan Subscription, 1)
+	go func() { subscribed <- broker.Subscribe() }()
+	<-cloneEntered
+	published := make(chan EventEnvelope, 1)
+	go func() { published <- broker.PublishLocal("root", "pi", json.RawMessage(`{"live":true}`)) }()
+	select {
+	case event := <-published:
+		if event.Seq != 2 {
+			t.Fatalf("published event = %#v", event)
+		}
+	case <-time.After(time.Second):
+		t.Fatal("publication blocked behind replay deep-copy")
+	}
+	close(cloneRelease)
+	sub := <-subscribed
+	defer sub.Close()
+	if len(sub.Replay) != 1 || sub.Replay[0].Seq != 1 {
+		t.Fatalf("replay = %#v", sub.Replay)
+	}
+	select {
+	case event := <-sub.Events:
+		if event.Seq != 2 {
+			t.Fatalf("live event = %#v", event)
+		}
+	case <-time.After(time.Second):
+		t.Fatal("live event missing after replay cut")
+	}
+}

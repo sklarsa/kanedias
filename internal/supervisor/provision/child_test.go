@@ -41,6 +41,8 @@ type recordingChildClient struct {
 
 	copyVolumeErr   error
 	copyInstanceErr error
+	updateErr       error
+	startErr        error
 	calls           []string
 	instancePut     *api.InstancePut
 	volumePut       *api.StorageVolumePut
@@ -121,7 +123,7 @@ func (f *recordingChildClient) UpdateInstance(_ context.Context, name string, pu
 	f.calls = append(f.calls, "update instance "+name+" "+etag)
 	f.instancePut = &put
 	f.child.InstancePut = put
-	return nil
+	return f.updateErr
 }
 func (f *recordingChildClient) UpdateStorageVolume(_ context.Context, _, name string, put api.StorageVolumePut, etag string) error {
 	f.calls = append(f.calls, "update volume "+name+" "+etag)
@@ -133,7 +135,7 @@ func (f *recordingChildClient) StartInstance(_ context.Context, name string) err
 	f.calls = append(f.calls, "start "+name)
 	f.child.Status = "Running"
 	f.child.StatusCode = api.Running
-	return nil
+	return f.startErr
 }
 func (f *recordingChildClient) StopInstance(_ context.Context, name string, force bool) error {
 	f.calls = append(f.calls, fmt.Sprintf("stop %s force=%v", name, force))
@@ -456,7 +458,7 @@ func TestProvisionChildAwaitsAmbiguousCopyBeforeFinalProbeAndDelete(t *testing.T
 			}
 			provisioner := newTestChildProvisioner(t, client)
 			provisioner.operationWasSubmitted = func(err error) bool { return errors.Is(err, ambiguous) }
-			provisioner.awaitSubmittedRemoteOperation = func(_ context.Context, err error) error {
+			provisioner.awaitSubmittedOperation = func(_ context.Context, err error) error {
 				if !errors.Is(err, ambiguous) {
 					t.Fatalf("await error = %v, want ambiguous copy error", err)
 				}
@@ -518,5 +520,44 @@ func TestProvisionChildRejectsInvalidDerivedIncusNames(t *testing.T) {
 	}
 	if len(client.calls) != 0 {
 		t.Fatalf("invalid name performed remote calls: %v", client.calls)
+	}
+}
+
+func TestProvisionChildAwaitsSubmittedLocalUpdateAndStartBeforeCleanup(t *testing.T) {
+	for _, operation := range []string{"update", "start"} {
+		t.Run(operation, func(t *testing.T) {
+			client := newRecordingChildClient()
+			ambiguous := errors.New("submitted local operation wait cancelled")
+			if operation == "update" {
+				client.updateErr = ambiguous
+			} else {
+				client.startErr = ambiguous
+			}
+			provisioner := newTestChildProvisioner(t, client)
+			provisioner.operationWasSubmitted = func(err error) bool { return errors.Is(err, ambiguous) }
+			awaited := false
+			provisioner.awaitSubmittedOperation = func(_ context.Context, err error) error {
+				if !errors.Is(err, ambiguous) {
+					t.Fatalf("await error = %v", err)
+				}
+				for _, call := range client.calls {
+					if strings.HasPrefix(call, "delete ") || strings.HasPrefix(call, "stop ") {
+						t.Fatalf("cleanup started before submitted %s became terminal: %#v", operation, client.calls)
+					}
+				}
+				awaited = true
+				return nil
+			}
+			if _, err := provisioner.ProvisionChild(context.Background(), validChildRequest()); !errors.Is(err, ambiguous) {
+				t.Fatalf("ProvisionChild() error = %v", err)
+			}
+			if !awaited {
+				t.Fatalf("submitted %s operation was not awaited", operation)
+			}
+			calls := strings.Join(client.calls, "\n")
+			if !strings.Contains(calls, "delete instance session-child-1\ndelete volume workspace-child-1") {
+				t.Fatalf("cleanup order after %s wait:\n%s", operation, calls)
+			}
+		})
 	}
 }

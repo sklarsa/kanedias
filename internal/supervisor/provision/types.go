@@ -15,9 +15,36 @@ type Resources struct {
 	RPCAddr   string
 }
 
+type SocketIdentity struct {
+	Device uint64 `json:"device"`
+	Inode  uint64 `json:"inode"`
+}
+
+// RecoveryTicket is held only by the admitted direct parent and is usable only
+// after that exact child process has exited.
+type RecoveryTicket struct {
+	SessionID      string               `json:"sessionId"`
+	ParentID       string               `json:"parentId"`
+	RootID         string               `json:"rootId"`
+	Pool           string               `json:"pool"`
+	Instance       string               `json:"instance"`
+	Volume         string               `json:"volume"`
+	SocketPath     string               `json:"socketPath"`
+	Socket         SocketIdentity       `json:"socket"`
+	Kind           contract.ChildKind   `json:"kind"`
+	Context        contract.ContextMode `json:"context"`
+	WorkerType     string               `json:"workerType"`
+	RunAttribution string               `json:"runAttribution,omitempty"`
+}
+
+type DirectChildRecoverer interface {
+	RecoverDirectChild(context.Context, RecoveryTicket) error
+}
+
 type RootRequest struct {
-	SessionID  string
-	SocketPath string
+	SessionID      string
+	SocketPath     string
+	RunAttribution string
 }
 
 type ChildRequest struct {
@@ -29,6 +56,7 @@ type ChildRequest struct {
 	HostSocketPath string
 	Worker         config.WorkerProfile
 	Contract       contract.CreateChildRequest
+	RunAttribution string
 }
 
 type RootProvisioner interface {

@@ -59,6 +59,9 @@ func (child *fakeChildProcess) WaitReady(ctx context.Context) error {
 	}
 	return nil
 }
+func (child *fakeChildProcess) RecoveryTicket() (provision.RecoveryTicket, bool) {
+	return provision.RecoveryTicket{}, true
+}
 func (child *fakeChildProcess) NextMessage(ctx context.Context) (process.ChildMessage, error) {
 	select {
 	case message := <-child.messages:
@@ -460,6 +463,9 @@ func newEscalatingChildProcess() *escalatingChildProcess {
 	return &escalatingChildProcess{done: make(chan struct{})}
 }
 func (*escalatingChildProcess) WaitReady(context.Context) error { return nil }
+func (*escalatingChildProcess) RecoveryTicket() (provision.RecoveryTicket, bool) {
+	return provision.RecoveryTicket{}, true
+}
 func (*escalatingChildProcess) NextMessage(context.Context) (process.ChildMessage, error) {
 	return process.ChildMessage{}, io.EOF
 }
@@ -703,4 +709,60 @@ func TestForwardedGrandchildEventPreservesSourceAndGetsLocalSubtreeSequence(t *t
 		time.Sleep(time.Millisecond)
 	}
 	close(events)
+}
+
+type orderingRecoverer struct {
+	childDone <-chan struct{}
+	called    atomic.Int32
+}
+
+func (recoverer *orderingRecoverer) RecoverDirectChild(context.Context, provision.RecoveryTicket) error {
+	select {
+	case <-recoverer.childDone:
+	default:
+		return errors.New("recovery ran before admitted child process exit")
+	}
+	recoverer.called.Add(1)
+	return nil
+}
+
+func TestDirectChildRecoveryRunsAfterCrashAndForcedEscalationExit(t *testing.T) {
+	for _, test := range []struct {
+		name  string
+		child ChildProcess
+		done  <-chan struct{}
+		start func()
+	}{
+		{
+			name:  "crash",
+			child: func() *fakeChildProcess { child := newFakeChildProcess(); child.finish(); return child }(),
+			start: func() {},
+		},
+		{
+			name:  "forced escalation",
+			child: newEscalatingChildProcess(),
+			start: func() {},
+		},
+	} {
+		t.Run(test.name, func(t *testing.T) {
+			done := test.child.Done()
+			recoverer := &orderingRecoverer{childDone: done}
+			node := childCreationNode(t, nil, nil)
+			node.deps.DirectChildRecoverer = recoverer
+			node.deps.ChildStopTimeout = 20 * time.Millisecond
+			ticket := provision.RecoveryTicket{SessionID: "child"}
+			entry := &childEntry{id: "child", process: test.child, recovery: &ticket}
+			if err := node.children.add(entry); err != nil {
+				t.Fatal(err)
+			}
+			ctx, cancel := context.WithTimeout(context.Background(), 20*time.Millisecond)
+			defer cancel()
+			if err := node.cleanupChild(ctx, entry, true); err != nil && !errors.Is(err, context.DeadlineExceeded) {
+				t.Fatal(err)
+			}
+			if recoverer.called.Load() != 1 {
+				t.Fatalf("recovery calls = %d", recoverer.called.Load())
+			}
+		})
+	}
 }

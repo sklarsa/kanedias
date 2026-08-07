@@ -30,6 +30,10 @@ func (node *Node) RunReadTask(ctx context.Context, task string) (contract.ReadCh
 
 	subscription := node.broker.Subscribe()
 	defer subscription.Close()
+	// Retained events are useful to general SSE consumers but cannot classify
+	// this delegated generation. Capture the local source boundary immediately
+	// before constructing/submitting the exact admitted prompt.
+	boundary := node.broker.SourceBoundary(identity.SessionID)
 	prompt, err := json.Marshal(map[string]string{"type": "prompt", "message": task})
 	if err != nil {
 		return contract.ReadChildResult{}, err
@@ -70,7 +74,7 @@ func (node *Node) RunReadTask(ctx context.Context, task string) (contract.ReadCh
 				return contract.ReadChildResult{}, ctx.Err()
 			}
 		}
-		if event.SessionID != identity.SessionID || event.Kind != "pi" {
+		if event.SessionID != identity.SessionID || event.Kind != "pi" || event.SourceSeq <= boundary {
 			continue
 		}
 		var envelope struct {
@@ -189,6 +193,9 @@ func (request WriteHandoffRequest) validate() error {
 	if len(request.Repositories) == 0 {
 		return contract.NewError(contract.ErrorInvalidRequest, "handoff requires at least one repository")
 	}
+	if len(request.Repositories) > 64 {
+		return contract.NewError(contract.ErrorInvalidRequest, "handoff supports at most 64 repositories")
+	}
 	if strings.TrimSpace(request.Summary) == "" {
 		return contract.NewError(contract.ErrorInvalidRequest, "handoff summary is required")
 	}
@@ -201,6 +208,9 @@ func (request WriteHandoffRequest) validate() error {
 			if strings.TrimSpace(value) == "" {
 				return contract.NewError(contract.ErrorInvalidRequest, "handoff repository "+field+" is required")
 			}
+		}
+		if len(repository.Repository) > 200 || len(repository.Branch) > 255 || len(repository.BaseCommit) > 64 || len(repository.HeadCommit) > 64 {
+			return contract.NewError(contract.ErrorInvalidRequest, "handoff repository fields exceed safe rendering bounds")
 		}
 		if _, duplicate := seen[repository.Repository]; duplicate {
 			return contract.NewError(contract.ErrorInvalidRequest, "handoff repositories must be unique")
@@ -215,12 +225,18 @@ func (request WriteHandoffRequest) validate() error {
 	return nil
 }
 
-func (node *Node) Handoff(_ context.Context, request WriteHandoffRequest) (HandoffAcceptance, error) {
+func (node *Node) Handoff(ctx context.Context, request WriteHandoffRequest) (HandoffAcceptance, error) {
 	identity := node.identity.Snapshot()
 	if identity.Kind != contract.ChildKindWrite {
 		return HandoffAcceptance{}, contract.NewError(contract.ErrorConflict, "handoff is accepted only by the owning write session")
 	}
 	if err := request.validate(); err != nil {
+		return HandoffAcceptance{}, err
+	}
+	if node.deps.HandoffVerifier == nil {
+		return HandoffAcceptance{}, contract.NewError(contract.ErrorInternal, "host GitHub handoff verifier is unavailable")
+	}
+	if err := node.deps.HandoffVerifier.Verify(ctx, request.Repositories); err != nil {
 		return HandoffAcceptance{}, err
 	}
 
@@ -251,10 +267,23 @@ func (node *Node) Handoff(_ context.Context, request WriteHandoffRequest) (Hando
 	if local != nil {
 		local.completeHandoff()
 	}
+	return HandoffAcceptance{Accepted: true, SessionID: identity.SessionID}, nil
+}
+
+// AcknowledgeHandoff transfers acknowledgement completion from the HTTP layer.
+// The fallback teardown watchdog must not start until the accepted response has
+// been written and flushed to the guest connection.
+func (node *Node) AcknowledgeHandoff() error {
+	node.handoffMu.Lock()
+	accepted := node.handoffComplete
+	node.handoffMu.Unlock()
+	if !accepted {
+		return contract.NewError(contract.ErrorConflict, "writer handoff has not been accepted")
+	}
 	if node.done != nil {
 		node.armHandoffShutdownWatchdog()
 	}
-	return HandoffAcceptance{Accepted: true, SessionID: identity.SessionID}, nil
+	return nil
 }
 
 func (node *Node) handoffAccepted() bool {

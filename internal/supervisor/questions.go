@@ -9,6 +9,7 @@ import (
 	"sort"
 	"strings"
 	"sync"
+	"time"
 
 	"github.com/sklarsa/kanedias/internal/supervisor/contract"
 	"github.com/sklarsa/kanedias/internal/supervisor/pirpc"
@@ -33,6 +34,7 @@ type pendingQuestion struct {
 	summary   QuestionSummary
 	raw       json.RawMessage
 	answering bool
+	timer     *time.Timer
 }
 
 type QuestionStore struct {
@@ -108,6 +110,11 @@ func (store *QuestionStore) Retain(raw json.RawMessage) (bool, error) {
 		return false, invariantf("duplicate extension UI dialog ID %q", request.ID)
 	}
 	store.pending[request.ID] = question
+	if request.Timeout > 0 {
+		question.timer = time.AfterFunc(time.Duration(request.Timeout)*time.Millisecond, func() {
+			store.expire(request.ID, question)
+		})
+	}
 	return true, nil
 }
 
@@ -157,6 +164,9 @@ func (store *QuestionStore) Answer(ctx context.Context, id string, raw json.RawM
 	defer store.mu.Unlock()
 	if current := store.pending[id]; current == question {
 		if err == nil || store.terminated {
+			if question.timer != nil {
+				question.timer.Stop()
+			}
 			delete(store.pending, id)
 		} else {
 			question.answering = false
@@ -165,9 +175,35 @@ func (store *QuestionStore) Answer(ctx context.Context, id string, raw json.RawM
 	return err
 }
 
+func (store *QuestionStore) expire(id string, expected *pendingQuestion) {
+	store.mu.Lock()
+	if store.pending[id] == expected {
+		delete(store.pending, id)
+	}
+	store.mu.Unlock()
+}
+
+// CancelPending reconciles Pi-side dialog cancellation without terminating the
+// store, allowing later generations to retain new questions.
+func (store *QuestionStore) CancelPending() {
+	store.mu.Lock()
+	for _, question := range store.pending {
+		if question.timer != nil {
+			question.timer.Stop()
+		}
+	}
+	store.pending = make(map[string]*pendingQuestion)
+	store.mu.Unlock()
+}
+
 func (store *QuestionStore) Clear() {
 	store.mu.Lock()
 	store.terminated = true
+	for _, question := range store.pending {
+		if question.timer != nil {
+			question.timer.Stop()
+		}
+	}
 	store.pending = make(map[string]*pendingQuestion)
 	store.mu.Unlock()
 }

@@ -11,6 +11,7 @@ import (
 	"net"
 	"os"
 	"path/filepath"
+	"syscall"
 	"time"
 
 	"github.com/sklarsa/kanedias/internal/config"
@@ -91,6 +92,15 @@ func runSupervisor(ctx context.Context, cfg config.Config, options SessionOption
 		}
 	}
 	spawner := process.Spawner{ConfigPath: options.ConfigPath}
+	handoffVerifier, err := supervisor.NewGitHubHandoffVerifier(cfg.Workspace.Repos, nil)
+	if err != nil {
+		return err
+	}
+	directRecoverer, err := provision.NewConfiguredDirectChildRecoverer(ctx, cfg)
+	if err != nil {
+		return err
+	}
+	defer directRecoverer.Close()
 	node, err := supervisor.NewRoot(identity, supervisor.Dependencies{
 		Provisioner: provision.NewRootProvisioner(cfg),
 		DialRPC:     dialPiRPC,
@@ -99,8 +109,11 @@ func runSupervisor(ctx context.Context, cfg config.Config, options SessionOption
 		SpawnChild: func(ctx context.Context, bootstrap process.Bootstrap) (supervisor.ChildProcess, error) {
 			return spawner.Spawn(ctx, bootstrap)
 		},
-		DescendantClient: supervisorapi.NewDescendantClient,
-		CloseListener:    closeListener,
+		DescendantClient:     supervisorapi.NewDescendantClient,
+		DirectChildRecoverer: directRecoverer,
+		CloseListener:        closeListener,
+		HandoffVerifier:      handoffVerifier,
+		RunAttribution:       os.Getenv("KANEDIAS_E2E_RUN_ID"),
 	}, supervisor.NewEventBroker())
 	if err != nil {
 		return err
@@ -160,6 +173,11 @@ func productionChildRunner(ctx context.Context, bootstrap process.Bootstrap, rep
 		return err
 	}
 	defer childProvisioner.Close()
+	directRecoverer, err := provision.NewConfiguredDirectChildRecoverer(ctx, cfg)
+	if err != nil {
+		return err
+	}
+	defer directRecoverer.Close()
 	identity, err := supervisor.NewIdentity(supervisor.IdentitySpec{
 		SessionID: bootstrap.SessionID, ParentID: bootstrap.ParentID, RootID: bootstrap.RootID,
 		Kind: bootstrap.Request.Kind, Context: bootstrap.Request.Context, Worker: bootstrap.Request.WorkerType,
@@ -171,6 +189,7 @@ func productionChildRunner(ctx context.Context, bootstrap process.Bootstrap, rep
 		SessionID: bootstrap.SessionID, ParentID: bootstrap.ParentID, RootID: bootstrap.RootID,
 		SourceInstance: bootstrap.SourceInstance, SourceVolume: bootstrap.SourceVolume,
 		HostSocketPath: bootstrap.SocketPath, Worker: bootstrap.Worker, Contract: bootstrap.Request,
+		RunAttribution: bootstrap.RunAttribution,
 	}}
 
 	var unixServer *supervisorapi.UnixServer
@@ -190,16 +209,36 @@ func productionChildRunner(ctx context.Context, bootstrap process.Bootstrap, rep
 			SessionID: bootstrap.Request.Fork.PiSessionID, SessionFile: bootstrap.Request.Fork.SessionFile,
 		}
 	}
+	handoffVerifier, err := supervisor.NewGitHubHandoffVerifier(cfg.Workspace.Repos, nil)
+	if err != nil {
+		return err
+	}
 	node, err := supervisor.NewChild(identity, supervisor.Dependencies{
 		Provisioner: adapter, DialRPC: dialPiRPC, Workers: configWorkerCatalog{config: cfg},
 		SocketPath: bootstrap.SocketPath,
 		SpawnChild: func(ctx context.Context, nested process.Bootstrap) (supervisor.ChildProcess, error) {
 			return spawner.Spawn(ctx, nested)
 		},
-		DescendantClient:  supervisorapi.NewDescendantClient,
-		CloseListener:     closeListener,
-		ReportWrite:       reporter.Write,
-		ExpectedPiBinding: expectedPiBinding,
+		DescendantClient:     supervisorapi.NewDescendantClient,
+		DirectChildRecoverer: directRecoverer,
+		CloseListener:        closeListener,
+		ReportWrite:          reporter.Write,
+		ExpectedPiBinding:    expectedPiBinding,
+		HandoffVerifier:      handoffVerifier,
+		RunAttribution:       bootstrap.RunAttribution,
+		ResourcePublished: func(resources *provision.Resources) error {
+			socket, err := recoverySocketIdentity(bootstrap.SocketPath)
+			if err != nil {
+				return err
+			}
+			return reporter.Ownership(provision.RecoveryTicket{
+				SessionID: bootstrap.SessionID, ParentID: bootstrap.ParentID, RootID: bootstrap.RootID,
+				Pool: resources.Pool, Instance: resources.Instance, Volume: resources.Volume,
+				SocketPath: bootstrap.SocketPath, Socket: socket,
+				Kind: bootstrap.Request.Kind, Context: bootstrap.Request.Context, WorkerType: bootstrap.Request.WorkerType,
+				RunAttribution: bootstrap.RunAttribution,
+			})
+		},
 	}, supervisor.NewEventBroker())
 	if err != nil {
 		return err
@@ -247,6 +286,21 @@ func productionChildRunner(ctx context.Context, bootstrap process.Bootstrap, rep
 	default:
 		return contract.NewError(contract.ErrorConflict, "unsupported child kind")
 	}
+}
+
+func recoverySocketIdentity(path string) (provision.SocketIdentity, error) {
+	info, err := os.Lstat(path)
+	if err != nil {
+		return provision.SocketIdentity{}, fmt.Errorf("inspect child recovery socket %q: %w", path, err)
+	}
+	if info.Mode()&os.ModeSymlink != 0 || info.Mode()&os.ModeSocket == 0 {
+		return provision.SocketIdentity{}, fmt.Errorf("child recovery path %q is not a Unix socket", path)
+	}
+	stat, ok := info.Sys().(*syscall.Stat_t)
+	if !ok {
+		return provision.SocketIdentity{}, fmt.Errorf("inspect child recovery socket %q identity", path)
+	}
+	return provision.SocketIdentity{Device: uint64(stat.Dev), Inode: stat.Ino}, nil
 }
 
 func dialPiRPC(ctx context.Context, address string) (io.ReadWriteCloser, error) {

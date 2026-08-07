@@ -12,10 +12,12 @@ import (
 	"io"
 	"net"
 	"net/http"
+	"net/url"
 	"os"
 	"os/exec"
 	"path/filepath"
 	"reflect"
+	"regexp"
 	"sort"
 	"strconv"
 	"strings"
@@ -36,6 +38,13 @@ const (
 	liveTimeout     = 30 * time.Minute
 	operationPoll   = 100 * time.Millisecond
 	metadataSession = "user.kanedias.session_id"
+	metadataParent  = "user.kanedias.parent_session_id"
+	metadataRoot    = "user.kanedias.root_session_id"
+	metadataKind    = "user.kanedias.kind"
+	metadataContext = "user.kanedias.context"
+	metadataWorker  = "user.kanedias.worker_type"
+	metadataVolume  = "user.kanedias.workspace_volume"
+	metadataRun     = "user.kanedias.e2e_run"
 )
 
 // TestLiveRecursiveSupervisorAcceptance is destructive by design, so every
@@ -169,6 +178,11 @@ func newLiveAcceptance(t *testing.T) *liveAcceptance {
 		cancel()
 		t.Fatalf("disposable repository %q is not present in workspace.repos", repository)
 	}
+	remote := strings.TrimSpace(os.Getenv("KANEDIAS_E2E_GITHUB_REMOTE"))
+	if err := preflightDisposableRemote(ctx, repository, remote); err != nil {
+		cancel()
+		t.Fatalf("disposable GitHub remote preflight failed before any push or Incus side effect: %v", err)
+	}
 
 	client, err := incusclient.Connect(ctx)
 	if err != nil {
@@ -244,7 +258,7 @@ func newLiveAcceptance(t *testing.T) *liveAcceptance {
 		t: t, ctx: ctx, cancel: cancel, repoRoot: repoRoot, runDir: runDir,
 		binary: filepath.Join(runDir, "kanedias-under-test"), configPath: configPath,
 		cfg: cfg, pool: pool, repository: repository,
-		remote: strings.TrimSpace(os.Getenv("KANEDIAS_E2E_GITHUB_REMOTE")), prefix: prefix,
+		remote: remote, prefix: prefix,
 		rawIncus: rawIncus, client: client, sessions: make(map[string]struct{}),
 	}
 	h.baseline = h.snapshotResources("baseline")
@@ -261,10 +275,11 @@ func (h *liveAcceptance) run() {
 
 	root, socket, tree, stream, stalled := h.startRoot("main")
 	defer stalled.Close()
+	h.exerciseQuestionFixture(tree, socket, stream)
 	h.exerciseRootRPC(tree, socket, stream)
-	h.exerciseQuestionFixture()
-	h.exerciseFreshRead(tree, socket)
+	h.exerciseFreshRead(tree, socket, stream)
 	h.exerciseForkedWrite(tree, socket)
+	h.exerciseDirectChildCrash(root, tree, socket)
 	h.exerciseGracefulCascade(root, tree, socket)
 	h.assertBaseline("after-graceful-cascade")
 
@@ -313,6 +328,11 @@ func (h *liveAcceptance) close() {
 	}
 	h.cancel()
 	if h.success && !h.t.Failed() {
+		for _, id := range h.sessionIDs() {
+			if _, err := os.Lstat(filepath.Join(h.runDir, id+".sock")); !errors.Is(err, os.ErrNotExist) {
+				h.t.Fatalf("session socket %s remains before artifact cleanup: %v", id, err)
+			}
+		}
 		if err := os.RemoveAll(h.runDir); err != nil {
 			h.t.Errorf("remove successful artifact directory: %v", err)
 		}
@@ -393,7 +413,7 @@ func (h *liveAcceptance) startRoot(label string) (*acceptanceProcess, string, su
 		h.t.Fatal(err)
 	}
 	h.snapshotTree(label+"-ready", client)
-	h.assertSessionMetadata(tree.SessionID)
+	h.assertSessionMetadata(tree)
 	return root, socket, tree, stream, stalled
 }
 
@@ -414,40 +434,34 @@ func (h *liveAcceptance) exerciseRootRPC(root supervisor.NodeSnapshot, socket st
 	}
 }
 
-func (h *liveAcceptance) exerciseQuestionFixture() {
-	fixture, err := os.ReadFile(filepath.Join(h.repoRoot, "internal", "supervisor", "testdata", "pi-input.json"))
-	if err != nil {
-		h.t.Fatal(err)
+func (h *liveAcceptance) exerciseQuestionFixture(root supervisor.NodeSnapshot, socket string, stream *sseCapture) {
+	client := unixHTTPClient(socket)
+	var question supervisor.QuestionSummary
+	h.poll(time.Minute, "controlled Pi question in root tree", func() bool {
+		var current supervisor.NodeSnapshot
+		if unixJSON(client, http.MethodGet, "/v1/tree", nil, &current) != nil || len(current.Questions) != 1 {
+			return false
+		}
+		question = current.Questions[0]
+		return strings.Contains(question.Title, h.prefix)
+	})
+	status, body, err := unixRequest(client, http.MethodPost, "/v1/sessions/"+root.SessionID+"/questions/"+question.ID+"/response", map[string]any{"value": "deterministic-answer"})
+	if err != nil || status != http.StatusNoContent {
+		h.t.Fatalf("route controlled Pi question answer = HTTP %d %s, %v", status, body, err)
 	}
-	sender := &fixtureQuestionSender{}
-	store := supervisor.NewQuestionStore(sender)
-	retained, err := store.Retain(fixture)
-	if err != nil || !retained {
-		h.t.Fatalf("retain controlled blocking question: retained=%v err=%v", retained, err)
+	status, _, err = unixRequest(client, http.MethodPost, "/v1/sessions/"+root.SessionID+"/questions/"+question.ID+"/response", map[string]any{"value": "duplicate"})
+	if err != nil || status != http.StatusNotFound {
+		h.t.Fatalf("duplicate controlled Pi question = HTTP %d, %v", status, err)
 	}
-	broker := supervisor.NewEventBroker()
-	for index := 0; index < supervisor.DefaultEventRingCapacity+32; index++ {
-		broker.PublishLocal("fixture", "pi", json.RawMessage(`{"type":"noise"}`))
-	}
-	if len(store.Summaries()) != 1 {
-		h.t.Fatal("blocking question did not survive event-ring eviction")
-	}
-	question := store.Summaries()[0]
-	if err := store.Answer(h.ctx, question.ID, json.RawMessage(`{"value":"deterministic-answer"}`)); err != nil {
-		h.t.Fatal(err)
-	}
-	if len(store.Summaries()) != 0 {
-		h.t.Fatal("answered question remained pending")
-	}
-	err = store.Answer(h.ctx, question.ID, json.RawMessage(`{"value":"duplicate"}`))
-	var typed *contract.Error
-	if !errors.As(err, &typed) || typed.Code != contract.ErrorNotFound {
-		h.t.Fatalf("duplicate question response error = %v", err)
-	}
-	h.writeJSON("question-fixture.json", map[string]any{"question": question, "responses": sender.messages})
+	h.poll(time.Minute, "controlled Pi question disappearance", func() bool {
+		var current supervisor.NodeSnapshot
+		return unixJSON(client, http.MethodGet, "/v1/tree", nil, &current) == nil && len(current.Questions) == 0
+	})
+	h.waitPiNotification(stream.events, root.SessionID, "KANEDIAS_E2E_QUESTION_ANSWER:deterministic-answer", time.Minute)
+	h.writeJSON("question-fixture.json", map[string]any{"question": question, "answer": "deterministic-answer", "duplicateStatus": status})
 }
 
-func (h *liveAcceptance) exerciseFreshRead(root supervisor.NodeSnapshot, socket string) {
+func (h *liveAcceptance) exerciseFreshRead(root supervisor.NodeSnapshot, socket string, stream *sseCapture) {
 	client := unixHTTPClient(socket)
 	body, err := os.ReadFile(filepath.Join(h.repoRoot, "internal", "supervisor", "testdata", "read-task.md"))
 	if err != nil {
@@ -465,9 +479,10 @@ func (h *liveAcceptance) exerciseFreshRead(root supervisor.NodeSnapshot, socket 
 		return child.Kind == contract.ChildKindRead && child.Context == contract.ContextFresh
 	})
 	h.trackTree(child)
+	h.waitSessionEvent(stream.events, child.SessionID, 2*time.Minute)
 	h.assertDistinct(root, child)
 	h.assertWorker(child, "reviewer")
-	h.assertSessionMetadata(child.SessionID)
+	h.assertSessionMetadata(child)
 	for _, command := range []map[string]any{{"type": "get_messages"}, {"type": "get_entries"}, {"type": "steer", "message": "Ensure the exact KANEDIAS_E2E_READ_OK marker is in the final response."}} {
 		response := h.rpc(client, child.SessionID, command)
 		if response["success"] != true {
@@ -518,7 +533,32 @@ func (h *liveAcceptance) exerciseForkedWrite(root supervisor.NodeSnapshot, socke
 	if child.ParentSessionID != root.SessionID || child.PiSessionID == root.PiSessionID {
 		h.t.Fatalf("fork metadata/identity mismatch: root=%#v child=%#v", root, child)
 	}
-	h.assertSessionMetadata(child.SessionID)
+	h.assertSessionMetadata(child)
+	childInstance := h.instanceForSession(child.SessionID)
+	var branchHeader struct {
+		ParentSession string `json:"parentSession"`
+	}
+	if err := json.Unmarshal([]byte(h.execInstance(childInstance, "head", "-n", "1", child.SessionFile)), &branchHeader); err != nil || branchHeader.ParentSession != root.SessionFile {
+		h.t.Fatalf("forked Pi branch parent metadata = %#v, %v; want %q", branchHeader, err, root.SessionFile)
+	}
+	var observedHead string
+	h.poll(12*time.Minute, "durable writer ref before child disappearance", func() bool {
+		command := exec.CommandContext(h.ctx, "git", "ls-remote", "--exit-code", h.remote, "refs/heads/"+branch)
+		output, err := command.Output()
+		if err != nil {
+			return false
+		}
+		fields := strings.Fields(string(output))
+		if len(fields) < 2 || fields[1] != "refs/heads/"+branch {
+			return false
+		}
+		var current supervisor.NodeSnapshot
+		if unixJSON(client, http.MethodGet, "/v1/tree", nil, &current) != nil || len(current.Children) == 0 {
+			return false
+		}
+		observedHead = fields[0]
+		return true
+	})
 	h.poll(12*time.Minute, "accepted writer handoff and child disappearance", func() bool {
 		var current supervisor.NodeSnapshot
 		return unixJSON(client, http.MethodGet, "/v1/tree", nil, &current) == nil && current.Lifecycle == "ready" && len(current.Children) == 0
@@ -535,9 +575,46 @@ func (h *liveAcceptance) exerciseForkedWrite(root supervisor.NodeSnapshot, socke
 	if !strings.Contains(resultText, branch) || !strings.Contains(resultText, head[0]) {
 		h.t.Fatalf("parent result did not retain verified refs branch=%q head=%q: %s", branch, head[0], resultText)
 	}
-	h.writeJSON("reported-git-refs.json", map[string]string{"repository": h.repository, "base": base, "branch": branch, "head": head[0]})
+	messages := h.rpc(client, root.SessionID, map[string]any{"type": "get_messages"})
+	typed, ok := findTypedWriteResult(messages, h.repository, branch, head[0])
+	if !ok {
+		h.t.Fatalf("parent Pi messages lack typed WriteChildResult for %s:%s@%s: %#v", h.repository, branch, head[0], messages)
+	}
+	if observedHead != head[0] {
+		h.t.Fatalf("pre-disappearance ref %q differs from final %q", observedHead, head[0])
+	}
+	h.writeJSON("reported-git-refs.json", map[string]any{"repository": h.repository, "base": base, "branch": branch, "head": head[0], "typedResult": typed, "observedBeforeDisappearance": observedHead})
 	h.assertSessionAbsent(child.SessionID)
 	h.snapshotTree("forked-write-complete", client)
+}
+
+func (h *liveAcceptance) exerciseDirectChildCrash(rootProcess *acceptanceProcess, root supervisor.NodeSnapshot, socket string) {
+	client := unixHTTPClient(socket)
+	h.startNestedDelegation(client, root.SessionID, "direct-child-crash")
+	var nested supervisor.NodeSnapshot
+	h.poll(8*time.Minute, "child and grandchild before direct-child crash", func() bool {
+		var current supervisor.NodeSnapshot
+		if unixJSON(client, http.MethodGet, "/v1/tree", nil, &current) != nil || len(current.Children) == 0 || len(current.Children[0].Children) == 0 {
+			return false
+		}
+		nested = current
+		return true
+	})
+	h.trackTree(nested)
+	h.assertTreeMetadata(nested)
+	pids := directSessionChildPIDs(rootProcess.cmd.Process.Pid)
+	if len(pids) != 1 {
+		h.t.Fatalf("direct child supervisor PIDs = %v, want exactly one", pids)
+	}
+	if err := syscall.Kill(pids[0], syscall.SIGKILL); err != nil {
+		h.t.Fatal(err)
+	}
+	descendants := treeSessionIDs(nested)[1:]
+	h.poll(2*time.Minute, "direct-child crash recovery", func() bool {
+		var current supervisor.NodeSnapshot
+		return h.sessionsAbsent(descendants) && unixJSON(client, http.MethodGet, "/v1/tree", nil, &current) == nil && current.Lifecycle == "ready" && len(current.Children) == 0
+	})
+	h.assertDescendantSocketsAbsent(nested)
 }
 
 func (h *liveAcceptance) exerciseGracefulCascade(rootProcess *acceptanceProcess, root supervisor.NodeSnapshot, socket string) {
@@ -553,6 +630,7 @@ func (h *liveAcceptance) exerciseGracefulCascade(rootProcess *acceptanceProcess,
 		return true
 	})
 	h.trackTree(nested)
+	h.assertTreeMetadata(nested)
 	pids := descendantPIDs(rootProcess.cmd.Process.Pid)
 	status, _, err := unixRequest(client, http.MethodDelete, "/v1/sessions/"+root.SessionID, nil)
 	if err != nil || status != http.StatusAccepted {
@@ -561,6 +639,7 @@ func (h *liveAcceptance) exerciseGracefulCascade(rootProcess *acceptanceProcess,
 	h.waitProcess(rootProcess, 2*time.Minute)
 	h.poll(2*time.Minute, "graceful descendant resource cleanup", func() bool { return h.sessionsAbsent(treeSessionIDs(nested)) })
 	h.assertPIDsDead(pids)
+	h.assertDescendantSocketsAbsent(nested)
 	if _, err := os.Stat(socket); !errors.Is(err, os.ErrNotExist) {
 		h.t.Fatalf("graceful root socket remains: %v", err)
 	}
@@ -579,6 +658,7 @@ func (h *liveAcceptance) exerciseKilledCascade(rootProcess *acceptanceProcess, r
 		return true
 	})
 	h.trackTree(nested)
+	h.assertTreeMetadata(nested)
 	pids := descendantPIDs(rootProcess.cmd.Process.Pid)
 	if err := rootProcess.cmd.Process.Signal(syscall.SIGKILL); err != nil {
 		h.t.Fatal(err)
@@ -590,6 +670,7 @@ func (h *liveAcceptance) exerciseKilledCascade(rootProcess *acceptanceProcess, r
 	}
 	h.poll(2*time.Minute, "liveness EOF descendant cleanup after SIGKILL", func() bool { return h.sessionsAbsent(descendants) })
 	h.assertPIDsDead(pids)
+	h.assertDescendantSocketsAbsent(nested)
 	// Approved v1 limitation: a killed root cannot clean its own instance or
 	// volume. Teardown targets only resources whose exact metadata matches this
 	// root; this is not host-wide crash reconciliation.
@@ -706,6 +787,46 @@ func (h *liveAcceptance) waitPiEvent(events <-chan supervisor.EventEnvelope, ses
 	}
 }
 
+func (h *liveAcceptance) waitSessionEvent(events <-chan supervisor.EventEnvelope, sessionID string, timeout time.Duration) {
+	timer := time.NewTimer(timeout)
+	defer timer.Stop()
+	for {
+		select {
+		case event, ok := <-events:
+			if !ok {
+				h.t.Fatalf("SSE ended before event from %s", sessionID)
+			}
+			if event.SessionID == sessionID {
+				return
+			}
+		case <-timer.C:
+			h.t.Fatalf("timed out waiting for root SSE envelope from %s", sessionID)
+		}
+	}
+}
+
+func (h *liveAcceptance) waitPiNotification(events <-chan supervisor.EventEnvelope, sessionID, marker string, timeout time.Duration) {
+	timer := time.NewTimer(timeout)
+	defer timer.Stop()
+	for {
+		select {
+		case event, ok := <-events:
+			if !ok {
+				h.t.Fatalf("SSE ended before Pi notification %q", marker)
+			}
+			if event.SessionID != sessionID {
+				continue
+			}
+			var payload struct{ Type, Method, Message string }
+			if json.Unmarshal(event.Payload, &payload) == nil && payload.Type == "extension_ui_request" && payload.Method == "notify" && payload.Message == marker {
+				return
+			}
+		case <-timer.C:
+			h.t.Fatalf("timed out waiting for Pi notification %q", marker)
+		}
+	}
+}
+
 func (h *liveAcceptance) snapshotResources(label string) resourceSnapshot {
 	server := h.rawIncus
 	instances, err := server.GetInstances(api.InstanceTypeAny)
@@ -737,22 +858,47 @@ func (h *liveAcceptance) assertBaseline(label string) {
 	}
 }
 
-func (h *liveAcceptance) assertSessionMetadata(sessionID string) {
-	h.trackSession(sessionID)
-	var instanceFound, volumeFound bool
-	snapshot := h.snapshotResources("metadata-" + safeName(sessionID))
+func (h *liveAcceptance) assertSessionMetadata(node supervisor.NodeSnapshot) {
+	h.trackSession(node.SessionID)
+	snapshot := h.snapshotResources("metadata-" + safeName(node.SessionID))
+	instances := make([]resourceRecord, 0, 1)
+	volumes := make([]resourceRecord, 0, 1)
 	for _, record := range snapshot.Instances {
-		if record.SessionID == sessionID {
-			instanceFound = true
+		if record.SessionID == node.SessionID {
+			instances = append(instances, record)
 		}
 	}
 	for _, record := range snapshot.Volumes {
-		if record.SessionID == sessionID {
-			volumeFound = true
+		if record.SessionID == node.SessionID {
+			volumes = append(volumes, record)
 		}
 	}
-	if !instanceFound || !volumeFound {
-		h.t.Fatalf("session %s metadata incomplete: instance=%v volume=%v", sessionID, instanceFound, volumeFound)
+	if len(instances) != 1 || len(volumes) != 1 {
+		h.t.Fatalf("session %s resource pair count: instances=%d volumes=%d", node.SessionID, len(instances), len(volumes))
+	}
+	wantInstance := "session-" + node.SessionID
+	wantVolume := "workspace-" + node.SessionID
+	if instances[0].Name != wantInstance || volumes[0].Name != wantVolume {
+		h.t.Fatalf("session %s deterministic resource names: instance=%q volume=%q", node.SessionID, instances[0].Name, volumes[0].Name)
+	}
+	want := map[string]string{
+		metadataSession: node.SessionID, metadataParent: node.ParentSessionID, metadataRoot: node.RootSessionID,
+		metadataKind: string(node.Kind), metadataContext: string(node.Context), metadataWorker: node.WorkerType,
+		metadataVolume: wantVolume, metadataRun: h.prefix,
+	}
+	for _, record := range []resourceRecord{instances[0], volumes[0]} {
+		for key, value := range want {
+			if record.Config[key] != value {
+				h.t.Fatalf("resource %s metadata %s=%q, want %q; all=%#v", record.Name, key, record.Config[key], value, record.Config)
+			}
+		}
+	}
+}
+
+func (h *liveAcceptance) assertTreeMetadata(tree supervisor.NodeSnapshot) {
+	h.assertSessionMetadata(tree)
+	for _, child := range tree.Children {
+		h.assertTreeMetadata(child)
 	}
 }
 
@@ -925,6 +1071,7 @@ func (h *liveAcceptance) startProcess(label, executable string, arguments ...str
 	}
 	command := exec.Command(executable, arguments...)
 	command.Dir = h.repoRoot
+	command.Env = append(os.Environ(), "KANEDIAS_E2E_RUN_ID="+h.prefix)
 	command.Stdout, command.Stderr = log, log
 	process := &acceptanceProcess{cmd: command, log: log, done: make(chan struct{})}
 	if err := command.Start(); err != nil {
@@ -1004,18 +1151,6 @@ func (h *liveAcceptance) assertPIDsDead(pids []int) {
 	})
 }
 
-type fixtureQuestionSender struct {
-	mu       sync.Mutex
-	messages []json.RawMessage
-}
-
-func (sender *fixtureQuestionSender) Send(_ context.Context, message json.RawMessage) error {
-	sender.mu.Lock()
-	defer sender.mu.Unlock()
-	sender.messages = append(sender.messages, append(json.RawMessage(nil), message...))
-	return nil
-}
-
 func unixHTTPClient(socket string) *http.Client {
 	return &http.Client{Transport: &http.Transport{Proxy: nil, DialContext: func(ctx context.Context, _, _ string) (net.Conn, error) {
 		return (&net.Dialer{}).DialContext(ctx, "unix", socket)
@@ -1063,20 +1198,11 @@ func unixRequest(client *http.Client, method, path string, input any) (int, []by
 }
 
 func sameResourceNames(left, right resourceSnapshot) bool {
-	return reflect.DeepEqual(sortedKeys(left.Instances), sortedKeys(right.Instances)) && reflect.DeepEqual(sortedKeys(left.Volumes), sortedKeys(right.Volumes))
+	return reflect.DeepEqual(left, right)
 }
 
 func resourceDiff(before, after resourceSnapshot) string {
-	return fmt.Sprintf("instances before=%v after=%v; volumes before=%v after=%v", sortedKeys(before.Instances), sortedKeys(after.Instances), sortedKeys(before.Volumes), sortedKeys(after.Volumes))
-}
-
-func sortedKeys[T any](values map[string]T) []string {
-	keys := make([]string, 0, len(values))
-	for key := range values {
-		keys = append(keys, key)
-	}
-	sort.Strings(keys)
-	return keys
+	return fmt.Sprintf("instances before=%#v after=%#v; volumes before=%#v after=%#v", before.Instances, after.Instances, before.Volumes, after.Volumes)
 }
 
 func kanediasMetadata(values map[string]string) map[string]string {
@@ -1089,12 +1215,86 @@ func kanediasMetadata(values map[string]string) map[string]string {
 	return metadata
 }
 
+func findTypedWriteResult(value any, repository, branch, head string) (map[string]any, bool) {
+	switch current := value.(type) {
+	case map[string]any:
+		if current["kind"] == "write" {
+			if repositories, ok := current["repositories"].([]any); ok {
+				for _, raw := range repositories {
+					entry, _ := raw.(map[string]any)
+					if entry["repository"] == repository && entry["branch"] == branch && entry["headCommit"] == head {
+						return current, true
+					}
+				}
+			}
+		}
+		for _, child := range current {
+			if result, ok := findTypedWriteResult(child, repository, branch, head); ok {
+				return result, true
+			}
+		}
+	case []any:
+		for _, child := range current {
+			if result, ok := findTypedWriteResult(child, repository, branch, head); ok {
+				return result, true
+			}
+		}
+	}
+	return nil, false
+}
+
 func treeSessionIDs(tree supervisor.NodeSnapshot) []string {
 	ids := []string{tree.SessionID}
 	for _, child := range tree.Children {
 		ids = append(ids, treeSessionIDs(child)...)
 	}
 	return ids
+}
+
+func (h *liveAcceptance) assertDescendantSocketsAbsent(tree supervisor.NodeSnapshot) {
+	ids := treeSessionIDs(tree)
+	if len(ids) > 0 {
+		ids = ids[1:]
+	}
+	for _, id := range ids {
+		if _, err := os.Lstat(filepath.Join(h.runDir, id+".sock")); !errors.Is(err, os.ErrNotExist) {
+			h.t.Fatalf("descendant socket %s remains before artifact cleanup: %v", id, err)
+		}
+	}
+}
+
+func directSessionChildPIDs(parent int) []int {
+	var result []int
+	entries, _ := os.ReadDir("/proc")
+	for _, entry := range entries {
+		pid, err := strconv.Atoi(entry.Name())
+		if err != nil {
+			continue
+		}
+		data, err := os.ReadFile(filepath.Join("/proc", entry.Name(), "status"))
+		if err != nil {
+			continue
+		}
+		if parsePPID(string(data)) != parent {
+			continue
+		}
+		cmdline, _ := os.ReadFile(filepath.Join("/proc", entry.Name(), "cmdline"))
+		if bytes.Contains(cmdline, []byte("session-child")) {
+			result = append(result, pid)
+		}
+	}
+	sort.Ints(result)
+	return result
+}
+
+func parsePPID(status string) int {
+	for _, line := range strings.Split(status, "\n") {
+		if strings.HasPrefix(line, "PPid:") {
+			parent, _ := strconv.Atoi(strings.TrimSpace(strings.TrimPrefix(line, "PPid:")))
+			return parent
+		}
+	}
+	return 0
 }
 
 func descendantPIDs(root int) []int {
@@ -1131,6 +1331,47 @@ func descendantPIDs(root int) []int {
 	}
 	sort.Ints(descendants)
 	return descendants
+}
+
+func preflightDisposableRemote(ctx context.Context, repository, remote string) error {
+	if githubRemoteSlug(remote) != repository {
+		return fmt.Errorf("explicit remote does not identify trusted github.com/%s", repository)
+	}
+	resolve := func(value string) (string, error) {
+		command := exec.CommandContext(ctx, "git", "ls-remote", "--exit-code", value, "HEAD")
+		output, err := command.Output()
+		if err != nil {
+			return "", err
+		}
+		fields := strings.Fields(string(output))
+		if len(fields) != 2 || fields[1] != "HEAD" {
+			return "", fmt.Errorf("remote returned no unique HEAD")
+		}
+		return fields[0], nil
+	}
+	explicitHead, err := resolve(remote)
+	if err != nil {
+		return fmt.Errorf("resolve explicit remote HEAD: %w", err)
+	}
+	trustedHead, err := resolve("https://github.com/" + repository + ".git")
+	if err != nil {
+		return fmt.Errorf("resolve trusted canonical remote HEAD: %w", err)
+	}
+	if explicitHead != trustedHead {
+		return fmt.Errorf("explicit remote HEAD differs from trusted canonical repository")
+	}
+	return nil
+}
+
+func githubRemoteSlug(remote string) string {
+	if match := regexp.MustCompile(`^git@github\.com:([^/]+/[^/]+?)(?:\.git)?$`).FindStringSubmatch(remote); len(match) == 2 {
+		return strings.TrimSuffix(match[1], ".git")
+	}
+	parsed, err := url.Parse(remote)
+	if err != nil || strings.ToLower(parsed.Hostname()) != "github.com" || (parsed.Scheme != "https" && parsed.Scheme != "ssh") {
+		return ""
+	}
+	return strings.TrimSuffix(strings.Trim(parsed.Path, "/"), ".git")
 }
 
 func commandOutput(t *testing.T, name string, arguments ...string) string {

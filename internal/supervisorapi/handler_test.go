@@ -38,6 +38,7 @@ type fakeService struct {
 	childRelease   <-chan struct{}
 	handoffRequest supervisor.WriteHandoffRequest
 	handoffResult  supervisor.HandoffAcceptance
+	ackCalled      chan struct{}
 	err            error
 }
 
@@ -527,5 +528,91 @@ func TestServeUnixRemovesStaleOwnedSocket(t *testing.T) {
 	cancel()
 	if err := <-result; err != nil {
 		t.Fatalf("ServeUnix() error = %v", err)
+	}
+}
+
+func TestDescendantSSEAcceptsPiSizedEnvelopeAndSurfacesStreamErrors(t *testing.T) {
+	path := filepath.Join(t.TempDir(), "child.sock")
+	large := json.RawMessage(`{"text":"` + strings.Repeat("x", 2<<20) + `"}`)
+	closed := make(chan supervisor.EventEnvelope)
+	close(closed)
+	service := &fakeService{sub: supervisor.Subscription{Replay: []supervisor.EventEnvelope{{Seq: 1, SessionID: "child", SourceSeq: 1, Kind: "pi", Payload: large}}, Events: closed, Close: func() {}}}
+	ctx, cancel := context.WithCancel(context.Background())
+	serverDone := make(chan error, 1)
+	go func() { serverDone <- ServeUnix(ctx, path, NewHandler(service)) }()
+	waitForSocket(t, path)
+	seam, err := NewDescendantClient(path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	sub, err := seam.Subscribe(context.Background())
+	if err != nil {
+		t.Fatal(err)
+	}
+	select {
+	case event := <-sub.Events:
+		if len(event.Payload) != len(large) {
+			t.Fatalf("payload bytes = %d, want %d", len(event.Payload), len(large))
+		}
+	case <-time.After(time.Second):
+		t.Fatal("Pi-sized descendant event was not forwarded")
+	}
+	sub.Close()
+	cancel()
+	if err := <-serverDone; err != nil {
+		t.Fatal(err)
+	}
+
+	badPath := filepath.Join(t.TempDir(), "bad.sock")
+	badCtx, badCancel := context.WithCancel(context.Background())
+	badDone := make(chan error, 1)
+	go func() {
+		badDone <- ServeUnix(badCtx, badPath, http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
+			w.Header().Set("Content-Type", "text/event-stream")
+			w.WriteHeader(http.StatusOK)
+			_, _ = io.WriteString(w, "data: not-json\n\n")
+		}))
+	}()
+	waitForSocket(t, badPath)
+	badSeam, _ := NewDescendantClient(badPath)
+	badSub, err := badSeam.Subscribe(context.Background())
+	if err != nil {
+		t.Fatal(err)
+	}
+	for range badSub.Events {
+	}
+	if badSub.Err == nil || badSub.Err() == nil {
+		t.Fatal("malformed child SSE ended without owned stream error")
+	}
+	badCancel()
+	if err := <-badDone; err != nil {
+		t.Fatal(err)
+	}
+}
+
+func TestDescendantUnaryOperationsHaveInternalDeadline(t *testing.T) {
+	path := filepath.Join(t.TempDir(), "stall.sock")
+	ctx, cancel := context.WithCancel(context.Background())
+	done := make(chan error, 1)
+	go func() {
+		done <- ServeUnix(ctx, path, http.HandlerFunc(func(_ http.ResponseWriter, request *http.Request) { <-request.Context().Done() }))
+	}()
+	waitForSocket(t, path)
+	seam, err := NewDescendantClient(path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	client := seam.(*DescendantClient)
+	client.unaryTimeout = 20 * time.Millisecond
+	started := time.Now()
+	_, err = client.Snapshot(context.Background())
+	if err == nil || time.Since(started) > time.Second {
+		t.Fatalf("bounded Snapshot() error=%v elapsed=%s", err, time.Since(started))
+	}
+	cancel()
+	select {
+	case <-done:
+	case <-time.After(6 * time.Second):
+		t.Fatal("server did not close")
 	}
 }

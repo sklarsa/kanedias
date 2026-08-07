@@ -19,6 +19,7 @@ import (
 	"time"
 
 	"github.com/sklarsa/kanedias/internal/supervisor/contract"
+	"github.com/sklarsa/kanedias/internal/supervisor/provision"
 )
 
 const defaultProbeInterval = 25 * time.Millisecond
@@ -48,6 +49,9 @@ type Child struct {
 	reportStop      chan struct{}
 	reportDone      chan struct{}
 	reportCloseOnce sync.Once
+	recoveryMu      sync.RWMutex
+	recoveryTicket  provision.RecoveryTicket
+	hasRecovery     bool
 }
 
 func (spawner Spawner) Spawn(ctx context.Context, bootstrap Bootstrap) (*Child, error) {
@@ -99,6 +103,10 @@ func (spawner Spawner) Spawn(ctx context.Context, bootstrap Bootstrap) (*Child, 
 
 	command := exec.CommandContext(ctx, executable,
 		"session-child", "--bootstrap-fd", "3", "--liveness-fd", "4", "--report-fd", "5")
+	// Recursive diagnostics follow the root process's already-private persistent
+	// log sinks instead of disappearing into /dev/null.
+	command.Stdout = os.Stdout
+	command.Stderr = os.Stderr
 	if spawner.ConfigPath != "" {
 		command.Env = withConfigPath(os.Environ(), spawner.ConfigPath)
 	}
@@ -212,25 +220,60 @@ func (child *Child) sendReport(event reportEvent) bool {
 }
 
 func (child *Child) WaitReady(ctx context.Context) error {
-	for {
-		message, err := child.NextMessage(ctx)
-		if err != nil {
-			return err
-		}
-		if message.SessionID != child.bootstrap.SessionID {
-			return fmt.Errorf("child report session ID %q does not match bootstrap %q", message.SessionID, child.bootstrap.SessionID)
-		}
-		if message.Type != MessageReady {
-			if message.Type == MessageFailure && message.Error != nil {
-				return contractError(message.Error)
-			}
-			return fmt.Errorf("child reported %q before readiness", message.Type)
-		}
-		if message.Ready.SocketPath != child.bootstrap.SocketPath {
-			return fmt.Errorf("child ready socket %q does not match bootstrap %q", message.Ready.SocketPath, child.bootstrap.SocketPath)
-		}
-		return probeTree(ctx, message.Ready.SocketPath, child.bootstrap, child.probeInterval)
+	ownership, err := child.NextMessage(ctx)
+	if err != nil {
+		return err
 	}
+	if ownership.SessionID != child.bootstrap.SessionID {
+		return fmt.Errorf("child report session ID %q does not match bootstrap %q", ownership.SessionID, child.bootstrap.SessionID)
+	}
+	if ownership.Type == MessageFailure && ownership.Error != nil {
+		return contractError(ownership.Error)
+	}
+	if ownership.Type != MessageOwnership || ownership.Ownership == nil {
+		return fmt.Errorf("child reported %q before ownership", ownership.Type)
+	}
+	if err := validateRecoveryTicket(child.bootstrap, *ownership.Ownership); err != nil {
+		return err
+	}
+	child.recoveryMu.Lock()
+	child.recoveryTicket = *ownership.Ownership
+	child.hasRecovery = true
+	child.recoveryMu.Unlock()
+
+	message, err := child.NextMessage(ctx)
+	if err != nil {
+		return err
+	}
+	if message.SessionID != child.bootstrap.SessionID {
+		return fmt.Errorf("child report session ID %q does not match bootstrap %q", message.SessionID, child.bootstrap.SessionID)
+	}
+	if message.Type != MessageReady {
+		if message.Type == MessageFailure && message.Error != nil {
+			return contractError(message.Error)
+		}
+		return fmt.Errorf("child reported %q before readiness", message.Type)
+	}
+	if message.Ready.SocketPath != child.bootstrap.SocketPath {
+		return fmt.Errorf("child ready socket %q does not match bootstrap %q", message.Ready.SocketPath, child.bootstrap.SocketPath)
+	}
+	return probeTree(ctx, message.Ready.SocketPath, child.bootstrap, child.probeInterval)
+}
+
+func validateRecoveryTicket(bootstrap Bootstrap, ticket provision.RecoveryTicket) error {
+	if ticket.SessionID != bootstrap.SessionID || ticket.ParentID != bootstrap.ParentID || ticket.RootID != bootstrap.RootID ||
+		ticket.Instance != "session-"+bootstrap.SessionID || ticket.Volume != "workspace-"+bootstrap.SessionID ||
+		ticket.SocketPath != bootstrap.SocketPath || ticket.Kind != bootstrap.Request.Kind || ticket.Context != bootstrap.Request.Context ||
+		ticket.WorkerType != bootstrap.Request.WorkerType || ticket.RunAttribution != bootstrap.RunAttribution || ticket.Pool == "" || ticket.Socket.Device == 0 || ticket.Socket.Inode == 0 {
+		return fmt.Errorf("child ownership ticket does not exactly match admitted bootstrap %q", bootstrap.SessionID)
+	}
+	return nil
+}
+
+func (child *Child) RecoveryTicket() (provision.RecoveryTicket, bool) {
+	child.recoveryMu.RLock()
+	defer child.recoveryMu.RUnlock()
+	return child.recoveryTicket, child.hasRecovery
 }
 
 func (child *Child) NextMessage(ctx context.Context) (ChildMessage, error) {

@@ -34,16 +34,20 @@ async function git(pi: Pick<ExtensionAPI, "exec">, args: string[], signal: Abort
 }
 
 function repositorySlug(remote: string): string | undefined {
-  let remotePath = remote.trim();
-  const scp = /^[^/\s@]+@[^/\s:]+:(.+)$/.exec(remotePath);
+  let remotePath: string;
+  const value = remote.trim();
+  const scp = /^git@github\.com:(.+)$/.exec(value);
   if (scp) {
     remotePath = scp[1]!;
   } else {
     try {
-      const parsed = new URL(remotePath);
+      const parsed = new URL(value);
+      if (parsed.hostname.toLowerCase() !== "github.com") return undefined;
+      if (parsed.protocol !== "https:" && parsed.protocol !== "ssh:") return undefined;
+      if (parsed.protocol === "ssh:" && parsed.username !== "git") return undefined;
       remotePath = decodeURIComponent(parsed.pathname);
     } catch {
-      // Local path remotes are valid for verification and tests.
+      return undefined;
     }
   }
   const segments = remotePath.replace(/\\/g, "/").split("/").filter(Boolean);
@@ -136,7 +140,7 @@ export async function verifyHandoff(
 
     await checkedGit(["-C", checkout, "check-ref-format", "--branch", repository.branch], `invalid branch ${repository.branch}`);
 
-    const origin = await checkedGit(["-C", checkout, "remote", "get-url", "origin"], "resolve origin remote");
+    const origin = await checkedGit(["-C", checkout, "config", "--get", "remote.origin.url"], "resolve literal origin remote");
     const originSlug = repositorySlug(origin);
     if (originSlug !== repository.repository) {
       throw new Error(`repository slug mismatch: handoff names ${repository.repository}, origin resolves to ${originSlug ?? "an unknown repository"}`);

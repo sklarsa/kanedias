@@ -155,3 +155,7 @@ func (router *Router) CreateChild(ctx context.Context, parent string, request co
 func (router *Router) Handoff(ctx context.Context, request WriteHandoffRequest) (HandoffAcceptance, error) {
 	return router.node.Handoff(ctx, request)
 }
+
+func (router *Router) AcknowledgeHandoff(context.Context) error {
+	return router.node.AcknowledgeHandoff()
+}

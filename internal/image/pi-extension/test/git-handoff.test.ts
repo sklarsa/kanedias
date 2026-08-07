@@ -45,6 +45,11 @@ function executingPi(calls: string[][]) {
   return {
     async exec(command: string, args: string[]) {
       calls.push([command, ...args]);
+      if (command === "git" && args.at(-3) === "config" && args.at(-2) === "--get" && args.at(-1) === "remote.origin.url") {
+        const checkout = args[1]!;
+        const segments = checkout.split(path.sep).filter(Boolean);
+        return { stdout: `https://github.com/${segments.at(-2)}/${segments.at(-1)}.git\n`, stderr: "", code: 0, killed: false };
+      }
       try {
         const { stdout, stderr } = await run(command, args);
         return { stdout, stderr, code: 0, killed: false };
@@ -79,7 +84,7 @@ test("verifies exact local and remote refs for multiple repositories in the requ
       ["git", "-C", repo.checkout, "rev-parse", "--show-toplevel"],
       ["git", "-C", repo.checkout, "rev-parse", "HEAD"],
       ["git", "-C", repo.checkout, "check-ref-format", "--branch", branch],
-      ["git", "-C", repo.checkout, "remote", "get-url", "origin"],
+      ["git", "-C", repo.checkout, "config", "--get", "remote.origin.url"],
       ["git", "-C", repo.checkout, "ls-remote", "--exit-code", "origin", `refs/heads/${branch}`],
     ];
   });
@@ -171,4 +176,22 @@ test("rejects repository mismatch, local head mismatch, invalid or absent branch
     ...base,
     repositories: [{ ...base.repositories[0]!, headCommit: localHead }],
   }, { workspaceRoot }), /remote.*mismatch|tip/i);
+});
+
+test("rejects non-GitHub and unsafe-protocol origins during guest preflight", async (t) => {
+  const root = await mkdtemp(path.join(os.tmpdir(), "kanedias-handoff-origin-"));
+  t.after(() => rm(root, { recursive: true, force: true }));
+  const repo = await repository(root, "owner/repo", "feature");
+  for (const origin of ["https://evil.example/owner/repo.git", "http://github.com/owner/repo.git", repo.remote]) {
+    const delegate = executingPi([]);
+    const pi = {
+      async exec(command: string, args: string[]) {
+        if (command === "git" && args.at(-3) === "config" && args.at(-2) === "--get" && args.at(-1) === "remote.origin.url") {
+          return { stdout: `${origin}\n`, stderr: "", code: 0, killed: false };
+        }
+        return delegate.exec(command, args);
+      },
+    } as any;
+    await assert.rejects(verifyHandoff(pi, inputFor(repo, "owner/repo", "feature"), { workspaceRoot: path.join(root, "repos") }), /repository slug mismatch|unknown repository/i);
+  }
 });

@@ -163,6 +163,8 @@ func (session *LocalSession) CallRPC(ctx context.Context, command json.RawMessag
 
 	if responseAccepted {
 		switch requestType {
+		case "abort":
+			session.questions.CancelPending()
 		case "prompt", "follow_up":
 			session.activityMu.Lock()
 			if responseSeq > session.lifecycleResponseSeq {
@@ -234,28 +236,20 @@ func (session *LocalSession) DrainDone() <-chan struct{} { return session.drainD
 
 func (session *LocalSession) drainEvents() {
 	defer close(session.drainDone)
-	for {
-		select {
-		case event := <-session.rpc.Events():
-			session.handleEvent(event)
-		case <-session.rpc.Done():
-			for {
-				select {
-				case event := <-session.rpc.Events():
-					session.handleEvent(event)
-				default:
-					session.handleRPCTermination()
-					return
-				}
-			}
-		}
+	for event := range session.rpc.Events() {
+		session.handleEvent(event)
 	}
+	session.handleRPCTermination()
 }
 
 func (session *LocalSession) handleEvent(event pirpc.Event) {
 	session.events.PublishLocal(session.identity.sessionID, "pi", event.Raw)
 	if event.Type == "extension_ui_request" {
 		_, _ = session.questions.Retain(event.Raw)
+	}
+
+	if event.Type == "agent_settled" || event.Type == "agent_end" {
+		session.questions.CancelPending()
 	}
 
 	switch event.Type {
@@ -301,9 +295,9 @@ func (session *LocalSession) applyActivityLocked(activity string) {
 		session.markRunningLocked()
 	case "agent_settled":
 		state := session.lifecycle.State()
-		if state == LifecycleReady && session.identity.kind == contract.ChildKindWrite {
-			// A settlement observed while Bind was still starting implies the
-			// streaming generation ran and settled before the caller resumed.
+		if state == LifecycleReady && session.identity.kind != contract.ChildKindRoot {
+			// A settlement may be drained before the accepted prompt response is
+			// reconciled. Every child kind still ran that admitted generation.
 			session.markRunningLocked()
 			state = session.lifecycle.State()
 		}

@@ -16,11 +16,13 @@ import (
 	"github.com/sklarsa/kanedias/internal/supervisor/provision"
 )
 
+var allowAllHandoffs = HandoffVerifierFunc(func(context.Context, []contract.RepositoryHandoff) error { return nil })
+
 func TestRunWriteTaskPromptsExactlyAndLeavesWriterLiveUntilHandoff(t *testing.T) {
 	identity := writerIdentity(t)
 	local, peer, broker := newTestLocalSession(t, identity)
 	bindTestLocal(t, local, peer, "pi-writer", "/tmp/writer.jsonl", false)
-	node := &Node{identity: identity, local: local, broker: broker, state: LifecycleReady}
+	node := &Node{identity: identity, local: local, broker: broker, state: LifecycleReady, deps: Dependencies{HandoffVerifier: allowAllHandoffs}}
 
 	done := make(chan error, 1)
 	go func() { done <- node.RunWriteTask(context.Background(), "implement exactly") }()
@@ -69,8 +71,9 @@ func TestStopWhileWriterAwaitsHandoffCleansProcessResourcesAndSocket(t *testing.
 		Provisioner: provisioner,
 		DialRPC:     func(context.Context, string) (io.ReadWriteCloser, error) { return tracked, nil },
 		Workers:     fakeWorkers{}, SocketPath: socket,
-		CloseListener: func(context.Context) error { listenerClosed.Store(true); return listener.Close() },
-		ReportWrite:   func(contract.WriteChildResult) error { return nil },
+		CloseListener:   func(context.Context) error { listenerClosed.Store(true); return listener.Close() },
+		ReportWrite:     func(contract.WriteChildResult) error { return nil },
+		HandoffVerifier: allowAllHandoffs,
 	}, NewEventBroker())
 	if err != nil {
 		t.Fatal(err)
@@ -138,7 +141,7 @@ func TestWriterHandoffRecordsAndForwardsExactlyOnceBeforeAcceptance(t *testing.T
 	}
 	var mu sync.Mutex
 	var forwarded []contract.WriteChildResult
-	node := &Node{identity: identity, reportWrite: func(result contract.WriteChildResult) error {
+	node := &Node{identity: identity, deps: Dependencies{HandoffVerifier: allowAllHandoffs}, reportWrite: func(result contract.WriteChildResult) error {
 		mu.Lock()
 		defer mu.Unlock()
 		forwarded = append(forwarded, result)
@@ -195,6 +198,7 @@ func TestAcceptedHandoffWatchdogForcesCleanupWhenPiDoesNotEOF(t *testing.T) {
 		Workers:     fakeWorkers{}, SocketPath: socket,
 		CloseListener:          func(context.Context) error { listenerClosed.Store(true); return listener.Close() },
 		ReportWrite:            func(contract.WriteChildResult) error { return nil },
+		HandoffVerifier:        allowAllHandoffs,
 		HandoffShutdownTimeout: 30 * time.Millisecond,
 	}, NewEventBroker())
 	if err != nil {
@@ -230,6 +234,9 @@ func TestAcceptedHandoffWatchdogForcesCleanupWhenPiDoesNotEOF(t *testing.T) {
 	}
 	if tracked.closed.Load() || listenerClosed.Load() || destroyCount() != 0 {
 		t.Fatal("cleanup began before handoff acceptance returned")
+	}
+	if err := node.AcknowledgeHandoff(); err != nil {
+		t.Fatalf("AcknowledgeHandoff() error = %v", err)
 	}
 
 	select {
@@ -270,7 +277,7 @@ func TestRejectedHandoffLeavesWriterLiveAndRetryable(t *testing.T) {
 		t.Fatal(err)
 	}
 	attempts := 0
-	node := &Node{identity: identity, reportWrite: func(contract.WriteChildResult) error {
+	node := &Node{identity: identity, deps: Dependencies{HandoffVerifier: allowAllHandoffs}, reportWrite: func(contract.WriteChildResult) error {
 		attempts++
 		if attempts == 1 {
 			return errors.New("report pipe unavailable")
@@ -322,5 +329,28 @@ func TestHandoffRejectsRootReadEmptyAndDuplicateRepositories(t *testing.T) {
 		if _, err := node.Handoff(context.Background(), request); err == nil {
 			t.Fatalf("accepted invalid request %#v", request)
 		}
+	}
+}
+
+func TestWriterHandoffRejectsForgedDirectPostBeforeReport(t *testing.T) {
+	identity := writerIdentity(t)
+	var reported atomic.Bool
+	node := &Node{
+		identity: identity,
+		deps: Dependencies{HandoffVerifier: HandoffVerifierFunc(func(context.Context, []contract.RepositoryHandoff) error {
+			return contract.NewError(contract.ErrorHandoffRefMismatch, "trusted GitHub tip differs")
+		})},
+		reportWrite: func(contract.WriteChildResult) error { reported.Store(true); return nil },
+	}
+	_, err := node.Handoff(context.Background(), WriteHandoffRequest{
+		Repositories: []contract.RepositoryHandoff{{Repository: "owner/repo", BaseCommit: "base", Branch: "feature", HeadCommit: "forged"}},
+		Summary:      "forged direct POST",
+	})
+	var typed *contract.Error
+	if !errors.As(err, &typed) || typed.Code != contract.ErrorHandoffRefMismatch {
+		t.Fatalf("Handoff() error = %v", err)
+	}
+	if reported.Load() {
+		t.Fatal("forged handoff was reported")
 	}
 }

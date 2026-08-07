@@ -22,6 +22,7 @@ import (
 
 	"github.com/sklarsa/kanedias/internal/config"
 	"github.com/sklarsa/kanedias/internal/supervisor/contract"
+	"github.com/sklarsa/kanedias/internal/supervisor/provision"
 )
 
 func validBootstrap(t *testing.T) Bootstrap {
@@ -33,6 +34,20 @@ func validBootstrap(t *testing.T) Bootstrap {
 		Worker:  config.WorkerProfile{Description: "Review code", Provider: "openai-codex", Model: "gpt-5", ThinkingLevel: "high"},
 		Request: contract.CreateChildRequest{WorkerType: "reviewer", Kind: contract.ChildKindRead, Context: contract.ContextFresh, Task: "review this change"},
 	}
+}
+
+func ownershipRecord(t *testing.T, bootstrap Bootstrap) string {
+	t.Helper()
+	wire, err := json.Marshal(ChildMessage{Type: MessageOwnership, SessionID: bootstrap.SessionID, Ownership: &provision.RecoveryTicket{
+		SessionID: bootstrap.SessionID, ParentID: bootstrap.ParentID, RootID: bootstrap.RootID,
+		Pool: "pool", Instance: "session-" + bootstrap.SessionID, Volume: "workspace-" + bootstrap.SessionID,
+		SocketPath: bootstrap.SocketPath, Socket: provision.SocketIdentity{Device: 1, Inode: 2},
+		Kind: bootstrap.Request.Kind, Context: bootstrap.Request.Context, WorkerType: bootstrap.Request.WorkerType,
+	}})
+	if err != nil {
+		t.Fatal(err)
+	}
+	return string(wire)
 }
 
 func TestSpawnerConfigPathReplacesOnlyKanediasConfig(t *testing.T) {
@@ -146,7 +161,7 @@ func TestSpawnerUsesOnlyInheritedProtocolDescriptorsAndProbesSocket(t *testing.T
 	serveTree(t, bootstrap.SocketPath, bootstrap.SessionID, bootstrap.ParentID, bootstrap.RootID)
 	script := filepath.Join(t.TempDir(), "helper.sh")
 	configPath := filepath.Join(t.TempDir(), "custom.toml")
-	contents := fmt.Sprintf("#!/bin/sh\nset -eu\n[ \"$*\" = 'session-child --bootstrap-fd 3 --liveness-fd 4 --report-fd 5' ]\n[ \"$KANEDIAS_CONFIG\" = %q ]\ncat <&3 >/dev/null\nprintf '%%s\\n' '%s' >&5\ncat <&4 >/dev/null\n", configPath, fmt.Sprintf(`{"type":"ready","sessionId":%q,"ready":{"socketPath":%q}}`, bootstrap.SessionID, bootstrap.SocketPath))
+	contents := fmt.Sprintf("#!/bin/sh\nset -eu\n[ \"$*\" = 'session-child --bootstrap-fd 3 --liveness-fd 4 --report-fd 5' ]\n[ \"$KANEDIAS_CONFIG\" = %q ]\ncat <&3 >/dev/null\nprintf '%%s\\n' '%s' '%s' >&5\ncat <&4 >/dev/null\n", configPath, ownershipRecord(t, bootstrap), fmt.Sprintf(`{"type":"ready","sessionId":%q,"ready":{"socketPath":%q}}`, bootstrap.SessionID, bootstrap.SocketPath))
 	if err := os.WriteFile(script, []byte(contents), 0o700); err != nil {
 		t.Fatal(err)
 	}
@@ -191,7 +206,7 @@ func TestSpawnerRejectsReadyUntilSessionAndSocketAreVerified(t *testing.T) {
 				socket = bootstrap.SocketPath
 			}
 			script := filepath.Join(t.TempDir(), "helper.sh")
-			contents := fmt.Sprintf("#!/bin/sh\ncat <&3 >/dev/null\nprintf '%%s\\n' '%s' >&5\ncat <&4 >/dev/null\n", fmt.Sprintf(`{"type":"ready","sessionId":%q,"ready":{"socketPath":%q}}`, session, socket))
+			contents := fmt.Sprintf("#!/bin/sh\ncat <&3 >/dev/null\nprintf '%%s\\n' '%s' '%s' >&5\ncat <&4 >/dev/null\n", ownershipRecord(t, bootstrap), fmt.Sprintf(`{"type":"ready","sessionId":%q,"ready":{"socketPath":%q}}`, session, socket))
 			if err := os.WriteFile(script, []byte(contents), 0o700); err != nil {
 				t.Fatal(err)
 			}
@@ -213,7 +228,7 @@ func TestSpawnerRejectsReadySocketServingStaleTreeIdentity(t *testing.T) {
 	bootstrap := validBootstrap(t)
 	serveTree(t, bootstrap.SocketPath, "stale-child", bootstrap.ParentID, bootstrap.RootID)
 	script := filepath.Join(t.TempDir(), "helper.sh")
-	contents := fmt.Sprintf("#!/bin/sh\ncat <&3 >/dev/null\nprintf '%%s\\n' '%s' >&5\ncat <&4 >/dev/null\n", fmt.Sprintf(`{"type":"ready","sessionId":%q,"ready":{"socketPath":%q}}`, bootstrap.SessionID, bootstrap.SocketPath))
+	contents := fmt.Sprintf("#!/bin/sh\ncat <&3 >/dev/null\nprintf '%%s\\n' '%s' '%s' >&5\ncat <&4 >/dev/null\n", ownershipRecord(t, bootstrap), fmt.Sprintf(`{"type":"ready","sessionId":%q,"ready":{"socketPath":%q}}`, bootstrap.SessionID, bootstrap.SocketPath))
 	if err := os.WriteFile(script, []byte(contents), 0o700); err != nil {
 		t.Fatal(err)
 	}
@@ -235,7 +250,7 @@ func TestSuccessfulTerminalReportRemainsProvisionalUntilRealProcessExit(t *testi
 	script := filepath.Join(t.TempDir(), "helper.sh")
 	ready := fmt.Sprintf(`{"type":"ready","sessionId":%q,"ready":{"socketPath":%q}}`, bootstrap.SessionID, bootstrap.SocketPath)
 	terminal := fmt.Sprintf(`{"type":"read","sessionId":%q,"read":{"kind":"read","workerType":"reviewer","sessionId":%q,"output":"done"}}`, bootstrap.SessionID, bootstrap.SessionID)
-	contents := fmt.Sprintf("#!/bin/sh\ncat <&3 >/dev/null\nprintf '%%s\\n' '%s' >&5\nprintf '%%s\\n' '%s' >&5\nsleep 0.2\n", ready, terminal)
+	contents := fmt.Sprintf("#!/bin/sh\ncat <&3 >/dev/null\nprintf '%%s\\n' '%s' '%s' '%s' >&5\nsleep 0.2\n", ownershipRecord(t, bootstrap), ready, terminal)
 	if err := os.WriteFile(script, []byte(contents), 0o700); err != nil {
 		t.Fatal(err)
 	}
@@ -272,7 +287,7 @@ func TestRealProcessGroupEscalatesFromDeadlineThroughTermToKill(t *testing.T) {
 	grandchildPID := filepath.Join(t.TempDir(), "grandchild.pid")
 	script := filepath.Join(t.TempDir(), "helper.sh")
 	ready := fmt.Sprintf(`{"type":"ready","sessionId":%q,"ready":{"socketPath":%q}}`, bootstrap.SessionID, bootstrap.SocketPath)
-	contents := fmt.Sprintf("#!/bin/sh\ntrap '' TERM\ncat <&3 >/dev/null\nprintf '%%s\\n' '%s' >&5\n(sh -c 'trap \"\" TERM; while :; do sleep 1; done') &\necho $! > '%s'\ncat <&4 >/dev/null &\nwait\n", ready, grandchildPID)
+	contents := fmt.Sprintf("#!/bin/sh\ntrap '' TERM\ncat <&3 >/dev/null\nprintf '%%s\\n' '%s' '%s' >&5\n(sh -c 'trap \"\" TERM; while :; do sleep 1; done') &\necho $! > '%s'\ncat <&4 >/dev/null &\nwait\n", ownershipRecord(t, bootstrap), ready, grandchildPID)
 	if err := os.WriteFile(script, []byte(contents), 0o700); err != nil {
 		t.Fatal(err)
 	}

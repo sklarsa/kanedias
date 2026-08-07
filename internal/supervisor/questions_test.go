@@ -227,3 +227,24 @@ func questionIDForFixture(name string) string {
 		return "uuid-4"
 	}
 }
+
+func TestQuestionStoreExpiresPiTimeoutAndCanCancelGenerationDialogs(t *testing.T) {
+	store := NewQuestionStore(nil)
+	retained, err := store.Retain(json.RawMessage(`{"type":"extension_ui_request","id":"timed","method":"input","title":"value","timeout":5}`))
+	if err != nil || !retained {
+		t.Fatalf("Retain() = %v, %v", retained, err)
+	}
+	waitFor(t, func() bool { return len(store.Summaries()) == 0 }, "question timeout expiry")
+	retained, err = store.Retain(json.RawMessage(`{"type":"extension_ui_request","id":"aborted","method":"confirm","title":"continue?"}`))
+	if err != nil || !retained {
+		t.Fatalf("Retain() = %v, %v", retained, err)
+	}
+	store.CancelPending()
+	if got := store.Summaries(); len(got) != 0 {
+		t.Fatalf("pending after cancellation = %#v", got)
+	}
+	retained, err = store.Retain(json.RawMessage(`{"type":"extension_ui_request","id":"next","method":"input","title":"next"}`))
+	if err != nil || !retained {
+		t.Fatalf("store did not accept next generation: %v, %v", retained, err)
+	}
+}

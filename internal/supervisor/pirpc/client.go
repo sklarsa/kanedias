@@ -38,9 +38,10 @@ type callResult struct {
 }
 
 type Client struct {
-	conn   io.ReadWriteCloser
-	events chan Event
-	done   chan struct{}
+	conn     io.ReadWriteCloser
+	events   chan Event
+	done     chan struct{}
+	readDone chan struct{}
 
 	writeGate chan struct{}
 	mu        sync.Mutex
@@ -54,6 +55,7 @@ func NewClient(conn io.ReadWriteCloser) *Client {
 		conn:      conn,
 		events:    make(chan Event, 128),
 		done:      make(chan struct{}),
+		readDone:  make(chan struct{}),
 		writeGate: make(chan struct{}, 1),
 		pending:   make(map[string]chan callResult),
 	}
@@ -153,10 +155,14 @@ func (client *Client) Err() error {
 }
 
 func (client *Client) Close() error {
-	return client.terminate(io.ErrClosedPipe)
+	err := client.terminate(io.ErrClosedPipe)
+	<-client.readDone
+	return err
 }
 
 func (client *Client) readLoop() {
+	defer close(client.events)
+	defer close(client.readDone)
 	reader := bufio.NewReaderSize(client.conn, MaxRecordBytes+1)
 	var sequence uint64
 	for {
@@ -231,7 +237,27 @@ func (client *Client) write(ctx context.Context, record []byte) error {
 	wire := make([]byte, 0, len(record)+1)
 	wire = append(wire, record...)
 	wire = append(wire, '\n')
+	writeDone := make(chan struct{})
+	go func() {
+		select {
+		case <-ctx.Done():
+			// Give a concurrently returning Write one scheduler turn to publish
+			// completion. If it remains active, the record outcome is ambiguous.
+			grace := time.NewTimer(5 * time.Millisecond)
+			select {
+			case <-writeDone:
+				grace.Stop()
+				return
+			case <-grace.C:
+			}
+			// Once a record write has started its completion is ambiguous. Closing
+			// the entire RPC transport is the only safe cancellation boundary.
+			client.terminate(ctx.Err())
+		case <-writeDone:
+		}
+	}()
 	written, err := client.conn.Write(wire)
+	close(writeDone)
 	if err != nil {
 		return err
 	}

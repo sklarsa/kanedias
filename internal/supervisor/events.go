@@ -8,6 +8,9 @@ import (
 const (
 	DefaultEventRingCapacity         = 4_096
 	DefaultSubscriberMailboxCapacity = 128
+	// The record cap remains useful for normal small events; this conservative
+	// aggregate cap prevents a ring of maximum-size Pi records consuming GiBs.
+	DefaultEventRingByteCapacity = 16 << 20
 )
 
 type EventEnvelope struct {
@@ -22,19 +25,23 @@ type Subscription struct {
 	Replay []EventEnvelope
 	Events <-chan EventEnvelope
 	Close  func()
+	Err    func() error
 }
 
 type EventBroker struct {
-	publishMu sync.Mutex
-	mu        sync.Mutex
-	ring      []EventEnvelope
-	ringCap   int
-	mailCap   int
-	nextSeq   uint64
-	sourceSeq map[string]uint64
-	nextSubID uint64
-	subs      map[uint64]*eventMailbox
-	closed    bool
+	publishMu   sync.Mutex
+	mu          sync.Mutex
+	ring        []EventEnvelope
+	ringCap     int
+	ringBytes   int
+	byteCap     int
+	mailCap     int
+	nextSeq     uint64
+	sourceSeq   map[string]uint64
+	nextSubID   uint64
+	subs        map[uint64]*eventMailbox
+	cloneReplay func([]EventEnvelope) []EventEnvelope
+	closed      bool
 }
 
 type eventMailbox struct {
@@ -49,21 +56,30 @@ type eventSubscriber struct {
 }
 
 func NewEventBroker() *EventBroker {
-	return newEventBroker(DefaultEventRingCapacity, DefaultSubscriberMailboxCapacity)
+	return newEventBrokerWithByteCapacity(DefaultEventRingCapacity, DefaultSubscriberMailboxCapacity, DefaultEventRingByteCapacity)
 }
 
 func newEventBroker(ringCapacity, mailboxCapacity int) *EventBroker {
+	return newEventBrokerWithByteCapacity(ringCapacity, mailboxCapacity, DefaultEventRingByteCapacity)
+}
+
+func newEventBrokerWithByteCapacity(ringCapacity, mailboxCapacity, byteCapacity int) *EventBroker {
 	if ringCapacity < 0 {
 		ringCapacity = 0
 	}
 	if mailboxCapacity < 0 {
 		mailboxCapacity = 0
 	}
+	if byteCapacity < 0 {
+		byteCapacity = 0
+	}
 	return &EventBroker{
-		ringCap:   ringCapacity,
-		mailCap:   mailboxCapacity,
-		sourceSeq: make(map[string]uint64),
-		subs:      make(map[uint64]*eventMailbox),
+		ringCap:     ringCapacity,
+		byteCap:     byteCapacity,
+		mailCap:     mailboxCapacity,
+		sourceSeq:   make(map[string]uint64),
+		subs:        make(map[uint64]*eventMailbox),
+		cloneReplay: cloneEnvelopes,
 	}
 }
 
@@ -128,8 +144,10 @@ func (broker *EventBroker) Subscribe() Subscription {
 	mailbox := &eventMailbox{events: make(chan EventEnvelope, broker.mailCap)}
 	broker.subs[id] = mailbox
 	broker.mu.Unlock()
-	replay := cloneEnvelopes(replaySnapshot)
 	broker.publishMu.Unlock()
+	// Ring payloads are immutable after retention, so the expensive deep copy
+	// is safe after releasing both publication/state locks.
+	replay := broker.cloneReplay(replaySnapshot)
 
 	var once sync.Once
 	return Subscription{
@@ -170,15 +188,31 @@ func (broker *EventBroker) Close() {
 func (broker *EventBroker) retainLocked(event EventEnvelope) EventEnvelope {
 	broker.nextSeq++
 	event.Seq = broker.nextSeq
-	if broker.ringCap > 0 {
-		if len(broker.ring) == broker.ringCap {
-			copy(broker.ring, broker.ring[1:])
-			broker.ring[len(broker.ring)-1] = event
-		} else {
-			broker.ring = append(broker.ring, event)
+	if broker.ringCap > 0 && broker.byteCap > 0 {
+		broker.ring = append(broker.ring, event)
+		broker.ringBytes += retainedEventBytes(event)
+		for len(broker.ring) > broker.ringCap || broker.ringBytes > broker.byteCap {
+			broker.ringBytes -= retainedEventBytes(broker.ring[0])
+			broker.ring[0] = EventEnvelope{}
+			broker.ring = broker.ring[1:]
 		}
 	}
 	return event
+}
+
+func retainedEventBytes(event EventEnvelope) int {
+	return len(event.SessionID) + len(event.Kind) + len(event.Payload) + 24
+}
+
+// SourceBoundary returns the last published source sequence at a cut ordered
+// against publication. Consumers can ignore retained/pre-generation records.
+func (broker *EventBroker) SourceBoundary(sessionID string) uint64 {
+	broker.publishMu.Lock()
+	broker.mu.Lock()
+	sequence := broker.sourceSeq[sessionID]
+	broker.mu.Unlock()
+	broker.publishMu.Unlock()
+	return sequence
 }
 
 func (broker *EventBroker) subscribersLocked() []eventSubscriber {

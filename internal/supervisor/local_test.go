@@ -169,6 +169,13 @@ func TestLocalSessionDelayedPromptResponseCannotOverwriteLaterSettlement(t *test
 		want     LifecycleState
 	}{
 		{name: "root", identity: rootIdentity, want: LifecycleReady},
+		{name: "reader", identity: func(t *testing.T) Identity {
+			identity, err := NewIdentity(IdentitySpec{SessionID: "reader-1", ParentID: "root-1", RootID: "root-1", Kind: contract.ChildKindRead, Context: contract.ContextFresh, Worker: "reviewer"})
+			if err != nil {
+				t.Fatal(err)
+			}
+			return identity
+		}, want: LifecycleCompleted},
 		{name: "writer", identity: writerIdentity, want: LifecycleAwaitingHandoff},
 	} {
 		t.Run(test.name, func(t *testing.T) {

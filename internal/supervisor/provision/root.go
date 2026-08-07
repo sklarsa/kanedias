@@ -192,8 +192,15 @@ func (provisioner *IncusRootProvisioner) ProvisionRoot(ctx context.Context, requ
 	rootVolumePut := rootVolume.Writable()
 	rootVolumePut.Config = copyConfig(rootVolumePut.Config)
 	rootVolumePut.Config[metaSessionID] = request.SessionID
+	rootVolumePut.Config[metaParentID] = ""
+	rootVolumePut.Config[metaRootID] = request.SessionID
 	rootVolumePut.Config[metaKind] = string(contract.ChildKindRoot)
+	rootVolumePut.Config[metaContext] = string(contract.ContextRoot)
+	rootVolumePut.Config[metaWorker] = ""
 	rootVolumePut.Config[metaVolume] = volume
+	if request.RunAttribution != "" {
+		rootVolumePut.Config[metaRun] = request.RunAttribution
+	}
 	if err := client.UpdateStorageVolume(ctx, pool, volume, rootVolumePut, rootVolumeETag); err != nil {
 		return nil, fmt.Errorf("write root volume metadata: %w", err)
 	}
@@ -203,8 +210,12 @@ func (provisioner *IncusRootProvisioner) ProvisionRoot(ctx context.Context, requ
 		InstancePut: api.InstancePut{
 			Profiles: []string{"default", rootSandboxProfile},
 			Config: map[string]string{
-				"user.kanedias.kind":                     "root",
-				"user.kanedias.session_id":               request.SessionID,
+				metaKind:                                 "root",
+				metaContext:                              string(contract.ContextRoot),
+				metaSessionID:                            request.SessionID,
+				metaParentID:                             "",
+				metaRootID:                               request.SessionID,
+				metaWorker:                               "",
 				"user.kanedias.rpc.port":                 rootRPCPort,
 				"user.kanedias.workspace_volume":         volume,
 				"environment.KANEDIAS_SESSION_ID":        request.SessionID,
@@ -228,6 +239,10 @@ func (provisioner *IncusRootProvisioner) ProvisionRoot(ctx context.Context, requ
 			},
 		},
 		Source: api.InstanceSource{Type: "image", Alias: provisioner.config.BaseImage.Name},
+	}
+	if request.RunAttribution != "" {
+		instanceRequest.Config[metaRun] = request.RunAttribution
+		instanceRequest.Config["environment.KANEDIAS_E2E_RUN_ID"] = request.RunAttribution
 	}
 	if err = client.CreateInstance(ctx, instanceRequest); err != nil {
 		owned.instanceOwned = provisioner.deps.operationWasSubmitted(err)
