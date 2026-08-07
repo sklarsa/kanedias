@@ -17,7 +17,7 @@ import (
 
 const MaxRecordBytes = 4 << 20
 
-var ErrForbiddenCommand = errors.New("Pi RPC command would replace the bound session")
+var ErrForbiddenCommand = errors.New("command would replace the bound Pi RPC session")
 
 var (
 	processIDPrefix = newProcessIDPrefix()
@@ -106,7 +106,7 @@ func (client *Client) CallWithSequence(ctx context.Context, command json.RawMess
 		if ctxErr := ctx.Err(); ctxErr != nil {
 			return nil, 0, ctxErr
 		}
-		client.terminate(fmt.Errorf("write Pi RPC command: %w", err))
+		_ = client.terminate(fmt.Errorf("write Pi RPC command: %w", err))
 		return nil, 0, err
 	}
 
@@ -138,7 +138,7 @@ func (client *Client) Send(ctx context.Context, command json.RawMessage) error {
 		if ctxErr := ctx.Err(); ctxErr != nil {
 			return ctxErr
 		}
-		client.terminate(fmt.Errorf("write Pi RPC command: %w", err))
+		_ = client.terminate(fmt.Errorf("write Pi RPC command: %w", err))
 		return err
 	}
 	return nil
@@ -170,17 +170,17 @@ func (client *Client) readLoop() {
 		if err != nil {
 			switch {
 			case errors.Is(err, bufio.ErrBufferFull):
-				client.terminate(fmt.Errorf("Pi RPC record exceeds %d bytes", MaxRecordBytes))
+				_ = client.terminate(fmt.Errorf("record exceeds %d bytes on the Pi RPC transport", MaxRecordBytes))
 			case errors.Is(err, io.EOF) && len(record) != 0:
-				client.terminate(fmt.Errorf("read Pi RPC record: partial record before EOF"))
+				_ = client.terminate(fmt.Errorf("read Pi RPC record: partial record before EOF"))
 			default:
-				client.terminate(err)
+				_ = client.terminate(err)
 			}
 			return
 		}
 		record = record[:len(record)-1]
 		if len(record) > MaxRecordBytes {
-			client.terminate(fmt.Errorf("Pi RPC record exceeds %d bytes", MaxRecordBytes))
+			_ = client.terminate(fmt.Errorf("record exceeds %d bytes on the Pi RPC transport", MaxRecordBytes))
 			return
 		}
 
@@ -189,7 +189,7 @@ func (client *Client) readLoop() {
 			Type string `json:"type"`
 		}
 		if err := json.Unmarshal(record, &envelope); err != nil {
-			client.terminate(fmt.Errorf("decode RPC record: %w", err))
+			_ = client.terminate(fmt.Errorf("decode RPC record: %w", err))
 			return
 		}
 		sequence++
@@ -252,7 +252,7 @@ func (client *Client) write(ctx context.Context, record []byte) error {
 			}
 			// Once a record write has started its completion is ambiguous. Closing
 			// the entire RPC transport is the only safe cancellation boundary.
-			client.terminate(ctx.Err())
+			_ = client.terminate(ctx.Err())
 		case <-writeDone:
 		}
 	}()

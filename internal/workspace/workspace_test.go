@@ -282,8 +282,10 @@ func TestSyncEmptyRepositoriesEnsuresSeedAndWarns(t *testing.T) {
 	}
 }
 
+type workspaceTestCtxKey struct{}
+
 func TestSyncRetriesSystemdBeforeCAAndDNSAndDestructiveRefresh(t *testing.T) {
-	ctx := context.WithValue(context.Background(), struct{}{}, "request")
+	ctx := context.WithValue(context.Background(), workspaceTestCtxKey{}, "request")
 	fake := &fakeClient{
 		requestCtx: ctx,
 		systemdResponses: []workspaceExecResponse{

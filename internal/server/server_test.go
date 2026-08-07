@@ -67,6 +67,7 @@ func TestRunRejectsNilContext(t *testing.T) {
 		return nil, errors.New("unexpected listen")
 	}
 
+	//nolint:staticcheck // SA1012: intentionally passing a nil context to verify run rejects it.
 	err := run(nil, Options{ListenAddress: "127.0.0.1:0", Logger: logger}, http.NotFoundHandler(), listen, time.Millisecond)
 	if err == nil || !strings.Contains(err.Error(), "context") {
 		t.Fatalf("run(nil, ...) error = %v, want context error", err)
@@ -75,6 +76,7 @@ func TestRunRejectsNilContext(t *testing.T) {
 		t.Fatal("run(nil, ...) called listen")
 	}
 
+	//nolint:staticcheck // SA1012: intentionally passing a nil context to verify Run rejects it.
 	err = Run(nil, Options{ListenAddress: "127.0.0.1:0", Logger: logger})
 	if err == nil || !strings.Contains(err.Error(), "context") {
 		t.Fatalf("Run(nil, ...) error = %v, want context error", err)
@@ -225,7 +227,7 @@ func TestRunServesAndGracefullyStopsOnContextCancellation(t *testing.T) {
 	if err != nil {
 		t.Fatalf("GET served endpoint: %v", err)
 	}
-	response.Body.Close()
+	_ = response.Body.Close()
 	if response.StatusCode != http.StatusNoContent {
 		t.Fatalf("GET status = %d, want %d", response.StatusCode, http.StatusNoContent)
 	}
@@ -372,7 +374,7 @@ func TestRunReturnsShutdownError(t *testing.T) {
 	go func() {
 		response, err := (&http.Client{Timeout: time.Second}).Get("http://" + effectiveAddress)
 		if response != nil {
-			response.Body.Close()
+			_ = response.Body.Close()
 		}
 		requestResult <- err
 	}()

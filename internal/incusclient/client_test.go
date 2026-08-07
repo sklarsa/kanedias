@@ -189,8 +189,10 @@ func (o *fakeOperation) Get() api.Operation {
 	return o.operation
 }
 
+type clientTestCtxKey struct{}
+
 func TestWaitOperationPassesContext(t *testing.T) {
-	key := struct{}{}
+	key := clientTestCtxKey{}
 	ctx := context.WithValue(context.Background(), key, "value")
 	op := &fakeOperation{}
 	if err := waitOperation(ctx, op); err != nil {

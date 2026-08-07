@@ -63,8 +63,10 @@ type completedRemoteOperation struct {
 func (completedRemoteOperation) Wait() error         { return nil }
 func (completedRemoteOperation) CancelTarget() error { return nil }
 
+type instanceTestCtxKey struct{}
+
 func TestCopyInstanceUsesStoppedInstanceOnlyPullClone(t *testing.T) {
-	ctx := context.WithValue(context.Background(), struct{}{}, "copy-context")
+	ctx := context.WithValue(context.Background(), instanceTestCtxKey{}, "copy-context")
 	server := &copyInstanceServer{
 		source:    &api.Instance{Name: "parent"},
 		operation: completedRemoteOperation{},

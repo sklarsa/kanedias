@@ -311,8 +311,10 @@ func TestServerCommandRejectsUnsafeListenAddressBeforeDelegation(t *testing.T) {
 	}
 }
 
+type serverCommandTestCtxKey struct{}
+
 func TestServerCommandDelegates(t *testing.T) {
-	ctx := context.WithValue(context.Background(), struct{}{}, "server context")
+	ctx := context.WithValue(context.Background(), serverCommandTestCtxKey{}, "server context")
 	runErr := errors.New("run server sentinel")
 	var stderr bytes.Buffer
 	calls := 0

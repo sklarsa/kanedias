@@ -302,7 +302,7 @@ func startOrderingPiPeer(peer net.Conn) <-chan struct{} {
 	done := make(chan struct{})
 	go func() {
 		defer close(done)
-		defer peer.Close()
+		defer func() { _ = peer.Close() }()
 		reader := bufio.NewReader(peer)
 		for {
 			line, err := reader.ReadBytes('\n')

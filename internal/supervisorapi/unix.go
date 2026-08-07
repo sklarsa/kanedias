@@ -33,13 +33,13 @@ type UnixServer struct {
 // therefore provision a guest proxy only after the host endpoint is live.
 func StartUnix(path string, handler http.Handler) (*UnixServer, error) {
 	if path == "" || !filepath.IsAbs(path) {
-		return nil, fmt.Errorf("Unix socket path must be absolute")
+		return nil, fmt.Errorf("socket path must be absolute for the Unix listener")
 	}
 	if handler == nil {
-		return nil, fmt.Errorf("Unix socket handler is required")
+		return nil, fmt.Errorf("handler is required for the Unix listener")
 	}
 	if len(path) >= len(syscall.RawSockaddrUnix{}.Path) {
-		return nil, fmt.Errorf("Unix socket path %q exceeds platform address bound", path)
+		return nil, fmt.Errorf("socket path %q exceeds the platform address bound for the Unix listener", path)
 	}
 	if err := prepareUnixPath(path); err != nil {
 		return nil, err
@@ -205,7 +205,7 @@ func prepareUnixPath(path string) error {
 	connection, dialErr := net.DialTimeout("unix", path, 100*time.Millisecond)
 	if dialErr == nil {
 		_ = connection.Close()
-		return fmt.Errorf("Unix socket %q is already accepting connections", path)
+		return fmt.Errorf("socket %q is already accepting connections on the Unix listener", path)
 	}
 	if !errors.Is(dialErr, syscall.ECONNREFUSED) && !errors.Is(dialErr, os.ErrNotExist) {
 		return fmt.Errorf("refuse to replace unverifiably stale Unix socket %q: %w", path, dialErr)

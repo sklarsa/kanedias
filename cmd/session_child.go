@@ -1,9 +1,6 @@
 package cmd
 
 import (
-	"context"
-
-	"github.com/sklarsa/kanedias/internal/supervisor/contract"
 	"github.com/sklarsa/kanedias/internal/supervisor/process"
 	"github.com/spf13/cobra"
 )
@@ -26,8 +23,4 @@ func newSessionChildCommand(runner process.ChildRunner) *cobra.Command {
 	command.Flags().IntVar(&reportFD, "report-fd", process.ReportFD, "inherited child-report descriptor")
 	command.Flags().IntVar(&terminalAckFD, "terminal-ack-fd", process.TerminalAckFD, "inherited parent terminal-ack descriptor")
 	return command
-}
-
-func unsupportedChildRunner(context.Context, process.Bootstrap, *process.Reporter) error {
-	return contract.NewError(contract.ErrorInternal, "child supervisor runtime is not available in this delivery stage")
 }

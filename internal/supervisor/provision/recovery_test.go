@@ -101,7 +101,7 @@ func TestDirectParentRecoveryRefusesWrongMetadataAndReplacementSocket(t *testing
 	if err != nil {
 		t.Fatal(err)
 	}
-	defer replacement.Close()
+	defer func() { _ = replacement.Close() }()
 	fake.instance.Config[metaParentID] = ticket.ParentID
 	if err := recoverer.RecoverDirectChild(context.Background(), ticket); err == nil || !strings.Contains(err.Error(), "replacement") {
 		t.Fatalf("replacement socket error = %v", err)

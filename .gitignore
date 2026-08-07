@@ -1,3 +1,4 @@
 .pi-subagents
 .worktrees
 config.toml
+bin/

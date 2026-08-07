@@ -59,8 +59,8 @@ func TestProtocolMarshalsExactExtensionUIResponses(t *testing.T) {
 func TestClientCorrelatesOutOfOrderResponses(t *testing.T) {
 	clientConn, peer := net.Pipe()
 	client := NewClient(clientConn)
-	defer client.Close()
-	defer peer.Close()
+	defer func() { _ = client.Close() }()
+	defer func() { _ = peer.Close() }()
 
 	stateResult := make(chan rpcCallResult, 1)
 	messagesResult := make(chan rpcCallResult, 1)
@@ -111,8 +111,8 @@ func TestClientCorrelatesOutOfOrderResponses(t *testing.T) {
 func TestClientDrainsEventBeforeFirstCommand(t *testing.T) {
 	clientConn, peer := net.Pipe()
 	client := NewClient(clientConn)
-	defer client.Close()
-	defer peer.Close()
+	defer func() { _ = client.Close() }()
+	defer func() { _ = peer.Close() }()
 
 	eventWritten := make(chan error, 1)
 	go func() {
@@ -151,8 +151,8 @@ func TestClientDrainsEventBeforeFirstCommand(t *testing.T) {
 func TestClientReplacesCallerID(t *testing.T) {
 	clientConn, peer := net.Pipe()
 	client := NewClient(clientConn)
-	defer client.Close()
-	defer peer.Close()
+	defer func() { _ = client.Close() }()
+	defer func() { _ = peer.Close() }()
 
 	done := make(chan error, 1)
 	go func() {
@@ -173,8 +173,8 @@ func TestClientSerializesConcurrentWrites(t *testing.T) {
 	clientConn, peer := net.Pipe()
 	probe := &concurrentWriteProbe{ReadWriteCloser: clientConn}
 	client := NewClient(probe)
-	defer client.Close()
-	defer peer.Close()
+	defer func() { _ = client.Close() }()
+	defer func() { _ = peer.Close() }()
 
 	const writes = 32
 	readDone := make(chan error, 1)
@@ -216,8 +216,8 @@ func TestClientSerializesConcurrentWrites(t *testing.T) {
 func TestClientCancellationRemovesPendingCall(t *testing.T) {
 	clientConn, peer := net.Pipe()
 	client := NewClient(clientConn)
-	defer client.Close()
-	defer peer.Close()
+	defer func() { _ = client.Close() }()
+	defer func() { _ = peer.Close() }()
 
 	ctx, cancel := context.WithCancel(context.Background())
 	done := make(chan error, 1)
@@ -250,8 +250,8 @@ func TestClientCancellationWhileWriteQueuedKeepsTransport(t *testing.T) {
 		release:         make(chan struct{}),
 	}
 	client := NewClient(probe)
-	defer client.Close()
-	defer peer.Close()
+	defer func() { _ = client.Close() }()
+	defer func() { _ = peer.Close() }()
 
 	firstDone := make(chan error, 1)
 	go func() {
@@ -304,7 +304,7 @@ func TestClientCancellationWhileWriteQueuedKeepsTransport(t *testing.T) {
 func TestClientEOFFailsEveryPendingCall(t *testing.T) {
 	clientConn, peer := net.Pipe()
 	client := NewClient(clientConn)
-	defer client.Close()
+	defer func() { _ = client.Close() }()
 
 	errs := make(chan error, 2)
 	for range 2 {
@@ -356,7 +356,7 @@ func TestClientRejectsPartialMalformedAndOversizedRecords(t *testing.T) {
 			case <-time.After(3 * time.Second):
 				t.Fatal("client did not terminate")
 			}
-			_ = <-writeDone
+			<-writeDone
 			if err := client.Err(); err == nil || !strings.Contains(err.Error(), tt.want) {
 				t.Fatalf("Err() = %v, want containing %q", err, tt.want)
 			}
@@ -368,8 +368,8 @@ func TestClientRejectsPartialMalformedAndOversizedRecords(t *testing.T) {
 func TestClientKeepsReadingAfterAgentSettled(t *testing.T) {
 	clientConn, peer := net.Pipe()
 	client := NewClient(clientConn)
-	defer client.Close()
-	defer peer.Close()
+	defer func() { _ = client.Close() }()
+	defer func() { _ = peer.Close() }()
 
 	writeJSONLineAsync(t, peer, `{"type":"agent_settled"}`)
 	select {
@@ -398,8 +398,8 @@ func TestClientRejectsSessionReplacementWithoutWriting(t *testing.T) {
 		t.Run(commandType, func(t *testing.T) {
 			clientConn, peer := net.Pipe()
 			client := NewClient(clientConn)
-			defer client.Close()
-			defer peer.Close()
+			defer func() { _ = client.Close() }()
+			defer func() { _ = peer.Close() }()
 			if err := peer.SetReadDeadline(time.Now().Add(50 * time.Millisecond)); err != nil {
 				t.Fatal(err)
 			}
@@ -423,8 +423,8 @@ func TestClientSendRejectsSessionReplacementWithoutWriting(t *testing.T) {
 		t.Run(commandType, func(t *testing.T) {
 			clientConn, peer := net.Pipe()
 			client := NewClient(clientConn)
-			defer client.Close()
-			defer peer.Close()
+			defer func() { _ = client.Close() }()
+			defer func() { _ = peer.Close() }()
 			if err := peer.SetReadDeadline(time.Now().Add(50 * time.Millisecond)); err != nil {
 				t.Fatal(err)
 			}
@@ -463,7 +463,7 @@ func TestClientCloseClosesUnderlyingConnectionExactlyOnce(t *testing.T) {
 			clientConn, peer := net.Pipe()
 			probe := &closeResultProbe{ReadWriteCloser: clientConn, results: tt.closeErrs}
 			client := NewClient(probe)
-			defer peer.Close()
+			defer func() { _ = peer.Close() }()
 
 			err := client.Close()
 			if !errors.Is(err, tt.wantErr) {
@@ -479,7 +479,7 @@ func TestClientCloseClosesUnderlyingConnectionExactlyOnce(t *testing.T) {
 func TestClientCloseUnblocksEventBackpressure(t *testing.T) {
 	clientConn, peer := net.Pipe()
 	client := NewClient(clientConn)
-	defer peer.Close()
+	defer func() { _ = peer.Close() }()
 
 	writeDone := make(chan error, 1)
 	go func() {
@@ -510,8 +510,8 @@ func TestClientCloseUnblocksEventBackpressure(t *testing.T) {
 func TestClientSendWritesExtensionUIResponseWithoutWaiting(t *testing.T) {
 	clientConn, peer := net.Pipe()
 	client := NewClient(clientConn)
-	defer client.Close()
-	defer peer.Close()
+	defer func() { _ = client.Close() }()
+	defer func() { _ = peer.Close() }()
 
 	const response = `{"type":"extension_ui_response","id":"uuid-1","value":"Allow"}`
 	done := make(chan error, 1)

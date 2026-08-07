@@ -276,12 +276,6 @@ func (session *LocalSession) handleRPCTermination() {
 	}
 }
 
-func (session *LocalSession) markRunning() {
-	session.activityMu.Lock()
-	defer session.activityMu.Unlock()
-	session.markRunningLocked()
-}
-
 func (session *LocalSession) markRunningLocked() {
 	switch session.lifecycle.State() {
 	case LifecycleReady, LifecycleAwaitingHandoff:
@@ -373,7 +367,7 @@ func decodeGetState(raw json.RawMessage) (pirpc.GetStateResponse, error) {
 		return state, invariantf("unexpected get_state response type %q command %q", state.Type, state.Command)
 	}
 	if !state.Success {
-		return state, fmt.Errorf("Pi get_state failed: %s", state.Error)
+		return state, fmt.Errorf("get_state failed on Pi: %s", state.Error)
 	}
 	return state, nil
 }

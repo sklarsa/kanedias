@@ -106,7 +106,7 @@ func syncWithDependencies(ctx context.Context, cfg config.Config, stdout, stderr
 		return err
 	}
 	if len(repositories) == 0 {
-		fmt.Fprintln(stderr, "warning: no repositories configured; workspace seed volume is ready")
+		_, _ = fmt.Fprintln(stderr, "warning: no repositories configured; workspace seed volume is ready")
 		return nil
 	}
 

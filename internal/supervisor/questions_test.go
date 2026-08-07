@@ -81,8 +81,8 @@ func TestQuestionStoreSendsExactResponsesAndConsumesOnce(t *testing.T) {
 		t.Run(tt.name, func(t *testing.T) {
 			clientConn, peerConn := net.Pipe()
 			rpc := pirpc.NewClient(clientConn)
-			defer rpc.Close()
-			defer peerConn.Close()
+			defer func() { _ = rpc.Close() }()
+			defer func() { _ = peerConn.Close() }()
 			store := NewQuestionStore(rpc)
 			if retained, err := store.Retain(readQuestionFixture(t, tt.fixture)); err != nil || !retained {
 				t.Fatalf("Retain() = (%v, %v), want (true, nil)", retained, err)
@@ -117,8 +117,8 @@ func TestQuestionStoreSendsExactResponsesAndConsumesOnce(t *testing.T) {
 func TestQuestionStoreRejectsConcurrentSecondAnswerWhileFirstSendIsPending(t *testing.T) {
 	clientConn, peerConn := net.Pipe()
 	rpc := pirpc.NewClient(clientConn)
-	defer rpc.Close()
-	defer peerConn.Close()
+	defer func() { _ = rpc.Close() }()
+	defer func() { _ = peerConn.Close() }()
 	store := NewQuestionStore(rpc)
 	if retained, err := store.Retain(readQuestionFixture(t, "pi-select.json")); err != nil || !retained {
 		t.Fatalf("Retain() = (%v, %v), want (true, nil)", retained, err)
@@ -177,8 +177,8 @@ func TestQuestionStoreRejectsAnswersThatDoNotMatchDialogMethod(t *testing.T) {
 func TestQuestionStoreRestoresPendingQuestionWhenPiSendFails(t *testing.T) {
 	clientConn, peerConn := net.Pipe()
 	rpc := pirpc.NewClient(clientConn)
-	peerConn.Close()
-	defer rpc.Close()
+	_ = peerConn.Close()
+	defer func() { _ = rpc.Close() }()
 
 	store := NewQuestionStore(rpc)
 	if retained, err := store.Retain(readQuestionFixture(t, "pi-select.json")); err != nil || !retained {

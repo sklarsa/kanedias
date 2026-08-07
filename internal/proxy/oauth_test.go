@@ -318,7 +318,7 @@ func readJSONFile(t *testing.T, path string, value any) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	defer file.Close()
+	defer func() { _ = file.Close() }()
 	if err := json.NewDecoder(file).Decode(value); err != nil && err != io.EOF {
 		t.Fatal(err)
 	}

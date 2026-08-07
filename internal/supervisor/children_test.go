@@ -510,7 +510,7 @@ func TestCleanupChildNeverUnlinksChildOwnedReplacementSocket(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	defer replacement.Close()
+	defer func() { _ = replacement.Close() }()
 	child := newFakeChildProcess()
 	child.finish()
 	node := childCreationNode(t, nil, nil)
