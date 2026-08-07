@@ -1,0 +1,8 @@
+{
+  "type": "extension_ui_request",
+  "id": "uuid-1",
+  "method": "select",
+  "title": "Allow dangerous command?",
+  "options": ["Allow", "Block"],
+  "timeout": 10000
+}

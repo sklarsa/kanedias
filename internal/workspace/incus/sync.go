@@ -43,12 +43,13 @@ type client interface {
 }
 
 type dependencies struct {
-	connect               func(context.Context) (client, error)
-	initCA                func() error
-	ensureNetwork         func(context.Context, client, config.Config) error
-	renderProfile         func(io.Writer, string, config.Config) error
-	newInstanceName       func() string
-	operationWasSubmitted func(error) bool
+	connect                 func(context.Context) (client, error)
+	initCA                  func() error
+	ensureNetwork           func(context.Context, client, config.Config) error
+	renderProfile           func(io.Writer, string, config.Config) error
+	newInstanceName         func() string
+	operationWasSubmitted   func(error) bool
+	awaitSubmittedOperation func(context.Context, error) error
 }
 
 func defaultDependencies() dependencies {
@@ -70,7 +71,8 @@ func defaultDependencies() dependencies {
 		newInstanceName: func() string {
 			return fmt.Sprintf("workspace-incus-sync-%d", time.Now().UnixNano())
 		},
-		operationWasSubmitted: incusclient.OperationWasSubmitted,
+		operationWasSubmitted:   incusclient.OperationWasSubmitted,
+		awaitSubmittedOperation: incusclient.AwaitSubmittedOperation,
 	}
 }
 
@@ -128,12 +130,17 @@ func syncWithDependencies(ctx context.Context, cfg config.Config, stdout, stderr
 	name := ""
 	instanceCreated := false
 	instanceRunning := false
+	var submittedErrors []error
 	defer func() {
 		cleanupCtx, cancel := context.WithTimeout(context.WithoutCancel(ctx), cleanupTimeout)
 		defer cancel()
 
+		result := err
+		for _, submittedErr := range submittedErrors {
+			result = errors.Join(result, deps.awaitSubmittedOperation(cleanupCtx, submittedErr))
+		}
 		cleanupErr := cleanupMaintenanceInstance(cleanupCtx, incus, name, instanceCreated, instanceRunning)
-		result := errors.Join(err, cleanupErr)
+		result = errors.Join(result, cleanupErr)
 		if result != nil && seedCreated {
 			result = errors.Join(result, incus.DeleteStorageVolume(cleanupCtx, pool, seed))
 		}
@@ -175,12 +182,18 @@ func syncWithDependencies(ctx context.Context, cfg config.Config, stdout, stderr
 	}
 	if createErr := incus.CreateInstance(ctx, request); createErr != nil {
 		instanceCreated = deps.operationWasSubmitted(createErr)
+		if instanceCreated {
+			submittedErrors = append(submittedErrors, createErr)
+		}
 		return createErr
 	}
 	instanceCreated = true
 
 	if startErr := incus.StartInstance(ctx, name); startErr != nil {
 		instanceRunning = deps.operationWasSubmitted(startErr)
+		if instanceRunning {
+			submittedErrors = append(submittedErrors, startErr)
+		}
 		return startErr
 	}
 	instanceRunning = true

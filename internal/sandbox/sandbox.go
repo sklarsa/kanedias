@@ -33,6 +33,7 @@ type lifecycleClient interface {
 	EnsureProfile(context.Context, string, []byte) error
 	GetStorageVolume(context.Context, string, string) (*api.StorageVolume, error)
 	CopyStorageVolume(context.Context, string, string, string) error
+	CopyStorageVolumeUntilTerminal(context.Context, string, string, string) error
 	DeleteStorageVolume(context.Context, string, string) error
 	GetInstance(context.Context, string) (*api.Instance, string, error)
 	CreateInstance(context.Context, api.InstancesPost) error
@@ -43,17 +44,18 @@ type lifecycleClient interface {
 }
 
 type dependencies struct {
-	connect               func(context.Context) (lifecycleClient, error)
-	acquireLock           func(string) (io.Closer, error)
-	defaultProxyOptions   func() (proxy.Options, error)
-	initCA                func(string, string) error
-	ensureNetwork         func(context.Context, lifecycleClient, config.Config) error
-	cloneIncusState       func(context.Context, incusworkspace.VolumeClient, string, string, string) (incusworkspace.CloneResult, error)
-	waitNestedIncus       func(context.Context, incusworkspace.Executor, string, time.Duration) error
-	verifyNestedIncus     func(context.Context, incusworkspace.Executor, string) error
-	operationWasSubmitted func(error) bool
-	readinessTimeout      time.Duration
-	readinessPollInterval time.Duration
+	connect                 func(context.Context) (lifecycleClient, error)
+	acquireLock             func(string) (io.Closer, error)
+	defaultProxyOptions     func() (proxy.Options, error)
+	initCA                  func(string, string) error
+	ensureNetwork           func(context.Context, lifecycleClient, config.Config) error
+	cloneIncusState         func(context.Context, incusworkspace.VolumeClient, string, string, string) (incusworkspace.CloneResult, error)
+	waitNestedIncus         func(context.Context, incusworkspace.Executor, string, time.Duration) error
+	verifyNestedIncus       func(context.Context, incusworkspace.Executor, string) error
+	operationWasSubmitted   func(error) bool
+	awaitSubmittedOperation func(context.Context, error) error
+	readinessTimeout        time.Duration
+	readinessPollInterval   time.Duration
 }
 
 func defaultDependencies() dependencies {
@@ -67,12 +69,13 @@ func defaultDependencies() dependencies {
 		ensureNetwork: func(ctx context.Context, client lifecycleClient, cfg config.Config) error {
 			return network.EnsureWithClient(ctx, client, cfg)
 		},
-		cloneIncusState:       incusworkspace.Clone,
-		waitNestedIncus:       incusworkspace.WaitReady,
-		verifyNestedIncus:     incusworkspace.VerifyNativeBtrfs,
-		operationWasSubmitted: incusclient.OperationWasSubmitted,
-		readinessTimeout:      60 * time.Second,
-		readinessPollInterval: time.Second,
+		cloneIncusState:         incusworkspace.Clone,
+		waitNestedIncus:         incusworkspace.WaitReady,
+		verifyNestedIncus:       incusworkspace.VerifyNativeBtrfs,
+		operationWasSubmitted:   incusclient.OperationWasSubmitted,
+		awaitSubmittedOperation: incusclient.AwaitSubmittedOperation,
+		readinessTimeout:        60 * time.Second,
+		readinessPollInterval:   time.Second,
 	}
 }
 
@@ -140,6 +143,7 @@ func create(ctx context.Context, cfg config.Config, name string, stdout, stderr 
 	incusVolumeCreated := false
 	instanceCreated := false
 	instanceRunning := false
+	var submittedErrors []error
 	defer func() {
 		if err == nil {
 			return
@@ -147,6 +151,9 @@ func create(ctx context.Context, cfg config.Config, name string, stdout, stderr 
 		cleanupCtx, cancel := context.WithTimeout(context.WithoutCancel(ctx), 30*time.Second)
 		defer cancel()
 		var cleanupErr error
+		for _, submittedErr := range submittedErrors {
+			cleanupErr = errors.Join(cleanupErr, deps.awaitSubmittedOperation(cleanupCtx, submittedErr))
+		}
 		if instanceCreated {
 			if instanceRunning {
 				fmt.Fprintf(stderr, "Stopping failed sandbox %s...\n", name)
@@ -179,6 +186,9 @@ func create(ctx context.Context, cfg config.Config, name string, stdout, stderr 
 	fmt.Fprintf(stdout, "Cloning workspace %s to %s...\n", seed, volume)
 	if copyErr := client.CopyStorageVolume(ctx, pool, seed, volume); copyErr != nil {
 		volumeCreated = deps.operationWasSubmitted(copyErr)
+		if volumeCreated {
+			submittedErrors = append(submittedErrors, copyErr)
+		}
 		return copyErr
 	}
 	volumeCreated = true
@@ -187,6 +197,9 @@ func create(ctx context.Context, cfg config.Config, name string, stdout, stderr 
 	clone, cloneErr := deps.cloneIncusState(ctx, client, pool, incusSeed, name)
 	incusVolumeCreated = clone.Created
 	if cloneErr != nil {
+		if deps.operationWasSubmitted(cloneErr) {
+			submittedErrors = append(submittedErrors, cloneErr)
+		}
 		return cloneErr
 	}
 
@@ -215,6 +228,7 @@ func create(ctx context.Context, cfg config.Config, name string, stdout, stderr 
 	if err := client.CreateInstance(ctx, request); err != nil {
 		if deps.operationWasSubmitted(err) {
 			instanceCreated = true
+			submittedErrors = append(submittedErrors, err)
 		}
 		return err
 	}
@@ -224,6 +238,7 @@ func create(ctx context.Context, cfg config.Config, name string, stdout, stderr 
 	if err := client.StartInstance(ctx, name); err != nil {
 		if deps.operationWasSubmitted(err) {
 			instanceRunning = true
+			submittedErrors = append(submittedErrors, err)
 		}
 		return err
 	}

@@ -153,13 +153,13 @@ Every tree node records:
 - Incus instance and volume names;
 - lifecycle state.
 
-Incus `user.kanedias.*` keys may record these identities to help an operator identify leaked resources after an abnormal crash. They are recovery metadata only; v1 does not adopt them.
+Every session-owned instance and custom workspace volume records exact session, parent/root, kind, context, worker, and workspace metadata. Authorized live acceptance resources additionally carry a unique run-attribution value. These keys support exact leak accounting and direct-parent recovery after confirmed child-process death; they never enable discovery, adoption, or a global registry.
 
 ## Resource Provisioning and COW Clones
 
 ### Root session
 
-A root supervisor creates its instance from the configured base image and clones the configured seed workspace volume, as the current session spike does.
+A root supervisor clones the configured seed workspace volume and creates its instance directly from the configured base image.
 
 ### Child session
 
@@ -319,7 +319,7 @@ There is one branch and exact head commit per modified repository. Read-only chi
 
 If a writer agent settles without handoff, the session enters an `awaiting_handoff` state. It remains live so a client can inspect its transcript, send a new prompt or follow-up asking it to finish the handoff, or cancel it. V1 does not enforce repository cleanliness or manufacture commits.
 
-Before accepting handoff, the extension verifies that every reported branch exists on its stated Git remote and resolves to the reported head commit. This verifies durability without imposing a clean-working-tree policy. A missing or mismatched remote ref leaves the writer live and returns a tool error.
+Before submitting handoff, the extension checks the guest checkout origin and reported refs as a defense-in-depth preflight. Guest checks do not establish durability or authority: the guest and its same-UID socket caller are untrusted. Before accepting handoff, the host supervisor derives the canonical GitHub remote only from its configured repository allowlist and runs bounded `git ls-remote` verification for each exact reported branch and head. That host-configured canonical check is authoritative. A missing, ambiguous, or mismatched remote ref leaves the writer live and returns a tool error without imposing a clean-working-tree policy.
 
 A successful handoff is terminal. Any unfinished descendants of that writer are cancelled as part of subtree teardown.
 
@@ -330,7 +330,7 @@ COW storage and GitHub have separate purposes:
 - COW cloning transfers the starting filesystem state into an independent sandbox quickly.
 - GitHub refs transfer completed writer changes back to the parent after the child disappears.
 
-The supervisor does not require a clean Git state before spawning a writer. The handoff skill instructs the agent to establish an appropriate commit boundary and push its work. The handoff tool checks remote reachability and exact head identity, after which the parent receives immutable commit identities and decides whether to inspect, merge, or cherry-pick them.
+The supervisor does not require a clean Git state before spawning a writer. The handoff skill instructs the agent to establish an appropriate commit boundary and push its work. Extension-side Git checks are preflight only. The host supervisor checks remote reachability and exact head identity against its configured canonical GitHub remote, after which the parent receives immutable commit identities and decides whether to inspect, merge, or cherry-pick them.
 
 Branch integration is deliberately outside the supervisor. Normal Git conflicts are handled as normal Git conflicts by the parent session or user.
 
@@ -361,8 +361,12 @@ Parent ownership is strict in v1:
 - stopping a supervisor cancels all unfinished direct children;
 - each child recursively cancels its descendants;
 - every child monitors an inherited parent-liveness pipe and begins cascading shutdown when that pipe reaches EOF;
+- terminal `read`, `write`, and `failure` reports use a separate inherited acknowledgement pipe: the child blocks after writing exactly one terminal report until its direct parent ingests that exact report, marks descendant SSE closure expected, writes one acknowledgement byte, and closes the pipe; cancellation closes the acknowledgement endpoint without acknowledging;
+- bootstrap, liveness, report, and terminal-ack endpoints are fixed descriptors `3`–`6`, marked close-on-exec before runtime code so grandchildren cannot retain them;
 - graceful shutdown is attempted before forced termination;
-- each supervisor removes only the resources it created;
+- each supervisor normally removes only the resources it created;
+- after an admitted direct child process has definitely exited, its direct parent has one narrow recovery exception: it may delete only the deterministic instance, volume, and socket named in that child's exact pre-published ownership ticket after pool, complete identity metadata, workspace name, run attribution, and socket device/inode all match;
+- recovery never scans for resources, discovers unrelated sessions, adopts a child, or acts before the exact child process exits;
 - no child is detached or adopted;
 - a successfully delivered Git handoff remains valid even after the child sandbox is deleted.
 
@@ -420,7 +424,7 @@ Cancelling the extension tool cancels the corresponding child subtree.
 
 ### Handoff
 
-`POST /v1/handoff` is called by the extension in a writer child after its remote-ref checks pass. It records and forwards the terminal result upward before acknowledging the extension.
+`POST /v1/handoff` is called by the extension in a writer child after guest-side remote preflight. The host then performs the authoritative bounded `ls-remote` check using the configured canonical GitHub remote, records and forwards the verified terminal result upward, and only then writes and flushes acknowledgement to the extension.
 
 ### Stop
 
@@ -525,3 +529,26 @@ The design is proven when the following path works:
 10. receive those refs in the parent tool result;
 11. observe the writer supervisor, Pi session, container, and volume disappear;
 12. terminate the root and verify cascading cleanup and socket removal.
+
+## Operational Acceptance Evidence
+
+The reviewed checkout is exercised by the opt-in Incus-tagged harness:
+
+```bash
+KANEDIAS_LIVE_SUPERVISOR=1 \
+KANEDIAS_CONFIG=./config.toml \
+KANEDIAS_E2E_PROVIDER_READY=1 \
+KANEDIAS_E2E_DISPOSABLE_GITHUB=1 \
+KANEDIAS_E2E_GITHUB_REPOSITORY=owner/disposable-repository \
+KANEDIAS_E2E_GITHUB_REMOTE=https://github.com/owner/disposable-repository.git \
+go test -tags=incus ./internal/supervisor \
+  -run TestLiveRecursiveSupervisorAcceptance -v -count=2
+```
+
+The provider and disposable-GitHub flags are separate, explicit authorizations. The test skips before building, starting a proxy, or touching Incus/GitHub when any required authorization or value is absent. It never infers permission from credentials already present on the machine.
+
+Each run builds the current checkout into a mode-private persistent run directory and uses that absolute binary for the owned proxy, root, and recursively spawned children. The proxy is owned and polled by default. `KANEDIAS_E2E_EXTERNAL_PROXY=1` opts into polling and preserving an operator-owned listener; because the harness cannot stop infrastructure it does not own, that mode omits the missing-proxy phase. Release evidence uses the default owned mode. No readiness path uses a fixed sleep.
+
+Before the first session, the harness records the exact project instance and custom-volume baseline. It records tree snapshots, consuming SSE output, process logs, Incus metadata/resource lists, and verified Git refs during the run. Every observed session is tracked by exact `user.kanedias.session_id` metadata. Successful runs remove their run directory; failures retain it below `KANEDIAS_E2E_ARTIFACT_DIR`, or the user cache under `kanedias/e2e`, and print the path.
+
+The live path covers a mode-`0600` root socket, consuming and stalled SSE clients, later RPC progress, fresh read delegation and routed control, a controlled blocking-question fixture, forked writer handoff with an independently resolved remote ref, graceful descendant cascade, parent-liveness cleanup after root `SIGKILL`, and missing-proxy zero-resource failure. A killed root cannot clean its own Incus resources in v1; test teardown removes only the root instance and volume whose metadata exactly matches that root session, then requires the complete baseline to be restored. Host-wide reconciliation remains deferred.

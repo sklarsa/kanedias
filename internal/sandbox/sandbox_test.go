@@ -142,16 +142,28 @@ func TestCreateRepositoryCopyFailureDoesNotCloneIncusState(t *testing.T) {
 func TestCreateSubmittedRepositoryCopyFailureRollsBackOwnedCloneWithoutIncusClone(t *testing.T) {
 	submitted := errors.New("submitted repository copy failed")
 	fake := &recordingClient{copyErr: submitted, submittedErr: submitted}
-	err := create(context.Background(), testConfig(), "demo", io.Discard, io.Discard, testDependencies(fake))
+	deps := testDependencies(fake)
+	deps.awaitSubmittedOperation = func(ctx context.Context, err error) error {
+		if !errors.Is(err, submitted) {
+			t.Fatalf("await error = %v, want submitted copy error", err)
+		}
+		deadline, bounded := ctx.Deadline()
+		if ctx.Err() != nil || !bounded || time.Until(deadline) <= 0 || time.Until(deadline) > 30*time.Second {
+			t.Fatalf("await context is not a live bounded cleanup context: err=%v bounded=%v deadline=%v", ctx.Err(), bounded, deadline)
+		}
+		fake.calls = append(fake.calls, "await-submitted")
+		return nil
+	}
+	err := create(context.Background(), testConfig(), "demo", io.Discard, io.Discard, deps)
 	if !errors.Is(err, submitted) {
 		t.Fatalf("Create error = %v, want submitted copy error", err)
 	}
 	if containsCallPrefix(fake.calls, "clone-incus ") {
 		t.Fatalf("Incus state clone attempted after repository copy failure: %v", fake.calls)
 	}
-	if !containsCall(fake.calls, "delete-volume kanedias-workspace-demo") {
-		t.Fatalf("ambiguous repository clone was not rolled back: %v", fake.calls)
-	}
+	assertCalls(t, fake.calls[len(fake.calls)-2:], []string{
+		"await-submitted", "delete-volume kanedias-workspace-demo",
+	})
 }
 
 func TestCreateIncusCloneFailureCleansAmbiguousIncusAndRepositoryClones(t *testing.T) {
@@ -529,6 +541,9 @@ func testDependencies(client *recordingClient) dependencies {
 			return incusworkspace.VerifyNativeBtrfs(ctx, executor, instance)
 		},
 		operationWasSubmitted: func(err error) bool { return client.submittedErr != nil && errors.Is(err, client.submittedErr) },
+		awaitSubmittedOperation: func(context.Context, error) error {
+			return nil
+		},
 		readinessTimeout:      60 * time.Second,
 		readinessPollInterval: time.Nanosecond,
 	}
@@ -607,6 +622,11 @@ func (c *recordingClient) GetStorageVolume(_ context.Context, _, name string) (*
 
 func (c *recordingClient) CopyStorageVolume(_ context.Context, _, source, target string) error {
 	c.calls = append(c.calls, "copy-volume "+source+" "+target)
+	return c.copyErr
+}
+
+func (c *recordingClient) CopyStorageVolumeUntilTerminal(_ context.Context, _, source, target string) error {
+	c.calls = append(c.calls, "copy-volume-terminal "+source+" "+target)
 	return c.copyErr
 }
 

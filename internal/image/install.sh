@@ -25,6 +25,7 @@ tmux_config_file="$assets_dir/tmux.conf"
 pi_rpc_socket_file="$assets_dir/kanedias-pi.socket"
 pi_rpc_service_file="$assets_dir/kanedias-pi@.service"
 pi_rpc_launcher_file="$assets_dir/kanedias-pi-rpc"
+pi_extension_dir="$assets_dir/pi-extension"
 
 for required_file in \
     "$authorized_hosts_file" "$pi_settings_file" "$pi_auth_file" \
@@ -35,6 +36,10 @@ for required_file in \
         exit 1
     fi
 done
+if [[ ! -d $pi_extension_dir ]]; then
+    echo "missing install input: $pi_extension_dir" >&2
+    exit 1
+fi
 
 export DEBIAN_FRONTEND=noninteractive
 
@@ -131,6 +136,11 @@ configure_managed_user() {
 }
 
 configure_managed_user
+
+if [[ $(id -u "$managed_user") != 1000 || $(id -g "$managed_user") != 1000 ]]; then
+    printf 'managed user %s must have numeric UID/GID 1000 for Incus proxy mappings\n' "$managed_user" >&2
+    exit 1
+fi
 
 install_cloud_apt_packages() {
     local architecture
@@ -467,7 +477,6 @@ npm install --global --ignore-scripts \
 
 pi_binary="$(dirname "$(command -v node)")/pi"
 GIT_TERMINAL_PROMPT=0 "$pi_binary" install git:github.com/obra/superpowers
-"$pi_binary" install npm:pi-subagents
 "$pi_binary" install npm:pi-web-suite
 EOF
 
@@ -479,6 +488,40 @@ EOF
         "$pi_auth_file" "$managed_home/.pi/agent/auth.json"
     install -m 0644 -o "$managed_user" -g "$managed_user" \
         "$pi_theme_file" "$managed_home/.pi/agent/themes/cobalt-ember.json"
+}
+
+install_pi_extension() {
+    rm -rf /opt/kanedias/pi-extension
+    install -d -m 0755 /opt/kanedias/pi-extension
+    cp -a "$pi_extension_dir/." /opt/kanedias/pi-extension/
+    chown -R root:root /opt/kanedias/pi-extension
+    find /opt/kanedias/pi-extension -type d -exec chmod 0755 {} +
+    find /opt/kanedias/pi-extension -type f -exec chmod 0644 {} +
+
+    (
+        export NVM_DIR="$managed_home/.nvm"
+        # shellcheck source=/dev/null
+        source "$NVM_DIR/nvm.sh"
+        nvm use --silent default
+        cd /opt/kanedias/pi-extension
+        npm ci --omit=dev --ignore-scripts
+    )
+
+    install -d -m 0755 /usr/lib/tmpfiles.d
+    cat > /usr/lib/tmpfiles.d/kanedias.conf <<EOF
+d /run/kanedias 0700 kanedias kanedias -
+EOF
+    systemd-tmpfiles --create /usr/lib/tmpfiles.d/kanedias.conf
+
+    install -d -m 0755 -o "$managed_user" -g "$managed_user" \
+        "$managed_home/.pi/agent/skills/delegate-session" \
+        "$managed_home/.pi/agent/skills/writer-handoff"
+    install -m 0644 -o "$managed_user" -g "$managed_user" \
+        /opt/kanedias/pi-extension/skills/delegate-session/SKILL.md \
+        "$managed_home/.pi/agent/skills/delegate-session/SKILL.md"
+    install -m 0644 -o "$managed_user" -g "$managed_user" \
+        /opt/kanedias/pi-extension/skills/writer-handoff/SKILL.md \
+        "$managed_home/.pi/agent/skills/writer-handoff/SKILL.md"
 }
 
 install_pi_rpc_service() {
@@ -503,4 +546,5 @@ install_uv
 install_tfenv
 install_nvm
 install_pi
+install_pi_extension
 install_pi_rpc_service

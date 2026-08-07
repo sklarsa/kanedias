@@ -1,0 +1,17 @@
+{
+  "kind": "write",
+  "workerType": "worker",
+  "sessionId": "sess-child-write",
+  "repositories": [
+    {
+      "repository": "owner/repository",
+      "baseCommit": "0123456789abcdef",
+      "branch": "kanedias/sess-child-write/authentication",
+      "headCommit": "fedcba9876543210"
+    }
+  ],
+  "summary": "Implemented authentication changes.",
+  "verification": [
+    "go test ./..."
+  ]
+}

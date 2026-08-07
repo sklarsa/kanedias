@@ -84,6 +84,9 @@ func (f *syncFakeClient) DeleteStorageVolume(ctx context.Context, _, name string
 func (f *syncFakeClient) CopyStorageVolume(context.Context, string, string, string) error {
 	return errors.New("unexpected CopyStorageVolume call")
 }
+func (f *syncFakeClient) CopyStorageVolumeUntilTerminal(context.Context, string, string, string) error {
+	return errors.New("unexpected CopyStorageVolumeUntilTerminal call")
+}
 func (f *syncFakeClient) GetNetwork(context.Context, string) (*api.Network, error) {
 	return nil, errors.New("unexpected direct GetNetwork call")
 }
@@ -189,6 +192,9 @@ func syncTestDependencies(fake *syncFakeClient) dependencies {
 		renderProfile:         func(io.Writer, string, config.Config) error { return nil },
 		newInstanceName:       func() string { return "workspace-incus-sync-test" },
 		operationWasSubmitted: func(err error) bool { return errors.Is(err, errSubmitted) },
+		awaitSubmittedOperation: func(context.Context, error) error {
+			return nil
+		},
 	}
 }
 
@@ -406,7 +412,16 @@ func TestSyncQuiesceFailureIsReturned(t *testing.T) {
 func TestSyncSubmittedCreateErrorCleansUpPotentialInstance(t *testing.T) {
 	fake := newSyncFake()
 	fake.errors["create-instance"] = errSubmitted
-	err := syncWithDependencies(context.Background(), syncTestConfig(), io.Discard, io.Discard, syncTestDependencies(fake))
+	deps := syncTestDependencies(fake)
+	deps.awaitSubmittedOperation = func(ctx context.Context, err error) error {
+		if !errors.Is(err, errSubmitted) {
+			t.Fatalf("await error = %v, want submitted error", err)
+		}
+		fake.observeCleanup(ctx)
+		fake.record("await-submitted")
+		return nil
+	}
+	err := syncWithDependencies(context.Background(), syncTestConfig(), io.Discard, io.Discard, deps)
 	if !errors.Is(err, errSubmitted) {
 		t.Fatalf("error = %v", err)
 	}
@@ -414,6 +429,10 @@ func TestSyncSubmittedCreateErrorCleansUpPotentialInstance(t *testing.T) {
 		if !containsCall(fake.calls, call) {
 			t.Fatalf("missing cleanup call %q: %v", call, fake.calls)
 		}
+	}
+	assertCallBefore(t, fake.calls, "await-submitted", "get-instance")
+	if !fake.cleanupCtxSeen {
+		t.Fatal("submitted operation await did not use the bounded cleanup context")
 	}
 }
 

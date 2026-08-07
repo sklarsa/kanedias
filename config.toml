@@ -37,3 +37,21 @@ volume = "kanedias-incus-seed"
 images = [
     "images:debian/13",
 ]
+
+[workers.researcher]
+description = "Research external sources and return evidence without modifying files."
+provider = "openai-codex"
+model = "gpt-5.6-sol"
+thinking_level = "high"
+
+[workers.reviewer]
+description = "Review code and designs without modifying files."
+provider = "openai-codex"
+model = "gpt-5.6-sol"
+thinking_level = "xhigh"
+
+[workers.worker]
+description = "Implement changes and hand off pushed Git refs."
+provider = "openai-codex"
+model = "gpt-5.6-sol"
+thinking_level = "high"

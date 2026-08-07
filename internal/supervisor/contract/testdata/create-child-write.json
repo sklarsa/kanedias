@@ -1,0 +1,11 @@
+{
+  "workerType": "worker",
+  "kind": "write",
+  "context": "fork",
+  "task": "Implement authentication.",
+  "fork": {
+    "sessionFile": "/workspace/.pi/sessions/root.jsonl",
+    "piSessionId": "pi-root",
+    "leafEntryId": "entry-42"
+  }
+}

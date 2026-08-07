@@ -1,0 +1,7 @@
+{
+  "type": "extension_ui_request",
+  "id": "uuid-4",
+  "method": "editor",
+  "title": "Edit some text",
+  "prefill": "Line 1\nLine 2\nLine 3"
+}

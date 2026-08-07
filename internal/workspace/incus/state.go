@@ -17,7 +17,7 @@ const (
 
 type VolumeClient interface {
 	GetStorageVolume(context.Context, string, string) (*api.StorageVolume, error)
-	CopyStorageVolume(context.Context, string, string, string) error
+	CopyStorageVolumeUntilTerminal(context.Context, string, string, string) error
 	DeleteStorageVolume(context.Context, string, string) error
 }
 
@@ -58,7 +58,7 @@ func Clone(ctx context.Context, client VolumeClient, pool, seed, sandbox string)
 		return result, fmt.Errorf("nested Incus seed %q is attached and cannot be cloned", seed)
 	}
 
-	err = client.CopyStorageVolume(ctx, pool, seed, result.Name)
+	err = client.CopyStorageVolumeUntilTerminal(ctx, pool, seed, result.Name)
 	if err == nil || incusclient.OperationWasSubmitted(err) {
 		result.Created = true
 	}

@@ -6,13 +6,19 @@ import (
 	"errors"
 	"io"
 	"os"
+	"os/exec"
+	"path/filepath"
 	"reflect"
 	"strings"
+	"syscall"
 	"testing"
+	"time"
 
 	"github.com/sklarsa/kanedias/internal/config"
 	"github.com/sklarsa/kanedias/internal/proxy"
 	"github.com/sklarsa/kanedias/internal/server"
+	"github.com/sklarsa/kanedias/internal/supervisor/contract"
+	"github.com/sklarsa/kanedias/internal/supervisor/process"
 	"github.com/spf13/cobra"
 	"github.com/spf13/pflag"
 )
@@ -109,7 +115,6 @@ func TestCommandHierarchyAndFlags(t *testing.T) {
 		{"image", "create"},
 		{"sandbox", "create"},
 		{"sandbox", "destroy"},
-		{"session"},
 		{"workspace", "incus", "sync"},
 		{"workspace", "repos", "sync"},
 	} {
@@ -122,6 +127,7 @@ func TestCommandHierarchyAndFlags(t *testing.T) {
 			t.Errorf("%s local flags = %q, want none", command.CommandPath(), localFlags)
 		}
 	}
+	assertFlags(t, mustFindCommand(t, root, "session"), "socket")
 }
 
 func TestWorkspaceParentShowsHelpAndRejectsLegacySync(t *testing.T) {
@@ -166,84 +172,103 @@ func TestWorkspaceParentShowsHelpAndRejectsLegacySync(t *testing.T) {
 	})
 }
 
-func TestSessionReadsPromptFromStdinAndDelegates(t *testing.T) {
-	cfg := config.Config{BaseImage: config.BaseImage{Name: "sentinel"}}
-	ctx := context.WithValue(context.Background(), struct{}{}, "session-context")
-	var stdout, stderr bytes.Buffer
-	var calls []string
+func TestSessionChildCommandIsHiddenAndUsesFixedDescriptorFlags(t *testing.T) {
+	root := newRootCommand(stubServices(), testProxyOptions())
+	child, remaining, err := root.Find([]string{"session-child"})
+	if err != nil || len(remaining) != 0 {
+		t.Fatalf("find session-child = (%v, %q, %v)", child, remaining, err)
+	}
+	if !child.Hidden {
+		t.Fatal("session-child command is visible")
+	}
+	for name, want := range map[string]string{"bootstrap-fd": "3", "liveness-fd": "4", "report-fd": "5", "terminal-ack-fd": "6"} {
+		flag := child.Flags().Lookup(name)
+		if flag == nil || flag.DefValue != want {
+			t.Errorf("--%s = %#v, want default %s", name, flag, want)
+		}
+	}
 
 	service := stubServices()
-	service.loadConfig = func(path string) (config.Config, error) {
-		calls = append(calls, "load")
-		if path != "/tmp/session.toml" {
-			t.Errorf("loaded path = %q, want /tmp/session.toml", path)
-		}
-		return cfg, nil
+	service.runSessionChild = func(context.Context, process.Bootstrap, *process.Reporter) error {
+		t.Fatal("runSessionChild called with remapped descriptors")
+		return nil
 	}
-	service.runSession = func(gotContext context.Context, gotConfig config.Config, prompt string, gotStdout, gotStderr io.Writer) error {
-		calls = append(calls, "run")
-		if gotContext != ctx {
-			t.Error("session did not receive the exact command context")
-		}
-		if !reflect.DeepEqual(gotConfig, cfg) {
-			t.Errorf("session config = %#v, want %#v", gotConfig, cfg)
-		}
-		if prompt != "first line\nsecond line\n" {
-			t.Errorf("prompt = %q, want exact stdin", prompt)
-		}
-		if gotStdout != &stdout {
-			t.Error("session did not receive the exact stdout writer")
-		}
-		if gotStderr != &stderr {
-			t.Error("session did not receive the exact stderr writer")
-		}
-		_, err := io.WriteString(gotStdout, "{\"type\":\"agent_settled\"}\n")
-		return err
-	}
-
-	root := newRootCommand(service, testProxyOptions())
-	root.SetIn(strings.NewReader("first line\nsecond line\n"))
-	root.SetOut(&stdout)
-	root.SetErr(&stderr)
-	root.SetArgs([]string{"--config", "/tmp/session.toml", "session"})
-	if err := root.ExecuteContext(ctx); err != nil {
-		t.Fatalf("ExecuteContext() error = %v", err)
-	}
-	if !reflect.DeepEqual(calls, []string{"load", "run"}) {
-		t.Errorf("call order = %q, want [load run]", calls)
-	}
-	if stdout.String() != "{\"type\":\"agent_settled\"}\n" {
-		t.Errorf("stdout = %q", stdout.String())
+	root = newRootCommand(service, testProxyOptions())
+	root.SetOut(io.Discard)
+	root.SetErr(io.Discard)
+	root.SetArgs([]string{"session-child", "--bootstrap-fd", "6"})
+	if err := root.Execute(); err == nil || !strings.Contains(err.Error(), "fixed descriptors") {
+		t.Fatalf("remapped descriptor error = %v", err)
 	}
 }
 
-func TestSessionRejectsEmptyInputBeforeWorkflow(t *testing.T) {
-	for _, input := range []string{"", " \n\t"} {
-		t.Run(strings.ReplaceAll(input, "\n", "\\n"), func(t *testing.T) {
-			runCalls := 0
-			service := stubServices()
-			service.loadConfig = func(string) (config.Config, error) {
-				t.Fatal("loadConfig called for empty session input")
-				return config.Config{}, nil
-			}
-			service.runSession = func(context.Context, config.Config, string, io.Writer, io.Writer) error {
-				runCalls++
-				return nil
-			}
-
-			root := newRootCommand(service, testProxyOptions())
-			root.SetIn(strings.NewReader(input))
-			root.SetOut(io.Discard)
-			root.SetErr(io.Discard)
-			root.SetArgs([]string{"session"})
-			if err := root.Execute(); err == nil {
-				t.Fatal("Execute() error = nil, want empty-input error")
-			}
-			if runCalls != 0 {
-				t.Errorf("runSession calls = %d, want 0", runCalls)
-			}
-		})
+func TestHiddenSessionChildMarksProtocolDescriptorsCloseOnExec(t *testing.T) {
+	if os.Getenv("KANEDIAS_CLOEXEC_HELPER") == "1" {
+		service := stubServices()
+		service.runSessionChild = func(context.Context, process.Bootstrap, *process.Reporter) error {
+			return syscall.Exec("/bin/sh", []string{"sh", "-c", `for fd in 3 4 5 6; do [ ! -e /proc/self/fd/$fd ] || exit $fd; done`}, os.Environ())
+		}
+		root := newRootCommand(service, testProxyOptions())
+		root.SetArgs([]string{"session-child", "--bootstrap-fd", "3", "--liveness-fd", "4", "--report-fd", "5"})
+		if err := root.Execute(); err != nil {
+			t.Fatal(err)
+		}
+		return
 	}
+
+	bootstrapRead, bootstrapWrite, err := os.Pipe()
+	if err != nil {
+		t.Fatal(err)
+	}
+	livenessRead, livenessWrite, err := os.Pipe()
+	if err != nil {
+		t.Fatal(err)
+	}
+	reportRead, reportWrite, err := os.Pipe()
+	if err != nil {
+		t.Fatal(err)
+	}
+	ackRead, ackWrite, err := os.Pipe()
+	if err != nil {
+		t.Fatal(err)
+	}
+	bootstrap := process.Bootstrap{
+		SessionID: "child-1", ParentID: "parent-1", RootID: "root-1",
+		SocketPath: filepath.Join(t.TempDir(), "child.sock"), SourceInstance: "instance", SourceVolume: "volume",
+		Worker:  config.WorkerProfile{Description: "review", Provider: "provider", Model: "model"},
+		Request: contract.CreateChildRequest{WorkerType: "reviewer", Kind: contract.ChildKindRead, Context: contract.ContextFresh, Task: "review"},
+	}
+	command := exec.Command(os.Args[0], "-test.run=TestHiddenSessionChildMarksProtocolDescriptorsCloseOnExec", "--")
+	command.Env = append(os.Environ(), "KANEDIAS_CLOEXEC_HELPER=1")
+	command.ExtraFiles = []*os.File{bootstrapRead, livenessRead, reportWrite, ackRead}
+	var stderr bytes.Buffer
+	command.Stderr = &stderr
+	if err := command.Start(); err != nil {
+		t.Fatal(err)
+	}
+	_ = bootstrapRead.Close()
+	_ = livenessRead.Close()
+	_ = reportWrite.Close()
+	_ = ackRead.Close()
+	if err := process.EncodeBootstrap(bootstrapWrite, bootstrap); err != nil {
+		t.Fatal(err)
+	}
+	_ = bootstrapWrite.Close()
+
+	done := make(chan error, 1)
+	go func() { done <- command.Wait() }()
+	select {
+	case err := <-done:
+		if err != nil {
+			t.Fatalf("hidden command CLOEXEC helper: %v: %s", err, stderr.String())
+		}
+	case <-time.After(3 * time.Second):
+		_ = command.Process.Kill()
+		t.Fatal("hidden command did not exec descriptor-check helper")
+	}
+	_ = livenessWrite.Close()
+	_ = reportRead.Close()
+	_ = ackWrite.Close()
 }
 
 func TestServerCommandRejectsPositionalArguments(t *testing.T) {
@@ -702,7 +727,7 @@ func stubServices() services {
 		destroySandbox: func(context.Context, config.Config, string, io.Writer, io.Writer) error {
 			return nil
 		},
-		runSession: func(context.Context, config.Config, string, io.Writer, io.Writer) error {
+		runSupervisor: func(context.Context, config.Config, SessionOptions, io.Writer) error {
 			return nil
 		},
 		syncRepos: func(context.Context, config.Config, io.Writer, io.Writer) error {
@@ -712,6 +737,9 @@ func stubServices() services {
 			return nil
 		},
 		runServer: func(context.Context, server.Options) error { return nil },
+		runSessionChild: func(context.Context, process.Bootstrap, *process.Reporter) error {
+			return nil
+		},
 	}
 }
 
@@ -754,8 +782,8 @@ func serverServicesThatRejectDependencies(t *testing.T) services {
 		t.Fatal("destroySandbox called by server command")
 		return nil
 	}
-	service.runSession = func(context.Context, config.Config, string, io.Writer, io.Writer) error {
-		t.Fatal("runSession called by server command")
+	service.runSupervisor = func(context.Context, config.Config, SessionOptions, io.Writer) error {
+		t.Fatal("runSupervisor called by server command")
 		return nil
 	}
 	service.syncRepos = func(context.Context, config.Config, io.Writer, io.Writer) error {
@@ -818,7 +846,9 @@ func assertChildCommands(t *testing.T, command *cobra.Command, names ...string) 
 	t.Helper()
 	var got []string
 	for _, child := range command.Commands() {
-		got = append(got, child.Name())
+		if !child.Hidden {
+			got = append(got, child.Name())
+		}
 	}
 	if !reflect.DeepEqual(got, names) {
 		t.Errorf("%s child commands = %q, want %q", command.CommandPath(), got, names)

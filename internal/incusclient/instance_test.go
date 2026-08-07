@@ -13,6 +13,95 @@ import (
 	"github.com/lxc/incus/v7/shared/api"
 )
 
+type copyInstanceServer struct {
+	incus.InstanceServer
+	contextSeen  context.Context
+	source       *api.Instance
+	copySource   incus.InstanceServer
+	copyInstance api.Instance
+	copyArgs     *incus.InstanceCopyArgs
+	operation    incus.RemoteOperation
+	updateName   string
+	updatePut    api.InstancePut
+	updateETag   string
+}
+
+func (s *copyInstanceServer) WithContext(ctx context.Context) incus.InstanceServer {
+	s.contextSeen = ctx
+	return s
+}
+
+func (s *copyInstanceServer) GetInstance(string) (*api.Instance, string, error) {
+	return s.source, "source-etag", nil
+}
+
+func (s *copyInstanceServer) CopyInstance(source incus.InstanceServer, instance api.Instance, args *incus.InstanceCopyArgs) (incus.RemoteOperation, error) {
+	s.copySource = source
+	s.copyInstance = instance
+	s.copyArgs = args
+	return s.operation, nil
+}
+
+func (s *copyInstanceServer) UpdateInstance(name string, put api.InstancePut, etag string) (incus.Operation, error) {
+	s.updateName = name
+	s.updatePut = put
+	s.updateETag = etag
+	return completedClientOperation{}, nil
+}
+
+type completedClientOperation struct {
+	incus.Operation
+}
+
+func (completedClientOperation) WaitContext(context.Context) error { return nil }
+func (completedClientOperation) Get() api.Operation                { return api.Operation{} }
+
+type completedRemoteOperation struct {
+	incus.RemoteOperation
+}
+
+func (completedRemoteOperation) Wait() error         { return nil }
+func (completedRemoteOperation) CancelTarget() error { return nil }
+
+func TestCopyInstanceUsesStoppedInstanceOnlyPullClone(t *testing.T) {
+	ctx := context.WithValue(context.Background(), struct{}{}, "copy-context")
+	server := &copyInstanceServer{
+		source:    &api.Instance{Name: "parent"},
+		operation: completedRemoteOperation{},
+	}
+	client := &Client{server: server}
+
+	if err := client.CopyInstance(ctx, "parent", "child"); err != nil {
+		t.Fatal(err)
+	}
+	if server.contextSeen != ctx {
+		t.Fatal("CopyInstance did not scope Incus requests to the supplied context")
+	}
+	if server.copySource != server || server.copyInstance.Name != "parent" {
+		t.Fatalf("copy source = %#v from %T, want parent from scoped server", server.copyInstance, server.copySource)
+	}
+	want := incus.InstanceCopyArgs{Name: "child", Mode: "pull", InstanceOnly: true, Live: false}
+	if server.copyArgs == nil || *server.copyArgs != want {
+		t.Fatalf("InstanceCopyArgs = %#v, want %#v", server.copyArgs, want)
+	}
+}
+
+func TestUpdateInstancePreservesETag(t *testing.T) {
+	server := &copyInstanceServer{}
+	client := &Client{server: server}
+	put := api.InstancePut{Description: "child", Config: api.ConfigMap{"key": "value"}}
+
+	if err := client.UpdateInstance(context.Background(), "child", put, "instance-etag"); err != nil {
+		t.Fatal(err)
+	}
+	if server.updateName != "child" || server.updateETag != "instance-etag" {
+		t.Fatalf("UpdateInstance arguments = %q, %q, want child and preserved ETag", server.updateName, server.updateETag)
+	}
+	if server.updatePut.Description != "child" || server.updatePut.Config["key"] != "value" {
+		t.Fatalf("UpdateInstance put = %#v, want supplied request", server.updatePut)
+	}
+}
+
 func TestExecCapturesStdoutAndStderr(t *testing.T) {
 	ctx := context.Background()
 	var gotPost api.InstanceExecPost
