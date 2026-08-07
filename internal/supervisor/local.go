@@ -5,7 +5,6 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
-	"sort"
 	"strings"
 	"sync"
 
@@ -187,8 +186,6 @@ func (session *LocalSession) Snapshot() NodeSnapshot {
 	session.mu.RUnlock()
 
 	questions := session.questions.Summaries()
-	children := make([]NodeSnapshot, 0)
-	sort.Slice(children, func(i, j int) bool { return children[i].SessionID < children[j].SessionID })
 	return NodeSnapshot{
 		SessionID:       identity.SessionID,
 		PiSessionID:     binding.SessionID,
@@ -201,7 +198,7 @@ func (session *LocalSession) Snapshot() NodeSnapshot {
 		Model:           model,
 		Lifecycle:       string(session.lifecycle.State()),
 		Questions:       questions,
-		Children:        children,
+		Children:        []NodeSnapshot{},
 	}
 }
 

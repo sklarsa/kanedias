@@ -28,9 +28,8 @@ const (
 
 type cleanDescendantEventEOF struct{ err error }
 
-func (streamErr cleanDescendantEventEOF) Error() string  { return streamErr.err.Error() }
-func (streamErr cleanDescendantEventEOF) Unwrap() error  { return streamErr.err }
-func (streamErr cleanDescendantEventEOF) CleanEOF() bool { return true }
+func (streamErr cleanDescendantEventEOF) Error() string { return streamErr.err.Error() }
+func (streamErr cleanDescendantEventEOF) Unwrap() error { return streamErr.err }
 
 type DescendantClient struct {
 	socketPath   string
@@ -120,11 +119,6 @@ func (client *DescendantClient) Snapshot(ctx context.Context) (supervisor.NodeSn
 func (client *DescendantClient) Close() error {
 	client.transport.CloseIdleConnections()
 	return nil
-}
-
-func (client *DescendantClient) Probe(ctx context.Context) error {
-	_, err := client.Snapshot(ctx)
-	return err
 }
 
 func (client *DescendantClient) CallRPC(ctx context.Context, sessionID string, command json.RawMessage) (json.RawMessage, error) {

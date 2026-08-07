@@ -7,6 +7,7 @@ import (
 	"net"
 	"os"
 	"path/filepath"
+	"sort"
 	"strings"
 	"text/template"
 
@@ -35,8 +36,15 @@ type templateData struct {
 	ProxyCACertPath string
 }
 
+// Types returns the supported profile type names in deterministic order,
+// derived from the single source of truth in profilePaths.
 func Types() []string {
-	return []string{string(ImageBuild), string(Lemonade), string(Sandbox)}
+	names := make([]string, 0, len(profilePaths))
+	for name := range profilePaths {
+		names = append(names, name)
+	}
+	sort.Strings(names)
+	return names
 }
 
 func Render(w io.Writer, name string, cfg config.Config) error {

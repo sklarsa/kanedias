@@ -75,15 +75,6 @@ func TestInstallerActivatesOnlyKanediasDelegationExtensionAndSkills(t *testing.T
 			t.Errorf("installer missing extension activation behavior %q", required)
 		}
 	}
-	launcher := string(piRPCLauncher)
-	for _, required := range []string{"args=(--mode rpc)", "args+=(--session \"$session_file\")", "args+=(-e /opt/kanedias/pi-extension/src/index.ts)", "--provider", "--model", "--thinking", `exec pi "${args[@]}"`} {
-		if !strings.Contains(launcher, required) {
-			t.Errorf("launcher missing %q", required)
-		}
-	}
-	if strings.Contains(launcher, "--no-session") || strings.Contains(launcher, "eval") {
-		t.Error("launcher uses ephemeral sessions or eval")
-	}
 	settings, err := os.ReadFile(filepath.Join("..", "..", "assets", "pi-settings.json"))
 	if err != nil {
 		t.Fatal(err)

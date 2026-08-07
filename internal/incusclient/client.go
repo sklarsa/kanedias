@@ -250,33 +250,28 @@ func startRemoteOperation(operation remoteOperationWaiter) *submittedRemoteOpera
 }
 
 func submitAndWaitRemoteOperation(ctx context.Context, submit func() (remoteOperationWaiter, error)) error {
-	operation, err := submit()
-	if err != nil {
-		return err
-	}
-	remote := startRemoteOperation(operation)
-	runRemoteOperationWaitHook(ctx, remote)
-	if err := waitSubmittedRemoteOperation(ctx, operation, remote); err != nil {
-		return &submittedOperationError{err: err, remote: remote}
-	}
-	return nil
+	return submitAndWaitRemote(ctx, submit, waitSubmittedRemoteOperation)
 }
 
 func submitAndWaitRemoteOperationUntilTerminal(ctx context.Context, submit func() (remoteOperationWaiter, error)) error {
+	return submitAndWaitRemote(ctx, submit, waitRemoteOperationUntilTerminal)
+}
+
+func submitAndWaitRemote(
+	ctx context.Context,
+	submit func() (remoteOperationWaiter, error),
+	wait func(context.Context, remoteOperationWaiter, *submittedRemoteOperation) error,
+) error {
 	operation, err := submit()
 	if err != nil {
 		return err
 	}
 	remote := startRemoteOperation(operation)
 	runRemoteOperationWaitHook(ctx, remote)
-	if err := waitRemoteOperationUntilTerminal(ctx, operation, remote); err != nil {
+	if err := wait(ctx, operation, remote); err != nil {
 		return &submittedOperationError{err: err, remote: remote}
 	}
 	return nil
-}
-
-func waitRemoteOperation(ctx context.Context, operation remoteOperationWaiter) error {
-	return waitRemoteOperationUntilTerminal(ctx, operation, startRemoteOperation(operation))
 }
 
 func waitRemoteOperationUntilTerminal(ctx context.Context, operation remoteOperationWaiter, remote *submittedRemoteOperation) error {
@@ -330,13 +325,4 @@ func AwaitSubmittedOperation(ctx context.Context, err error) error {
 		return nil
 	}
 	return fmt.Errorf("error does not retain a submitted operation waiter")
-}
-
-// AwaitSubmittedRemoteOperation preserves the Task 4 remote-copy seam.
-func AwaitSubmittedRemoteOperation(ctx context.Context, err error) error {
-	var submitted *submittedOperationError
-	if !errors.As(err, &submitted) || submitted.remote == nil {
-		return fmt.Errorf("error does not retain a submitted remote operation")
-	}
-	return AwaitSubmittedOperation(ctx, err)
 }

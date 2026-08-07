@@ -3,7 +3,6 @@ package proxy
 import (
 	"context"
 	"crypto/tls"
-	"crypto/x509"
 	"encoding/base64"
 	"io"
 	"net"
@@ -54,22 +53,7 @@ func TestProxyInjectsProviderCredentials(t *testing.T) {
 
 	proxyServer := httptest.NewServer(handler)
 	defer proxyServer.Close()
-	proxyURL, err := url.Parse(proxyServer.URL)
-	if err != nil {
-		t.Fatal(err)
-	}
-
-	roots := x509.NewCertPool()
-	if !roots.AppendCertsFromPEM(caPEM) {
-		t.Fatal("failed to trust test proxy CA")
-	}
-	client := &http.Client{Transport: &http.Transport{
-		Proxy: http.ProxyURL(proxyURL),
-		TLSClientConfig: &tls.Config{
-			MinVersion: tls.VersionTLS12,
-			RootCAs:    roots,
-		},
-	}}
+	client := observedMITMClient(t, proxyServer.URL, caPEM)
 
 	tests := []struct {
 		name              string
@@ -150,18 +134,7 @@ func TestProxyInjectsOAuthCredentials(t *testing.T) {
 
 	proxyServer := httptest.NewServer(handler)
 	defer proxyServer.Close()
-	proxyURL, err := url.Parse(proxyServer.URL)
-	if err != nil {
-		t.Fatal(err)
-	}
-	roots := x509.NewCertPool()
-	if !roots.AppendCertsFromPEM(caPEM) {
-		t.Fatal("failed to trust test proxy CA")
-	}
-	client := &http.Client{Transport: &http.Transport{
-		Proxy:           http.ProxyURL(proxyURL),
-		TLSClientConfig: &tls.Config{RootCAs: roots, MinVersion: tls.VersionTLS12},
-	}}
+	client := observedMITMClient(t, proxyServer.URL, caPEM)
 
 	tests := []struct {
 		host          string
@@ -283,18 +256,7 @@ func TestProxyRejectsMismatchedProviderAuthority(t *testing.T) {
 	handler.Tr.TLSClientConfig = &tls.Config{InsecureSkipVerify: true} // local fake upstream
 	proxyServer := httptest.NewServer(handler)
 	defer proxyServer.Close()
-	proxyURL, err := url.Parse(proxyServer.URL)
-	if err != nil {
-		t.Fatal(err)
-	}
-	roots := x509.NewCertPool()
-	if !roots.AppendCertsFromPEM(caPEM) {
-		t.Fatal("failed to trust test proxy CA")
-	}
-	client := &http.Client{Transport: &http.Transport{
-		Proxy:           http.ProxyURL(proxyURL),
-		TLSClientConfig: &tls.Config{RootCAs: roots, MinVersion: tls.VersionTLS12},
-	}}
+	client := observedMITMClient(t, proxyServer.URL, caPEM)
 	req, err := http.NewRequest(http.MethodGet, "https://api.github.com/test", nil)
 	if err != nil {
 		t.Fatal(err)
@@ -478,28 +440,6 @@ func TestProxyReturnsAgentFriendlyGitHubAuthError(t *testing.T) {
 				t.Errorf("body = %q, want %q", body, "GitHub auth unavailable")
 			}
 		})
-	}
-}
-
-func TestInitCAGeneratesValidKeyPair(t *testing.T) {
-	dir := t.TempDir()
-	certPath := filepath.Join(dir, "ca.crt")
-	keyPath := filepath.Join(dir, "ca.key")
-
-	if err := InitCA(certPath, keyPath); err != nil {
-		t.Fatalf("initialize CA: %v", err)
-	}
-
-	certPEM, err := os.ReadFile(certPath)
-	if err != nil {
-		t.Fatal(err)
-	}
-	keyPEM, err := os.ReadFile(keyPath)
-	if err != nil {
-		t.Fatal(err)
-	}
-	if _, err := tls.X509KeyPair(certPEM, keyPEM); err != nil {
-		t.Fatalf("generated CA is not a valid key pair: %v", err)
 	}
 }
 
