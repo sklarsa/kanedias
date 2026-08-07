@@ -124,6 +124,48 @@ func TestCommandHierarchyAndFlags(t *testing.T) {
 	}
 }
 
+func TestWorkspaceParentShowsHelpAndRejectsLegacySync(t *testing.T) {
+	service := stubServices()
+	service.loadConfig = func(string) (config.Config, error) {
+		t.Fatal("loadConfig called by workspace parent command")
+		return config.Config{}, nil
+	}
+	service.syncRepos = func(context.Context, config.Config, io.Writer, io.Writer) error {
+		t.Fatal("syncRepos called by workspace parent command")
+		return nil
+	}
+	service.syncIncusWorkspace = func(context.Context, config.Config, io.Writer, io.Writer) error {
+		t.Fatal("syncIncusWorkspace called by workspace parent command")
+		return nil
+	}
+
+	t.Run("bare workspace shows help", func(t *testing.T) {
+		var stdout bytes.Buffer
+		root := newRootCommand(service, testProxyOptions())
+		root.SetOut(&stdout)
+		root.SetErr(io.Discard)
+		root.SetArgs([]string{"workspace"})
+
+		if err := root.Execute(); err != nil {
+			t.Fatalf("Execute() error = %v, want successful help", err)
+		}
+		if !strings.Contains(stdout.String(), "Manage the Incus workspace") {
+			t.Errorf("stdout = %q, want workspace help", stdout.String())
+		}
+	})
+
+	t.Run("legacy sync is rejected", func(t *testing.T) {
+		root := newRootCommand(service, testProxyOptions())
+		root.SetOut(io.Discard)
+		root.SetErr(io.Discard)
+		root.SetArgs([]string{"workspace", "sync"})
+
+		if err := root.Execute(); err == nil {
+			t.Fatal("Execute() error = nil, want workspace sync argument error")
+		}
+	})
+}
+
 func TestSessionReadsPromptFromStdinAndDelegates(t *testing.T) {
 	cfg := config.Config{BaseImage: config.BaseImage{Name: "sentinel"}}
 	ctx := context.WithValue(context.Background(), struct{}{}, "session-context")

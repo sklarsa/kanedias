@@ -6,6 +6,10 @@ func newWorkspaceCommand(service services, configPath func() string) *cobra.Comm
 	command := &cobra.Command{
 		Use:   "workspace",
 		Short: "Manage the Incus workspace",
+		Args:  cobra.NoArgs,
+		RunE: func(cmd *cobra.Command, _ []string) error {
+			return cmd.Help()
+		},
 	}
 	command.AddCommand(
 		newWorkspaceIncusCommand(service, configPath),
