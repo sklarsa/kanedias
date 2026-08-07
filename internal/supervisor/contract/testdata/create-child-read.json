@@ -1,0 +1,6 @@
+{
+  "workerType": "reviewer",
+  "kind": "read",
+  "context": "fresh",
+  "task": "Review the authentication design."
+}

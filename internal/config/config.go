@@ -5,15 +5,30 @@ import (
 	"net/netip"
 	"os"
 	"path/filepath"
+	"sort"
+	"strings"
 
 	"github.com/pelletier/go-toml/v2"
 )
 
+type WorkerProfile struct {
+	Description   string `toml:"description" json:"description"`
+	Provider      string `toml:"provider" json:"provider"`
+	Model         string `toml:"model" json:"model"`
+	ThinkingLevel string `toml:"thinking_level" json:"thinkingLevel,omitempty"`
+}
+
 type Config struct {
-	Network   Network   `toml:"network"`
-	BaseImage BaseImage `toml:"base_image"`
-	Workspace Workspace `toml:"workspace"`
-	Dir       string    `toml:"-"`
+	Network   Network                  `toml:"network"`
+	BaseImage BaseImage                `toml:"base_image"`
+	Workspace Workspace                `toml:"workspace"`
+	Workers   map[string]WorkerProfile `toml:"workers"`
+	Dir       string                   `toml:"-"`
+}
+
+var validThinkingLevels = map[string]struct{}{
+	"off": {}, "minimal": {}, "low": {}, "medium": {},
+	"high": {}, "xhigh": {}, "max": {},
 }
 
 type BaseImage struct {
@@ -61,6 +76,53 @@ func Load(path string) (Config, error) {
 		return Config{}, err
 	}
 	return cfg, nil
+}
+
+func (cfg Config) ResolveWorker(name string) (WorkerProfile, error) {
+	profile, ok := cfg.Workers[name]
+	if !ok {
+		return WorkerProfile{}, fmt.Errorf("unknown worker type %q", name)
+	}
+	return profile, nil
+}
+
+func (cfg Config) WorkerNames() []string {
+	names := make([]string, 0, len(cfg.Workers))
+	for name := range cfg.Workers {
+		names = append(names, name)
+	}
+	sort.Strings(names)
+	return names
+}
+
+func (cfg Config) ValidateSupervisor() error {
+	if err := cfg.ValidateLifecycle(); err != nil {
+		return err
+	}
+	if len(cfg.Workers) == 0 {
+		return fmt.Errorf("at least one worker is required")
+	}
+	for _, name := range cfg.WorkerNames() {
+		profile := cfg.Workers[name]
+		if strings.TrimSpace(name) == "" {
+			return fmt.Errorf("worker name is required")
+		}
+		if strings.TrimSpace(profile.Description) == "" {
+			return fmt.Errorf("worker %q description is required", name)
+		}
+		if strings.TrimSpace(profile.Provider) == "" {
+			return fmt.Errorf("worker %q provider is required", name)
+		}
+		if strings.TrimSpace(profile.Model) == "" {
+			return fmt.Errorf("worker %q model is required", name)
+		}
+		if profile.ThinkingLevel != "" {
+			if _, ok := validThinkingLevels[profile.ThinkingLevel]; !ok {
+				return fmt.Errorf("worker %q has invalid thinking_level %q", name, profile.ThinkingLevel)
+			}
+		}
+	}
+	return nil
 }
 
 func (cfg Config) ValidateLifecycle() error {

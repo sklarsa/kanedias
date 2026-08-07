@@ -1,0 +1,6 @@
+{
+  "kind": "read",
+  "workerType": "reviewer",
+  "sessionId": "sess-child-read",
+  "output": "The review found no blockers."
+}
