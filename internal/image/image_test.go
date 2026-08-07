@@ -273,6 +273,9 @@ func TestCreateRunsImageWorkflowInOrder(t *testing.T) {
 	if stderr.Len() != 0 {
 		t.Errorf("stderr = %q, want empty", stderr.String())
 	}
+	if got := stdout.String(); !strings.Contains(got, "installer output") {
+		t.Errorf("stdout = %q, want streamed installer output", got)
+	}
 }
 
 func TestCreateUploadsEmptyAuthorizedHosts(t *testing.T) {
@@ -482,7 +485,13 @@ func (c *recordingClient) Exec(_ context.Context, _ string, request incusclient.
 	if c.exec != nil {
 		return "", "", c.exec()
 	}
-	return "installer output", "", nil
+	const output = "installer output"
+	// Mirror the real Incus layer: output is streamed to the caller's writer as
+	// it arrives, not only returned after the command completes.
+	if request.Stdout != nil {
+		_, _ = io.WriteString(request.Stdout, output)
+	}
+	return output, "", nil
 }
 
 func (c *recordingClient) StopInstance(ctx context.Context, _ string, force bool) error {
