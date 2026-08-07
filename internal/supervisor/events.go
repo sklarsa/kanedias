@@ -69,10 +69,9 @@ func (broker *EventBroker) PublishLocal(sessionID, kind string, payload json.Raw
 		Kind:      kind,
 		Payload:   cloneRaw(payload),
 	}
-	event, subscribers := broker.retainLocked(event)
+	event = broker.retainLocked(event)
+	broker.deliverLocked(event)
 	broker.mu.Unlock()
-
-	broker.deliver(event, subscribers)
 	return cloneEnvelope(event)
 }
 
@@ -84,10 +83,9 @@ func (broker *EventBroker) Forward(source EventEnvelope) EventEnvelope {
 		Kind:      source.Kind,
 		Payload:   cloneRaw(source.Payload),
 	}
-	event, subscribers := broker.retainLocked(event)
+	event = broker.retainLocked(event)
+	broker.deliverLocked(event)
 	broker.mu.Unlock()
-
-	broker.deliver(event, subscribers)
 	return cloneEnvelope(event)
 }
 
@@ -112,7 +110,7 @@ func (broker *EventBroker) Subscribe() Subscription {
 	}
 }
 
-func (broker *EventBroker) retainLocked(event EventEnvelope) (EventEnvelope, map[uint64]*eventMailbox) {
+func (broker *EventBroker) retainLocked(event EventEnvelope) EventEnvelope {
 	broker.nextSeq++
 	event.Seq = broker.nextSeq
 	if broker.ringCap > 0 {
@@ -123,19 +121,16 @@ func (broker *EventBroker) retainLocked(event EventEnvelope) (EventEnvelope, map
 			broker.ring = append(broker.ring, event)
 		}
 	}
-	subscribers := make(map[uint64]*eventMailbox, len(broker.subs))
-	for id, mailbox := range broker.subs {
-		subscribers[id] = mailbox
-	}
-	return event, subscribers
+	return event
 }
 
-func (broker *EventBroker) deliver(event EventEnvelope, subscribers map[uint64]*eventMailbox) {
-	for id, mailbox := range subscribers {
+func (broker *EventBroker) deliverLocked(event EventEnvelope) {
+	for id, mailbox := range broker.subs {
 		if mailbox.send(cloneEnvelope(event)) {
 			continue
 		}
-		broker.removeSubscriber(id, mailbox)
+		delete(broker.subs, id)
+		mailbox.close()
 	}
 }
 

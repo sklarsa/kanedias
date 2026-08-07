@@ -50,7 +50,7 @@ func NewHandler(service Service) http.Handler {
 		serveEvents(w, request, service)
 	})
 	router.Post("/v1/sessions/{sessionID}/rpc", func(w http.ResponseWriter, request *http.Request) {
-		body, err := readJSONBody(w, request)
+		body, err := readRPCBody(w, request)
 		if err != nil {
 			writeError(w, err)
 			return
@@ -76,11 +76,31 @@ func NewHandler(service Service) http.Handler {
 	})
 	router.Delete("/v1/sessions/{sessionID}", func(w http.ResponseWriter, request *http.Request) {
 		sessionID := chi.URLParam(request, "sessionID")
-		// Complete the response before a self-stop can tear down this connection.
+		// Complete and flush the response before a self-stop can tear down this connection.
 		writeJSON(w, http.StatusAccepted, map[string]string{"status": "stopping"})
+		if flusher, ok := w.(http.Flusher); ok {
+			flusher.Flush()
+		}
 		go func(ctx context.Context) { _ = service.Stop(ctx, sessionID) }(context.WithoutCancel(request.Context()))
 	})
 	return router
+}
+
+func readRPCBody(w http.ResponseWriter, request *http.Request) (json.RawMessage, error) {
+	body, err := readJSONBody(w, request)
+	if err != nil {
+		return nil, err
+	}
+	var object map[string]json.RawMessage
+	if err := json.Unmarshal(body, &object); err != nil || object == nil {
+		return nil, contract.NewError(contract.ErrorInvalidRequest, "Pi RPC body must be a JSON object")
+	}
+	typeRaw, ok := object["type"]
+	var commandType string
+	if !ok || json.Unmarshal(typeRaw, &commandType) != nil || strings.TrimSpace(commandType) == "" {
+		return nil, contract.NewError(contract.ErrorInvalidRequest, "Pi RPC body type must be a nonempty string")
+	}
+	return body, nil
 }
 
 func readJSONBody(w http.ResponseWriter, request *http.Request) (json.RawMessage, error) {

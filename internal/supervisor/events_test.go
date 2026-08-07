@@ -2,6 +2,7 @@ package supervisor
 
 import (
 	"encoding/json"
+	"sync"
 	"testing"
 	"time"
 )
@@ -128,6 +129,40 @@ func TestEventBrokerOverflowDisconnectsOnlySlowSubscriber(t *testing.T) {
 		}
 	case <-time.After(time.Second):
 		t.Fatal("slow subscriber was not disconnected")
+	}
+}
+
+func TestEventBrokerConcurrentPublishersDeliverMonotonicSequence(t *testing.T) {
+	const publishers = 256
+	broker := newEventBroker(publishers, publishers)
+	subscription := broker.Subscribe()
+	defer subscription.Close()
+
+	start := make(chan struct{})
+	var group sync.WaitGroup
+	group.Add(publishers)
+	for n := 0; n < publishers; n++ {
+		go func() {
+			defer group.Done()
+			<-start
+			broker.PublishLocal("root", "pi", json.RawMessage(`{}`))
+		}()
+	}
+	close(start)
+	group.Wait()
+
+	for want := uint64(1); want <= publishers; want++ {
+		select {
+		case event, ok := <-subscription.Events:
+			if !ok {
+				t.Fatalf("subscriber disconnected at sequence %d", want)
+			}
+			if event.Seq != want {
+				t.Fatalf("delivered Seq = %d, want monotonic %d", event.Seq, want)
+			}
+		case <-time.After(time.Second):
+			t.Fatalf("timed out waiting for sequence %d", want)
+		}
 	}
 }
 

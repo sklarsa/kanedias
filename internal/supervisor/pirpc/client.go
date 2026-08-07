@@ -25,12 +25,15 @@ var (
 )
 
 type Event struct {
+	// Seq is the monotonic position of this record on the Pi transport.
+	Seq  uint64
 	Type string
 	Raw  json.RawMessage
 }
 
 type callResult struct {
 	raw json.RawMessage
+	seq uint64
 	err error
 }
 
@@ -59,21 +62,28 @@ func NewClient(conn io.ReadWriteCloser) *Client {
 }
 
 func (client *Client) Call(ctx context.Context, command json.RawMessage) (json.RawMessage, error) {
+	raw, _, err := client.CallWithSequence(ctx, command)
+	return raw, err
+}
+
+// CallWithSequence returns the response and its monotonic position on the Pi
+// transport so owners can reconcile responses with asynchronously drained events.
+func (client *Client) CallWithSequence(ctx context.Context, command json.RawMessage) (json.RawMessage, uint64, error) {
 	commandType, err := parseCommandType(command)
 	if err != nil {
-		return nil, err
+		return nil, 0, err
 	}
 	if isForbidden(commandType) {
-		return nil, fmt.Errorf("%w: %s", ErrForbiddenCommand, commandType)
+		return nil, 0, fmt.Errorf("%w: %s", ErrForbiddenCommand, commandType)
 	}
 	if err := ctx.Err(); err != nil {
-		return nil, err
+		return nil, 0, err
 	}
 
 	id := fmt.Sprintf("kanedias-%s-%d", processIDPrefix, requestCounter.Add(1))
 	wire, err := commandWithID(command, id)
 	if err != nil {
-		return nil, err
+		return nil, 0, err
 	}
 	result := make(chan callResult, 1)
 
@@ -84,7 +94,7 @@ func (client *Client) Call(ctx context.Context, command json.RawMessage) (json.R
 		if err == nil {
 			err = io.ErrClosedPipe
 		}
-		return nil, err
+		return nil, 0, err
 	}
 	client.pending[id] = result
 	client.mu.Unlock()
@@ -92,18 +102,18 @@ func (client *Client) Call(ctx context.Context, command json.RawMessage) (json.R
 	if err := client.write(ctx, wire); err != nil {
 		client.removePending(id)
 		if ctxErr := ctx.Err(); ctxErr != nil {
-			return nil, ctxErr
+			return nil, 0, ctxErr
 		}
 		client.terminate(fmt.Errorf("write Pi RPC command: %w", err))
-		return nil, err
+		return nil, 0, err
 	}
 
 	select {
 	case response := <-result:
-		return response.raw, response.err
+		return response.raw, response.seq, response.err
 	case <-ctx.Done():
 		client.removePending(id)
-		return nil, ctx.Err()
+		return nil, 0, ctx.Err()
 	}
 }
 
@@ -148,6 +158,7 @@ func (client *Client) Close() error {
 
 func (client *Client) readLoop() {
 	reader := bufio.NewReaderSize(client.conn, MaxRecordBytes+1)
+	var sequence uint64
 	for {
 		record, err := reader.ReadSlice('\n')
 		if err != nil {
@@ -175,19 +186,20 @@ func (client *Client) readLoop() {
 			client.terminate(fmt.Errorf("decode RPC record: %w", err))
 			return
 		}
+		sequence++
 		raw := append(json.RawMessage(nil), record...)
-		if envelope.Type == "response" && client.dispatchResponse(envelope.ID, raw) {
+		if envelope.Type == "response" && client.dispatchResponse(envelope.ID, sequence, raw) {
 			continue
 		}
 		select {
-		case client.events <- Event{Type: envelope.Type, Raw: raw}:
+		case client.events <- Event{Seq: sequence, Type: envelope.Type, Raw: raw}:
 		case <-client.done:
 			return
 		}
 	}
 }
 
-func (client *Client) dispatchResponse(id string, raw json.RawMessage) bool {
+func (client *Client) dispatchResponse(id string, sequence uint64, raw json.RawMessage) bool {
 	client.mu.Lock()
 	result, ok := client.pending[id]
 	if ok {
@@ -195,7 +207,7 @@ func (client *Client) dispatchResponse(id string, raw json.RawMessage) bool {
 	}
 	client.mu.Unlock()
 	if ok {
-		result <- callResult{raw: raw}
+		result <- callResult{raw: raw, seq: sequence}
 	}
 	return ok
 }

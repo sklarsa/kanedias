@@ -118,6 +118,71 @@ func TestLocalSessionWriterSettlementAwaitsHandoffAndFollowUpResumes(t *testing.
 	}
 }
 
+func TestLocalSessionDelayedPromptResponseCannotOverwriteLaterSettlement(t *testing.T) {
+	for _, test := range []struct {
+		name     string
+		identity func(*testing.T) Identity
+		want     LifecycleState
+	}{
+		{name: "root", identity: rootIdentity, want: LifecycleReady},
+		{name: "writer", identity: writerIdentity, want: LifecycleAwaitingHandoff},
+	} {
+		t.Run(test.name, func(t *testing.T) {
+			local, peer, broker := newTestLocalSession(t, test.identity(t))
+			bindTestLocal(t, local, peer, "pi-"+test.name, "/sessions/pi.jsonl", false)
+			result := make(chan error, 1)
+			go func() {
+				_, err := local.CallRPC(context.Background(), json.RawMessage(`{"type":"prompt","message":"work"}`))
+				result <- err
+			}()
+			request := readObject(t, peer)
+			writeBatch(t, peer,
+				`{"id":"`+request.ID+`","type":"response","command":"prompt","success":true}`,
+				`{"type":"agent_start"}`,
+				`{"type":"agent_settled"}`,
+			)
+			waitFor(t, func() bool { return brokerReplayCount(broker) == 2 }, "events after accepted prompt")
+			if err := <-result; err != nil {
+				t.Fatal(err)
+			}
+			waitFor(t, func() bool { return local.Snapshot().Lifecycle == string(test.want) }, "settlement to remain terminal for generation")
+		})
+	}
+}
+
+func TestLocalSessionGetStateReconcilesSettlementAfterResponse(t *testing.T) {
+	for _, test := range []struct {
+		name     string
+		identity func(*testing.T) Identity
+		want     LifecycleState
+	}{
+		{name: "root", identity: rootIdentity, want: LifecycleReady},
+		{name: "writer", identity: writerIdentity, want: LifecycleAwaitingHandoff},
+	} {
+		t.Run(test.name, func(t *testing.T) {
+			local, peer, broker := newTestLocalSession(t, test.identity(t))
+			result := make(chan error, 1)
+			go func() { result <- local.Bind(context.Background()) }()
+			request := readObject(t, peer)
+			response, err := json.Marshal(map[string]any{
+				"id": request.ID, "type": "response", "command": "get_state", "success": true,
+				"data": map[string]any{"sessionId": "pi-" + test.name, "sessionFile": "/sessions/pi.jsonl", "isStreaming": true},
+			})
+			if err != nil {
+				t.Fatal(err)
+			}
+			writeBatch(t, peer, string(response), `{"type":"agent_settled"}`)
+			waitFor(t, func() bool { return brokerReplayCount(broker) == 1 }, "settlement after get_state response")
+			if err := <-result; err != nil {
+				t.Fatal(err)
+			}
+			if got := local.Snapshot().Lifecycle; got != string(test.want) {
+				t.Fatalf("lifecycle = %q, want %q", got, test.want)
+			}
+		})
+	}
+}
+
 func TestLocalSessionForbiddenRPCStaysUnwritten(t *testing.T) {
 	local, peer, _ := newTestLocalSession(t, rootIdentity(t))
 	bindTestLocal(t, local, peer, "pi-root", "/sessions/pi-root.jsonl", false)
@@ -166,6 +231,15 @@ type testRPCObject struct {
 func rootIdentity(t *testing.T) Identity {
 	t.Helper()
 	identity, err := NewIdentity(IdentitySpec{SessionID: "root", RootID: "root", Kind: contract.ChildKindRoot, Context: contract.ContextRoot})
+	if err != nil {
+		t.Fatal(err)
+	}
+	return identity
+}
+
+func writerIdentity(t *testing.T) Identity {
+	t.Helper()
+	identity, err := NewIdentity(IdentitySpec{SessionID: "writer", ParentID: "root", RootID: "root", Kind: contract.ChildKindWrite, Context: contract.ContextFresh, Worker: "worker"})
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -246,11 +320,21 @@ func readObject(t *testing.T, peer net.Conn) testRPCObject {
 
 func writeLine(t *testing.T, peer net.Conn, line string) {
 	t.Helper()
+	writeBatch(t, peer, line)
+}
+
+func writeBatch(t *testing.T, peer net.Conn, lines ...string) {
+	t.Helper()
+	var wire []byte
+	for _, line := range lines {
+		wire = append(wire, line...)
+		wire = append(wire, '\n')
+	}
 	peer.SetWriteDeadline(time.Now().Add(time.Second))
-	_, err := peer.Write(append([]byte(line), '\n'))
+	_, err := peer.Write(wire)
 	peer.SetWriteDeadline(time.Time{})
 	if err != nil {
-		t.Fatalf("write Pi RPC line: %v", err)
+		t.Fatalf("write Pi RPC lines: %v", err)
 	}
 }
 

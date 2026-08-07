@@ -4,6 +4,7 @@ import (
 	"context"
 	"errors"
 	"io"
+	"net/http"
 	"strings"
 	"testing"
 	"time"
@@ -21,6 +22,10 @@ type recordingRootClient struct {
 	deleteInstErr error
 	deleteVolErr  error
 	request       api.InstancesPost
+	lateVolume    bool
+	volumeReady   bool
+	lateInstance  bool
+	instanceReady bool
 }
 
 func (client *recordingRootClient) Disconnect() { client.calls = append(client.calls, "disconnect") }
@@ -41,9 +46,16 @@ func (client *recordingRootClient) GetImageAlias(context.Context, string) (*api.
 	client.calls = append(client.calls, "get-image")
 	return &api.ImageAliasesEntry{Name: "base"}, nil
 }
-func (client *recordingRootClient) GetStorageVolume(context.Context, string, string) (*api.StorageVolume, error) {
-	client.calls = append(client.calls, "get-seed")
-	return &api.StorageVolume{Name: "seed"}, nil
+func (client *recordingRootClient) GetStorageVolume(_ context.Context, _ string, name string) (*api.StorageVolume, error) {
+	if name == "seed" {
+		client.calls = append(client.calls, "get-seed")
+		return &api.StorageVolume{Name: "seed"}, nil
+	}
+	client.calls = append(client.calls, "probe-volume")
+	if client.lateVolume && !client.volumeReady {
+		return nil, api.StatusErrorf(http.StatusNotFound, "not materialized")
+	}
+	return &api.StorageVolume{Name: name}, nil
 }
 func (client *recordingRootClient) CopyStorageVolume(context.Context, string, string, string) error {
 	client.calls = append(client.calls, "copy-volume")
@@ -72,6 +84,9 @@ func (client *recordingRootClient) DeleteInstance(context.Context, string) error
 }
 func (client *recordingRootClient) GetInstanceState(context.Context, string) (*api.InstanceState, error) {
 	client.calls = append(client.calls, "get-state")
+	if client.lateInstance && !client.instanceReady {
+		return nil, api.StatusErrorf(http.StatusNotFound, "not materialized")
+	}
 	return &api.InstanceState{StatusCode: api.Running, Network: map[string]api.InstanceStateNetwork{"eth0": {Addresses: []api.InstanceStateNetworkAddress{{Family: "inet", Scope: "global", Address: "10.55.0.9"}}}}}, nil
 }
 
@@ -96,10 +111,11 @@ func testRootDependencies(client *recordingRootClient) rootDependencies {
 			client.calls = append(client.calls, "check-proxy")
 			return nil
 		},
-		operationWasSubmitted: func(error) bool { return false },
-		newName:               func() (string, error) { return "session-test", nil },
-		readinessTimeout:      time.Second,
-		retryInterval:         time.Millisecond,
+		operationWasSubmitted:   func(error) bool { return false },
+		awaitSubmittedOperation: func(context.Context, error) error { return nil },
+		newName:                 func() (string, error) { return "session-test", nil },
+		readinessTimeout:        time.Second,
+		retryInterval:           time.Millisecond,
 	}
 }
 
@@ -147,6 +163,84 @@ func TestRootProvisionerCreatesSocketProxyBeforeStarting(t *testing.T) {
 	calls := strings.Join(client.calls, ",")
 	if strings.Index(calls, "create-instance") > strings.Index(calls, "start-instance") || device == nil {
 		t.Fatalf("instance started before proxy device was submitted: %s", calls)
+	}
+}
+
+func TestRootProvisionerAwaitsSubmittedVolumeBeforeProbingLateMaterialization(t *testing.T) {
+	primary := errors.New("copy wait cancelled")
+	client := &recordingRootClient{copyErr: primary, lateVolume: true}
+	deps := testRootDependencies(client)
+	deps.operationWasSubmitted = func(err error) bool { return errors.Is(err, primary) }
+	deps.awaitSubmittedOperation = func(_ context.Context, err error) error {
+		if !errors.Is(err, primary) {
+			t.Fatalf("await error = %v", err)
+		}
+		client.calls = append(client.calls, "await-operation")
+		if _, probeErr := client.GetStorageVolume(context.Background(), "btrfs", rootWorkspaceNamePrefix+"session-test"); !api.StatusErrorCheck(probeErr, http.StatusNotFound) {
+			t.Fatalf("first pre-terminal probe = %v, want 404", probeErr)
+		}
+		client.volumeReady = true
+		return nil
+	}
+	provisioner := newRootProvisioner(rootTestConfig(), deps)
+	if resources, err := provisioner.ProvisionRoot(context.Background(), RootRequest{SessionID: "root-1", SocketPath: "/tmp/root.sock"}); resources != nil || !errors.Is(err, primary) {
+		t.Fatalf("ProvisionRoot() = (%v, %v)", resources, err)
+	}
+	calls := strings.Join(client.calls, ",")
+	if !strings.Contains(calls, "await-operation,probe-volume,probe-volume,delete-volume") {
+		t.Fatalf("late volume cleanup order = %s", calls)
+	}
+}
+
+func TestRootProvisionerAwaitsSubmittedCreateBeforeProbingLateInstance(t *testing.T) {
+	primary := errors.New("create wait cancelled")
+	client := &recordingRootClient{createErr: primary, lateInstance: true}
+	deps := testRootDependencies(client)
+	deps.operationWasSubmitted = func(err error) bool { return errors.Is(err, primary) }
+	deps.awaitSubmittedOperation = func(_ context.Context, err error) error {
+		if !errors.Is(err, primary) {
+			t.Fatalf("await error = %v", err)
+		}
+		client.calls = append(client.calls, "await-operation")
+		if _, probeErr := client.GetInstanceState(context.Background(), "session-test"); !api.StatusErrorCheck(probeErr, http.StatusNotFound) {
+			t.Fatalf("first pre-terminal probe = %v, want 404", probeErr)
+		}
+		client.instanceReady = true
+		return nil
+	}
+	provisioner := newRootProvisioner(rootTestConfig(), deps)
+	if resources, err := provisioner.ProvisionRoot(context.Background(), RootRequest{SessionID: "root-1", SocketPath: "/tmp/root.sock"}); resources != nil || !errors.Is(err, primary) {
+		t.Fatalf("ProvisionRoot() = (%v, %v)", resources, err)
+	}
+	calls := strings.Join(client.calls, ",")
+	if !strings.Contains(calls, "await-operation,get-state,get-state,stop-instance,delete-instance,delete-volume") {
+		t.Fatalf("late instance cleanup order = %s", calls)
+	}
+}
+
+func TestRootProvisionerAwaitsSubmittedStartBeforeCleanupProbe(t *testing.T) {
+	primary := errors.New("start wait cancelled")
+	client := &recordingRootClient{startErr: primary, lateInstance: true}
+	deps := testRootDependencies(client)
+	deps.operationWasSubmitted = func(err error) bool { return errors.Is(err, primary) }
+	deps.awaitSubmittedOperation = func(_ context.Context, err error) error {
+		if !errors.Is(err, primary) {
+			t.Fatalf("await error = %v", err)
+		}
+		client.calls = append(client.calls, "await-operation")
+		if _, probeErr := client.GetInstanceState(context.Background(), "session-test"); !api.StatusErrorCheck(probeErr, http.StatusNotFound) {
+			t.Fatalf("first pre-terminal probe = %v, want 404", probeErr)
+		}
+		client.instanceReady = true
+		return nil
+	}
+	provisioner := newRootProvisioner(rootTestConfig(), deps)
+	if resources, err := provisioner.ProvisionRoot(context.Background(), RootRequest{SessionID: "root-1", SocketPath: "/tmp/root.sock"}); resources != nil || !errors.Is(err, primary) {
+		t.Fatalf("ProvisionRoot() = (%v, %v)", resources, err)
+	}
+	calls := strings.Join(client.calls, ",")
+	if !strings.Contains(calls, "start-instance,await-operation,get-state,get-state,stop-instance,delete-instance,delete-volume") {
+		t.Fatalf("late start cleanup order = %s", calls)
 	}
 }
 

@@ -9,6 +9,7 @@ import (
 	"net"
 	"os"
 	"path/filepath"
+	"strings"
 	"sync"
 	"sync/atomic"
 	"testing"
@@ -20,22 +21,32 @@ import (
 )
 
 type fakeRootProvisioner struct {
-	mu           sync.Mutex
-	calls        int
-	request      provision.RootRequest
-	resources    *provision.Resources
-	provisionErr error
-	destroyErr   error
-	destroyed    int
-	onDestroy    func()
+	mu               sync.Mutex
+	calls            int
+	request          provision.RootRequest
+	resources        *provision.Resources
+	provisionErr     error
+	destroyErr       error
+	destroyed        int
+	onDestroy        func()
+	provisionStarted chan struct{}
+	provisionRelease chan struct{}
 }
 
 func (fake *fakeRootProvisioner) ProvisionRoot(_ context.Context, request provision.RootRequest) (*provision.Resources, error) {
 	fake.mu.Lock()
-	defer fake.mu.Unlock()
 	fake.calls++
 	fake.request = request
-	return fake.resources, fake.provisionErr
+	started, release := fake.provisionStarted, fake.provisionRelease
+	resources, err := fake.resources, fake.provisionErr
+	fake.mu.Unlock()
+	if started != nil {
+		close(started)
+	}
+	if release != nil {
+		<-release
+	}
+	return resources, err
 }
 func (fake *fakeRootProvisioner) Destroy(context.Context, *provision.Resources) error {
 	fake.mu.Lock()
@@ -302,6 +313,50 @@ func TestRootNodeEOFEndsPendingCallAndFailsNode(t *testing.T) {
 	}
 }
 
+func TestRootNodeWaitsForBufferedPiEventsBeforeDoneAndCleanup(t *testing.T) {
+	path, _ := boundSocket(t)
+	host, peer := net.Pipe()
+	fake := &fakeRootProvisioner{resources: &provision.Resources{SessionID: "root-1", Instance: "i", Volume: "v", RPCAddr: "rpc"}}
+	broker := NewEventBroker()
+	node, err := NewRoot(testRootIdentity(t), Dependencies{Provisioner: fake, SocketPath: path, DialRPC: func(context.Context, string) (io.ReadWriteCloser, error) { return host, nil }, Workers: fakeWorkers{}}, broker)
+	if err != nil {
+		t.Fatal(err)
+	}
+	startPiPeer(t, peer, nil)
+	if err := node.Start(context.Background()); err != nil {
+		t.Fatal(err)
+	}
+
+	broker.mu.Lock()
+	writeDone := make(chan struct{})
+	go func() {
+		_, _ = peer.Write([]byte("{\"type\":\"agent_settled\",\"final\":true}\n"))
+		_ = peer.Close()
+		close(writeDone)
+	}()
+	<-writeDone
+	select {
+	case <-node.Done():
+		broker.mu.Unlock()
+		t.Fatal("Node.Done closed while a buffered Pi event was still blocked in publication")
+	case <-time.After(20 * time.Millisecond):
+	}
+	broker.mu.Unlock()
+	select {
+	case <-node.Done():
+	case <-time.After(time.Second):
+		t.Fatal("Node.Done did not close after event drain")
+	}
+	sub := broker.Subscribe()
+	defer sub.Close()
+	if len(sub.Replay) != 1 || !strings.Contains(string(sub.Replay[0].Payload), `"final":true`) {
+		t.Fatalf("final replay = %#v", sub.Replay)
+	}
+	if fake.destroyed != 1 {
+		t.Fatalf("Destroy called %d times", fake.destroyed)
+	}
+}
+
 func TestRootNodeStopIsIdempotentAndClosesPiBeforeDestroy(t *testing.T) {
 	path, _ := boundSocket(t)
 	host, peer := net.Pipe()
@@ -329,6 +384,121 @@ func TestRootNodeStopIsIdempotentAndClosesPiBeforeDestroy(t *testing.T) {
 	}
 	if fake.destroyed != 1 {
 		t.Fatalf("Destroy called %d times", fake.destroyed)
+	}
+}
+
+func TestRootNodeStopBeforeStartPreventsProvisioning(t *testing.T) {
+	path, _ := boundSocket(t)
+	fake := &fakeRootProvisioner{resources: &provision.Resources{SessionID: "root-1", RPCAddr: "rpc"}}
+	node, err := NewRoot(testRootIdentity(t), Dependencies{
+		Provisioner: fake, SocketPath: path,
+		DialRPC: func(context.Context, string) (io.ReadWriteCloser, error) {
+			t.Fatal("DialRPC called after stop-before-start")
+			return nil, nil
+		}, Workers: fakeWorkers{},
+	}, nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := node.Stop(context.Background(), StopReasonRequested); err != nil {
+		t.Fatalf("Stop() error = %v", err)
+	}
+	if err := node.Start(context.Background()); err == nil {
+		t.Fatal("Start() succeeded after Done closed")
+	}
+	if fake.calls != 0 || fake.destroyed != 0 {
+		t.Fatalf("provision calls=%d destroys=%d, want zero", fake.calls, fake.destroyed)
+	}
+}
+
+func TestRootNodeStopWhileProvisioningDestroysLateResourcesWithoutDialing(t *testing.T) {
+	path, _ := boundSocket(t)
+	started := make(chan struct{})
+	release := make(chan struct{})
+	cleanupErr := errors.New("late cleanup failed")
+	fake := &fakeRootProvisioner{
+		resources:        &provision.Resources{SessionID: "root-1", Instance: "late-instance", Volume: "late-volume", RPCAddr: "rpc"},
+		destroyErr:       cleanupErr,
+		provisionStarted: started, provisionRelease: release,
+	}
+	node, err := NewRoot(testRootIdentity(t), Dependencies{
+		Provisioner: fake, SocketPath: path,
+		DialRPC: func(context.Context, string) (io.ReadWriteCloser, error) {
+			t.Fatal("DialRPC called after stop won provisioning race")
+			return nil, nil
+		}, Workers: fakeWorkers{},
+	}, nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	startDone := make(chan error, 1)
+	go func() { startDone <- node.Start(context.Background()) }()
+	<-started
+	stopDone := make(chan error, 1)
+	go func() { stopDone <- node.Stop(context.Background(), StopReasonRequested) }()
+	select {
+	case <-node.Done():
+		t.Fatal("Done closed before in-flight provisioning returned ownership")
+	case <-time.After(20 * time.Millisecond):
+	}
+	close(release)
+	if err := <-stopDone; !errors.Is(err, cleanupErr) {
+		t.Fatalf("Stop() error = %v, want joined cleanup error", err)
+	}
+	if err := <-startDone; err == nil {
+		t.Fatal("Start() succeeded after stop won")
+	}
+	if fake.destroyed != 1 {
+		t.Fatalf("Destroy called %d times, want exactly once", fake.destroyed)
+	}
+	select {
+	case <-node.Done():
+	default:
+		t.Fatal("Done remains open after joined cleanup")
+	}
+}
+
+func TestRootNodeChangedPiIdentityIsTerminalAndCleansResources(t *testing.T) {
+	path, _ := boundSocket(t)
+	host, peer := net.Pipe()
+	fake := &fakeRootProvisioner{resources: &provision.Resources{SessionID: "root-1", Instance: "i", Volume: "v", RPCAddr: "rpc"}}
+	node, err := NewRoot(testRootIdentity(t), Dependencies{Provisioner: fake, SocketPath: path, DialRPC: func(context.Context, string) (io.ReadWriteCloser, error) { return host, nil }, Workers: fakeWorkers{}}, nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	startPiPeer(t, peer, nil)
+	if err := node.Start(context.Background()); err != nil {
+		t.Fatal(err)
+	}
+	pending := make(chan error, 1)
+	go func() {
+		_, err := node.CallRPC(context.Background(), json.RawMessage(`{"type":"get_messages"}`))
+		pending <- err
+	}()
+	_ = readObject(t, peer)
+	changed := make(chan error, 1)
+	go func() {
+		_, err := node.CallRPC(context.Background(), json.RawMessage(`{"type":"get_state"}`))
+		changed <- err
+	}()
+	request := readObject(t, peer)
+	writeGetStateResponse(t, peer, request.ID, "pi-other", "/sessions/pi-other.jsonl", false)
+	if err := <-changed; !errors.Is(err, ErrInvariant) {
+		t.Fatalf("changed get_state error = %v, want ErrInvariant", err)
+	}
+	if err := <-pending; err == nil {
+		t.Fatal("pending call was not failed by identity invariant")
+	}
+	select {
+	case <-node.Done():
+	case <-time.After(time.Second):
+		t.Fatal("node did not finish after identity invariant")
+	}
+	if got := node.Snapshot().Lifecycle; got != string(LifecycleFailed) {
+		t.Fatalf("lifecycle = %q, want failed", got)
+	}
+	if fake.destroyed != 1 {
+		t.Fatalf("Destroy called %d times, want once", fake.destroyed)
 	}
 }
 

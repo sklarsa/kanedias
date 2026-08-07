@@ -47,15 +47,16 @@ type rootClient interface {
 }
 
 type rootDependencies struct {
-	connect               func(context.Context) (rootClient, error)
-	ensureNetwork         func(context.Context, rootClient, config.Config) error
-	renderProfile         func(io.Writer, string, config.Config) error
-	initProxyCA           func() error
-	checkProxy            func(context.Context, config.Config) error
-	operationWasSubmitted func(error) bool
-	newName               func() (string, error)
-	readinessTimeout      time.Duration
-	retryInterval         time.Duration
+	connect                 func(context.Context) (rootClient, error)
+	ensureNetwork           func(context.Context, rootClient, config.Config) error
+	renderProfile           func(io.Writer, string, config.Config) error
+	initProxyCA             func() error
+	checkProxy              func(context.Context, config.Config) error
+	operationWasSubmitted   func(error) bool
+	awaitSubmittedOperation func(context.Context, error) error
+	newName                 func() (string, error)
+	readinessTimeout        time.Duration
+	retryInterval           time.Duration
 }
 
 // IncusRootProvisioner creates and owns one image-based root session.
@@ -87,11 +88,12 @@ func defaultRootDependencies() rootDependencies {
 			}
 			return proxy.InitCA(options.CACertPath, options.CAKeyPath)
 		},
-		checkProxy:            checkRootProxy,
-		operationWasSubmitted: incusclient.OperationWasSubmitted,
-		newName:               newRootName,
-		readinessTimeout:      60 * time.Second,
-		retryInterval:         500 * time.Millisecond,
+		checkProxy:              checkRootProxy,
+		operationWasSubmitted:   incusclient.OperationWasSubmitted,
+		awaitSubmittedOperation: incusclient.AwaitSubmittedOperation,
+		newName:                 newRootName,
+		readinessTimeout:        60 * time.Second,
+		retryInterval:           500 * time.Millisecond,
 	}
 }
 
@@ -151,12 +153,18 @@ func (provisioner *IncusRootProvisioner) ProvisionRoot(ctx context.Context, requ
 	}
 	volume := rootWorkspaceNamePrefix + name
 	owned := rootOwned{instance: name, volume: volume, pool: pool}
+	var submittedErrors []error
 	defer func() {
 		if err == nil {
 			return
 		}
 		cleanupCtx, cancel := context.WithTimeout(context.WithoutCancel(ctx), rootCleanupTimeout)
 		defer cancel()
+		for _, submittedErr := range submittedErrors {
+			if awaitErr := provisioner.deps.awaitSubmittedOperation(cleanupCtx, submittedErr); awaitErr != nil {
+				err = errors.Join(err, awaitErr)
+			}
+		}
 		if cleanupErr := cleanupRoot(cleanupCtx, client, owned); cleanupErr != nil {
 			err = errors.Join(err, fmt.Errorf("clean up root session %q: %w", name, cleanupErr))
 		}
@@ -164,6 +172,10 @@ func (provisioner *IncusRootProvisioner) ProvisionRoot(ctx context.Context, requ
 
 	if err = client.CopyStorageVolume(ctx, pool, seed, volume); err != nil {
 		owned.volumeOwned = provisioner.deps.operationWasSubmitted(err)
+		owned.volumeAmbiguous = owned.volumeOwned
+		if owned.volumeOwned {
+			submittedErrors = append(submittedErrors, err)
+		}
 		return nil, err
 	}
 	owned.volumeOwned = true
@@ -193,12 +205,19 @@ func (provisioner *IncusRootProvisioner) ProvisionRoot(ctx context.Context, requ
 	}
 	if err = client.CreateInstance(ctx, instanceRequest); err != nil {
 		owned.instanceOwned = provisioner.deps.operationWasSubmitted(err)
+		owned.instanceAmbiguous = owned.instanceOwned
+		if owned.instanceOwned {
+			submittedErrors = append(submittedErrors, err)
+		}
 		return nil, err
 	}
 	owned.instanceOwned = true
 
 	if err = client.StartInstance(ctx, name); err != nil {
 		owned.startAmbiguous = provisioner.deps.operationWasSubmitted(err)
+		if owned.startAmbiguous {
+			submittedErrors = append(submittedErrors, err)
+		}
 		return nil, err
 	}
 	owned.running = true
@@ -229,23 +248,26 @@ func (provisioner *IncusRootProvisioner) Destroy(ctx context.Context, resources 
 }
 
 type rootOwned struct {
-	instance, volume, pool     string
-	instanceOwned, volumeOwned bool
-	running, startAmbiguous    bool
+	instance, volume, pool             string
+	instanceOwned, volumeOwned         bool
+	instanceAmbiguous, volumeAmbiguous bool
+	running, startAmbiguous            bool
 }
 
 func cleanupRoot(ctx context.Context, client rootClient, owned rootOwned) error {
 	var cleanupErr error
 	shouldStop := owned.running
-	if owned.instanceOwned && owned.startAmbiguous {
+	if owned.instanceOwned && (owned.instanceAmbiguous || owned.startAmbiguous) {
 		state, err := client.GetInstanceState(ctx, owned.instance)
 		switch {
+		case err == nil && state != nil:
+			shouldStop = state.StatusCode != api.Stopped
 		case err == nil:
-			shouldStop = state != nil && state.StatusCode != api.Stopped
+			cleanupErr = errors.Join(cleanupErr, fmt.Errorf("probe possibly owned root instance %q: returned no state", owned.instance))
 		case incusclient.IsNotFound(err):
 			owned.instanceOwned = false
 		default:
-			cleanupErr = errors.Join(cleanupErr, err)
+			cleanupErr = errors.Join(cleanupErr, fmt.Errorf("probe possibly owned root instance %q: %w", owned.instance, err))
 		}
 	}
 	if shouldStop {
@@ -256,6 +278,18 @@ func cleanupRoot(ctx context.Context, client rootClient, owned rootOwned) error 
 	if owned.instanceOwned {
 		if err := client.DeleteInstance(ctx, owned.instance); err != nil && !incusclient.IsNotFound(err) {
 			cleanupErr = errors.Join(cleanupErr, err)
+		}
+	}
+	if owned.volumeOwned && owned.volumeAmbiguous {
+		volume, err := client.GetStorageVolume(ctx, owned.pool, owned.volume)
+		switch {
+		case err == nil && volume != nil:
+		case err == nil:
+			cleanupErr = errors.Join(cleanupErr, fmt.Errorf("probe possibly owned root volume %q: returned no volume", owned.volume))
+		case incusclient.IsNotFound(err):
+			owned.volumeOwned = false
+		default:
+			cleanupErr = errors.Join(cleanupErr, fmt.Errorf("probe possibly owned root volume %q: %w", owned.volume, err))
 		}
 	}
 	if owned.volumeOwned {

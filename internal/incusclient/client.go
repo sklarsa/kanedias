@@ -149,6 +149,7 @@ func IsNotFound(err error) bool {
 
 type submittedOperationError struct {
 	err    error
+	local  operationWaiter
 	remote *submittedRemoteOperation
 }
 
@@ -176,7 +177,7 @@ func submitAndWaitOperation(ctx context.Context, submit func() (operationWaiter,
 		return err
 	}
 	if err := waitOperation(ctx, operation); err != nil {
-		return &submittedOperationError{err: err}
+		return &submittedOperationError{err: err, local: operation}
 	}
 	return nil
 }
@@ -251,18 +252,35 @@ func waitSubmittedRemoteOperation(ctx context.Context, operation remoteOperation
 	}
 }
 
-// AwaitSubmittedRemoteOperation waits for a previously submitted remote copy
-// to reach a terminal state. It is intended for bounded cleanup after the
-// request context used to submit the copy has been cancelled.
+// AwaitSubmittedOperation waits for a previously submitted local create/start
+// or remote copy to reach terminal state on a detached bounded cleanup context.
+func AwaitSubmittedOperation(ctx context.Context, err error) error {
+	var submitted *submittedOperationError
+	if !errors.As(err, &submitted) {
+		return fmt.Errorf("error does not retain a submitted operation")
+	}
+	if submitted.remote != nil {
+		select {
+		case <-submitted.remote.done:
+			return submitted.remote.err
+		case <-ctx.Done():
+			return fmt.Errorf("await submitted Incus remote operation: %w", ctx.Err())
+		}
+	}
+	if submitted.local != nil {
+		if waitErr := submitted.local.WaitContext(ctx); waitErr != nil {
+			return fmt.Errorf("await submitted Incus local operation: %w", waitErr)
+		}
+		return nil
+	}
+	return fmt.Errorf("error does not retain a submitted operation waiter")
+}
+
+// AwaitSubmittedRemoteOperation preserves the Task 4 remote-copy seam.
 func AwaitSubmittedRemoteOperation(ctx context.Context, err error) error {
 	var submitted *submittedOperationError
 	if !errors.As(err, &submitted) || submitted.remote == nil {
 		return fmt.Errorf("error does not retain a submitted remote operation")
 	}
-	select {
-	case <-submitted.remote.done:
-		return nil
-	case <-ctx.Done():
-		return fmt.Errorf("await submitted Incus remote operation: %w", ctx.Err())
-	}
+	return AwaitSubmittedOperation(ctx, err)
 }

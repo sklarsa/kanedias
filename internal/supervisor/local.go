@@ -6,6 +6,7 @@ import (
 	"errors"
 	"fmt"
 	"sort"
+	"strings"
 	"sync"
 
 	"github.com/sklarsa/kanedias/internal/supervisor/contract"
@@ -38,6 +39,12 @@ type LocalSession struct {
 	mu      sync.RWMutex
 	binding PiBinding
 	model   contract.ModelProfile
+
+	activityMu           sync.Mutex
+	lifecycleResponseSeq uint64
+	lastActivitySeq      uint64
+	lastActivity         string
+	drainDone            chan struct{}
 }
 
 func NewLocalSession(identity Identity, rpc *pirpc.Client, events *EventBroker) *LocalSession {
@@ -50,6 +57,7 @@ func NewLocalSession(identity Identity, rpc *pirpc.Client, events *EventBroker) 
 		events:    events,
 		questions: NewQuestionStore(rpc),
 		lifecycle: newLifecycle(LifecycleStarting),
+		drainDone: make(chan struct{}),
 	}
 	go session.drainEvents()
 	return session
@@ -66,7 +74,7 @@ func (session *LocalSession) Bind(ctx context.Context) error {
 		return invariantf("Pi session is already bound")
 	}
 
-	raw, err := session.rpc.Call(ctx, json.RawMessage(`{"type":"get_state"}`))
+	raw, responseSeq, err := session.rpc.CallWithSequence(ctx, json.RawMessage(`{"type":"get_state"}`))
 	if err != nil {
 		return err
 	}
@@ -84,24 +92,32 @@ func (session *LocalSession) Bind(ctx context.Context) error {
 	session.model = model
 	session.mu.Unlock()
 
+	session.activityMu.Lock()
+	defer session.activityMu.Unlock()
+	session.lifecycleResponseSeq = responseSeq
 	if err := session.lifecycle.Transition(LifecycleReady); err != nil {
 		return err
 	}
-	if state.Data.IsStreaming {
-		_ = session.lifecycle.Transition(LifecycleRunning)
+	if session.lastActivitySeq > responseSeq {
+		session.applyActivityLocked(session.lastActivity)
+	} else if state.Data.IsStreaming {
+		session.markRunningLocked()
 	}
 	return nil
 }
 
 func (session *LocalSession) CallRPC(ctx context.Context, command json.RawMessage) (json.RawMessage, error) {
-	var request struct {
-		Type string `json:"type"`
+	var object map[string]json.RawMessage
+	if err := json.Unmarshal(command, &object); err != nil || object == nil {
+		return nil, contract.NewError(contract.ErrorInvalidRequest, "Pi RPC command must be a JSON object")
 	}
-	if err := json.Unmarshal(command, &request); err != nil {
-		return nil, contract.NewError(contract.ErrorInvalidRequest, "invalid Pi RPC command: "+err.Error())
+	var requestType string
+	typeRaw, ok := object["type"]
+	if !ok || json.Unmarshal(typeRaw, &requestType) != nil || strings.TrimSpace(requestType) == "" {
+		return nil, contract.NewError(contract.ErrorInvalidRequest, "Pi RPC command type must be a nonempty string")
 	}
 
-	response, err := session.rpc.Call(ctx, command)
+	response, responseSeq, err := session.rpc.CallWithSequence(ctx, command)
 	if err != nil {
 		if errors.Is(err, pirpc.ErrForbiddenCommand) {
 			return nil, contract.NewError(contract.ErrorForbiddenRPC, err.Error())
@@ -113,12 +129,13 @@ func (session *LocalSession) CallRPC(ctx context.Context, command json.RawMessag
 		Success bool `json:"success"`
 	}
 	acceptedErr := json.Unmarshal(response, &accepted)
-	if request.Type == "get_state" && acceptedErr == nil && accepted.Success {
+	if requestType == "get_state" && acceptedErr == nil && accepted.Success {
 		state, err := decodeGetState(response)
 		if err != nil {
 			return nil, err
 		}
 		if err := session.verifyBinding(state.Data.SessionID, state.Data.SessionFile); err != nil {
+			session.failTerminalInvariant()
 			return nil, err
 		}
 		session.mu.Lock()
@@ -127,9 +144,16 @@ func (session *LocalSession) CallRPC(ctx context.Context, command json.RawMessag
 	}
 
 	if acceptedErr == nil && accepted.Success {
-		switch request.Type {
+		switch requestType {
 		case "prompt", "follow_up":
-			session.markRunning()
+			session.activityMu.Lock()
+			if responseSeq > session.lifecycleResponseSeq {
+				session.lifecycleResponseSeq = responseSeq
+			}
+			if session.lastActivitySeq <= responseSeq {
+				session.markRunningLocked()
+			}
+			session.activityMu.Unlock()
 		}
 	}
 	return response, nil
@@ -163,23 +187,35 @@ func (session *LocalSession) Snapshot() NodeSnapshot {
 
 func (session *LocalSession) StopRPC() error {
 	session.questions.Clear()
+	session.activityMu.Lock()
 	state := session.lifecycle.State()
 	if state == LifecycleStopped {
+		session.activityMu.Unlock()
 		return session.rpc.Close()
 	}
 	if state != LifecycleStopping {
 		if err := session.lifecycle.Transition(LifecycleStopping); err != nil {
+			session.activityMu.Unlock()
 			return err
 		}
 	}
+	session.activityMu.Unlock()
 	closeErr := session.rpc.Close()
+	<-session.drainDone
+	session.activityMu.Lock()
+	defer session.activityMu.Unlock()
 	if err := session.lifecycle.Transition(LifecycleStopped); err != nil {
 		return errors.Join(closeErr, err)
 	}
 	return closeErr
 }
 
+// DrainDone closes only after every Pi event buffered before RPC termination has
+// been reconciled and published.
+func (session *LocalSession) DrainDone() <-chan struct{} { return session.drainDone }
+
 func (session *LocalSession) drainEvents() {
+	defer close(session.drainDone)
 	for {
 		select {
 		case event := <-session.rpc.Events():
@@ -205,10 +241,55 @@ func (session *LocalSession) handleEvent(event pirpc.Event) {
 	}
 
 	switch event.Type {
+	case "agent_start", "agent_settled":
+		session.activityMu.Lock()
+		if event.Seq > session.lastActivitySeq {
+			session.lastActivitySeq = event.Seq
+			session.lastActivity = event.Type
+		}
+		if event.Seq > session.lifecycleResponseSeq {
+			session.applyActivityLocked(event.Type)
+		}
+		session.activityMu.Unlock()
+	}
+}
+
+func (session *LocalSession) handleRPCTermination() {
+	session.questions.Clear()
+	session.activityMu.Lock()
+	defer session.activityMu.Unlock()
+	switch session.lifecycle.State() {
+	case LifecycleStarting, LifecycleReady, LifecycleRunning, LifecycleAwaitingHandoff:
+		_ = session.lifecycle.Transition(LifecycleFailed)
+	}
+}
+
+func (session *LocalSession) markRunning() {
+	session.activityMu.Lock()
+	defer session.activityMu.Unlock()
+	session.markRunningLocked()
+}
+
+func (session *LocalSession) markRunningLocked() {
+	switch session.lifecycle.State() {
+	case LifecycleReady, LifecycleAwaitingHandoff:
+		_ = session.lifecycle.Transition(LifecycleRunning)
+	}
+}
+
+func (session *LocalSession) applyActivityLocked(activity string) {
+	switch activity {
 	case "agent_start":
-		session.markRunning()
+		session.markRunningLocked()
 	case "agent_settled":
-		if session.lifecycle.State() != LifecycleRunning {
+		state := session.lifecycle.State()
+		if state == LifecycleReady && session.identity.kind == contract.ChildKindWrite {
+			// A settlement observed while Bind was still starting implies the
+			// streaming generation ran and settled before the caller resumed.
+			session.markRunningLocked()
+			state = session.lifecycle.State()
+		}
+		if state != LifecycleRunning {
 			return
 		}
 		switch session.identity.kind {
@@ -220,19 +301,15 @@ func (session *LocalSession) handleEvent(event pirpc.Event) {
 	}
 }
 
-func (session *LocalSession) handleRPCTermination() {
-	session.questions.Clear()
+func (session *LocalSession) failTerminalInvariant() {
+	session.activityMu.Lock()
 	switch session.lifecycle.State() {
 	case LifecycleStarting, LifecycleReady, LifecycleRunning, LifecycleAwaitingHandoff:
 		_ = session.lifecycle.Transition(LifecycleFailed)
 	}
-}
-
-func (session *LocalSession) markRunning() {
-	switch session.lifecycle.State() {
-	case LifecycleReady, LifecycleAwaitingHandoff:
-		_ = session.lifecycle.Transition(LifecycleRunning)
-	}
+	session.activityMu.Unlock()
+	session.questions.Clear()
+	_ = session.rpc.Close()
 }
 
 func (session *LocalSession) verifyBinding(sessionID, sessionFile string) error {

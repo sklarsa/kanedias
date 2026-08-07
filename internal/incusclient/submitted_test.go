@@ -4,6 +4,8 @@ import (
 	"context"
 	"errors"
 	"testing"
+
+	"github.com/lxc/incus/v7/shared/api"
 )
 
 func TestSubmittedLocalOperationWaitFailuresAreMarked(t *testing.T) {
@@ -22,6 +24,46 @@ func TestSubmittedLocalOperationWaitFailuresAreMarked(t *testing.T) {
 		})
 	}
 }
+
+func TestSubmittedLocalOperationCanBeAwaitedAfterRequestCancellation(t *testing.T) {
+	operation := &rewaitLocalOperation{terminal: make(chan struct{})}
+	requestCtx, cancel := context.WithCancel(context.Background())
+	cancel()
+	submittedErr := submitAndWaitOperation(requestCtx, func() (operationWaiter, error) { return operation, nil })
+	if !errors.Is(submittedErr, context.Canceled) || !OperationWasSubmitted(submittedErr) {
+		t.Fatalf("submitted error = %v", submittedErr)
+	}
+	awaitDone := make(chan error, 1)
+	go func() { awaitDone <- AwaitSubmittedOperation(context.Background(), submittedErr) }()
+	select {
+	case err := <-awaitDone:
+		t.Fatalf("await returned before local operation terminal state: %v", err)
+	default:
+	}
+	close(operation.terminal)
+	if err := <-awaitDone; err != nil {
+		t.Fatalf("AwaitSubmittedOperation() error = %v", err)
+	}
+}
+
+type rewaitLocalOperation struct {
+	terminal chan struct{}
+	calls    int
+}
+
+func (operation *rewaitLocalOperation) WaitContext(ctx context.Context) error {
+	operation.calls++
+	if operation.calls == 1 {
+		return ctx.Err()
+	}
+	select {
+	case <-operation.terminal:
+		return nil
+	case <-ctx.Done():
+		return ctx.Err()
+	}
+}
+func (*rewaitLocalOperation) Get() api.Operation { return api.Operation{} }
 
 func TestSubmittedVolumeCopyWaitFailureIsMarked(t *testing.T) {
 	waitErr := errors.New("copy wait failed")

@@ -27,11 +27,14 @@ type Node struct {
 	deps     Dependencies
 	broker   *EventBroker
 
-	mu        sync.RWMutex
-	started   bool
-	local     *LocalSession
-	resources *provision.Resources
-	state     LifecycleState
+	mu            sync.RWMutex
+	started       bool
+	stopRequested bool
+	startupCancel context.CancelFunc
+	startupDone   chan struct{}
+	local         *LocalSession
+	resources     *provision.Resources
+	state         LifecycleState
 
 	finishOnce sync.Once
 	finishErr  error
@@ -67,8 +70,20 @@ func (node *Node) Start(ctx context.Context) error {
 		node.mu.Unlock()
 		return invariantf("root node has already been started")
 	}
+	if node.stopRequested {
+		node.mu.Unlock()
+		return contract.NewError(contract.ErrorSessionStopping, "root node was stopped before startup")
+	}
 	node.started = true
+	startupCtx, cancel := context.WithCancel(ctx)
+	node.startupCancel = cancel
+	node.startupDone = make(chan struct{})
+	startupDone := node.startupDone
 	node.mu.Unlock()
+	defer func() {
+		cancel()
+		close(startupDone)
+	}()
 
 	if err := validateBoundSupervisorSocket(node.deps.SocketPath); err != nil {
 		node.failStart(ctx, err)
@@ -76,10 +91,22 @@ func (node *Node) Start(ctx context.Context) error {
 	}
 
 	identity := node.identity.Snapshot()
-	resources, err := node.deps.Provisioner.ProvisionRoot(ctx, provision.RootRequest{
+	resources, err := node.deps.Provisioner.ProvisionRoot(startupCtx, provision.RootRequest{
 		SessionID:  identity.SessionID,
 		SocketPath: node.deps.SocketPath,
 	})
+	node.mu.Lock()
+	if resources != nil {
+		node.resources = resources
+	}
+	stopRequested := node.stopRequested
+	if err == nil && resources != nil && !stopRequested {
+		node.state = LifecycleStarting
+	}
+	node.mu.Unlock()
+	if stopRequested {
+		return errors.Join(contract.NewError(contract.ErrorSessionStopping, "root startup was cancelled by stop"), err, startupCtx.Err())
+	}
 	if err != nil {
 		node.failStart(ctx, err)
 		return node.finishedError()
@@ -89,15 +116,22 @@ func (node *Node) Start(ctx context.Context) error {
 		return node.finishedError()
 	}
 
-	node.mu.Lock()
-	node.resources = resources
-	node.state = LifecycleStarting
-	node.mu.Unlock()
-
-	connection, err := node.deps.DialRPC(ctx, resources.RPCAddr)
+	connection, err := node.deps.DialRPC(startupCtx, resources.RPCAddr)
 	if err != nil {
+		if node.startupWasStopped() {
+			return errors.Join(contract.NewError(contract.ErrorSessionStopping, "root startup was cancelled while dialing Pi"), err)
+		}
 		node.failStart(ctx, fmt.Errorf("dial Pi RPC at %q: %w", resources.RPCAddr, err))
 		return node.finishedError()
+	}
+	node.mu.RLock()
+	stopRequested = node.stopRequested
+	node.mu.RUnlock()
+	if stopRequested {
+		if connection != nil {
+			_ = connection.Close()
+		}
+		return contract.NewError(contract.ErrorSessionStopping, "root startup was cancelled before Pi binding")
 	}
 	if connection == nil {
 		node.failStart(ctx, invariantf("Pi RPC dialer returned a nil connection"))
@@ -112,12 +146,21 @@ func (node *Node) Start(ctx context.Context) error {
 
 	// A successful transport dial is not readiness. Bind performs the correlated
 	// get_state handshake and moves the local session to ready only on success.
-	if err := local.Bind(ctx); err != nil {
+	if err := local.Bind(startupCtx); err != nil {
+		if node.startupWasStopped() {
+			return errors.Join(contract.NewError(contract.ErrorSessionStopping, "root startup was cancelled while binding Pi"), err)
+		}
 		node.failStart(ctx, fmt.Errorf("bind root Pi session: %w", err))
 		return node.finishedError()
 	}
 
-	go node.watchRPC(rpc)
+	node.mu.RLock()
+	stopRequested = node.stopRequested
+	node.mu.RUnlock()
+	if stopRequested {
+		return contract.NewError(contract.ErrorSessionStopping, "root startup was cancelled after Pi binding")
+	}
+	go node.watchRPC(rpc, local)
 	return nil
 }
 
@@ -126,10 +169,10 @@ func (node *Node) CallRPC(ctx context.Context, command json.RawMessage) (json.Ra
 	local := node.local
 	state := node.state
 	node.mu.RUnlock()
+	if state == LifecycleFailed || state == LifecycleStopping || state == LifecycleStopped {
+		return nil, contract.NewError(contract.ErrorSessionStopping, "root session is not available")
+	}
 	if local == nil {
-		if state == LifecycleFailed || state == LifecycleStopping || state == LifecycleStopped {
-			return nil, contract.NewError(contract.ErrorSessionStopping, "root session is not available")
-		}
 		return nil, contract.NewError(contract.ErrorChildUnavailable, "root Pi RPC is not ready")
 	}
 	return local.CallRPC(ctx, command)
@@ -142,7 +185,7 @@ func (node *Node) Snapshot() NodeSnapshot {
 	node.mu.RUnlock()
 	if local != nil {
 		snapshot := local.Snapshot()
-		if state == LifecycleFailed || state == LifecycleStopped {
+		if state == LifecycleFailed || state == LifecycleStopping || state == LifecycleStopped {
 			snapshot.Lifecycle = string(state)
 		}
 		return snapshot
@@ -171,13 +214,11 @@ func (node *Node) WorkerSummaries() []contract.WorkerSummary {
 	return node.deps.Workers.Summaries()
 }
 
-func (node *Node) watchRPC(rpc *pirpc.Client) {
+func (node *Node) watchRPC(rpc *pirpc.Client, local *LocalSession) {
 	<-rpc.Done()
-	node.mu.RLock()
-	local := node.local
-	node.mu.RUnlock()
-	if local != nil {
-		local.questions.Clear()
+	<-local.DrainDone()
+	if node.startupWasStopped() {
+		return
 	}
 	err := rpc.Err()
 	if err == nil {
@@ -211,6 +252,25 @@ func validateBoundSupervisorSocket(path string) error {
 	return nil
 }
 
+func (node *Node) startupWasStopped() bool {
+	node.mu.RLock()
+	defer node.mu.RUnlock()
+	return node.stopRequested
+}
+
+func (node *Node) requestStop() <-chan struct{} {
+	node.mu.Lock()
+	defer node.mu.Unlock()
+	node.stopRequested = true
+	if node.state != LifecycleStopped && node.state != LifecycleFailed {
+		node.state = LifecycleStopping
+	}
+	if node.startupCancel != nil {
+		node.startupCancel()
+	}
+	return node.startupDone
+}
+
 func (node *Node) finish(ctx context.Context, primary error, terminal LifecycleState, closeRPC bool) {
 	node.finishOnce.Do(func() {
 		node.mu.RLock()
@@ -223,6 +283,7 @@ func (node *Node) finish(ctx context.Context, primary error, terminal LifecycleS
 			if closeRPC {
 				cleanupErr = errors.Join(cleanupErr, local.StopRPC())
 			} else {
+				<-local.DrainDone()
 				local.questions.Clear()
 			}
 		}

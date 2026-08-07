@@ -20,18 +20,19 @@ import (
 )
 
 type fakeService struct {
-	mu            sync.Mutex
-	snapshot      supervisor.NodeSnapshot
-	workers       []contract.WorkerSummary
-	rpcSession    string
-	rpcBody       json.RawMessage
-	answerSession string
-	answerID      string
-	answerBody    json.RawMessage
-	sub           supervisor.Subscription
-	stopSession   string
-	stopCalled    chan struct{}
-	err           error
+	mu             sync.Mutex
+	snapshot       supervisor.NodeSnapshot
+	workers        []contract.WorkerSummary
+	rpcSession     string
+	rpcBody        json.RawMessage
+	answerSession  string
+	answerID       string
+	answerBody     json.RawMessage
+	sub            supervisor.Subscription
+	stopSession    string
+	stopCalled     chan struct{}
+	stopMayObserve <-chan struct{}
+	err            error
 }
 
 func (service *fakeService) Snapshot(context.Context) (supervisor.NodeSnapshot, error) {
@@ -54,6 +55,9 @@ func (service *fakeService) Subscribe(context.Context) (supervisor.Subscription,
 	return service.sub, service.err
 }
 func (service *fakeService) Stop(_ context.Context, session string) error {
+	if service.stopMayObserve != nil {
+		<-service.stopMayObserve
+	}
 	service.mu.Lock()
 	service.stopSession = session
 	service.mu.Unlock()
@@ -133,6 +137,39 @@ func TestHandlerEventsUsesStandardSSEFraming(t *testing.T) {
 	}
 }
 
+func TestHandlerRejectsMalformedRPCEnvelopesAsInvalidRequest(t *testing.T) {
+	service := &fakeService{}
+	handler := NewHandler(service)
+	for _, body := range []string{`{`, `{}`, `{"type":""}`, `{"type":"   "}`, `{"type":null}`, `{"type":1}`, `null`, `[]`} {
+		request := httptest.NewRequest(http.MethodPost, "/v1/sessions/self/rpc", strings.NewReader(body))
+		request.Header.Set("Content-Type", "application/json")
+		response := httptest.NewRecorder()
+		handler.ServeHTTP(response, request)
+		if response.Code != http.StatusBadRequest || !strings.Contains(response.Body.String(), `"code":"invalid_request"`) {
+			t.Errorf("body %q => %d %q, want typed 400", body, response.Code, response.Body.String())
+		}
+	}
+	service.mu.Lock()
+	defer service.mu.Unlock()
+	if service.rpcBody != nil {
+		t.Fatalf("invalid RPC reached service: %s", service.rpcBody)
+	}
+}
+
+func TestHandlerPreservesArbitraryPiRPCFields(t *testing.T) {
+	service := &fakeService{}
+	body := `{"type":"prompt","message":"go","nested":{"raw":[1,true,null]}}`
+	response := jsonRequest(t, NewHandler(service), http.MethodPost, "/v1/sessions/self/rpc", body)
+	if response.Code != http.StatusOK {
+		t.Fatalf("status = %d: %s", response.Code, response.Body.String())
+	}
+	service.mu.Lock()
+	defer service.mu.Unlock()
+	if string(service.rpcBody) != body {
+		t.Fatalf("RPC body = %s, want byte-preserved %s", service.rpcBody, body)
+	}
+}
+
 func TestHandlerRejectsWrongMethodsContentTypeOversizeAndHTML(t *testing.T) {
 	handler := NewHandler(&fakeService{})
 	for _, test := range []struct {
@@ -176,6 +213,59 @@ func waitForSocket(t *testing.T, path string) {
 		}
 		time.Sleep(5 * time.Millisecond)
 	}
+}
+
+func TestDeleteFlushesResponseOverUnixBeforeStopObservation(t *testing.T) {
+	path := filepath.Join(t.TempDir(), "api.sock")
+	mayObserve := make(chan struct{})
+	observed := make(chan struct{})
+	service := &fakeService{stopMayObserve: mayObserve, stopCalled: observed}
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+	serverDone := make(chan error, 1)
+	go func() { serverDone <- ServeUnix(ctx, path, NewHandler(service)) }()
+	waitForSocket(t, path)
+
+	transport := &http.Transport{DialContext: func(ctx context.Context, _, _ string) (net.Conn, error) {
+		return (&net.Dialer{}).DialContext(ctx, "unix", path)
+	}}
+	client := &http.Client{Transport: transport}
+	response, err := client.Do(mustRequest(t, http.MethodDelete, "http://unix/v1/sessions/self", nil))
+	if err != nil {
+		t.Fatal(err)
+	}
+	body, err := io.ReadAll(response.Body)
+	_ = response.Body.Close()
+	if err != nil {
+		t.Fatal(err)
+	}
+	if response.StatusCode != http.StatusAccepted || !strings.Contains(string(body), `"status":"stopping"`) {
+		t.Fatalf("DELETE response = %d %q", response.StatusCode, body)
+	}
+	select {
+	case <-observed:
+		t.Fatal("Stop was observed before the client received the complete response")
+	default:
+	}
+	close(mayObserve)
+	select {
+	case <-observed:
+	case <-time.After(time.Second):
+		t.Fatal("Stop was not invoked after response receipt")
+	}
+	cancel()
+	if err := <-serverDone; err != nil {
+		t.Fatal(err)
+	}
+}
+
+func mustRequest(t *testing.T, method, url string, body io.Reader) *http.Request {
+	t.Helper()
+	request, err := http.NewRequest(method, url, body)
+	if err != nil {
+		t.Fatal(err)
+	}
+	return request
 }
 
 func TestServeUnixModeAndUnlinkOnShutdown(t *testing.T) {
