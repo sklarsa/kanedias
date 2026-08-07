@@ -36,22 +36,28 @@ type reportEvent struct {
 }
 
 type Child struct {
-	command         *exec.Cmd
-	bootstrap       Bootstrap
-	liveness        *os.File
-	reports         chan reportEvent
-	probeInterval   time.Duration
-	waitDone        chan struct{}
-	waitErr         error
-	closeOnce       sync.Once
-	killOnce        sync.Once
-	reportReader    *os.File
-	reportStop      chan struct{}
-	reportDone      chan struct{}
-	reportCloseOnce sync.Once
-	recoveryMu      sync.RWMutex
-	recoveryTicket  provision.RecoveryTicket
-	hasRecovery     bool
+	command           *exec.Cmd
+	bootstrap         Bootstrap
+	liveness          *os.File
+	reports           chan reportEvent
+	probeInterval     time.Duration
+	waitDone          chan struct{}
+	waitErr           error
+	closeOnce         sync.Once
+	killOnce          sync.Once
+	reportReader      *os.File
+	terminalAck       *os.File
+	terminalAckOnce   sync.Once
+	terminalMu        sync.Mutex
+	pendingTerminal   *ChildMessage
+	terminalAcked     bool
+	terminalAckClosed bool
+	reportStop        chan struct{}
+	reportDone        chan struct{}
+	reportCloseOnce   sync.Once
+	recoveryMu        sync.RWMutex
+	recoveryTicket    provision.RecoveryTicket
+	hasRecovery       bool
 }
 
 func (spawner Spawner) Spawn(ctx context.Context, bootstrap Bootstrap) (*Child, error) {
@@ -92,6 +98,16 @@ func (spawner Spawner) Spawn(ctx context.Context, bootstrap Bootstrap) (*Child, 
 		livenessWrite.Close()
 		return nil, fmt.Errorf("create report pipe: %w", err)
 	}
+	terminalAckRead, terminalAckWrite, err := os.Pipe()
+	if err != nil {
+		bootstrapRead.Close()
+		bootstrapWrite.Close()
+		livenessRead.Close()
+		livenessWrite.Close()
+		reportRead.Close()
+		reportWrite.Close()
+		return nil, fmt.Errorf("create terminal acknowledgement pipe: %w", err)
+	}
 	closeAll := func() {
 		bootstrapRead.Close()
 		bootstrapWrite.Close()
@@ -99,10 +115,12 @@ func (spawner Spawner) Spawn(ctx context.Context, bootstrap Bootstrap) (*Child, 
 		livenessWrite.Close()
 		reportRead.Close()
 		reportWrite.Close()
+		terminalAckRead.Close()
+		terminalAckWrite.Close()
 	}
 
 	command := exec.CommandContext(ctx, executable,
-		"session-child", "--bootstrap-fd", "3", "--liveness-fd", "4", "--report-fd", "5")
+		"session-child", "--bootstrap-fd", "3", "--liveness-fd", "4", "--report-fd", "5", "--terminal-ack-fd", "6")
 	// Recursive diagnostics follow the root process's already-private persistent
 	// log sinks instead of disappearing into /dev/null.
 	command.Stdout = os.Stdout
@@ -115,7 +133,7 @@ func (spawner Spawner) Spawn(ctx context.Context, bootstrap Bootstrap) (*Child, 
 	// grandchild behind.
 	command.SysProcAttr = &syscall.SysProcAttr{Setpgid: true}
 	// ExtraFiles is the complete descriptor allowlist beyond stdin/out/err.
-	command.ExtraFiles = []*os.File{bootstrapRead, livenessRead, reportWrite}
+	command.ExtraFiles = []*os.File{bootstrapRead, livenessRead, reportWrite, terminalAckRead}
 	if err := command.Start(); err != nil {
 		closeAll()
 		return nil, fmt.Errorf("start child supervisor: %w", err)
@@ -123,6 +141,7 @@ func (spawner Spawner) Spawn(ctx context.Context, bootstrap Bootstrap) (*Child, 
 	_ = bootstrapRead.Close()
 	_ = livenessRead.Close()
 	_ = reportWrite.Close()
+	_ = terminalAckRead.Close()
 
 	writeDone := make(chan error, 1)
 	go func() {
@@ -137,6 +156,7 @@ func (spawner Spawner) Spawn(ctx context.Context, bootstrap Bootstrap) (*Child, 
 			_ = command.Wait()
 			_ = livenessWrite.Close()
 			_ = reportRead.Close()
+			_ = terminalAckWrite.Close()
 			return nil, fmt.Errorf("send child bootstrap: %w", err)
 		}
 	case <-ctx.Done():
@@ -145,6 +165,7 @@ func (spawner Spawner) Spawn(ctx context.Context, bootstrap Bootstrap) (*Child, 
 		_ = command.Wait()
 		_ = livenessWrite.Close()
 		_ = reportRead.Close()
+		_ = terminalAckWrite.Close()
 		return nil, ctx.Err()
 	}
 
@@ -155,7 +176,8 @@ func (spawner Spawner) Spawn(ctx context.Context, bootstrap Bootstrap) (*Child, 
 	child := &Child{
 		command: command, bootstrap: bootstrap, liveness: livenessWrite,
 		reports: make(chan reportEvent, 1), probeInterval: interval, waitDone: make(chan struct{}),
-		reportReader: reportRead, reportStop: make(chan struct{}), reportDone: make(chan struct{}),
+		reportReader: reportRead, terminalAck: terminalAckWrite,
+		reportStop: make(chan struct{}), reportDone: make(chan struct{}),
 	}
 	go child.readReports(reportRead)
 	go func() { child.waitErr = command.Wait(); close(child.waitDone) }()
@@ -285,10 +307,72 @@ func (child *Child) NextMessage(ctx context.Context) (ChildMessage, error) {
 		if event.err != nil {
 			return ChildMessage{}, event.err
 		}
+		if isTerminalMessage(event.message) {
+			child.terminalMu.Lock()
+			if child.pendingTerminal != nil || child.terminalAcked {
+				child.terminalMu.Unlock()
+				return ChildMessage{}, fmt.Errorf("child published more than one terminal report")
+			}
+			message := event.message
+			child.pendingTerminal = &message
+			child.terminalMu.Unlock()
+		}
 		return event.message, nil
 	case <-ctx.Done():
 		return ChildMessage{}, ctx.Err()
 	}
+}
+
+func isTerminalMessage(message ChildMessage) bool {
+	return message.Type == MessageRead || message.Type == MessageWrite || message.Type == MessageFailure
+}
+
+func (child *Child) AcknowledgeTerminal(message ChildMessage) error {
+	if !isTerminalMessage(message) {
+		return fmt.Errorf("cannot acknowledge non-terminal child report %q", message.Type)
+	}
+	child.terminalMu.Lock()
+	defer child.terminalMu.Unlock()
+	if child.pendingTerminal == nil {
+		return fmt.Errorf("no terminal child report is pending acknowledgement")
+	}
+	pending, pendingErr := json.Marshal(child.pendingTerminal)
+	acknowledged, acknowledgedErr := json.Marshal(message)
+	if pendingErr != nil || acknowledgedErr != nil || !bytes.Equal(pending, acknowledged) {
+		return fmt.Errorf("terminal acknowledgement does not match the exact ingested report")
+	}
+	if child.terminalAcked {
+		return fmt.Errorf("terminal child report was already acknowledged")
+	}
+	if child.terminalAckClosed {
+		return fmt.Errorf("terminal acknowledgement endpoint is closed")
+	}
+	child.terminalAcked = true
+	var result error
+	child.terminalAckOnce.Do(func() {
+		_, writeErr := child.terminalAck.Write([]byte{TerminalAckByte})
+		closeErr := child.terminalAck.Close()
+		result = errors.Join(writeErr, closeErr)
+	})
+	if result != nil {
+		return fmt.Errorf("acknowledge terminal child report: %w", result)
+	}
+	return nil
+}
+
+func (child *Child) CloseTerminalAck() error {
+	child.terminalMu.Lock()
+	defer child.terminalMu.Unlock()
+	if child.terminalAckClosed || child.terminalAcked {
+		return nil
+	}
+	child.terminalAckClosed = true
+	var err error
+	child.terminalAckOnce.Do(func() { err = child.terminalAck.Close() })
+	if errors.Is(err, os.ErrClosed) {
+		return nil
+	}
+	return err
 }
 
 func (child *Child) CloseLiveness() error {
@@ -318,6 +402,7 @@ func (child *Child) Wait() error {
 }
 
 func (child *Child) Terminate() error {
+	_ = child.CloseTerminalAck()
 	_ = child.CloseLiveness()
 	select {
 	case <-child.waitDone:
@@ -334,6 +419,7 @@ func (child *Child) Terminate() error {
 }
 
 func (child *Child) Kill() error {
+	_ = child.CloseTerminalAck()
 	_ = child.CloseLiveness()
 	var err error
 	child.killOnce.Do(func() {

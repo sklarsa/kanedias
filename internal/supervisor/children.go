@@ -32,6 +32,8 @@ type ChildProcess interface {
 	WaitReady(context.Context) error
 	RecoveryTicket() (provision.RecoveryTicket, bool)
 	NextMessage(context.Context) (process.ChildMessage, error)
+	AcknowledgeTerminal(process.ChildMessage) error
+	CloseTerminalAck() error
 	CloseLiveness() error
 	CloseReports() error
 	Done() <-chan struct{}
@@ -56,12 +58,11 @@ type childEntry struct {
 	eventCancel context.CancelFunc
 	recovery    *provision.RecoveryTicket
 
-	cleanupOnce         sync.Once
-	cleanupDone         chan struct{}
-	cleanupErr          error
-	streamErr           error
-	eventCloseExpected  bool
-	eventCloseExpectedC chan struct{}
+	cleanupOnce        sync.Once
+	cleanupDone        chan struct{}
+	cleanupErr         error
+	streamErr          error
+	eventCloseExpected bool
 }
 
 func (entry *childEntry) init() {
@@ -70,9 +71,6 @@ func (entry *childEntry) init() {
 	}
 	if entry.spawnDone == nil {
 		entry.spawnDone = make(chan struct{})
-	}
-	if entry.eventCloseExpectedC == nil {
-		entry.eventCloseExpectedC = make(chan struct{})
 	}
 }
 
@@ -121,9 +119,6 @@ func (entry *childEntry) expectEventStreamClose() {
 	entry.mu.Lock()
 	if !entry.eventCloseExpected {
 		entry.eventCloseExpected = true
-		if entry.eventCloseExpectedC != nil {
-			close(entry.eventCloseExpectedC)
-		}
 	}
 	cancel := entry.eventCancel
 	entry.mu.Unlock()
@@ -136,33 +131,6 @@ func (entry *childEntry) eventStreamCloseIsExpected() bool {
 	entry.mu.RLock()
 	defer entry.mu.RUnlock()
 	return entry.eventCloseExpected
-}
-
-func (entry *childEntry) waitForExpectedEventStreamClose(ctx context.Context, grace time.Duration) bool {
-	entry.mu.RLock()
-	expected := entry.eventCloseExpected
-	expectedC := entry.eventCloseExpectedC
-	entry.mu.RUnlock()
-	if expected {
-		return true
-	}
-	timer := time.NewTimer(grace)
-	defer timer.Stop()
-	select {
-	case <-expectedC:
-	case <-ctx.Done():
-	case <-timer.C:
-	}
-	return entry.eventStreamCloseIsExpected()
-}
-
-type cleanEventStreamEOF interface {
-	CleanEOF() bool
-}
-
-func isCleanEventStreamEOF(err error) bool {
-	var clean cleanEventStreamEOF
-	return errors.As(err, &clean) && clean.CleanEOF()
 }
 
 type childRegistry struct {
@@ -253,13 +221,6 @@ func (node *Node) forwardChildEvents(ctx context.Context, cancel context.CancelF
 				if subscription.Err != nil {
 					streamErr = subscription.Err()
 				}
-				// A clean HTTP/SSE EOF can be observed just before the independent
-				// report pipe publishes a terminal result. Give that signal one
-				// short, bounded scheduling window; all other stream failures remain
-				// immediately fatal.
-				if streamErr != nil && isCleanEventStreamEOF(streamErr) && entry.waitForExpectedEventStreamClose(ctx, node.childEscalationGrace()) {
-					return
-				}
 				if streamErr != nil && !entry.eventStreamCloseIsExpected() && ctx.Err() == nil {
 					entry.setStreamError(streamErr)
 					_, child, _ := entry.values()
@@ -290,6 +251,10 @@ func (node *Node) cleanupChild(ctx context.Context, entry *childEntry, requestSt
 		}
 		var cleanupErr error
 		if child != nil && requestStop {
+			// A forced/cancelled stop is not a terminal acceptance. Closing the
+			// private ack endpoint unblocks any terminal reporter without granting
+			// acknowledgement, then normal stop cascades through the child subtree.
+			cleanupErr = errors.Join(cleanupErr, child.CloseTerminalAck())
 			// Mark and cancel event ownership before any intentional child stop.
 			// Its server may close SSE as part of Stop before the process/report
 			// paths have otherwise had a chance to classify that EOF.
@@ -304,7 +269,7 @@ func (node *Node) cleanupChild(ctx context.Context, entry *childEntry, requestSt
 			select {
 			case <-child.Done():
 			case <-ctx.Done():
-				cleanupErr = errors.Join(cleanupErr, ctx.Err(), child.CloseLiveness())
+				cleanupErr = errors.Join(cleanupErr, ctx.Err(), child.CloseTerminalAck(), child.CloseLiveness())
 				grace := time.NewTimer(node.childEscalationGrace())
 				select {
 				case <-child.Done():
@@ -320,7 +285,7 @@ func (node *Node) cleanupChild(ctx context.Context, entry *childEntry, requestSt
 					}
 				}
 			}
-			cleanupErr = errors.Join(cleanupErr, child.Wait(), child.CloseLiveness(), child.CloseReports())
+			cleanupErr = errors.Join(cleanupErr, child.Wait(), child.CloseTerminalAck(), child.CloseLiveness(), child.CloseReports())
 			entry.mu.RLock()
 			ticket := entry.recovery
 			entry.mu.RUnlock()

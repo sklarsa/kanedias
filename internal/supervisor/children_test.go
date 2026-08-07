@@ -40,6 +40,8 @@ type fakeChildProcess struct {
 	liveness     atomic.Int32
 	terminated   atomic.Int32
 	killed       atomic.Int32
+	acknowledged atomic.Int32
+	ackClosed    atomic.Int32
 }
 
 func newFakeChildProcess() *fakeChildProcess {
@@ -65,9 +67,6 @@ func (child *fakeChildProcess) RecoveryTicket() (provision.RecoveryTicket, bool)
 func (child *fakeChildProcess) NextMessage(ctx context.Context) (process.ChildMessage, error) {
 	select {
 	case message := <-child.messages:
-		if child.autoFinish {
-			child.finish()
-		}
 		return message, nil
 	case <-child.done:
 		return process.ChildMessage{}, io.EOF
@@ -75,6 +74,14 @@ func (child *fakeChildProcess) NextMessage(ctx context.Context) (process.ChildMe
 		return process.ChildMessage{}, ctx.Err()
 	}
 }
+func (child *fakeChildProcess) AcknowledgeTerminal(process.ChildMessage) error {
+	child.acknowledged.Add(1)
+	if child.autoFinish {
+		child.finish()
+	}
+	return nil
+}
+func (child *fakeChildProcess) CloseTerminalAck() error { child.ackClosed.Add(1); return nil }
 func (child *fakeChildProcess) CloseLiveness() error {
 	child.liveness.Add(1)
 	child.finish()
@@ -285,6 +292,9 @@ func TestCreateChildCancellationStopsAndSynchronouslyCleansChild(t *testing.T) {
 	if node.children.get("child-cancel") != nil {
 		t.Fatal("cancelled child remains registered")
 	}
+	if child.ackClosed.Load() == 0 {
+		t.Fatal("cancellation did not close the terminal acknowledgement endpoint")
+	}
 	select {
 	case <-child.Done():
 	default:
@@ -311,51 +321,6 @@ func TestParentStopMarksCleanEventEOFExpectedBeforeStoppingChild(t *testing.T) {
 	defer cancel()
 	if err := node.cleanupChild(ctx, entry, true); err != nil {
 		t.Fatalf("normal parent stop retained expected clean EOF: %v", err)
-	}
-}
-
-func TestTerminalReadReportWinsWhenCleanEventEOFArrivesFirst(t *testing.T) {
-	child := newFakeChildProcess()
-	child.autoFinish = true
-	client := &eofDescendant{
-		fakeDescendantClient: fakeDescendantClient{snapshot: directChildSnapshot("child-terminal")},
-		process:              child, events: make(chan EventEnvelope), subscribed: make(chan struct{}),
-		subscriptionClosed: make(chan struct{}), eofObserved: make(chan struct{}),
-	}
-	node := childCreationNode(t,
-		func(context.Context, process.Bootstrap) (ChildProcess, error) { return child, nil },
-		func(string) (DescendantClient, error) { return client, nil },
-	)
-	node.deps.NewSessionID = func() (string, error) { return "child-terminal", nil }
-	result := make(chan struct {
-		terminal TerminalResult
-		err      error
-	}, 1)
-	go func() {
-		terminal, err := node.CreateChild(context.Background(), "root-1", readRequest())
-		result <- struct {
-			terminal TerminalResult
-			err      error
-		}{terminal: terminal, err: err}
-	}()
-	<-client.subscribed
-	close(client.events)
-	<-client.eofObserved
-	child.messages <- process.ChildMessage{
-		Type: process.MessageRead, SessionID: "child-terminal",
-		Read: &contract.ReadChildResult{Kind: contract.ChildKindRead, WorkerType: "reviewer", SessionID: "child-terminal", Output: "review complete"},
-	}
-
-	select {
-	case got := <-result:
-		if got.err != nil {
-			t.Fatalf("terminal read teardown retained clean EOF that arrived first: %v", got.err)
-		}
-		if got.terminal.Read == nil || got.terminal.Read.Output != "review complete" {
-			t.Fatalf("terminal result = %#v", got.terminal)
-		}
-	case <-time.After(time.Second):
-		t.Fatal("terminal read report did not settle after clean EOF")
 	}
 }
 
@@ -486,6 +451,28 @@ func TestCreateChildSuccessWaitsForProcessExitAndRejectsTerminalContractMismatch
 	}
 }
 
+func TestCreateChildRejectsNonterminalReportWithoutAcknowledgingIt(t *testing.T) {
+	child := newFakeChildProcess()
+	child.messages <- process.ChildMessage{Type: process.MessageReady, SessionID: "child-nonterminal", Ready: &process.ReadyMessage{SocketPath: "/tmp/child-nonterminal.sock"}}
+	client := &stoppingDescendant{fakeDescendantClient: fakeDescendantClient{snapshot: directChildSnapshot("child-nonterminal")}, process: child}
+	node := childCreationNode(t,
+		func(context.Context, process.Bootstrap) (ChildProcess, error) { return child, nil },
+		func(string) (DescendantClient, error) { return client, nil },
+	)
+	node.deps.NewSessionID = func() (string, error) { return "child-nonterminal", nil }
+	_, err := node.CreateChild(context.Background(), "root-1", readRequest())
+	var typed *contract.Error
+	if !errors.As(err, &typed) || typed.Code != contract.ErrorChildFailed {
+		t.Fatalf("nonterminal report error = %v, want typed child_failed", err)
+	}
+	if child.acknowledged.Load() != 0 {
+		t.Fatal("parent acknowledged a nonterminal child report")
+	}
+	if node.children.get("child-nonterminal") != nil {
+		t.Fatal("nonterminal child remains registered")
+	}
+}
+
 func TestCreateChildValidatesInstalledDescendantIdentityBeforeReadiness(t *testing.T) {
 	for _, test := range []struct {
 		name string
@@ -579,11 +566,13 @@ func (*escalatingChildProcess) RecoveryTicket() (provision.RecoveryTicket, bool)
 func (*escalatingChildProcess) NextMessage(context.Context) (process.ChildMessage, error) {
 	return process.ChildMessage{}, io.EOF
 }
-func (*escalatingChildProcess) CloseLiveness() error        { return nil }
-func (*escalatingChildProcess) CloseReports() error         { return nil }
-func (child *escalatingChildProcess) Done() <-chan struct{} { return child.done }
-func (child *escalatingChildProcess) Wait() error           { <-child.done; return nil }
-func (child *escalatingChildProcess) Terminate() error      { child.terminated.Add(1); return nil }
+func (*escalatingChildProcess) AcknowledgeTerminal(process.ChildMessage) error { return nil }
+func (*escalatingChildProcess) CloseTerminalAck() error                        { return nil }
+func (*escalatingChildProcess) CloseLiveness() error                           { return nil }
+func (*escalatingChildProcess) CloseReports() error                            { return nil }
+func (child *escalatingChildProcess) Done() <-chan struct{}                    { return child.done }
+func (child *escalatingChildProcess) Wait() error                              { <-child.done; return nil }
+func (child *escalatingChildProcess) Terminate() error                         { child.terminated.Add(1); return nil }
 func (child *escalatingChildProcess) Kill() error {
 	child.killed.Add(1)
 	child.closeOnce.Do(func() { close(child.done) })

@@ -130,7 +130,7 @@ func TestSessionChildCommandIsHiddenAndUsesFixedDescriptorFlags(t *testing.T) {
 	if !child.Hidden {
 		t.Fatal("session-child command is visible")
 	}
-	for name, want := range map[string]string{"bootstrap-fd": "3", "liveness-fd": "4", "report-fd": "5"} {
+	for name, want := range map[string]string{"bootstrap-fd": "3", "liveness-fd": "4", "report-fd": "5", "terminal-ack-fd": "6"} {
 		flag := child.Flags().Lookup(name)
 		if flag == nil || flag.DefValue != want {
 			t.Errorf("--%s = %#v, want default %s", name, flag, want)
@@ -155,7 +155,7 @@ func TestHiddenSessionChildMarksProtocolDescriptorsCloseOnExec(t *testing.T) {
 	if os.Getenv("KANEDIAS_CLOEXEC_HELPER") == "1" {
 		service := stubServices()
 		service.runSessionChild = func(context.Context, process.Bootstrap, *process.Reporter) error {
-			return syscall.Exec("/bin/sh", []string{"sh", "-c", `for fd in 3 4 5; do [ ! -e /proc/self/fd/$fd ] || exit $fd; done`}, os.Environ())
+			return syscall.Exec("/bin/sh", []string{"sh", "-c", `for fd in 3 4 5 6; do [ ! -e /proc/self/fd/$fd ] || exit $fd; done`}, os.Environ())
 		}
 		root := newRootCommand(service, testProxyOptions())
 		root.SetArgs([]string{"session-child", "--bootstrap-fd", "3", "--liveness-fd", "4", "--report-fd", "5"})
@@ -177,6 +177,10 @@ func TestHiddenSessionChildMarksProtocolDescriptorsCloseOnExec(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
+	ackRead, ackWrite, err := os.Pipe()
+	if err != nil {
+		t.Fatal(err)
+	}
 	bootstrap := process.Bootstrap{
 		SessionID: "child-1", ParentID: "parent-1", RootID: "root-1",
 		SocketPath: filepath.Join(t.TempDir(), "child.sock"), SourceInstance: "instance", SourceVolume: "volume",
@@ -185,7 +189,7 @@ func TestHiddenSessionChildMarksProtocolDescriptorsCloseOnExec(t *testing.T) {
 	}
 	command := exec.Command(os.Args[0], "-test.run=TestHiddenSessionChildMarksProtocolDescriptorsCloseOnExec", "--")
 	command.Env = append(os.Environ(), "KANEDIAS_CLOEXEC_HELPER=1")
-	command.ExtraFiles = []*os.File{bootstrapRead, livenessRead, reportWrite}
+	command.ExtraFiles = []*os.File{bootstrapRead, livenessRead, reportWrite, ackRead}
 	var stderr bytes.Buffer
 	command.Stderr = &stderr
 	if err := command.Start(); err != nil {
@@ -194,6 +198,7 @@ func TestHiddenSessionChildMarksProtocolDescriptorsCloseOnExec(t *testing.T) {
 	_ = bootstrapRead.Close()
 	_ = livenessRead.Close()
 	_ = reportWrite.Close()
+	_ = ackRead.Close()
 	if err := process.EncodeBootstrap(bootstrapWrite, bootstrap); err != nil {
 		t.Fatal(err)
 	}
@@ -212,6 +217,7 @@ func TestHiddenSessionChildMarksProtocolDescriptorsCloseOnExec(t *testing.T) {
 	}
 	_ = livenessWrite.Close()
 	_ = reportRead.Close()
+	_ = ackWrite.Close()
 }
 
 func TestServerCommandRejectsPositionalArguments(t *testing.T) {

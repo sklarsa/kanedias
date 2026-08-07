@@ -85,7 +85,7 @@ func TestProductionChildRequiresAbsoluteConfigBeforeProvisioning(t *testing.T) {
 	for _, path := range []string{"", "relative.toml"} {
 		t.Run(path, func(t *testing.T) {
 			t.Setenv("KANEDIAS_CONFIG", path)
-			reporter := process.NewReporter(io.Discard, bootstrap.SessionID)
+			reporter := process.NewAcknowledgedReporter(context.Background(), io.Discard, io.NopCloser(bytes.NewReader([]byte{process.TerminalAckByte})), bootstrap.SessionID)
 			if err := productionChildRunner(context.Background(), bootstrap, reporter); err == nil {
 				t.Fatal("production child accepted missing/relative config")
 			}

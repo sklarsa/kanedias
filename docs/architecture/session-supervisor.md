@@ -361,6 +361,8 @@ Parent ownership is strict in v1:
 - stopping a supervisor cancels all unfinished direct children;
 - each child recursively cancels its descendants;
 - every child monitors an inherited parent-liveness pipe and begins cascading shutdown when that pipe reaches EOF;
+- terminal `read`, `write`, and `failure` reports use a separate inherited acknowledgement pipe: the child blocks after writing exactly one terminal report until its direct parent ingests that exact report, marks descendant SSE closure expected, writes one acknowledgement byte, and closes the pipe; cancellation closes the acknowledgement endpoint without acknowledging;
+- bootstrap, liveness, report, and terminal-ack endpoints are fixed descriptors `3`–`6`, marked close-on-exec before runtime code so grandchildren cannot retain them;
 - graceful shutdown is attempted before forced termination;
 - each supervisor normally removes only the resources it created;
 - after an admitted direct child process has definitely exited, its direct parent has one narrow recovery exception: it may delete only the deterministic instance, volume, and socket named in that child's exact pre-published ownership ticket after pool, complete identity metadata, workspace name, run attribution, and socket device/inode all match;

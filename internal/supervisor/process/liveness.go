@@ -25,9 +25,10 @@ func IdempotentStop(stop func(context.Context) error) func(context.Context) erro
 
 // Fixed child descriptors form the inherited process protocol.
 const (
-	BootstrapFD = 3
-	LivenessFD  = 4
-	ReportFD    = 5
+	BootstrapFD   = 3
+	LivenessFD    = 4
+	ReportFD      = 5
+	TerminalAckFD = 6
 )
 
 type ChildRunner func(context.Context, Bootstrap, *Reporter) error
@@ -35,53 +36,62 @@ type ChildRunner func(context.Context, Bootstrap, *Reporter) error
 // RunInheritedChild owns the hidden command's fixed inherited descriptors. It
 // marks every inherited descriptor close-on-exec before invoking runtime code,
 // so grandchildren cannot retain any ancestor protocol endpoint.
-func RunInheritedChild(ctx context.Context, bootstrapFD, livenessFD, reportFD int, runner ChildRunner) error {
-	if bootstrapFD != BootstrapFD || livenessFD != LivenessFD || reportFD != ReportFD {
-		return fmt.Errorf("session-child requires fixed descriptors 3, 4, and 5")
+func RunInheritedChild(ctx context.Context, bootstrapFD, livenessFD, reportFD, terminalAckFD int, runner ChildRunner) error {
+	if bootstrapFD != BootstrapFD || livenessFD != LivenessFD || reportFD != ReportFD || terminalAckFD != TerminalAckFD {
+		return fmt.Errorf("session-child requires fixed descriptors 3, 4, 5, and 6")
 	}
 	if runner == nil {
 		return fmt.Errorf("child session runner is required")
 	}
-	for _, descriptor := range []int{bootstrapFD, livenessFD, reportFD} {
+	for _, descriptor := range []int{bootstrapFD, livenessFD, reportFD, terminalAckFD} {
 		syscall.CloseOnExec(descriptor)
 	}
 	bootstrapFile := os.NewFile(uintptr(bootstrapFD), "child-bootstrap")
 	livenessFile := os.NewFile(uintptr(livenessFD), "parent-liveness")
 	reportFile := os.NewFile(uintptr(reportFD), "child-report")
-	if bootstrapFile == nil || livenessFile == nil || reportFile == nil {
+	terminalAckFile := os.NewFile(uintptr(terminalAckFD), "parent-terminal-ack")
+	if bootstrapFile == nil || livenessFile == nil || reportFile == nil || terminalAckFile == nil {
 		return fmt.Errorf("open inherited child descriptors")
 	}
 	defer livenessFile.Close()
 	defer reportFile.Close()
+	defer terminalAckFile.Close()
 
 	bootstrap, err := DecodeBootstrap(bootstrapFile)
 	closeErr := bootstrapFile.Close()
 	if err != nil || closeErr != nil {
 		return errors.Join(err, closeErr)
 	}
-	reporter := NewReporter(reportFile, bootstrap.SessionID)
 	childCtx, cancel := context.WithCancel(ctx)
+	cancelAckClose := context.AfterFunc(childCtx, func() { _ = terminalAckFile.Close() })
+	defer cancelAckClose()
+	reporter := NewAcknowledgedReporter(childCtx, reportFile, terminalAckFile, bootstrap.SessionID)
 	defer cancel()
 	stop := IdempotentStop(func(context.Context) error { cancel(); return nil })
 
 	monitorDone := make(chan error, 1)
 	go func() { monitorDone <- MonitorParentLiveness(childCtx, livenessFile, stop) }()
 	runErr := runner(childCtx, bootstrap, reporter)
-	_ = stop(context.WithoutCancel(ctx))
-	monitorErr := <-monitorDone
-	if errors.Is(monitorErr, context.Canceled) {
-		monitorErr = nil
-	}
-	if runErr != nil && !(errors.Is(runErr, context.Canceled) && childCtx.Err() != nil) {
+	var reportErr error
+	if runErr != nil && !reporter.TerminalSent() && !(errors.Is(runErr, context.Canceled) && childCtx.Err() != nil) {
 		code := contract.ErrorChildFailed
 		var contractErr *contract.Error
 		if errors.As(runErr, &contractErr) {
 			code = contractErr.Code
 		}
-		reportErr := reporter.Failure(code, runErr.Error())
-		return errors.Join(runErr, monitorErr, reportErr)
+		// The child context remains live while the terminal failure is reported;
+		// the direct parent's acknowledgement is the teardown boundary.
+		reportErr = reporter.Failure(code, runErr.Error())
 	}
-	return monitorErr
+	_ = stop(context.WithoutCancel(ctx))
+	monitorErr := <-monitorDone
+	if errors.Is(monitorErr, context.Canceled) {
+		monitorErr = nil
+	}
+	if childCtx.Err() != nil && (errors.Is(runErr, ErrTerminalAckClosed) || errors.Is(runErr, context.Canceled)) {
+		runErr = nil
+	}
+	return errors.Join(runErr, monitorErr, reportErr)
 }
 
 // MonitorParentLiveness waits for EOF on the inherited liveness descriptor.

@@ -3,11 +3,13 @@
 package process
 
 import (
+	"bufio"
 	"bytes"
 	"context"
 	"encoding/json"
 	"errors"
 	"fmt"
+	"io"
 	"net"
 	"net/http"
 	"os"
@@ -119,13 +121,123 @@ func TestBootstrapRejectsInvalidInputsBeforeProvisioning(t *testing.T) {
 	}
 }
 
-func TestReporterEmitsTypedStrictJSONLMessages(t *testing.T) {
-	var output bytes.Buffer
-	reporter := NewReporter(&output, "child-1")
-	if err := reporter.Read(contract.ReadChildResult{Kind: contract.ChildKindRead, WorkerType: "reviewer", SessionID: "child-1", Output: "done"}); err != nil {
+func TestTerminalReporterWaitsForExactParentAcknowledgement(t *testing.T) {
+	reportRead, reportWrite, err := os.Pipe()
+	if err != nil {
 		t.Fatal(err)
 	}
-	if err := reporter.Failure(contract.ErrorChildFailed, "boom"); err != nil {
+	defer reportRead.Close()
+	ackRead, ackWrite, err := os.Pipe()
+	if err != nil {
+		t.Fatal(err)
+	}
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+	reporter := NewAcknowledgedReporter(ctx, reportWrite, ackRead, "child-1")
+	reported := make(chan error, 1)
+	go func() {
+		reported <- reporter.Read(contract.ReadChildResult{Kind: contract.ChildKindRead, WorkerType: "reviewer", SessionID: "child-1", Output: "done"})
+	}()
+
+	reader := bufio.NewReader(reportRead)
+	record, err := reader.ReadBytes('\n')
+	if err != nil {
+		t.Fatal(err)
+	}
+	message, err := DecodeChildMessage(bytes.NewReader(record[:len(record)-1]))
+	if err != nil || message.Type != MessageRead {
+		t.Fatalf("terminal report = %#v, %v", message, err)
+	}
+	select {
+	case err := <-reported:
+		t.Fatalf("terminal reporter returned before parent acknowledgement: %v", err)
+	case <-time.After(350 * time.Millisecond):
+	}
+	if _, err := ackWrite.Write([]byte{TerminalAckByte}); err != nil {
+		t.Fatal(err)
+	}
+	if err := ackWrite.Close(); err != nil {
+		t.Fatal(err)
+	}
+	select {
+	case err := <-reported:
+		if err != nil {
+			t.Fatal(err)
+		}
+	case <-time.After(time.Second):
+		t.Fatal("terminal reporter did not return after exact acknowledgement")
+	}
+}
+
+func TestTerminalReporterRejectsMalformedAcknowledgementAndSecondTerminal(t *testing.T) {
+	for _, test := range []struct {
+		name string
+		ack  []byte
+	}{
+		{name: "missing", ack: nil},
+		{name: "wrong byte", ack: []byte{0}},
+		{name: "extra byte", ack: []byte{TerminalAckByte, TerminalAckByte}},
+	} {
+		t.Run(test.name, func(t *testing.T) {
+			var output bytes.Buffer
+			ackRead, ackWrite, err := os.Pipe()
+			if err != nil {
+				t.Fatal(err)
+			}
+			reporter := NewAcknowledgedReporter(context.Background(), &output, ackRead, "child-1")
+			done := make(chan error, 1)
+			go func() { done <- reporter.Failure(contract.ErrorChildFailed, "boom") }()
+			if len(test.ack) != 0 {
+				if _, err := ackWrite.Write(test.ack); err != nil {
+					t.Fatal(err)
+				}
+			}
+			if err := ackWrite.Close(); err != nil {
+				t.Fatal(err)
+			}
+			if err := <-done; err == nil || !strings.Contains(err.Error(), "terminal acknowledgement") {
+				t.Fatalf("malformed ack error = %v", err)
+			}
+			if err := reporter.Failure(contract.ErrorChildFailed, "again"); err == nil || !strings.Contains(err.Error(), "terminal report") {
+				t.Fatalf("second terminal error = %v", err)
+			}
+			if err := reporter.Ready("/tmp/child.sock"); err == nil || !strings.Contains(err.Error(), "terminal report") {
+				t.Fatalf("post-terminal nonterminal error = %v", err)
+			}
+		})
+	}
+}
+
+func TestTerminalReporterCancellationUnblocksAcknowledgementWait(t *testing.T) {
+	var output bytes.Buffer
+	ackRead, ackWrite, err := os.Pipe()
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer ackWrite.Close()
+	ctx, cancel := context.WithCancel(context.Background())
+	reporter := NewAcknowledgedReporter(ctx, &output, ackRead, "child-1")
+	done := make(chan error, 1)
+	go func() { done <- reporter.Failure(contract.ErrorChildFailed, "boom") }()
+	cancel()
+	select {
+	case err := <-done:
+		if !errors.Is(err, context.Canceled) {
+			t.Fatalf("cancelled terminal reporter error = %v", err)
+		}
+	case <-time.After(time.Second):
+		t.Fatal("cancelled terminal reporter remained blocked")
+	}
+}
+
+func TestReporterEmitsTypedStrictJSONLMessages(t *testing.T) {
+	var output bytes.Buffer
+	readReporter := NewAcknowledgedReporter(context.Background(), &output, io.NopCloser(bytes.NewReader([]byte{TerminalAckByte})), "child-1")
+	if err := readReporter.Read(contract.ReadChildResult{Kind: contract.ChildKindRead, WorkerType: "reviewer", SessionID: "child-1", Output: "done"}); err != nil {
+		t.Fatal(err)
+	}
+	failureReporter := NewAcknowledgedReporter(context.Background(), &output, io.NopCloser(bytes.NewReader([]byte{TerminalAckByte})), "child-1")
+	if err := failureReporter.Failure(contract.ErrorChildFailed, "boom"); err != nil {
 		t.Fatal(err)
 	}
 	decoder := json.NewDecoder(&output)
@@ -161,7 +273,7 @@ func TestSpawnerUsesOnlyInheritedProtocolDescriptorsAndProbesSocket(t *testing.T
 	serveTree(t, bootstrap.SocketPath, bootstrap.SessionID, bootstrap.ParentID, bootstrap.RootID)
 	script := filepath.Join(t.TempDir(), "helper.sh")
 	configPath := filepath.Join(t.TempDir(), "custom.toml")
-	contents := fmt.Sprintf("#!/bin/sh\nset -eu\n[ \"$*\" = 'session-child --bootstrap-fd 3 --liveness-fd 4 --report-fd 5' ]\n[ \"$KANEDIAS_CONFIG\" = %q ]\ncat <&3 >/dev/null\nprintf '%%s\\n' '%s' '%s' >&5\ncat <&4 >/dev/null\n", configPath, ownershipRecord(t, bootstrap), fmt.Sprintf(`{"type":"ready","sessionId":%q,"ready":{"socketPath":%q}}`, bootstrap.SessionID, bootstrap.SocketPath))
+	contents := fmt.Sprintf("#!/bin/sh\nset -eu\n[ \"$*\" = 'session-child --bootstrap-fd 3 --liveness-fd 4 --report-fd 5 --terminal-ack-fd 6' ]\n[ \"$KANEDIAS_CONFIG\" = %q ]\ncat <&3 >/dev/null\nprintf '%%s\\n' '%s' '%s' >&5\ncat <&4 >/dev/null\n", configPath, ownershipRecord(t, bootstrap), fmt.Sprintf(`{"type":"ready","sessionId":%q,"ready":{"socketPath":%q}}`, bootstrap.SessionID, bootstrap.SocketPath))
 	if err := os.WriteFile(script, []byte(contents), 0o700); err != nil {
 		t.Fatal(err)
 	}
@@ -184,6 +296,50 @@ func TestSpawnerUsesOnlyInheritedProtocolDescriptorsAndProbesSocket(t *testing.T
 	}
 	if err := child.CloseReports(); err != nil {
 		t.Fatal(err)
+	}
+}
+
+func TestSpawnerTerminalAcknowledgementOrdersProcessExit(t *testing.T) {
+	bootstrap := validBootstrap(t)
+	serveTree(t, bootstrap.SocketPath, bootstrap.SessionID, bootstrap.ParentID, bootstrap.RootID)
+	marker := filepath.Join(t.TempDir(), "after-ack")
+	script := filepath.Join(t.TempDir(), "helper.sh")
+	ready := fmt.Sprintf(`{"type":"ready","sessionId":%q,"ready":{"socketPath":%q}}`, bootstrap.SessionID, bootstrap.SocketPath)
+	terminal := fmt.Sprintf(`{"type":"read","sessionId":%q,"read":{"kind":"read","workerType":"reviewer","sessionId":%q,"output":"done"}}`, bootstrap.SessionID, bootstrap.SessionID)
+	contents := fmt.Sprintf("#!/bin/sh\nset -eu\n[ \"$*\" = 'session-child --bootstrap-fd 3 --liveness-fd 4 --report-fd 5 --terminal-ack-fd 6' ]\ncat <&3 >/dev/null\nprintf '%%s\\n' '%s' '%s' '%s' >&5\ndd bs=1 count=1 <&6 2>/dev/null | od -An -tu1 | grep -q ' 6'\n[ -z \"$(cat <&6)\" ]\nprintf acknowledged > %q\n", ownershipRecord(t, bootstrap), ready, terminal, marker)
+	if err := os.WriteFile(script, []byte(contents), 0o700); err != nil {
+		t.Fatal(err)
+	}
+	child, err := (Spawner{Executable: script, ProbeInterval: time.Millisecond}).Spawn(context.Background(), bootstrap)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer child.Kill()
+	ctx, cancel := context.WithTimeout(context.Background(), 3*time.Second)
+	defer cancel()
+	if err := child.WaitReady(ctx); err != nil {
+		t.Fatal(err)
+	}
+	message, err := child.NextMessage(ctx)
+	if err != nil || message.Type != MessageRead {
+		t.Fatalf("terminal message = %#v, %v", message, err)
+	}
+	select {
+	case <-child.Done():
+		t.Fatal("child process exited before terminal acknowledgement")
+	case <-time.After(350 * time.Millisecond):
+	}
+	if _, err := os.Stat(marker); !errors.Is(err, os.ErrNotExist) {
+		t.Fatalf("post-ack marker exists before acknowledgement: %v", err)
+	}
+	if err := child.AcknowledgeTerminal(message); err != nil {
+		t.Fatal(err)
+	}
+	if err := child.Wait(); err != nil {
+		t.Fatal(err)
+	}
+	if data, err := os.ReadFile(marker); err != nil || string(data) != "acknowledged" {
+		t.Fatalf("post-ack marker = %q, %v", data, err)
 	}
 }
 
@@ -274,6 +430,82 @@ func TestSuccessfulTerminalReportRemainsProvisionalUntilRealProcessExit(t *testi
 	case <-time.After(50 * time.Millisecond):
 	}
 	if err := child.Wait(); err != nil {
+		t.Fatal(err)
+	}
+	if err := child.CloseReports(); err != nil {
+		t.Fatal(err)
+	}
+}
+
+func TestParentStopUnblocksRealChildWaitingForTerminalAcknowledgement(t *testing.T) {
+	if os.Getenv("KANEDIAS_TERMINAL_ACK_HELPER") == "1" {
+		err := RunInheritedChild(context.Background(), BootstrapFD, LivenessFD, ReportFD, TerminalAckFD, func(ctx context.Context, bootstrap Bootstrap, reporter *Reporter) error {
+			info, err := os.Stat(bootstrap.SocketPath)
+			if err != nil {
+				return err
+			}
+			stat := info.Sys().(*syscall.Stat_t)
+			ticket := provision.RecoveryTicket{
+				SessionID: bootstrap.SessionID, ParentID: bootstrap.ParentID, RootID: bootstrap.RootID,
+				Pool: "pool", Instance: "session-" + bootstrap.SessionID, Volume: "workspace-" + bootstrap.SessionID,
+				SocketPath: bootstrap.SocketPath, Socket: provision.SocketIdentity{Device: uint64(stat.Dev), Inode: stat.Ino},
+				Kind: bootstrap.Request.Kind, Context: bootstrap.Request.Context, WorkerType: bootstrap.Request.WorkerType,
+			}
+			if err := reporter.Ownership(ticket); err != nil {
+				return err
+			}
+			if err := reporter.Ready(bootstrap.SocketPath); err != nil {
+				return err
+			}
+			return reporter.Read(contract.ReadChildResult{Kind: contract.ChildKindRead, WorkerType: bootstrap.Request.WorkerType, SessionID: bootstrap.SessionID, Output: "done"})
+		})
+		if err != nil {
+			t.Fatal(err)
+		}
+		return
+	}
+
+	bootstrap := validBootstrap(t)
+	serveTree(t, bootstrap.SocketPath, bootstrap.SessionID, bootstrap.ParentID, bootstrap.RootID)
+	script := filepath.Join(t.TempDir(), "helper.sh")
+	contents := "#!/bin/sh\nexec \"$KANEDIAS_TERMINAL_ACK_TEST_BINARY\" -test.run '^TestParentStopUnblocksRealChildWaitingForTerminalAcknowledgement$'\n"
+	if err := os.WriteFile(script, []byte(contents), 0o700); err != nil {
+		t.Fatal(err)
+	}
+	t.Setenv("KANEDIAS_TERMINAL_ACK_HELPER", "1")
+	t.Setenv("KANEDIAS_TERMINAL_ACK_TEST_BINARY", os.Args[0])
+	child, err := (Spawner{Executable: script, ProbeInterval: time.Millisecond}).Spawn(context.Background(), bootstrap)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer child.Kill()
+	ctx, cancel := context.WithTimeout(context.Background(), 3*time.Second)
+	defer cancel()
+	if err := child.WaitReady(ctx); err != nil {
+		t.Fatal(err)
+	}
+	message, err := child.NextMessage(ctx)
+	if err != nil || message.Type != MessageRead {
+		t.Fatalf("terminal message = %#v, %v", message, err)
+	}
+	if err := child.CloseTerminalAck(); err != nil {
+		t.Fatal(err)
+	}
+	if err := child.AcknowledgeTerminal(message); err == nil || !strings.Contains(err.Error(), "closed") {
+		t.Fatalf("acknowledgement after forced endpoint close = %v", err)
+	}
+	if err := child.CloseLiveness(); err != nil {
+		t.Fatal(err)
+	}
+	select {
+	case <-child.Done():
+	case <-time.After(3 * time.Second):
+		t.Fatal("parent stop left child blocked waiting for terminal acknowledgement")
+	}
+	if err := child.Wait(); err != nil {
+		t.Fatal(err)
+	}
+	if err := child.CloseTerminalAck(); err != nil {
 		t.Fatal(err)
 	}
 	if err := child.CloseReports(); err != nil {

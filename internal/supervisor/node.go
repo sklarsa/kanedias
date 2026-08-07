@@ -367,10 +367,6 @@ func (node *Node) CreateChild(ctx context.Context, parent string, request contra
 	if err != nil {
 		return TerminalResult{}, node.failChildCreation(ctx, entry, err)
 	}
-	// A terminal report makes the child's subsequent HTTP/SSE shutdown expected.
-	// Cancel our subscription before teardown can produce a clean EOF that would
-	// otherwise be indistinguishable from an owned stream failure.
-	entry.expectEventStreamClose()
 	if message.SessionID != childID {
 		return TerminalResult{}, node.failChildCreation(ctx, entry, fmt.Errorf("terminal report session ID %q does not match %q", message.SessionID, childID))
 	}
@@ -396,7 +392,16 @@ func (node *Node) CreateChild(ctx context.Context, parent string, request contra
 	case process.MessageFailure:
 		terminalErr = contract.NewError(message.Error.Code, message.Error.Message)
 	default:
-		terminalErr = contract.NewError(contract.ErrorChildFailed, "child returned a non-terminal report")
+		return TerminalResult{}, node.failChildCreation(ctx, entry, contract.NewError(contract.ErrorChildFailed, "child returned a non-terminal report"))
+	}
+
+	// The terminal report has now been ingested and checked against the exact
+	// admission. Mark SSE closure expected before acknowledging that same report.
+	// The child cannot return from Reporter.Read/Write/Failure and begin teardown
+	// until this inherited protocol write succeeds.
+	entry.expectEventStreamClose()
+	if err := child.AcknowledgeTerminal(message); err != nil {
+		return TerminalResult{}, node.failChildCreation(ctx, entry, errors.Join(contract.NewError(contract.ErrorChildFailed, "acknowledge child terminal report failed"), err))
 	}
 
 	select {

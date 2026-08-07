@@ -2,10 +2,12 @@ package process
 
 import (
 	"bytes"
+	"context"
 	"encoding/json"
 	"errors"
 	"fmt"
 	"io"
+	"os"
 	"path/filepath"
 	"strings"
 	"sync"
@@ -17,7 +19,10 @@ import (
 
 const MaxRecordBytes = 1 << 20
 
-var ErrRecordTooLarge = errors.New("process protocol record exceeds 1 MiB")
+var (
+	ErrRecordTooLarge    = errors.New("process protocol record exceeds 1 MiB")
+	ErrTerminalAckClosed = errors.New("terminal acknowledgement endpoint closed without acknowledgement")
+)
 
 type Bootstrap struct {
 	SessionID      string                      `json:"sessionId"`
@@ -231,37 +236,113 @@ func strictDecode(reader io.Reader, target any) error {
 	return nil
 }
 
+const TerminalAckByte byte = 0x06
+
 type Reporter struct {
-	mu        sync.Mutex
-	writer    io.Writer
-	sessionID string
+	mu           sync.Mutex
+	writer       io.Writer
+	sessionID    string
+	ctx          context.Context
+	terminalAck  io.ReadCloser
+	terminalMu   sync.Mutex
+	terminalSent bool
 }
 
-func NewReporter(writer io.Writer, sessionID string) *Reporter {
-	return &Reporter{writer: writer, sessionID: sessionID}
+// NewAcknowledgedReporter binds terminal reporting to the private inherited
+// parent acknowledgement endpoint. A terminal method does not return until the
+// direct parent writes exactly one acknowledgement byte and closes the pipe.
+func NewAcknowledgedReporter(ctx context.Context, writer io.Writer, terminalAck io.ReadCloser, sessionID string) *Reporter {
+	if ctx == nil {
+		ctx = context.Background()
+	}
+	return &Reporter{writer: writer, sessionID: sessionID, ctx: ctx, terminalAck: terminalAck}
 }
 
 func (reporter *Reporter) Ownership(ticket provision.RecoveryTicket) error {
-	return reporter.send(ChildMessage{Type: MessageOwnership, SessionID: reporter.sessionID, Ownership: &ticket})
+	return reporter.sendNonterminal(ChildMessage{Type: MessageOwnership, SessionID: reporter.sessionID, Ownership: &ticket})
 }
 
 func (reporter *Reporter) Ready(socketPath string) error {
-	return reporter.send(ChildMessage{Type: MessageReady, SessionID: reporter.sessionID, Ready: &ReadyMessage{SocketPath: socketPath}})
+	return reporter.sendNonterminal(ChildMessage{Type: MessageReady, SessionID: reporter.sessionID, Ready: &ReadyMessage{SocketPath: socketPath}})
 }
 
 func (reporter *Reporter) Read(result contract.ReadChildResult) error {
-	return reporter.send(ChildMessage{Type: MessageRead, SessionID: reporter.sessionID, Read: &result})
+	return reporter.sendTerminal(ChildMessage{Type: MessageRead, SessionID: reporter.sessionID, Read: &result})
 }
 
 func (reporter *Reporter) Write(result contract.WriteChildResult) error {
-	return reporter.send(ChildMessage{Type: MessageWrite, SessionID: reporter.sessionID, Write: &result})
+	return reporter.sendTerminal(ChildMessage{Type: MessageWrite, SessionID: reporter.sessionID, Write: &result})
 }
 
 func (reporter *Reporter) Failure(code contract.ErrorCode, message string) error {
-	return reporter.send(ChildMessage{Type: MessageFailure, SessionID: reporter.sessionID, Error: &WireError{Code: code, Message: message}})
+	return reporter.sendTerminal(ChildMessage{Type: MessageFailure, SessionID: reporter.sessionID, Error: &WireError{Code: code, Message: message}})
 }
 
-func (reporter *Reporter) send(message ChildMessage) error {
+func (reporter *Reporter) TerminalSent() bool {
+	reporter.terminalMu.Lock()
+	defer reporter.terminalMu.Unlock()
+	return reporter.terminalSent
+}
+
+func (reporter *Reporter) sendTerminal(message ChildMessage) error {
+	reporter.terminalMu.Lock()
+	if reporter.terminalSent {
+		reporter.terminalMu.Unlock()
+		return fmt.Errorf("child terminal report already sent")
+	}
+	reporter.terminalSent = true
+	reporter.terminalMu.Unlock()
+	if err := reporter.sendWire(message); err != nil {
+		return err
+	}
+	if reporter.terminalAck == nil {
+		return fmt.Errorf("terminal acknowledgement reader is required")
+	}
+	return reporter.waitForTerminalAck()
+}
+
+func (reporter *Reporter) waitForTerminalAck() error {
+	result := make(chan error, 1)
+	go func() {
+		data, err := io.ReadAll(io.LimitReader(reporter.terminalAck, 2))
+		closeErr := reporter.terminalAck.Close()
+		if err == nil && closeErr != nil && !errors.Is(closeErr, os.ErrClosed) {
+			err = closeErr
+		}
+		if err != nil {
+			result <- fmt.Errorf("read terminal acknowledgement: %w", err)
+			return
+		}
+		if len(data) == 0 {
+			result <- ErrTerminalAckClosed
+			return
+		}
+		if len(data) != 1 || data[0] != TerminalAckByte {
+			result <- fmt.Errorf("terminal acknowledgement must contain exactly byte 0x%02x", TerminalAckByte)
+			return
+		}
+		result <- nil
+	}()
+	select {
+	case err := <-result:
+		return err
+	case <-reporter.ctx.Done():
+		_ = reporter.terminalAck.Close()
+		<-result
+		return reporter.ctx.Err()
+	}
+}
+
+func (reporter *Reporter) sendNonterminal(message ChildMessage) error {
+	reporter.terminalMu.Lock()
+	defer reporter.terminalMu.Unlock()
+	if reporter.terminalSent {
+		return fmt.Errorf("child terminal report already sent")
+	}
+	return reporter.sendWire(message)
+}
+
+func (reporter *Reporter) sendWire(message ChildMessage) error {
 	if err := message.Validate(); err != nil {
 		return err
 	}

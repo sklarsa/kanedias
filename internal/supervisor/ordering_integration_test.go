@@ -54,6 +54,26 @@ func (recoverer orderingRecoverer) RecoverDirectChild(context.Context, provision
 	return appendOrderingStep(recoverer.path, "recovery")
 }
 
+type heldTerminalChild struct {
+	*process.Child
+	held    chan struct{}
+	release <-chan struct{}
+}
+
+func (child *heldTerminalChild) NextMessage(ctx context.Context) (process.ChildMessage, error) {
+	message, err := child.Child.NextMessage(ctx)
+	if err != nil || (message.Type != process.MessageRead && message.Type != process.MessageWrite && message.Type != process.MessageFailure) {
+		return message, err
+	}
+	close(child.held)
+	select {
+	case <-child.release:
+		return message, nil
+	case <-ctx.Done():
+		return process.ChildMessage{}, ctx.Err()
+	}
+}
+
 func TestIntegratedHandoffOrderingThroughSpawnerReportPipeAndHTTPFlush(t *testing.T) {
 	if os.Getenv(orderingHelperEnv) == "ordering" {
 		runOrderingChildHelper(t)
@@ -84,12 +104,22 @@ func TestIntegratedHandoffOrderingThroughSpawnerReportPipeAndHTTPFlush(t *testin
 		t.Fatal(err)
 	}
 	spawner := process.Spawner{Executable: script, ProbeInterval: time.Millisecond}
+	terminalHeld := make(chan struct{})
+	releaseTerminal := make(chan struct{})
+	var spawnedChild *heldTerminalChild
+	var childSocket string
 	node, err := supervisor.NewRoot(identity, supervisor.Dependencies{
 		Provisioner: orderingRootProvisioner{},
 		DialRPC:     func(context.Context, string) (io.ReadWriteCloser, error) { return clientConn, nil },
 		Workers:     orderingWorkers{}, SocketPath: rootSocket,
 		SpawnChild: func(ctx context.Context, bootstrap process.Bootstrap) (supervisor.ChildProcess, error) {
-			return spawner.Spawn(ctx, bootstrap)
+			child, err := spawner.Spawn(ctx, bootstrap)
+			if err != nil {
+				return nil, err
+			}
+			childSocket = bootstrap.SocketPath
+			spawnedChild = &heldTerminalChild{Child: child, held: terminalHeld, release: releaseTerminal}
+			return spawnedChild, nil
 		},
 		DescendantClient:     supervisorapi.NewDescendantClient,
 		DirectChildRecoverer: orderingRecoverer{path: orderPath},
@@ -117,6 +147,48 @@ func TestIntegratedHandoffOrderingThroughSpawnerReportPipeAndHTTPFlush(t *testin
 			err    error
 		}{result, err}
 	}()
+
+	select {
+	case <-terminalHeld:
+	case <-ctx.Done():
+		t.Fatalf("parent did not reach held terminal ingestion: %v", ctx.Err())
+	}
+	// Hold direct-parent terminal ingestion longer than the rejected 250 ms
+	// grace. The child is blocked in Reporter.Write, so its process and HTTP/SSE
+	// server must remain live until this exact report is released and acked.
+	select {
+	case <-spawnedChild.Done():
+		t.Fatal("child process exited before terminal report acknowledgement")
+	case <-time.After(350 * time.Millisecond):
+	}
+	probe, err := supervisorapi.NewDescendantClient(childSocket)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err := probe.Snapshot(ctx); err != nil {
+		t.Fatalf("child server tore down before terminal acknowledgement: %v", err)
+	}
+	subscription, err := probe.Subscribe(ctx)
+	if err != nil {
+		t.Fatalf("child SSE tore down before terminal acknowledgement: %v", err)
+	}
+	select {
+	case _, ok := <-subscription.Events:
+		if !ok {
+			t.Fatal("child SSE closed before terminal acknowledgement")
+		}
+	case <-time.After(20 * time.Millisecond):
+	}
+	if subscription.Close != nil {
+		subscription.Close()
+	}
+	if closer, ok := probe.(io.Closer); ok {
+		_ = closer.Close()
+	}
+	if steps := readOrderingSteps(orderPath); !reflect.DeepEqual(steps, []string{"verified"}) {
+		t.Fatalf("pre-ack order = %v, want [verified]", steps)
+	}
+	close(releaseTerminal)
 
 	var got struct {
 		result supervisor.TerminalResult
@@ -201,7 +273,11 @@ func TestUnexpectedCleanDescendantSSEEOFFailsAndCleansOwnedChild(t *testing.T) {
 	if err := node.Start(ctx); err != nil {
 		t.Fatal(err)
 	}
+	startedFailureWait := time.Now()
 	_, err = node.CreateChild(ctx, "root-order", contract.CreateChildRequest{WorkerType: "worker", Kind: contract.ChildKindWrite, Context: contract.ContextFresh, Task: "remain active until stream ownership fails"})
+	if elapsed := time.Since(startedFailureWait); elapsed >= 2*time.Second {
+		t.Fatalf("unexpected SSE EOF waited for a possible terminal report for %s", elapsed)
+	}
 	var typed *contract.Error
 	if !errors.As(err, &typed) || typed.Code != contract.ErrorChildFailed {
 		t.Fatalf("clean descendant SSE EOF error = %v, want typed child_failed", err)
@@ -326,7 +402,8 @@ func runOrderingChildHelper(t *testing.T) {
 	bootstrapFile := os.NewFile(3, "bootstrap")
 	livenessFile := os.NewFile(4, "liveness")
 	reportFile := os.NewFile(5, "report")
-	if bootstrapFile == nil || livenessFile == nil || reportFile == nil {
+	ackFile := os.NewFile(6, "terminal-ack")
+	if bootstrapFile == nil || livenessFile == nil || reportFile == nil || ackFile == nil {
 		t.Fatal("ordering helper inherited descriptors are missing")
 	}
 	bootstrap, err := process.DecodeBootstrap(bootstrapFile)
@@ -346,7 +423,7 @@ func runOrderingChildHelper(t *testing.T) {
 		t.Fatal(err)
 	}
 	stat := info.Sys().(*syscall.Stat_t)
-	reporter := process.NewReporter(reportFile, bootstrap.SessionID)
+	reporter := process.NewAcknowledgedReporter(context.Background(), reportFile, ackFile, bootstrap.SessionID)
 	ticket := provision.RecoveryTicket{SessionID: bootstrap.SessionID, ParentID: bootstrap.ParentID, RootID: bootstrap.RootID, Pool: "pool", Instance: "session-" + bootstrap.SessionID, Volume: "workspace-" + bootstrap.SessionID, SocketPath: bootstrap.SocketPath, Socket: provision.SocketIdentity{Device: uint64(stat.Dev), Inode: stat.Ino}, Kind: bootstrap.Request.Kind, Context: bootstrap.Request.Context, WorkerType: bootstrap.Request.WorkerType, RunAttribution: bootstrap.RunAttribution}
 	if err := reporter.Ownership(ticket); err != nil {
 		t.Fatal(err)
@@ -404,6 +481,7 @@ func runOrderingChildHelper(t *testing.T) {
 	_ = os.Remove(bootstrap.SocketPath)
 	_ = livenessFile.Close()
 	_ = reportFile.Close()
+	_ = ackFile.Close()
 	if err := appendOrderingStep(service.orderPath, "exit"); err != nil {
 		t.Fatal(err)
 	}
@@ -413,6 +491,7 @@ func runCleanEOFChildHelper(t *testing.T) {
 	bootstrapFile := os.NewFile(3, "bootstrap")
 	livenessFile := os.NewFile(4, "liveness")
 	reportFile := os.NewFile(5, "report")
+	ackFile := os.NewFile(6, "terminal-ack")
 	bootstrap, err := process.DecodeBootstrap(bootstrapFile)
 	if err != nil {
 		t.Fatal(err)
@@ -430,7 +509,7 @@ func runCleanEOFChildHelper(t *testing.T) {
 		t.Fatal(err)
 	}
 	stat := info.Sys().(*syscall.Stat_t)
-	reporter := process.NewReporter(reportFile, bootstrap.SessionID)
+	reporter := process.NewAcknowledgedReporter(context.Background(), reportFile, ackFile, bootstrap.SessionID)
 	ticket := provision.RecoveryTicket{SessionID: bootstrap.SessionID, ParentID: bootstrap.ParentID, RootID: bootstrap.RootID, Pool: "pool", Instance: "session-" + bootstrap.SessionID, Volume: "workspace-" + bootstrap.SessionID, SocketPath: bootstrap.SocketPath, Socket: provision.SocketIdentity{Device: uint64(stat.Dev), Inode: stat.Ino}, Kind: bootstrap.Request.Kind, Context: bootstrap.Request.Context, WorkerType: bootstrap.Request.WorkerType}
 	if err := reporter.Ownership(ticket); err != nil {
 		t.Fatal(err)
@@ -468,6 +547,7 @@ func runCleanEOFChildHelper(t *testing.T) {
 	_ = os.Remove(bootstrap.SocketPath)
 	_ = livenessFile.Close()
 	_ = reportFile.Close()
+	_ = ackFile.Close()
 }
 
 func appendOrderingStep(path, step string) error {
