@@ -17,6 +17,10 @@ type ExecRequest struct {
 	Environment map[string]string
 	Cwd         string
 	Stdin       io.Reader
+	// Stdout and Stderr, when non-nil, receive command output as it arrives.
+	// The captured strings returned by Exec are still populated regardless.
+	Stdout io.Writer
+	Stderr io.Writer
 }
 
 func (c *Client) GetImageAlias(ctx context.Context, name string) (*api.ImageAliasesEntry, error) {
@@ -142,6 +146,14 @@ func (b *captureBuffer) String() string {
 func exec(ctx context.Context, call execCall, request ExecRequest) (stdout, stderr string, err error) {
 	var stdoutBuffer captureBuffer
 	var stderrBuffer captureBuffer
+	var stdoutWriter io.Writer = &stdoutBuffer
+	var stderrWriter io.Writer = &stderrBuffer
+	if request.Stdout != nil {
+		stdoutWriter = io.MultiWriter(&stdoutBuffer, request.Stdout)
+	}
+	if request.Stderr != nil {
+		stderrWriter = io.MultiWriter(&stderrBuffer, request.Stderr)
+	}
 	dataDone := make(chan bool)
 	operation, err := call(api.InstanceExecPost{
 		Command:     request.Command,
@@ -151,8 +163,8 @@ func exec(ctx context.Context, call execCall, request ExecRequest) (stdout, stde
 		Interactive: false,
 	}, &incus.InstanceExecArgs{
 		Stdin:    request.Stdin,
-		Stdout:   &stdoutBuffer,
-		Stderr:   &stderrBuffer,
+		Stdout:   stdoutWriter,
+		Stderr:   stderrWriter,
 		DataDone: dataDone,
 	})
 	if err != nil {

@@ -226,12 +226,11 @@ func createWithClient(ctx context.Context, client imageClient, cfg config.Config
 	}
 
 	fmt.Fprintln(stdout, "Running image installer...")
-	execStdout, execStderr, execErr := client.Exec(ctx, instanceName, incusclient.ExecRequest{
+	if _, _, execErr := client.Exec(ctx, instanceName, incusclient.ExecRequest{
 		Command: []string{"bash", "/root/install.sh"},
-	})
-	_, _ = io.WriteString(stdout, execStdout)
-	_, _ = io.WriteString(stderr, execStderr)
-	if execErr != nil {
+		Stdout:  stdout,
+		Stderr:  stderr,
+	}); execErr != nil {
 		return fmt.Errorf("run image installer: %w", execErr)
 	}
 	if _, _, err := client.Exec(ctx, instanceName, incusclient.ExecRequest{
