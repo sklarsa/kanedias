@@ -54,8 +54,8 @@ Add `bin/` so build output is not committed.
   2. `actions/setup-go@v5` with `go-version-file: go.mod`
   3. `make build`
   4. gofmt check step (fails on unformatted files)
-  5. `golangci-lint/golangci-lint-action@v6`, version pinned to the `v2.12.x`
-     line to match local behavior.
+  5. `golangci-lint/golangci-lint-action@v7` (v7+ is required for
+     golangci-lint v2), version pinned to `v2.12.2` to match local behavior.
 - No test step yet (per request).
 
 ## Error Handling
