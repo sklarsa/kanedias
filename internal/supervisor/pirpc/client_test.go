@@ -73,26 +73,36 @@ func TestClientCorrelatesOutOfOrderResponses(t *testing.T) {
 		messagesResult <- rpcCallResult{raw: raw, err: err}
 	}()
 
-	commands := make(map[string]wireCommand, 2)
+	var observed [2]wireCommand
+	seenTypes := make(map[string]struct{}, len(observed))
 	reader := bufio.NewReader(peer)
-	for range 2 {
-		command := readCommand(t, reader)
+	for index := range observed {
+		observed[index] = readCommand(t, reader)
+		command := observed[index]
 		if command.ID == "" {
 			t.Fatal("private ID is empty")
 		}
-		if _, duplicate := commands[command.Type]; duplicate {
+		if _, duplicate := seenTypes[command.Type]; duplicate {
 			t.Fatalf("duplicate command type %q", command.Type)
 		}
-		commands[command.Type] = command
+		seenTypes[command.Type] = struct{}{}
 	}
-	if commands["get_state"].ID == commands["get_messages"].ID {
-		t.Fatalf("private IDs = %q, %q", commands["get_state"].ID, commands["get_messages"].ID)
+	if observed[0].ID == observed[1].ID {
+		t.Fatalf("private IDs = %q, %q", observed[0].ID, observed[1].ID)
 	}
 
-	messages := commands["get_messages"]
-	state := commands["get_state"]
-	writeJSONLine(t, peer, fmt.Sprintf(`{"id":%q,"type":"response","command":"get_messages","success":true,"data":{"marker":"messages-response"}}`, messages.ID))
-	writeJSONLine(t, peer, fmt.Sprintf(`{"id":%q,"type":"response","command":"get_state","success":true,"data":{"marker":"state-response"}}`, state.ID))
+	respond := func(command wireCommand) {
+		switch command.Type {
+		case "get_state":
+			writeJSONLine(t, peer, fmt.Sprintf(`{"id":%q,"type":"response","command":"get_state","success":true,"data":{"marker":"state-response"}}`, command.ID))
+		case "get_messages":
+			writeJSONLine(t, peer, fmt.Sprintf(`{"id":%q,"type":"response","command":"get_messages","success":true,"data":{"marker":"messages-response"}}`, command.ID))
+		default:
+			t.Fatalf("unexpected command type %q", command.Type)
+		}
+	}
+	respond(observed[1])
+	respond(observed[0])
 
 	assertCallResponse(t, <-stateResult, "get_state", "state-response")
 	assertCallResponse(t, <-messagesResult, "get_messages", "messages-response")
