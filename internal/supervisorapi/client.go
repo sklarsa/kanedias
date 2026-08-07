@@ -26,6 +26,12 @@ const (
 	defaultUnaryTimeout        = 10 * time.Second
 )
 
+type cleanDescendantEventEOF struct{ err error }
+
+func (streamErr cleanDescendantEventEOF) Error() string  { return streamErr.err.Error() }
+func (streamErr cleanDescendantEventEOF) Unwrap() error  { return streamErr.err }
+func (streamErr cleanDescendantEventEOF) CleanEOF() bool { return true }
+
 type DescendantClient struct {
 	socketPath   string
 	client       *http.Client
@@ -231,7 +237,7 @@ func (client *DescendantClient) Subscribe(ctx context.Context) (supervisor.Subsc
 			setStreamErr(contract.NewError(contract.ErrorChildUnavailable, "read child event stream: "+err.Error()))
 			return
 		}
-		setStreamErr(contract.NewError(contract.ErrorChildUnavailable, "child event stream ended unexpectedly"))
+		setStreamErr(cleanDescendantEventEOF{err: contract.NewError(contract.ErrorChildUnavailable, "child event stream ended unexpectedly")})
 	}()
 	return supervisor.Subscription{
 		Replay: []supervisor.EventEnvelope{}, Events: events, Close: closeStream,

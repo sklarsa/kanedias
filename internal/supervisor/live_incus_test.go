@@ -1420,15 +1420,50 @@ func preflightCheckoutOrigin(ctx context.Context, repository, authorizedRemote, 
 	return nil
 }
 
+var githubSlugComponent = regexp.MustCompile(`^[A-Za-z0-9_.-]+$`)
+
 func githubRemoteSlug(remote string) string {
-	if match := regexp.MustCompile(`^git@github\.com:([^/]+/[^/]+?)(?:\.git)?$`).FindStringSubmatch(remote); len(match) == 2 {
-		return strings.TrimSuffix(match[1], ".git")
+	if strings.HasPrefix(remote, "git@github.com:") {
+		return canonicalGitHubSlug(strings.TrimPrefix(remote, "git@github.com:"))
 	}
 	parsed, err := url.Parse(remote)
-	if err != nil || strings.ToLower(parsed.Hostname()) != "github.com" || (parsed.Scheme != "https" && parsed.Scheme != "ssh") {
+	if err != nil || parsed.Opaque != "" || parsed.Host != "github.com" || parsed.Port() != "" ||
+		parsed.RawQuery != "" || parsed.ForceQuery || parsed.Fragment != "" || strings.ContainsAny(remote, "?#") || parsed.RawPath != "" {
 		return ""
 	}
-	return strings.TrimSuffix(strings.Trim(parsed.Path, "/"), ".git")
+	switch parsed.Scheme {
+	case "https":
+		if parsed.User != nil {
+			return ""
+		}
+	case "ssh":
+		if parsed.User == nil || parsed.User.Username() != "git" {
+			return ""
+		}
+		if _, hasPassword := parsed.User.Password(); hasPassword {
+			return ""
+		}
+	default:
+		return ""
+	}
+	return canonicalGitHubSlug(strings.TrimPrefix(parsed.Path, "/"))
+}
+
+func canonicalGitHubSlug(path string) string {
+	if path == "" || strings.HasPrefix(path, "/") || strings.HasSuffix(path, "/") || strings.Contains(path, "\\") {
+		return ""
+	}
+	parts := strings.Split(path, "/")
+	if len(parts) != 2 {
+		return ""
+	}
+	parts[1] = strings.TrimSuffix(parts[1], ".git")
+	for _, part := range parts {
+		if part == "" || part == "." || part == ".." || !githubSlugComponent.MatchString(part) {
+			return ""
+		}
+	}
+	return parts[0] + "/" + parts[1]
 }
 
 func commandOutput(t *testing.T, name string, arguments ...string) string {

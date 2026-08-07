@@ -95,6 +95,49 @@ type stoppingDescendant struct {
 	maximum *atomic.Int32
 }
 
+type cleanEOFTestError struct{ error }
+
+func (cleanEOFTestError) CleanEOF() bool { return true }
+
+type eofDescendant struct {
+	fakeDescendantClient
+	process            *fakeChildProcess
+	events             chan EventEnvelope
+	subscribed         chan struct{}
+	subscriptionClosed chan struct{}
+	closeOnce          sync.Once
+	eofObserved        chan struct{}
+	eofOnce            sync.Once
+	closeEventsOnStop  bool
+}
+
+func (client *eofDescendant) Subscribe(context.Context) (Subscription, error) {
+	close(client.subscribed)
+	return Subscription{
+		Replay: []EventEnvelope{},
+		Events: client.events,
+		Close: func() {
+			client.closeOnce.Do(func() { close(client.subscriptionClosed) })
+		},
+		Err: func() error {
+			client.eofOnce.Do(func() { close(client.eofObserved) })
+			return cleanEOFTestError{error: contract.NewError(contract.ErrorChildUnavailable, "child event stream ended unexpectedly")}
+		},
+	}, nil
+}
+
+func (client *eofDescendant) Stop(_ context.Context, target string) error {
+	client.mu.Lock()
+	client.stops = append(client.stops, target)
+	client.mu.Unlock()
+	if client.closeEventsOnStop {
+		close(client.events)
+	}
+	<-client.subscriptionClosed
+	client.process.finish()
+	return nil
+}
+
 func (client *stoppingDescendant) Stop(_ context.Context, target string) error {
 	client.mu.Lock()
 	client.stops = append(client.stops, target)
@@ -246,6 +289,73 @@ func TestCreateChildCancellationStopsAndSynchronouslyCleansChild(t *testing.T) {
 	case <-child.Done():
 	default:
 		t.Fatal("cancellation returned before process exit")
+	}
+}
+
+func TestParentStopMarksCleanEventEOFExpectedBeforeStoppingChild(t *testing.T) {
+	child := newFakeChildProcess()
+	client := &eofDescendant{
+		fakeDescendantClient: fakeDescendantClient{snapshot: directChildSnapshot("child-stop")},
+		process:              child, events: make(chan EventEnvelope), subscribed: make(chan struct{}),
+		subscriptionClosed: make(chan struct{}), eofObserved: make(chan struct{}), closeEventsOnStop: true,
+	}
+	node := childCreationNode(t, nil, nil)
+	entry := &childEntry{id: "child-stop", client: client, process: child}
+	if err := node.children.add(entry); err != nil {
+		t.Fatal(err)
+	}
+	node.startChildEventForwarder(entry)
+	<-client.subscribed
+
+	ctx, cancel := context.WithTimeout(context.Background(), time.Second)
+	defer cancel()
+	if err := node.cleanupChild(ctx, entry, true); err != nil {
+		t.Fatalf("normal parent stop retained expected clean EOF: %v", err)
+	}
+}
+
+func TestTerminalReadReportWinsWhenCleanEventEOFArrivesFirst(t *testing.T) {
+	child := newFakeChildProcess()
+	child.autoFinish = true
+	client := &eofDescendant{
+		fakeDescendantClient: fakeDescendantClient{snapshot: directChildSnapshot("child-terminal")},
+		process:              child, events: make(chan EventEnvelope), subscribed: make(chan struct{}),
+		subscriptionClosed: make(chan struct{}), eofObserved: make(chan struct{}),
+	}
+	node := childCreationNode(t,
+		func(context.Context, process.Bootstrap) (ChildProcess, error) { return child, nil },
+		func(string) (DescendantClient, error) { return client, nil },
+	)
+	node.deps.NewSessionID = func() (string, error) { return "child-terminal", nil }
+	result := make(chan struct {
+		terminal TerminalResult
+		err      error
+	}, 1)
+	go func() {
+		terminal, err := node.CreateChild(context.Background(), "root-1", readRequest())
+		result <- struct {
+			terminal TerminalResult
+			err      error
+		}{terminal: terminal, err: err}
+	}()
+	<-client.subscribed
+	close(client.events)
+	<-client.eofObserved
+	child.messages <- process.ChildMessage{
+		Type: process.MessageRead, SessionID: "child-terminal",
+		Read: &contract.ReadChildResult{Kind: contract.ChildKindRead, WorkerType: "reviewer", SessionID: "child-terminal", Output: "review complete"},
+	}
+
+	select {
+	case got := <-result:
+		if got.err != nil {
+			t.Fatalf("terminal read teardown retained clean EOF that arrived first: %v", got.err)
+		}
+		if got.terminal.Read == nil || got.terminal.Read.Output != "review complete" {
+			t.Fatalf("terminal result = %#v", got.terminal)
+		}
+	case <-time.After(time.Second):
+		t.Fatal("terminal read report did not settle after clean EOF")
 	}
 }
 

@@ -6,6 +6,7 @@ import (
 	"context"
 	"errors"
 	"reflect"
+	"strings"
 	"testing"
 
 	"github.com/sklarsa/kanedias/internal/supervisor"
@@ -74,14 +75,16 @@ func TestCheckoutOriginPreflightCanonicalizesAndResolvesBeforePrompt(t *testing.
 	const head = "0123456789012345678901234567890123456789"
 	resolve := func(_ context.Context, remote string) (string, error) {
 		switch remote {
-		case "git@github.com:owner/disposable.git", "https://github.com/owner/disposable.git":
+		case "git@github.com:owner/disposable.git", "https://github.com/owner/disposable.git", "ssh://git@github.com/owner/disposable.git":
 			return head, nil
 		default:
 			return "", errors.New("unexpected remote")
 		}
 	}
-	if err := preflightCheckoutOrigin(context.Background(), "owner/disposable", "https://github.com/owner/disposable.git", "git@github.com:owner/disposable.git", resolve); err != nil {
-		t.Fatalf("canonical SSH/HTTPS checkout equivalence: %v", err)
+	for _, origin := range []string{"git@github.com:owner/disposable.git", "ssh://git@github.com/owner/disposable.git"} {
+		if err := preflightCheckoutOrigin(context.Background(), "owner/disposable", "https://github.com/owner/disposable.git", origin, resolve); err != nil {
+			t.Fatalf("canonical checkout origin %q: %v", origin, err)
+		}
 	}
 
 	for _, origin := range []string{"https://github.com/owner/wrong.git", "/tmp/local.git", "file:///tmp/local.git"} {
@@ -96,5 +99,37 @@ func TestCheckoutOriginPreflightCanonicalizesAndResolvesBeforePrompt(t *testing.
 		if called {
 			t.Fatalf("origin %q was resolved before canonical rejection", origin)
 		}
+	}
+}
+
+func TestCheckoutOriginPreflightRejectsCredentialsAndNoncanonicalURLComponentsBeforeGit(t *testing.T) {
+	unsafe := []string{
+		"https://token@github.com/owner/disposable.git",
+		"https://user:secret@github.com/owner/disposable.git",
+		"https://github.com:443/owner/disposable.git",
+		"https://github.com/owner/disposable.git?ref=main",
+		"https://github.com/owner/disposable.git#main",
+		"https://github.com/owner/disposable.git/extra",
+		"ssh://github.com/owner/disposable.git",
+		"ssh://root@github.com/owner/disposable.git",
+		"ssh://git:secret@github.com/owner/disposable.git",
+		"ssh://git@github.com:22/owner/disposable.git",
+		"ssh://git@github.com/owner/disposable.git?ref=main",
+		"ssh://git@github.com/owner/disposable.git#main",
+	}
+	for _, origin := range unsafe {
+		t.Run(origin, func(t *testing.T) {
+			called := false
+			err := preflightCheckoutOrigin(context.Background(), "owner/disposable", "https://github.com/owner/disposable.git", origin, func(context.Context, string) (string, error) {
+				called = true
+				return strings.Repeat("a", 40), nil
+			})
+			if err == nil {
+				t.Fatalf("unsafe origin %q accepted", origin)
+			}
+			if called {
+				t.Fatalf("unsafe origin %q reached host git resolver", origin)
+			}
+		})
 	}
 }

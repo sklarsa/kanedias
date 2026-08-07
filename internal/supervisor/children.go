@@ -56,11 +56,12 @@ type childEntry struct {
 	eventCancel context.CancelFunc
 	recovery    *provision.RecoveryTicket
 
-	cleanupOnce        sync.Once
-	cleanupDone        chan struct{}
-	cleanupErr         error
-	streamErr          error
-	eventCloseExpected bool
+	cleanupOnce         sync.Once
+	cleanupDone         chan struct{}
+	cleanupErr          error
+	streamErr           error
+	eventCloseExpected  bool
+	eventCloseExpectedC chan struct{}
 }
 
 func (entry *childEntry) init() {
@@ -69,6 +70,9 @@ func (entry *childEntry) init() {
 	}
 	if entry.spawnDone == nil {
 		entry.spawnDone = make(chan struct{})
+	}
+	if entry.eventCloseExpectedC == nil {
+		entry.eventCloseExpectedC = make(chan struct{})
 	}
 }
 
@@ -115,7 +119,12 @@ func (entry *childEntry) setStreamError(err error) {
 
 func (entry *childEntry) expectEventStreamClose() {
 	entry.mu.Lock()
-	entry.eventCloseExpected = true
+	if !entry.eventCloseExpected {
+		entry.eventCloseExpected = true
+		if entry.eventCloseExpectedC != nil {
+			close(entry.eventCloseExpectedC)
+		}
+	}
 	cancel := entry.eventCancel
 	entry.mu.Unlock()
 	if cancel != nil {
@@ -127,6 +136,33 @@ func (entry *childEntry) eventStreamCloseIsExpected() bool {
 	entry.mu.RLock()
 	defer entry.mu.RUnlock()
 	return entry.eventCloseExpected
+}
+
+func (entry *childEntry) waitForExpectedEventStreamClose(ctx context.Context, grace time.Duration) bool {
+	entry.mu.RLock()
+	expected := entry.eventCloseExpected
+	expectedC := entry.eventCloseExpectedC
+	entry.mu.RUnlock()
+	if expected {
+		return true
+	}
+	timer := time.NewTimer(grace)
+	defer timer.Stop()
+	select {
+	case <-expectedC:
+	case <-ctx.Done():
+	case <-timer.C:
+	}
+	return entry.eventStreamCloseIsExpected()
+}
+
+type cleanEventStreamEOF interface {
+	CleanEOF() bool
+}
+
+func isCleanEventStreamEOF(err error) bool {
+	var clean cleanEventStreamEOF
+	return errors.As(err, &clean) && clean.CleanEOF()
 }
 
 type childRegistry struct {
@@ -213,13 +249,22 @@ func (node *Node) forwardChildEvents(ctx context.Context, cancel context.CancelF
 				if entry.eventStreamCloseIsExpected() || ctx.Err() != nil {
 					return
 				}
+				var streamErr error
 				if subscription.Err != nil {
-					if streamErr := subscription.Err(); streamErr != nil {
-						entry.setStreamError(streamErr)
-						_, child, _ := entry.values()
-						if child != nil {
-							_ = child.CloseLiveness()
-						}
+					streamErr = subscription.Err()
+				}
+				// A clean HTTP/SSE EOF can be observed just before the independent
+				// report pipe publishes a terminal result. Give that signal one
+				// short, bounded scheduling window; all other stream failures remain
+				// immediately fatal.
+				if streamErr != nil && isCleanEventStreamEOF(streamErr) && entry.waitForExpectedEventStreamClose(ctx, node.childEscalationGrace()) {
+					return
+				}
+				if streamErr != nil && !entry.eventStreamCloseIsExpected() && ctx.Err() == nil {
+					entry.setStreamError(streamErr)
+					_, child, _ := entry.values()
+					if child != nil {
+						_ = child.CloseLiveness()
 					}
 				}
 				return
@@ -245,6 +290,10 @@ func (node *Node) cleanupChild(ctx context.Context, entry *childEntry, requestSt
 		}
 		var cleanupErr error
 		if child != nil && requestStop {
+			// Mark and cancel event ownership before any intentional child stop.
+			// Its server may close SSE as part of Stop before the process/report
+			// paths have otherwise had a chance to classify that EOF.
+			entry.expectEventStreamClose()
 			if client != nil {
 				cleanupErr = errors.Join(cleanupErr, client.Stop(ctx, entry.id))
 			} else {
