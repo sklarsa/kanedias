@@ -1,0 +1,1 @@
+Inspect the current checkout without modifying any files. Use routed control requests normally while you work. Your final response must contain the exact marker `KANEDIAS_E2E_READ_OK` and briefly state that the workspace was only read.

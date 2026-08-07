@@ -153,7 +153,7 @@ Every tree node records:
 - Incus instance and volume names;
 - lifecycle state.
 
-Incus `user.kanedias.*` keys may record these identities to help an operator identify leaked resources after an abnormal crash. They are recovery metadata only; v1 does not adopt them.
+Every session-owned instance and custom workspace volume records its Kanedias session ID in `user.kanedias.session_id`; child resources additionally record parent/root, kind, context, worker, and workspace metadata. These keys support exact leak accounting and operator cleanup after abnormal process death. They are recovery metadata only; v1 does not adopt them.
 
 ## Resource Provisioning and COW Clones
 
@@ -525,3 +525,26 @@ The design is proven when the following path works:
 10. receive those refs in the parent tool result;
 11. observe the writer supervisor, Pi session, container, and volume disappear;
 12. terminate the root and verify cascading cleanup and socket removal.
+
+## Operational Acceptance Evidence
+
+The reviewed checkout is exercised by the opt-in Incus-tagged harness:
+
+```bash
+KANEDIAS_LIVE_SUPERVISOR=1 \
+KANEDIAS_CONFIG=./config.toml \
+KANEDIAS_E2E_PROVIDER_READY=1 \
+KANEDIAS_E2E_DISPOSABLE_GITHUB=1 \
+KANEDIAS_E2E_GITHUB_REPOSITORY=owner/disposable-repository \
+KANEDIAS_E2E_GITHUB_REMOTE=https://github.com/owner/disposable-repository.git \
+go test -tags=incus ./internal/supervisor \
+  -run TestLiveRecursiveSupervisorAcceptance -v -count=2
+```
+
+The provider and disposable-GitHub flags are separate, explicit authorizations. The test skips before building, starting a proxy, or touching Incus/GitHub when any required authorization or value is absent. It never infers permission from credentials already present on the machine.
+
+Each run builds the current checkout into a mode-private persistent run directory and uses that absolute binary for the owned proxy, root, and recursively spawned children. The proxy is owned and polled by default. `KANEDIAS_E2E_EXTERNAL_PROXY=1` opts into polling and preserving an operator-owned listener; because the harness cannot stop infrastructure it does not own, that mode omits the missing-proxy phase. Release evidence uses the default owned mode. No readiness path uses a fixed sleep.
+
+Before the first session, the harness records the exact project instance and custom-volume baseline. It records tree snapshots, consuming SSE output, process logs, Incus metadata/resource lists, and verified Git refs during the run. Every observed session is tracked by exact `user.kanedias.session_id` metadata. Successful runs remove their run directory; failures retain it below `KANEDIAS_E2E_ARTIFACT_DIR`, or the user cache under `kanedias/e2e`, and print the path.
+
+The live path covers a mode-`0600` root socket, consuming and stalled SSE clients, later RPC progress, fresh read delegation and routed control, a controlled blocking-question fixture, forked writer handoff with an independently resolved remote ref, graceful descendant cascade, parent-liveness cleanup after root `SIGKILL`, and missing-proxy zero-resource failure. A killed root cannot clean its own Incus resources in v1; test teardown removes only the root instance and volume whose metadata exactly matches that root session, then requires the complete baseline to be restored. Host-wide reconciliation remains deferred.

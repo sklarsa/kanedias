@@ -57,6 +57,80 @@ func TestRunWriteTaskPromptsExactlyAndLeavesWriterLiveUntilHandoff(t *testing.T)
 	}
 }
 
+func TestStopWhileWriterAwaitsHandoffCleansProcessResourcesAndSocket(t *testing.T) {
+	identity := writerIdentity(t)
+	socket, listener := boundSocket(t)
+	clientConn, peer := net.Pipe()
+	tracked := &trackedConn{ReadWriteCloser: clientConn}
+	resources := &provision.Resources{Instance: "writer-instance", Volume: "writer-volume", RPCAddr: "rpc"}
+	provisioner := &fakeRootProvisioner{resources: resources}
+	var listenerClosed atomic.Bool
+	node, err := NewChild(identity, Dependencies{
+		Provisioner: provisioner,
+		DialRPC:     func(context.Context, string) (io.ReadWriteCloser, error) { return tracked, nil },
+		Workers:     fakeWorkers{}, SocketPath: socket,
+		CloseListener: func(context.Context) error { listenerClosed.Store(true); return listener.Close() },
+		ReportWrite:   func(contract.WriteChildResult) error { return nil },
+	}, NewEventBroker())
+	if err != nil {
+		t.Fatal(err)
+	}
+	peerDone := make(chan struct{})
+	go func() {
+		defer close(peerDone)
+		reader := bufio.NewReader(peer)
+		for {
+			line, err := reader.ReadBytes('\n')
+			if err != nil {
+				return
+			}
+			var command struct {
+				ID   string `json:"id"`
+				Type string `json:"type"`
+			}
+			if json.Unmarshal(line, &command) != nil {
+				return
+			}
+			response := map[string]any{"id": command.ID, "type": "response", "command": command.Type, "success": true}
+			if command.Type == "get_state" {
+				response["data"] = map[string]any{"sessionId": "pi-writer", "sessionFile": "/tmp/writer.jsonl", "isStreaming": false}
+			}
+			wire, _ := json.Marshal(response)
+			_, _ = peer.Write(append(wire, '\n'))
+			if command.Type == "prompt" {
+				_, _ = peer.Write([]byte(`{"type":"agent_settled"}` + "\n"))
+			}
+		}
+	}()
+	if err := node.Start(context.Background()); err != nil {
+		t.Fatal(err)
+	}
+	if err := node.RunWriteTask(context.Background(), "prepare handoff"); err != nil {
+		t.Fatal(err)
+	}
+	waitFor(t, func() bool { return node.Snapshot().Lifecycle == string(LifecycleAwaitingHandoff) }, "writer awaiting handoff")
+
+	stopCtx, cancel := context.WithTimeout(context.Background(), time.Second)
+	defer cancel()
+	if err := node.Stop(stopCtx, StopReasonRequested); err != nil {
+		t.Fatal(err)
+	}
+	if !tracked.closed.Load() || !listenerClosed.Load() {
+		t.Fatalf("stop awaiting handoff did not close Pi/socket: pi=%v socket=%v", tracked.closed.Load(), listenerClosed.Load())
+	}
+	provisioner.mu.Lock()
+	destroyed := provisioner.destroyed
+	provisioner.mu.Unlock()
+	if destroyed != 1 {
+		t.Fatalf("destroy calls = %d, want 1", destroyed)
+	}
+	select {
+	case <-peerDone:
+	case <-time.After(time.Second):
+		t.Fatal("Pi peer did not observe stop while awaiting handoff")
+	}
+}
+
 func TestWriterHandoffRecordsAndForwardsExactlyOnceBeforeAcceptance(t *testing.T) {
 	identity, err := NewIdentity(IdentitySpec{SessionID: "writer-1", ParentID: "root-1", RootID: "root-1", Kind: contract.ChildKindWrite, Context: contract.ContextFresh, Worker: "worker"})
 	if err != nil {

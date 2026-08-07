@@ -22,6 +22,7 @@ type recordingRootClient struct {
 	deleteInstErr error
 	deleteVolErr  error
 	request       api.InstancesPost
+	volumePut     api.StorageVolumePut
 	lateVolume    bool
 	volumeReady   bool
 	lateInstance  bool
@@ -60,6 +61,18 @@ func (client *recordingRootClient) GetStorageVolume(_ context.Context, _ string,
 func (client *recordingRootClient) CopyStorageVolume(context.Context, string, string, string) error {
 	client.calls = append(client.calls, "copy-volume")
 	return client.copyErr
+}
+func (client *recordingRootClient) GetStorageVolumeWithETag(_ context.Context, _ string, name string) (*api.StorageVolume, string, error) {
+	client.calls = append(client.calls, "get-owned-volume")
+	return &api.StorageVolume{Name: name, StorageVolumePut: api.StorageVolumePut{Config: api.ConfigMap{"source": "seed"}}}, "etag", nil
+}
+func (client *recordingRootClient) UpdateStorageVolume(_ context.Context, _, _ string, request api.StorageVolumePut, etag string) error {
+	client.calls = append(client.calls, "tag-volume")
+	if etag != "etag" {
+		return errors.New("unexpected volume ETag")
+	}
+	client.volumePut = request
+	return nil
 }
 func (client *recordingRootClient) DeleteStorageVolume(context.Context, string, string) error {
 	client.calls = append(client.calls, "delete-volume")
@@ -170,6 +183,15 @@ func TestRootProvisionerCreatesSocketProxyBeforeStarting(t *testing.T) {
 	}
 	if client.request.Devices["root"]["pool"] != resources.Pool || client.request.Devices["workspace"]["pool"] != resources.Pool {
 		t.Fatalf("root/workspace devices do not use effective pool %q: %#v", resources.Pool, client.request.Devices)
+	}
+	if got := client.volumePut.Config["user.kanedias.session_id"]; got != "root-1" {
+		t.Fatalf("root volume session metadata = %q, want root-1", got)
+	}
+	if got := client.volumePut.Config["user.kanedias.kind"]; got != "root" {
+		t.Fatalf("root volume kind metadata = %q, want root", got)
+	}
+	if got := client.volumePut.Config["user.kanedias.workspace_volume"]; got != resources.Volume {
+		t.Fatalf("root volume name metadata = %q, want %q", got, resources.Volume)
 	}
 	calls := strings.Join(client.calls, ",")
 	if strings.Index(calls, "create-instance") > strings.Index(calls, "start-instance") || device == nil {

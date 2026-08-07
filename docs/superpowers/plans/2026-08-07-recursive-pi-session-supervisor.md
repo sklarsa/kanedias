@@ -4,7 +4,7 @@
 
 **Goal:** Build a foreground, host-side, recursively composable supervisor where every Pi session owns an independent Incus sandbox, exposes a hybrid Unix-socket API, and can synchronously delegate read or write work to COW-cloned child sessions.
 
-**Architecture:** Add a new `internal/supervisor` runtime rather than stretching the one-shot `internal/session` spike. Freeze Go/TypeScript contracts and the persistent Pi RPC pump first, then develop the root runtime/API, Incus COW provisioner, and lightweight Pi extension in parallel branches. Integrate those seams into recursive child processes, then add read/write completion, Git handoff, and a live acceptance harness.
+**Architecture:** Use the recursive `internal/supervisor` runtime as the sole session implementation. Freeze Go/TypeScript contracts and the persistent Pi RPC pump first, then develop the root runtime/API, Incus COW provisioner, and lightweight Pi extension in parallel branches. Integrate those seams into recursive child processes, then add read/write completion, Git handoff, and a live acceptance harness.
 
 **Tech Stack:** Go 1.26.5, Incus Go client v7.3.0, Pi coding agent 0.83.0, TypeScript, Node.js 22, TypeBox 1.3.7, HTTP/JSON and SSE over Unix sockets, GitHub refs.
 
@@ -174,7 +174,7 @@ internal/incusclient/storage.go
 internal/incusclient/storage_test.go
 ```
 
-`internal/session/**` remains untouched until PR 8 removes the superseded spike.
+The superseded session spike is removed when the final acceptance harness makes the recursive runtime authoritative.
 
 The dependency direction is strict: `supervisor` may import `contract`, `pirpc`, `process`, and `provision`; those subpackages must never import the parent `supervisor` package. `process` and `provision` exchange only `contract` types or their own primitive wire/resource types. This prevents Go import cycles while the PR 2, PR 4, and PR 5 lanes develop in parallel and PR 3 follows PR 2.
 
@@ -707,7 +707,7 @@ Do not review this half in isolation; review it with PR 3 at root gate 2.
 
 - [ ] **Step 1: Extract root provisioning behind the PR 1 resource owner**
 
-Port the proxy check, network/profile preparation, seed-volume clone, image-based instance creation, start, RPC address discovery, and cleanup from `internal/session/session.go` behind PR 1’s `provision.RootProvisioner`.
+Implement the proxy check, network/profile preparation, seed-volume clone, image-based instance creation, start, RPC address discovery, and cleanup behind PR 1’s `provision.RootProvisioner`.
 
 Bind the host Unix listener before provisioning, then include this instance-local device in the root `InstancesPost` before the instance starts:
 
@@ -1382,7 +1382,7 @@ Fresh sessions intentionally omit both `--no-session` and `--session`, causing P
 
 Remove `npm:pi-subagents` from `assets/pi-settings.json` and its installer invocation. Install the two Kanedias skills with the staged extension. Keep unrelated packages unless they conflict with the two Kanedias tool names.
 
-- [ ] **Step 3: Add failing CLI tests and replace the one-shot command**
+- [ ] **Step 3: Add failing CLI tests and replace the previous session command**
 
 New contract:
 
@@ -1620,7 +1620,7 @@ Review PRs 8–9 together. Parallel reviewers cover read/session behavior and wr
 
 ### Task 10: Build the End-to-End Acceptance Harness and Remove the Spike
 
-**PR-sized deliverable:** Repeatable live evidence for the approved 12-step acceptance scenario, leak diagnostics, operational documentation, and removal of the superseded one-shot session implementation.
+**PR-sized deliverable:** Repeatable live evidence for the approved 12-step acceptance scenario, leak diagnostics, operational documentation, and removal of the superseded legacy session implementation.
 
 **Files:**
 - Create: `internal/supervisor/live_incus_test.go`
@@ -1628,10 +1628,7 @@ Review PRs 8–9 together. Parallel reviewers cover read/session behavior and wr
 - Create: `internal/supervisor/testdata/write-task.md`
 - Modify: `docs/architecture/session-supervisor.md`
 - Modify: `docs/superpowers/plans/2026-08-07-recursive-pi-session-supervisor.md`
-- Delete: `internal/session/session.go`
-- Delete: `internal/session/session_test.go`
-- Delete: `internal/session/rpc.go`
-- Delete: `internal/session/rpc_test.go`
+- Delete: superseded legacy session package and tests
 - Modify: `cmd/root.go`
 
 **Interfaces:**
@@ -1695,9 +1692,9 @@ go test -tags=incus ./internal/supervisor -run TestLiveRecursiveSupervisorAccept
 
 On failure, save tree snapshots, SSE envelopes, process stderr, Incus metadata, resource lists, and reported Git refs under the persistent run directory from Step 1 and print that path. Do not use `t.TempDir()` for evidence that must survive the test process.
 
-- [ ] **Step 10: Remove the old one-shot session package**
+- [ ] **Step 10: Remove the old session package**
 
-Delete `internal/session/**`, remove its import from `cmd/root.go`, and ensure no tests or docs refer to one-prompt stdout forwarding.
+Delete the superseded session package, remove its command import, and remove obsolete prompt/stdout-forwarding documentation.
 
 - [ ] **Step 11: Run final verification**
 
@@ -1724,6 +1721,14 @@ Then run the live acceptance command once more with the proxy prerequisite satis
 git add cmd docs internal
 git commit -m "test: verify recursive Pi session supervision"
 ```
+
+### Operational evidence produced by the final harness
+
+The final harness is `TestLiveRecursiveSupervisorAcceptance` under the `incus` build tag. It requires separate explicit live-provider and disposable-GitHub authorization in addition to `KANEDIAS_LIVE_SUPERVISOR=1` and an explicit `KANEDIAS_CONFIG`; otherwise it skips before side effects while the entire tagged path still compiles. The release command uses `-count=2` to detect state retained between runs.
+
+Each run builds the reviewed checkout to an absolute binary in a persistent, mode-private artifact directory. It owns and polls the proxy by default, captures an exact Incus instance/custom-volume baseline, and accounts for every observed session through `user.kanedias.session_id` on both the instance and workspace volume. Failure evidence includes process logs, tree snapshots, consuming SSE envelopes, Incus metadata/resource sets, and independently resolved Git refs. Successful runs delete the run directory; failed runs retain and print it.
+
+The acceptance sequence covers the root socket and stalled-client backpressure, fresh read delegation with routed Pi control, controlled question retention/answer/duplicate rejection, forked write delegation with parent-file preservation and exact remote ref verification, graceful recursive stop, descendant liveness cleanup after root `SIGKILL`, the expected killed-root cleanup limitation with exact metadata teardown, and missing-proxy zero-resource failure. Full live evidence is recorded only when the explicit prerequisites are supplied; clean skip output is evidence only of gating and tagged compilation, not of live success.
 
 - [ ] **Step 13: Run release review gate 6**
 

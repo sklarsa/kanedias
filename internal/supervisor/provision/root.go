@@ -37,7 +37,9 @@ type rootClient interface {
 	EnsureProfile(context.Context, string, []byte) error
 	GetImageAlias(context.Context, string) (*api.ImageAliasesEntry, error)
 	GetStorageVolume(context.Context, string, string) (*api.StorageVolume, error)
+	GetStorageVolumeWithETag(context.Context, string, string) (*api.StorageVolume, string, error)
 	CopyStorageVolume(context.Context, string, string, string) error
+	UpdateStorageVolume(context.Context, string, string, api.StorageVolumePut, string) error
 	DeleteStorageVolume(context.Context, string, string) error
 	CreateInstance(context.Context, api.InstancesPost) error
 	StartInstance(context.Context, string) error
@@ -179,6 +181,22 @@ func (provisioner *IncusRootProvisioner) ProvisionRoot(ctx context.Context, requ
 		return nil, err
 	}
 	owned.volumeOwned = true
+
+	rootVolume, rootVolumeETag, err := client.GetStorageVolumeWithETag(ctx, pool, volume)
+	if err != nil {
+		return nil, fmt.Errorf("get copied root workspace volume %q: %w", volume, err)
+	}
+	if rootVolume == nil {
+		return nil, fmt.Errorf("get copied root workspace volume %q: returned no volume", volume)
+	}
+	rootVolumePut := rootVolume.Writable()
+	rootVolumePut.Config = copyConfig(rootVolumePut.Config)
+	rootVolumePut.Config[metaSessionID] = request.SessionID
+	rootVolumePut.Config[metaKind] = string(contract.ChildKindRoot)
+	rootVolumePut.Config[metaVolume] = volume
+	if err := client.UpdateStorageVolume(ctx, pool, volume, rootVolumePut, rootVolumeETag); err != nil {
+		return nil, fmt.Errorf("write root volume metadata: %w", err)
+	}
 
 	instanceRequest := api.InstancesPost{
 		Name: name,
