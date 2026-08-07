@@ -48,6 +48,20 @@ V1 does not provide:
 
 The caller remains responsible for putting a root supervisor in the background or under another process manager when desired.
 
+## Runtime Prerequisite: Kanedias Proxy
+
+A Kanedias credential proxy must already be running before any root or child supervisor creates session-owned resources:
+
+```text
+kanedias proxy run
+```
+
+The proxy listens on the configured Incus network gateway on port `3128`. The sandbox profile sets `HTTP_PROXY`, `HTTPS_PROXY`, their lowercase equivalents, and the Kanedias proxy CA for processes inside each container. Model-provider, GitHub, package-manager, and other outbound requests therefore depend on this service.
+
+Every supervisor performs a fail-fast TCP reachability check against the configured proxy listener before creating or starting session-owned resources. If the listener is unavailable, session creation returns a clear prerequisite error instead of allowing Pi or Git operations to fail later with indirect connectivity errors.
+
+The proxy is shared host infrastructure, not part of a session's ownership tree. Supervisors neither launch nor stop it.
+
 ## Core Invariants
 
 ### One supervisor, one Pi session
