@@ -134,13 +134,13 @@ func createWithClient(ctx context.Context, client imageClient, cfg config.Config
 		return err
 	}
 
-	fmt.Fprintln(stdout, "Ensuring image-build profile...")
+	_, _ = fmt.Fprintln(stdout, "Ensuring image-build profile...")
 	if err := client.EnsureProfile(ctx, string(profiles.ImageBuild), inputs.profile); err != nil {
 		return fmt.Errorf("ensure image-build profile: %w", err)
 	}
 
 	instanceName := fmt.Sprintf("image-build-%d-%d", time.Now().UnixNano(), os.Getpid())
-	fmt.Fprintf(stdout, "Creating temporary instance %s...\n", instanceName)
+	_, _ = fmt.Fprintf(stdout, "Creating temporary instance %s...\n", instanceName)
 	request := api.InstancesPost{
 		InstancePut: api.InstancePut{
 			Profiles: []string{"default", string(profiles.ImageBuild)},
@@ -181,7 +181,7 @@ func createWithClient(ctx context.Context, client imageClient, cfg config.Config
 		err = errors.Join(err, cleanupErr)
 	}()
 
-	fmt.Fprintln(stdout, "Uploading image build inputs...")
+	_, _ = fmt.Fprintln(stdout, "Uploading image build inputs...")
 	if err := client.PushFile(ctx, instanceName, "/root/install.sh", installer, 0o700); err != nil {
 		return fmt.Errorf("upload image build input %q: %w", "/root/install.sh", err)
 	}
@@ -225,7 +225,7 @@ func createWithClient(ctx context.Context, client imageClient, cfg config.Config
 		}
 	}
 
-	fmt.Fprintln(stdout, "Running image installer...")
+	_, _ = fmt.Fprintln(stdout, "Running image installer...")
 	if _, _, execErr := client.Exec(ctx, instanceName, incusclient.ExecRequest{
 		Command: []string{"bash", "/root/install.sh"},
 		Stdout:  stdout,
@@ -239,17 +239,17 @@ func createWithClient(ctx context.Context, client imageClient, cfg config.Config
 		return fmt.Errorf("verify Pi extension production dependencies: %w", err)
 	}
 
-	fmt.Fprintf(stdout, "Stopping temporary instance %s...\n", instanceName)
+	_, _ = fmt.Fprintf(stdout, "Stopping temporary instance %s...\n", instanceName)
 	if err := client.StopInstance(ctx, instanceName, false); err != nil {
 		return fmt.Errorf("stop temporary image-build instance: %w", err)
 	}
 	instanceRunning = false
 
 	description := fmt.Sprintf("kanedias sandbox from %s/%s", cfg.BaseImage.Source, cfg.BaseImage.Image)
-	fmt.Fprintf(stdout, "Publishing image %s...\n", cfg.BaseImage.Name)
+	_, _ = fmt.Fprintf(stdout, "Publishing image %s...\n", cfg.BaseImage.Name)
 	if err := client.PublishInstance(ctx, instanceName, cfg.BaseImage.Name, description); err != nil {
 		return fmt.Errorf("publish image %q: %w", cfg.BaseImage.Name, err)
 	}
-	fmt.Fprintf(stdout, "Published image %s.\n", cfg.BaseImage.Name)
+	_, _ = fmt.Fprintf(stdout, "Published image %s.\n", cfg.BaseImage.Name)
 	return nil
 }

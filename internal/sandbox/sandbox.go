@@ -106,18 +106,18 @@ func create(ctx context.Context, cfg config.Config, name string, stdout, stderr 
 	if err != nil {
 		return err
 	}
-	defer lock.Close()
+	defer func() { _ = lock.Close() }()
 
 	options, err := deps.defaultProxyOptions()
 	if err != nil {
 		return err
 	}
-	fmt.Fprintln(stdout, "Initializing proxy CA...")
+	_, _ = fmt.Fprintln(stdout, "Initializing proxy CA...")
 	if err := deps.initCA(options.CACertPath, options.CAKeyPath); err != nil {
 		return fmt.Errorf("initialize proxy CA: %w", err)
 	}
 
-	fmt.Fprintln(stdout, "Ensuring sandbox network...")
+	_, _ = fmt.Fprintln(stdout, "Ensuring sandbox network...")
 	if err := deps.ensureNetwork(ctx, client, cfg); err != nil {
 		return err
 	}
@@ -126,7 +126,7 @@ func create(ctx context.Context, cfg config.Config, name string, stdout, stderr 
 	if err := profiles.Render(&profile, sandboxProfile, cfg); err != nil {
 		return err
 	}
-	fmt.Fprintln(stdout, "Ensuring sandbox profile...")
+	_, _ = fmt.Fprintln(stdout, "Ensuring sandbox profile...")
 	if err := client.EnsureProfile(ctx, sandboxProfile, profile.Bytes()); err != nil {
 		return err
 	}
@@ -156,24 +156,24 @@ func create(ctx context.Context, cfg config.Config, name string, stdout, stderr 
 		}
 		if instanceCreated {
 			if instanceRunning {
-				fmt.Fprintf(stderr, "Stopping failed sandbox %s...\n", name)
+				_, _ = fmt.Fprintf(stderr, "Stopping failed sandbox %s...\n", name)
 				if stopErr := client.StopInstance(cleanupCtx, name, true); stopErr != nil && !incusclient.IsNotFound(stopErr) {
 					cleanupErr = errors.Join(cleanupErr, stopErr)
 				}
 			}
-			fmt.Fprintf(stderr, "Deleting failed sandbox %s...\n", name)
+			_, _ = fmt.Fprintf(stderr, "Deleting failed sandbox %s...\n", name)
 			if deleteErr := client.DeleteInstance(cleanupCtx, name); deleteErr != nil && !incusclient.IsNotFound(deleteErr) {
 				cleanupErr = errors.Join(cleanupErr, deleteErr)
 			}
 		}
 		if incusVolumeCreated {
-			fmt.Fprintf(stderr, "Deleting failed nested Incus state %s...\n", incusVolume)
+			_, _ = fmt.Fprintf(stderr, "Deleting failed nested Incus state %s...\n", incusVolume)
 			if deleteErr := incusworkspace.Delete(cleanupCtx, client, pool, incusSeed, incusVolume); deleteErr != nil && !incusclient.IsNotFound(deleteErr) {
 				cleanupErr = errors.Join(cleanupErr, deleteErr)
 			}
 		}
 		if volumeCreated {
-			fmt.Fprintf(stderr, "Deleting failed workspace %s...\n", volume)
+			_, _ = fmt.Fprintf(stderr, "Deleting failed workspace %s...\n", volume)
 			if deleteErr := client.DeleteStorageVolume(cleanupCtx, pool, volume); deleteErr != nil && !incusclient.IsNotFound(deleteErr) {
 				cleanupErr = errors.Join(cleanupErr, deleteErr)
 			}
@@ -183,7 +183,7 @@ func create(ctx context.Context, cfg config.Config, name string, stdout, stderr 
 		}
 	}()
 
-	fmt.Fprintf(stdout, "Cloning workspace %s to %s...\n", seed, volume)
+	_, _ = fmt.Fprintf(stdout, "Cloning workspace %s to %s...\n", seed, volume)
 	if copyErr := client.CopyStorageVolume(ctx, pool, seed, volume); copyErr != nil {
 		volumeCreated = deps.operationWasSubmitted(copyErr)
 		if volumeCreated {
@@ -193,7 +193,7 @@ func create(ctx context.Context, cfg config.Config, name string, stdout, stderr 
 	}
 	volumeCreated = true
 
-	fmt.Fprintf(stdout, "Cloning nested Incus state %s to %s...\n", incusSeed, incusVolume)
+	_, _ = fmt.Fprintf(stdout, "Cloning nested Incus state %s to %s...\n", incusSeed, incusVolume)
 	clone, cloneErr := deps.cloneIncusState(ctx, client, pool, incusSeed, name)
 	incusVolumeCreated = clone.Created
 	if cloneErr != nil {
@@ -224,7 +224,7 @@ func create(ctx context.Context, cfg config.Config, name string, stdout, stderr 
 		},
 		Source: api.InstanceSource{Type: "image", Alias: cfg.BaseImage.Name},
 	}
-	fmt.Fprintf(stdout, "Creating sandbox %s...\n", name)
+	_, _ = fmt.Fprintf(stdout, "Creating sandbox %s...\n", name)
 	if err := client.CreateInstance(ctx, request); err != nil {
 		if deps.operationWasSubmitted(err) {
 			instanceCreated = true
@@ -234,7 +234,7 @@ func create(ctx context.Context, cfg config.Config, name string, stdout, stderr 
 	}
 	instanceCreated = true
 
-	fmt.Fprintf(stdout, "Starting sandbox %s...\n", name)
+	_, _ = fmt.Fprintf(stdout, "Starting sandbox %s...\n", name)
 	if err := client.StartInstance(ctx, name); err != nil {
 		if deps.operationWasSubmitted(err) {
 			instanceRunning = true
@@ -244,23 +244,23 @@ func create(ctx context.Context, cfg config.Config, name string, stdout, stderr 
 	}
 	instanceRunning = true
 
-	fmt.Fprintf(stdout, "Waiting for systemd in %s...\n", name)
+	_, _ = fmt.Fprintf(stdout, "Waiting for systemd in %s...\n", name)
 	if err := waitForSystemd(ctx, client, name, deps.readinessTimeout, deps.readinessPollInterval); err != nil {
 		return err
 	}
 
-	fmt.Fprintf(stdout, "Updating trusted CA certificates in %s...\n", name)
+	_, _ = fmt.Fprintf(stdout, "Updating trusted CA certificates in %s...\n", name)
 	if _, _, err := client.Exec(ctx, name, incusclient.ExecRequest{Command: []string{"update-ca-certificates"}}); err != nil {
 		return fmt.Errorf("update trusted CA certificates in sandbox %q: %w", name, err)
 	}
-	fmt.Fprintf(stdout, "Waiting for nested Incus in %s...\n", name)
+	_, _ = fmt.Fprintf(stdout, "Waiting for nested Incus in %s...\n", name)
 	if err := deps.waitNestedIncus(ctx, client, name, deps.readinessTimeout); err != nil {
 		return err
 	}
 	if err := deps.verifyNestedIncus(ctx, client, name); err != nil {
 		return err
 	}
-	fmt.Fprintf(stdout, "Sandbox %s is ready.\n", name)
+	_, _ = fmt.Fprintf(stdout, "Sandbox %s is ready.\n", name)
 	return nil
 }
 
@@ -337,7 +337,7 @@ func destroy(ctx context.Context, cfg config.Config, name string, stdout, _ io.W
 	if err != nil {
 		return err
 	}
-	defer lock.Close()
+	defer func() { _ = lock.Close() }()
 
 	instance, _, err := client.GetInstance(ctx, name)
 	instanceExists := err == nil
@@ -360,12 +360,12 @@ func destroy(ctx context.Context, cfg config.Config, name string, stdout, _ io.W
 			return fmt.Errorf("refusing to remove %q: nested Incus state device: %w", name, err)
 		}
 		if instance.StatusCode == api.Running {
-			fmt.Fprintf(stdout, "Stopping sandbox %s...\n", name)
+			_, _ = fmt.Fprintf(stdout, "Stopping sandbox %s...\n", name)
 			if err := client.StopInstance(ctx, name, true); err != nil {
 				return err
 			}
 		}
-		fmt.Fprintf(stdout, "Deleting sandbox %s...\n", name)
+		_, _ = fmt.Fprintf(stdout, "Deleting sandbox %s...\n", name)
 		if err := client.DeleteInstance(ctx, name); err != nil {
 			return err
 		}
@@ -379,7 +379,7 @@ func destroy(ctx context.Context, cfg config.Config, name string, stdout, _ io.W
 		if err != nil {
 			return err
 		}
-		fmt.Fprintf(stdout, "Deleting %s %s...\n", description, volume)
+		_, _ = fmt.Fprintf(stdout, "Deleting %s %s...\n", description, volume)
 		if err := delete(ctx, client, pool, seed, volume); err != nil && !incusclient.IsNotFound(err) {
 			return err
 		}
@@ -394,7 +394,7 @@ func destroy(ctx context.Context, cfg config.Config, name string, stdout, _ io.W
 	incusErr := deleteVolume(incusVolume, incusSeed, "nested Incus state", deleteIncusState)
 	workspaceErr := deleteVolume(volume, seed, "workspace", deleteWorkspace)
 	if !instanceExists && incusErr == nil && workspaceErr == nil {
-		fmt.Fprintf(stdout, "Sandbox %s and its volumes are absent.\n", name)
+		_, _ = fmt.Fprintf(stdout, "Sandbox %s and its volumes are absent.\n", name)
 	}
 	return errors.Join(incusErr, workspaceErr)
 }

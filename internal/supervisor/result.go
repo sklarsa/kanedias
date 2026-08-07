@@ -132,7 +132,7 @@ func lastAssistantText(ctx context.Context, local *LocalSession) (string, error)
 		return "", childReadFailure(contract.ErrorChildFailed, "get final assistant text", errors.New(decoded.Error))
 	}
 	if decoded.Data.Text == nil {
-		return "", childReadFailure(contract.ErrorChildFailed, "get final assistant text", errors.New("Pi returned null final assistant text"))
+		return "", childReadFailure(contract.ErrorChildFailed, "get final assistant text", errors.New("null final assistant text returned by Pi"))
 	}
 	return *decoded.Data.Text, nil
 }

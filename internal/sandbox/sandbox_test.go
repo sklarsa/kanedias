@@ -472,7 +472,7 @@ func TestLifecycleLockIsNonBlockingAndPrivate(t *testing.T) {
 	}()
 
 	if second, err := acquireLifecycleLock(name); err == nil {
-		second.Close()
+		_ = second.Close()
 		t.Fatal("second lifecycle lock acquisition succeeded")
 	}
 

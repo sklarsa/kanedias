@@ -73,7 +73,7 @@ func (client *DescendantClient) request(ctx context.Context, method, path string
 }
 
 func readDescendantJSON(response *http.Response, target any) error {
-	defer response.Body.Close()
+	defer func() { _ = response.Body.Close() }()
 	mediaType, _, err := mime.ParseMediaType(response.Header.Get("Content-Type"))
 	if err != nil || mediaType != "application/json" {
 		return contract.NewError(contract.ErrorChildUnavailable, "child response is not JSON")
@@ -148,7 +148,7 @@ func (client *DescendantClient) AnswerQuestion(ctx context.Context, sessionID, q
 	if err != nil {
 		return err
 	}
-	defer response.Body.Close()
+	defer func() { _ = response.Body.Close() }()
 	if response.StatusCode == http.StatusNoContent {
 		return nil
 	}
@@ -183,7 +183,7 @@ func (client *DescendantClient) Subscribe(ctx context.Context) (supervisor.Subsc
 	}
 	mediaType, _, mediaErr := mime.ParseMediaType(response.Header.Get("Content-Type"))
 	if response.StatusCode != http.StatusOK || mediaErr != nil || mediaType != "text/event-stream" {
-		response.Body.Close()
+		_ = response.Body.Close()
 		cancel()
 		return supervisor.Subscription{}, contract.NewError(contract.ErrorChildUnavailable, "child event stream is unavailable")
 	}

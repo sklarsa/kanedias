@@ -63,7 +63,7 @@ func routingNode(t *testing.T, clients map[string]*fakeDescendantClient) *Node {
 	node := &Node{identity: testRootIdentity(t), broker: NewEventBroker(), state: LifecycleReady, done: make(chan struct{}), startupDone: make(chan struct{})}
 	node.children = newChildRegistry()
 	for id, client := range clients {
-		node.children.add(&childEntry{id: id, client: client})
+		_ = node.children.add(&childEntry{id: id, client: client})
 	}
 	return node
 }
@@ -109,7 +109,10 @@ func TestRouterDoesNotHoldRegistryLockDuringDescendantHTTP(t *testing.T) {
 	go func() { _, err := NewRouter(node).Snapshot(context.Background()); done <- err }()
 	<-entered
 	added := make(chan struct{})
-	go func() { node.children.add(&childEntry{id: "sibling", client: &fakeDescendantClient{}}); close(added) }()
+	go func() {
+		_ = node.children.add(&childEntry{id: "sibling", client: &fakeDescendantClient{}})
+		close(added)
+	}()
 	select {
 	case <-added:
 	case <-time.After(time.Second):

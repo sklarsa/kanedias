@@ -48,7 +48,7 @@ func Clone(ctx context.Context, client VolumeClient, pool, seed, sandbox string)
 	if err != nil {
 		return result, err
 	}
-	defer lock.Close()
+	defer func() { _ = lock.Close() }()
 
 	seedVolume, err := client.GetStorageVolume(ctx, pool, seed)
 	if err != nil {

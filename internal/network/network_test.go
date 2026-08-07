@@ -42,8 +42,10 @@ func missingClient() *fakeClient {
 	return &fakeClient{getErr: api.StatusErrorf(http.StatusNotFound, "missing")}
 }
 
+type networkTestCtxKey struct{}
+
 func TestEnsureWithClientCreatesMissingBridge(t *testing.T) {
-	ctx := context.WithValue(context.Background(), struct{}{}, "request")
+	ctx := context.WithValue(context.Background(), networkTestCtxKey{}, "request")
 	fake := missingClient()
 	if err := EnsureWithClient(ctx, fake, testConfig("")); err != nil {
 		t.Fatal(err)

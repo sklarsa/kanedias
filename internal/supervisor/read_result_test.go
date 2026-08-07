@@ -17,7 +17,7 @@ func TestRunReadTaskSendsExactFreshAndForkPromptAndRequiresAcceptance(t *testing
 	for _, mode := range []contract.ContextMode{contract.ContextFresh, contract.ContextFork} {
 		t.Run(string(mode), func(t *testing.T) {
 			node, peer := boundReadNodeForContext(t, mode)
-			defer peer.Close()
+			defer func() { _ = peer.Close() }()
 			go func() {
 				reader := bufio.NewReader(peer)
 				prompt := readRPCCommand(t, reader)
@@ -55,7 +55,7 @@ func TestReadResultRequiresSettledStopAndNonNullFinalText(t *testing.T) {
 	for _, tt := range tests {
 		t.Run(tt.name, func(t *testing.T) {
 			node, peer := boundReadNode(t)
-			defer peer.Close()
+			defer func() { _ = peer.Close() }()
 			serverDone := make(chan struct{})
 			go func() {
 				defer close(serverDone)
@@ -153,7 +153,7 @@ func boundReadNodeForContext(t *testing.T, mode contract.ContextMode) (*Node, ne
 
 func TestRunReadTaskIgnoresSuccessfulRetainedGenerationBeforeExactPrompt(t *testing.T) {
 	node, peer := boundReadNode(t)
-	defer peer.Close()
+	defer func() { _ = peer.Close() }()
 	_, _ = peer.Write([]byte(`{"type":"message_end","message":{"role":"assistant","stopReason":"stop"}}` + "\n" + `{"type":"agent_settled"}` + "\n"))
 	waitFor(t, func() bool { return node.broker.SourceBoundary("child-1") >= 2 }, "old generation replay")
 	go func() {

@@ -57,7 +57,7 @@ func ensureProject(server projectManager) error {
 	}
 	for key, required := range requiredProjectFeatures {
 		if project.Config[key] != required {
-			return fmt.Errorf("Incus project %q has incompatible feature %q", ProjectName, key)
+			return fmt.Errorf("incompatible feature %q on Incus project %q", key, ProjectName)
 		}
 	}
 	return nil

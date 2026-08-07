@@ -126,7 +126,7 @@ func TestTerminalReporterWaitsForExactParentAcknowledgement(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	defer reportRead.Close()
+	defer func() { _ = reportRead.Close() }()
 	ackRead, ackWrite, err := os.Pipe()
 	if err != nil {
 		t.Fatal(err)
@@ -214,7 +214,7 @@ func TestTerminalReporterCancellationUnblocksAcknowledgementWait(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	defer ackWrite.Close()
+	defer func() { _ = ackWrite.Close() }()
 	ctx, cancel := context.WithCancel(context.Background())
 	reporter := NewAcknowledgedReporter(ctx, &output, ackRead, "child-1")
 	done := make(chan error, 1)
@@ -282,7 +282,7 @@ func TestSpawnerUsesOnlyInheritedProtocolDescriptorsAndProbesSocket(t *testing.T
 	if err != nil {
 		t.Fatal(err)
 	}
-	defer child.Kill()
+	defer func() { _ = child.Kill() }()
 	readyCtx, cancel := context.WithTimeout(context.Background(), 3*time.Second)
 	defer cancel()
 	if err := child.WaitReady(readyCtx); err != nil {
@@ -314,7 +314,7 @@ func TestSpawnerTerminalAcknowledgementOrdersProcessExit(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	defer child.Kill()
+	defer func() { _ = child.Kill() }()
 	ctx, cancel := context.WithTimeout(context.Background(), 3*time.Second)
 	defer cancel()
 	if err := child.WaitReady(ctx); err != nil {
@@ -370,7 +370,7 @@ func TestSpawnerRejectsReadyUntilSessionAndSocketAreVerified(t *testing.T) {
 			if err != nil {
 				t.Fatal(err)
 			}
-			defer child.Kill()
+			defer func() { _ = child.Kill() }()
 			ctx, cancel := context.WithTimeout(context.Background(), time.Second)
 			defer cancel()
 			if err := child.WaitReady(ctx); err == nil {
@@ -392,7 +392,7 @@ func TestSpawnerRejectsReadySocketServingStaleTreeIdentity(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	defer child.Kill()
+	defer func() { _ = child.Kill() }()
 	ctx, cancel := context.WithTimeout(context.Background(), 100*time.Millisecond)
 	defer cancel()
 	if err := child.WaitReady(ctx); err == nil {
@@ -414,7 +414,7 @@ func TestSuccessfulTerminalReportRemainsProvisionalUntilRealProcessExit(t *testi
 	if err != nil {
 		t.Fatal(err)
 	}
-	defer child.Kill()
+	defer func() { _ = child.Kill() }()
 	ctx, cancel := context.WithTimeout(context.Background(), time.Second)
 	defer cancel()
 	if err := child.WaitReady(ctx); err != nil {
@@ -478,7 +478,7 @@ func TestParentStopUnblocksRealChildWaitingForTerminalAcknowledgement(t *testing
 	if err != nil {
 		t.Fatal(err)
 	}
-	defer child.Kill()
+	defer func() { _ = child.Kill() }()
 	ctx, cancel := context.WithTimeout(context.Background(), 3*time.Second)
 	defer cancel()
 	if err := child.WaitReady(ctx); err != nil {

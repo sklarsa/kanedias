@@ -98,7 +98,7 @@ type IncusChildProvisioner struct {
 
 func NewIncusChildProvisioner(client childIncusClient, options ChildProvisionOptions) (*IncusChildProvisioner, error) {
 	if client == nil {
-		return nil, fmt.Errorf("Incus child client is required")
+		return nil, fmt.Errorf("child client is required for Incus")
 	}
 	if strings.TrimSpace(options.WorkspacePool) == "" {
 		return nil, fmt.Errorf("workspace pool is required")

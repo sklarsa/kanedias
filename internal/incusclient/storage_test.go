@@ -83,7 +83,7 @@ func TestGetStoragePoolWrapsError(t *testing.T) {
 }
 
 func TestGetStoragePoolUsesRequestContext(t *testing.T) {
-	ctx := context.WithValue(context.Background(), struct{}{}, "pool-context")
+	ctx := context.WithValue(context.Background(), clientTestCtxKey{}, "pool-context")
 	server := &storageAdapterServer{pool: &api.StoragePool{Name: "default", Driver: "btrfs"}}
 	client := &Client{server: server}
 

@@ -23,7 +23,7 @@ func TestSeedLockAllowsReadersAndExcludesWriter(t *testing.T) {
 	}
 
 	if writer, err := acquireSeedLock(pool, "seed", true); err == nil {
-		writer.Close()
+		_ = writer.Close()
 		t.Fatal("exclusive seed lock succeeded while shared locks were held")
 	}
 
@@ -38,7 +38,7 @@ func TestSeedLockAllowsReadersAndExcludesWriter(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	defer writer.Close()
+	defer func() { _ = writer.Close() }()
 }
 
 func TestSeedLockUsesPrivatePermissions(t *testing.T) {
@@ -48,7 +48,7 @@ func TestSeedLockUsesPrivatePermissions(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	defer lock.Close()
+	defer func() { _ = lock.Close() }()
 
 	dir := filepath.Join(os.TempDir(), fmt.Sprintf("kanedias-incus-seed-locks-%d", os.Getuid()))
 	dirInfo, err := os.Stat(dir)

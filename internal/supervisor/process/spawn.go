@@ -86,37 +86,37 @@ func (spawner Spawner) Spawn(ctx context.Context, bootstrap Bootstrap) (*Child, 
 	}
 	livenessRead, livenessWrite, err := os.Pipe()
 	if err != nil {
-		bootstrapRead.Close()
-		bootstrapWrite.Close()
+		_ = bootstrapRead.Close()
+		_ = bootstrapWrite.Close()
 		return nil, fmt.Errorf("create liveness pipe: %w", err)
 	}
 	reportRead, reportWrite, err := os.Pipe()
 	if err != nil {
-		bootstrapRead.Close()
-		bootstrapWrite.Close()
-		livenessRead.Close()
-		livenessWrite.Close()
+		_ = bootstrapRead.Close()
+		_ = bootstrapWrite.Close()
+		_ = livenessRead.Close()
+		_ = livenessWrite.Close()
 		return nil, fmt.Errorf("create report pipe: %w", err)
 	}
 	terminalAckRead, terminalAckWrite, err := os.Pipe()
 	if err != nil {
-		bootstrapRead.Close()
-		bootstrapWrite.Close()
-		livenessRead.Close()
-		livenessWrite.Close()
-		reportRead.Close()
-		reportWrite.Close()
+		_ = bootstrapRead.Close()
+		_ = bootstrapWrite.Close()
+		_ = livenessRead.Close()
+		_ = livenessWrite.Close()
+		_ = reportRead.Close()
+		_ = reportWrite.Close()
 		return nil, fmt.Errorf("create terminal acknowledgement pipe: %w", err)
 	}
 	closeAll := func() {
-		bootstrapRead.Close()
-		bootstrapWrite.Close()
-		livenessRead.Close()
-		livenessWrite.Close()
-		reportRead.Close()
-		reportWrite.Close()
-		terminalAckRead.Close()
-		terminalAckWrite.Close()
+		_ = bootstrapRead.Close()
+		_ = bootstrapWrite.Close()
+		_ = livenessRead.Close()
+		_ = livenessWrite.Close()
+		_ = reportRead.Close()
+		_ = reportWrite.Close()
+		_ = terminalAckRead.Close()
+		_ = terminalAckWrite.Close()
 	}
 
 	command := exec.CommandContext(ctx, executable,
@@ -195,7 +195,7 @@ func withConfigPath(environment []string, path string) []string {
 }
 
 func (child *Child) readReports(reader *os.File) {
-	defer reader.Close()
+	defer func() { _ = reader.Close() }()
 	defer close(child.reports)
 	defer close(child.reportDone)
 	buffered := bufio.NewReaderSize(reader, MaxRecordBytes+1)

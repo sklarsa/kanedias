@@ -71,7 +71,7 @@ func syncRepositories(ctx context.Context, incus client, instance string, reposi
 	}
 
 	for _, repository := range repositories {
-		fmt.Fprintf(stdout, "Syncing %s...\n", repository.slug)
+		_, _ = fmt.Fprintf(stdout, "Syncing %s...\n", repository.slug)
 		if err := syncRepository(ctx, incus, instance, repository, stdout, stderr); err != nil {
 			return err
 		}
@@ -181,10 +181,10 @@ func exec(ctx context.Context, incus client, instance string, stdout, stderr io.
 func execOutput(ctx context.Context, incus client, instance string, stdout, stderr io.Writer, command []string) (string, error) {
 	commandStdout, commandStderr, err := incus.Exec(ctx, instance, incusclient.ExecRequest{Command: command})
 	if commandStdout != "" {
-		fmt.Fprint(stdout, commandStdout)
+		_, _ = fmt.Fprint(stdout, commandStdout)
 	}
 	if commandStderr != "" {
-		fmt.Fprint(stderr, commandStderr)
+		_, _ = fmt.Fprint(stderr, commandStderr)
 	}
 	if err != nil {
 		return commandStdout, fmt.Errorf("execute %q: %w", strings.Join(command, " "), err)

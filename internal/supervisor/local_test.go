@@ -258,7 +258,7 @@ func TestLocalSessionEOFFailsPendingCallAndClearsQuestions(t *testing.T) {
 		result <- err
 	}()
 	_ = readObject(t, peer)
-	peer.Close()
+	_ = peer.Close()
 
 	select {
 	case err := <-result:
@@ -304,8 +304,8 @@ func newTestLocalSession(t *testing.T, identity Identity) (*LocalSession, net.Co
 	broker := newEventBroker(8, 8)
 	local := NewLocalSession(identity, rpc, broker)
 	t.Cleanup(func() {
-		local.StopRPC()
-		peerConn.Close()
+		_ = local.StopRPC()
+		_ = peerConn.Close()
 	})
 	return local, peerConn, broker
 }
@@ -356,9 +356,9 @@ func writeGetStateResponse(t *testing.T, peer net.Conn, id, sessionID, sessionFi
 
 func readObject(t *testing.T, peer net.Conn) testRPCObject {
 	t.Helper()
-	peer.SetReadDeadline(time.Now().Add(time.Second))
+	_ = peer.SetReadDeadline(time.Now().Add(time.Second))
 	line, err := bufio.NewReader(peer).ReadBytes('\n')
-	peer.SetReadDeadline(time.Time{})
+	_ = peer.SetReadDeadline(time.Time{})
 	if err != nil {
 		t.Fatalf("read Pi RPC command: %v", err)
 	}
@@ -381,9 +381,9 @@ func writeBatch(t *testing.T, peer net.Conn, lines ...string) {
 		wire = append(wire, line...)
 		wire = append(wire, '\n')
 	}
-	peer.SetWriteDeadline(time.Now().Add(time.Second))
+	_ = peer.SetWriteDeadline(time.Now().Add(time.Second))
 	_, err := peer.Write(wire)
-	peer.SetWriteDeadline(time.Time{})
+	_ = peer.SetWriteDeadline(time.Time{})
 	if err != nil {
 		t.Fatalf("write Pi RPC lines: %v", err)
 	}
@@ -391,8 +391,8 @@ func writeBatch(t *testing.T, peer net.Conn, lines ...string) {
 
 func assertNoPeerWrite(t *testing.T, peer net.Conn) {
 	t.Helper()
-	peer.SetReadDeadline(time.Now().Add(30 * time.Millisecond))
-	defer peer.SetReadDeadline(time.Time{})
+	_ = peer.SetReadDeadline(time.Now().Add(30 * time.Millisecond))
+	defer func() { _ = peer.SetReadDeadline(time.Time{}) }()
 	buffer := make([]byte, 1)
 	if _, err := peer.Read(buffer); err == nil {
 		t.Fatal("unexpected Pi RPC bytes were written")

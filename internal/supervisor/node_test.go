@@ -91,7 +91,7 @@ func boundSocket(t *testing.T) (string, net.Listener) {
 		t.Fatal(err)
 	}
 	if err := os.Chmod(path, 0o600); err != nil {
-		listener.Close()
+		_ = listener.Close()
 		t.Fatal(err)
 	}
 	t.Cleanup(func() { _ = listener.Close() })
@@ -254,7 +254,7 @@ func TestRootNodeTCPConnectionAloneIsNotReady(t *testing.T) {
 func TestRootNodeBindsOnlyAfterGetStateAndBuffersInitialEvent(t *testing.T) {
 	path, _ := boundSocket(t)
 	host, peer := net.Pipe()
-	defer peer.Close()
+	defer func() { _ = peer.Close() }()
 	fake := &fakeRootProvisioner{resources: &provision.Resources{SessionID: "root-1", Pool: "btrfs", Instance: "i", Volume: "v", RPCAddr: "rpc"}}
 	broker := NewEventBroker()
 	node, err := NewRoot(testRootIdentity(t), Dependencies{Provisioner: fake, SocketPath: path, DialRPC: func(context.Context, string) (io.ReadWriteCloser, error) { return host, nil }, Workers: fakeWorkers{}, CloseListener: func(context.Context) error { return nil }}, broker)
@@ -295,7 +295,7 @@ func TestRootNodeBindsOnlyAfterGetStateAndBuffersInitialEvent(t *testing.T) {
 func TestRootNodeForbiddenRPCIsNotWritten(t *testing.T) {
 	path, _ := boundSocket(t)
 	host, peer := net.Pipe()
-	defer peer.Close()
+	defer func() { _ = peer.Close() }()
 	fake := &fakeRootProvisioner{resources: &provision.Resources{SessionID: "root-1", RPCAddr: "rpc"}}
 	node, err := NewRoot(testRootIdentity(t), Dependencies{Provisioner: fake, SocketPath: path, DialRPC: func(context.Context, string) (io.ReadWriteCloser, error) { return host, nil }, Workers: fakeWorkers{}, CloseListener: func(context.Context) error { return nil }}, nil)
 	if err != nil {
@@ -404,7 +404,7 @@ func TestRootNodeWaitsForBufferedPiEventsBeforeDoneAndCleanup(t *testing.T) {
 func TestRootNodeStopIsIdempotentAndClosesPiBeforeDestroy(t *testing.T) {
 	path, _ := boundSocket(t)
 	host, peer := net.Pipe()
-	defer peer.Close()
+	defer func() { _ = peer.Close() }()
 	tracked := &trackedConn{ReadWriteCloser: host}
 	fake := &fakeRootProvisioner{resources: &provision.Resources{SessionID: "root-1", RPCAddr: "rpc"}}
 	var orderMu sync.Mutex

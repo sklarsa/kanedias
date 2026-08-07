@@ -158,7 +158,7 @@ func (s *openAICodexOAuthSource) requestToken(ctx context.Context, form url.Valu
 	if err != nil {
 		return oauthCredential{}, err
 	}
-	defer resp.Body.Close()
+	defer func() { _ = resp.Body.Close() }()
 	if resp.StatusCode < 200 || resp.StatusCode >= 300 {
 		return oauthCredential{}, fmt.Errorf("token endpoint returned HTTP %d", resp.StatusCode)
 	}
@@ -205,7 +205,7 @@ func (s *openAICodexOAuthSource) Login(ctx context.Context, output io.Writer) er
 	if err != nil {
 		return fmt.Errorf("request OpenAI device code: %w", err)
 	}
-	defer resp.Body.Close()
+	defer func() { _ = resp.Body.Close() }()
 	if resp.StatusCode < 200 || resp.StatusCode >= 300 {
 		return fmt.Errorf("OpenAI device-code endpoint returned HTTP %d", resp.StatusCode)
 	}
@@ -221,7 +221,7 @@ func (s *openAICodexOAuthSource) Login(ctx context.Context, output io.Writer) er
 	if err != nil || device.DeviceAuthID == "" || device.UserCode == "" {
 		return errors.New("OpenAI device-code response is missing required fields")
 	}
-	fmt.Fprintf(output, "Open %s and enter code %s\n", s.deviceVerificationURL, device.UserCode)
+	_, _ = fmt.Fprintf(output, "Open %s and enter code %s\n", s.deviceVerificationURL, device.UserCode)
 
 	loginCtx, cancel := context.WithTimeout(ctx, 15*time.Minute)
 	defer cancel()
@@ -253,7 +253,7 @@ func (s *openAICodexOAuthSource) Login(ctx context.Context, output io.Writer) er
 	if err := atomicWriteJSON(s.path, credential); err != nil {
 		return fmt.Errorf("save OpenAI Codex OAuth credential: %w", err)
 	}
-	fmt.Fprintln(output, "OpenAI Codex login complete.")
+	_, _ = fmt.Fprintln(output, "OpenAI Codex login complete.")
 	return nil
 }
 
@@ -456,7 +456,7 @@ func (s *claudeOAuthSource) Token(ctx context.Context) (bearerToken, error) {
 func (s *claudeOAuthSource) refresh(ctx context.Context, file *claudeCredentialFile) error {
 	credential := &file.ClaudeAI
 	if credential.RefreshToken == "" {
-		return errors.New("Claude OAuth refresh token is missing")
+		return errors.New("missing Claude OAuth refresh token")
 	}
 	clientID := credential.ClientID
 	if clientID == "" {
@@ -480,9 +480,9 @@ func (s *claudeOAuthSource) refresh(ctx context.Context, file *claudeCredentialF
 	if err != nil {
 		return fmt.Errorf("refresh Claude OAuth token: %w", err)
 	}
-	defer resp.Body.Close()
+	defer func() { _ = resp.Body.Close() }()
 	if resp.StatusCode < 200 || resp.StatusCode >= 300 {
-		return fmt.Errorf("Claude OAuth token endpoint returned HTTP %d", resp.StatusCode)
+		return fmt.Errorf("token endpoint returned HTTP %d for Claude OAuth", resp.StatusCode)
 	}
 	var payload struct {
 		AccessToken  string `json:"access_token"`
@@ -494,7 +494,7 @@ func (s *claudeOAuthSource) refresh(ctx context.Context, file *claudeCredentialF
 		return fmt.Errorf("decode Claude OAuth token response: %w", err)
 	}
 	if payload.AccessToken == "" || payload.ExpiresIn <= 0 {
-		return errors.New("Claude OAuth token response is missing required fields")
+		return errors.New("missing required fields in Claude OAuth token response")
 	}
 	credential.AccessToken = payload.AccessToken
 	if payload.RefreshToken != "" {
@@ -652,7 +652,7 @@ func readJSON(path string, value any) error {
 	if err != nil {
 		return err
 	}
-	defer file.Close()
+	defer func() { _ = file.Close() }()
 	if err := json.NewDecoder(io.LimitReader(file, 1<<20)).Decode(value); err != nil {
 		return err
 	}
@@ -668,7 +668,7 @@ func atomicWriteJSON(path string, value any) error {
 		return err
 	}
 	temporaryPath := temporary.Name()
-	defer os.Remove(temporaryPath)
+	defer func() { _ = os.Remove(temporaryPath) }()
 	if err := temporary.Chmod(0600); err != nil {
 		_ = temporary.Close()
 		return err

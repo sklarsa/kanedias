@@ -475,7 +475,7 @@ func TestServeUnixIdentityCheckedShutdownNeverUnlinksReplacementSocket(t *testin
 	if err != nil {
 		t.Fatal(err)
 	}
-	defer replacement.Close()
+	defer func() { _ = replacement.Close() }()
 
 	cancel()
 	if err := <-result; err == nil || !strings.Contains(err.Error(), "refuse unlink of replaced Unix socket") {

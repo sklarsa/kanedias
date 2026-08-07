@@ -61,13 +61,13 @@ func EnsureWithClient(ctx context.Context, client Client, cfg config.Config) err
 	}
 
 	if !network.Managed {
-		return fmt.Errorf("Incus network %q is not managed", Name)
+		return fmt.Errorf("network %q is not managed by Incus", Name)
 	}
 	if network.Type != "bridge" {
-		return fmt.Errorf("Incus network %q has type %q; it must be a bridge", Name, network.Type)
+		return fmt.Errorf("unexpected type %q on Incus network %q; it must be a bridge", network.Type, Name)
 	}
 	if network.Config["ipv4.nat"] != "true" {
-		return fmt.Errorf("Incus network %q must have ipv4.nat=true for direct image-build egress; run: incus network set %s ipv4.nat=true --project default", Name, Name)
+		return fmt.Errorf("ipv4.nat=true required for direct image-build egress on Incus network %q; run: incus network set %s ipv4.nat=true --project default", Name, Name)
 	}
 	if err := requirePrefix("ipv4.address", network.Config["ipv4.address"], ipv4); err != nil {
 		return err
@@ -83,10 +83,10 @@ func EnsureWithClient(ctx context.Context, client Client, cfg config.Config) err
 func requirePrefix(setting, actual string, expected netip.Prefix) error {
 	actualPrefix, err := netip.ParsePrefix(actual)
 	if err != nil {
-		return fmt.Errorf("Incus network %q has invalid %s %q: %w", Name, setting, actual, err)
+		return fmt.Errorf("invalid %s %q on Incus network %q: %w", setting, actual, Name, err)
 	}
 	if actualPrefix != expected {
-		return fmt.Errorf("Incus network %q has %s %q, expected %q", Name, setting, actual, expected.String())
+		return fmt.Errorf("unexpected %s %q on Incus network %q, expected %q", setting, actual, Name, expected.String())
 	}
 	return nil
 }

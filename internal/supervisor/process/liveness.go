@@ -53,9 +53,9 @@ func RunInheritedChild(ctx context.Context, bootstrapFD, livenessFD, reportFD, t
 	if bootstrapFile == nil || livenessFile == nil || reportFile == nil || terminalAckFile == nil {
 		return fmt.Errorf("open inherited child descriptors")
 	}
-	defer livenessFile.Close()
-	defer reportFile.Close()
-	defer terminalAckFile.Close()
+	defer func() { _ = livenessFile.Close() }()
+	defer func() { _ = reportFile.Close() }()
+	defer func() { _ = terminalAckFile.Close() }()
 
 	bootstrap, err := DecodeBootstrap(bootstrapFile)
 	closeErr := bootstrapFile.Close()
@@ -73,7 +73,7 @@ func RunInheritedChild(ctx context.Context, bootstrapFD, livenessFD, reportFD, t
 	go func() { monitorDone <- MonitorParentLiveness(childCtx, livenessFile, stop) }()
 	runErr := runner(childCtx, bootstrap, reporter)
 	var reportErr error
-	if runErr != nil && !reporter.TerminalSent() && !(errors.Is(runErr, context.Canceled) && childCtx.Err() != nil) {
+	if runErr != nil && !reporter.TerminalSent() && (!errors.Is(runErr, context.Canceled) || childCtx.Err() == nil) {
 		code := contract.ErrorChildFailed
 		var contractErr *contract.Error
 		if errors.As(runErr, &contractErr) {
@@ -103,7 +103,7 @@ func MonitorParentLiveness(ctx context.Context, parent io.ReadCloser, stop func(
 	if stop == nil {
 		return fmt.Errorf("parent liveness stop function is required")
 	}
-	defer parent.Close()
+	defer func() { _ = parent.Close() }()
 
 	readResult := make(chan error, 1)
 	go func() {
