@@ -6,6 +6,7 @@ import (
 	"errors"
 	"io"
 	"net"
+	"os"
 	"path/filepath"
 	"sync"
 	"sync/atomic"
@@ -473,36 +474,208 @@ func (child *escalatingChildProcess) Kill() error {
 	return nil
 }
 
-func TestUnexpectedFinishUsesDetachedDeadlineAndEscalatesHangingDescendant(t *testing.T) {
+type phaseRootProvisioner struct {
+	destroyStarted chan context.Context
+	destroyRelease <-chan struct{}
+	destroyDone    chan struct{}
+	waitForTimeout bool
+}
+
+func (*phaseRootProvisioner) ProvisionRoot(context.Context, provision.RootRequest) (*provision.Resources, error) {
+	return nil, errors.New("unused")
+}
+
+func (p *phaseRootProvisioner) Destroy(ctx context.Context, _ *provision.Resources) error {
+	p.destroyStarted <- ctx
+	defer close(p.destroyDone)
+	if p.waitForTimeout {
+		<-ctx.Done()
+		return ctx.Err()
+	}
+	select {
+	case <-p.destroyRelease:
+		return nil
+	case <-ctx.Done():
+		return ctx.Err()
+	}
+}
+
+func assertLiveBoundedContext(t *testing.T, phase string, ctx context.Context) time.Time {
+	t.Helper()
+	if err := ctx.Err(); err != nil {
+		t.Errorf("%s context already expired: %v", phase, err)
+	}
+	deadline, ok := ctx.Deadline()
+	if !ok {
+		t.Errorf("%s context has no deadline", phase)
+	}
+	return deadline
+}
+
+func TestUnexpectedFinishUsesIndependentDeadlinesForDescendantsResourcesAndListener(t *testing.T) {
+	path, listener := boundSocket(t)
+	original, err := os.Lstat(path)
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	resourceRelease := make(chan struct{})
+	resources := &phaseRootProvisioner{
+		destroyStarted: make(chan context.Context, 1),
+		destroyRelease: resourceRelease,
+		destroyDone:    make(chan struct{}),
+	}
+	listenerStarted := make(chan context.Context, 1)
+	listenerRelease := make(chan struct{})
+	listenerDone := make(chan struct{})
+	identityChecked := atomic.Bool{}
+
 	node := childCreationNode(t, nil, nil)
-	node.resources = nil
-	node.deps.ChildStopTimeout = 30 * time.Millisecond
-	listenerCalled := atomic.Bool{}
-	node.deps.CloseListener = func(context.Context) error { listenerCalled.Store(true); return nil }
+	node.deps.Provisioner = resources
+	node.deps.ChildStopTimeout = 100 * time.Millisecond
+	node.deps.CloseListener = func(ctx context.Context) error {
+		listenerStarted <- ctx
+		defer close(listenerDone)
+		select {
+		case <-listenerRelease:
+		case <-ctx.Done():
+			return ctx.Err()
+		}
+		current, err := os.Lstat(path)
+		if err != nil {
+			return err
+		}
+		if !os.SameFile(original, current) {
+			return errors.New("listener socket identity changed")
+		}
+		identityChecked.Store(true)
+		if err := listener.Close(); err != nil {
+			return err
+		}
+		return os.Remove(path)
+	}
 	client := &deadlineDescendant{}
 	child := newEscalatingChildProcess()
 	if err := node.children.add(&childEntry{id: "child-hanging", client: client, process: child}); err != nil {
 		t.Fatal(err)
 	}
 
+	finishReturned := make(chan struct{})
 	started := time.Now()
-	node.finish(context.Background(), io.EOF, LifecycleFailed, false)
+	go func() {
+		node.finish(context.Background(), io.EOF, LifecycleFailed, false)
+		close(finishReturned)
+	}()
+
+	resourceCtx := <-resources.destroyStarted
+	resourceDeadline := assertLiveBoundedContext(t, "resource", resourceCtx)
+	select {
+	case <-resources.destroyDone:
+		t.Error("resource destruction returned before its release")
+	default:
+	}
+	select {
+	case <-node.Done():
+		t.Error("Node.Done closed before resource destruction completed")
+	default:
+	}
+	close(resourceRelease)
+	<-resources.destroyDone
+
+	listenerCtx := <-listenerStarted
+	listenerDeadline := assertLiveBoundedContext(t, "listener", listenerCtx)
+	if !listenerDeadline.After(resourceDeadline) {
+		t.Errorf("listener deadline %v is not fresh after resource deadline %v", listenerDeadline, resourceDeadline)
+	}
+	select {
+	case <-listenerDone:
+		t.Error("listener cleanup returned before identity-checked cleanup was released")
+	default:
+	}
+	select {
+	case <-node.Done():
+		t.Error("Node.Done closed before listener cleanup completed")
+	default:
+	}
+	close(listenerRelease)
+	<-listenerDone
+	<-finishReturned
+
 	if elapsed := time.Since(started); elapsed > time.Second {
 		t.Fatalf("unexpected finish took %s, want bounded cleanup", elapsed)
 	}
 	if !client.deadlineSeen.Load() {
-		t.Fatal("unexpected descendant Stop did not receive a bounded cleanup context")
+		t.Error("unexpected descendant Stop did not receive a bounded cleanup context")
 	}
 	if child.terminated.Load() != 1 || child.killed.Load() != 1 {
-		t.Fatalf("escalation TERM=%d KILL=%d, want 1 each", child.terminated.Load(), child.killed.Load())
+		t.Errorf("escalation TERM=%d KILL=%d, want 1 each", child.terminated.Load(), child.killed.Load())
 	}
-	if !listenerCalled.Load() {
-		t.Fatal("own listener cleanup was skipped after descendant escalation")
+	if !identityChecked.Load() {
+		t.Error("listener did not complete identity-checked socket cleanup")
+	}
+	if _, err := os.Lstat(path); !errors.Is(err, os.ErrNotExist) {
+		t.Errorf("listener socket remains after cleanup: %v", err)
 	}
 	select {
 	case <-node.Done():
 	default:
-		t.Fatal("Node.Done remains open after bounded unexpected cleanup")
+		t.Error("Node.Done remains open after all finalization phases")
+	}
+}
+
+func TestResourcePhaseTimeoutStillGivesListenerFreshDeadline(t *testing.T) {
+	resources := &phaseRootProvisioner{
+		destroyStarted: make(chan context.Context, 1),
+		destroyDone:    make(chan struct{}),
+		waitForTimeout: true,
+	}
+	listenerStarted := make(chan context.Context, 1)
+	listenerRelease := make(chan struct{})
+	listenerDone := make(chan struct{})
+
+	node := childCreationNode(t, nil, nil)
+	node.deps.Provisioner = resources
+	node.deps.ChildStopTimeout = 30 * time.Millisecond
+	node.deps.CloseListener = func(ctx context.Context) error {
+		listenerStarted <- ctx
+		defer close(listenerDone)
+		select {
+		case <-listenerRelease:
+			return nil
+		case <-ctx.Done():
+			return ctx.Err()
+		}
+	}
+
+	finishReturned := make(chan struct{})
+	go func() {
+		node.finish(context.Background(), nil, LifecycleStopped, false)
+		close(finishReturned)
+	}()
+
+	resourceCtx := <-resources.destroyStarted
+	resourceDeadline := assertLiveBoundedContext(t, "resource", resourceCtx)
+	<-resources.destroyDone
+	listenerCtx := <-listenerStarted
+	listenerDeadline := assertLiveBoundedContext(t, "listener after resource timeout", listenerCtx)
+	if !listenerDeadline.After(resourceDeadline) {
+		t.Errorf("listener deadline %v is not fresh after timed-out resource deadline %v", listenerDeadline, resourceDeadline)
+	}
+	select {
+	case <-listenerDone:
+		t.Error("listener returned before release after resource timeout")
+	default:
+	}
+	select {
+	case <-node.Done():
+		t.Error("Node.Done closed before listener completed after resource timeout")
+	default:
+	}
+	close(listenerRelease)
+	<-listenerDone
+	<-finishReturned
+	if err := node.finishedError(); !errors.Is(err, context.DeadlineExceeded) {
+		t.Errorf("finish error = %v, want resource deadline exceeded", err)
 	}
 }
 

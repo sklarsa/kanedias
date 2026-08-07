@@ -490,11 +490,6 @@ func (node *Node) markStartupDone() {
 
 func (node *Node) finish(ctx context.Context, primary error, terminal LifecycleState, closeRPC bool) {
 	node.finishOnce.Do(func() {
-		// Every finish trigger, including unexpected transport/identity failure,
-		// receives a detached deadline before any descendant HTTP can run.
-		cleanupCtx, cancel := context.WithTimeout(context.WithoutCancel(ctx), node.childStopTimeout())
-		defer cancel()
-
 		// Closing admission precedes the child snapshot. The registry itself is
 		// never held while child HTTP, process waits, or cleanup runs.
 		node.mu.Lock()
@@ -505,7 +500,11 @@ func (node *Node) finish(ctx context.Context, primary error, terminal LifecycleS
 
 		var cleanupErr error
 		if node.children != nil {
-			cleanupErr = errors.Join(cleanupErr, node.stopChildren(cleanupCtx))
+			// Descendant stop and process escalation may consume their entire
+			// deadline. Keep that phase from starving this node's own teardown.
+			childrenCtx, cancelChildren := context.WithTimeout(context.WithoutCancel(ctx), node.childStopTimeout())
+			cleanupErr = errors.Join(cleanupErr, node.stopChildren(childrenCtx))
+			cancelChildren()
 		}
 		if local != nil {
 			if closeRPC {
@@ -516,13 +515,17 @@ func (node *Node) finish(ctx context.Context, primary error, terminal LifecycleS
 			}
 		}
 		if resources != nil {
-			cleanupErr = errors.Join(cleanupErr, node.deps.Provisioner.Destroy(cleanupCtx, resources))
+			resourcesCtx, cancelResources := context.WithTimeout(context.WithoutCancel(ctx), node.childStopTimeout())
+			cleanupErr = errors.Join(cleanupErr, node.deps.Provisioner.Destroy(resourcesCtx, resources))
+			cancelResources()
 		}
 		if node.broker != nil {
 			node.broker.Close()
 		}
 		if node.deps.CloseListener != nil {
-			cleanupErr = errors.Join(cleanupErr, node.deps.CloseListener(cleanupCtx))
+			listenerCtx, cancelListener := context.WithTimeout(context.WithoutCancel(ctx), node.childStopTimeout())
+			cleanupErr = errors.Join(cleanupErr, node.deps.CloseListener(listenerCtx))
+			cancelListener()
 		}
 
 		node.mu.Lock()
