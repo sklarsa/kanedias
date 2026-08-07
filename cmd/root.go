@@ -16,22 +16,24 @@ import (
 	"github.com/sklarsa/kanedias/internal/server"
 	"github.com/sklarsa/kanedias/internal/session"
 	"github.com/sklarsa/kanedias/internal/workspace"
+	incusworkspace "github.com/sklarsa/kanedias/internal/workspace/incus"
 	"github.com/spf13/cobra"
 )
 
 type services struct {
-	loadConfig       func(string) (config.Config, error)
-	ensureNetwork    func(context.Context, config.Config) error
-	renderProfile    func(io.Writer, string, config.Config) error
-	runProxy         func(context.Context, proxy.Options) error
-	initCA           func(string, string) error
-	loginOpenAICodex func(context.Context, string, io.Writer) error
-	createImage      func(context.Context, config.Config, io.Writer, io.Writer) error
-	createSandbox    func(context.Context, config.Config, string, io.Writer, io.Writer) error
-	destroySandbox   func(context.Context, config.Config, string, io.Writer, io.Writer) error
-	runSession       func(context.Context, config.Config, string, io.Writer, io.Writer) error
-	syncWorkspace    func(context.Context, config.Config, io.Writer, io.Writer) error
-	runServer        func(context.Context, server.Options) error
+	loadConfig         func(string) (config.Config, error)
+	ensureNetwork      func(context.Context, config.Config) error
+	renderProfile      func(io.Writer, string, config.Config) error
+	runProxy           func(context.Context, proxy.Options) error
+	initCA             func(string, string) error
+	loginOpenAICodex   func(context.Context, string, io.Writer) error
+	createImage        func(context.Context, config.Config, io.Writer, io.Writer) error
+	createSandbox      func(context.Context, config.Config, string, io.Writer, io.Writer) error
+	destroySandbox     func(context.Context, config.Config, string, io.Writer, io.Writer) error
+	runSession         func(context.Context, config.Config, string, io.Writer, io.Writer) error
+	syncRepos          func(context.Context, config.Config, io.Writer, io.Writer) error
+	syncIncusWorkspace func(context.Context, config.Config, io.Writer, io.Writer) error
+	runServer          func(context.Context, server.Options) error
 }
 
 // Execute runs the Kanedias command-line interface.
@@ -60,18 +62,19 @@ func execute(ctx context.Context, service services, options proxy.Options) error
 
 func realServices() services {
 	return services{
-		loadConfig:       config.Load,
-		ensureNetwork:    network.Ensure,
-		renderProfile:    profiles.Render,
-		runProxy:         proxy.RunContext,
-		initCA:           proxy.InitCA,
-		loginOpenAICodex: proxy.LoginOpenAICodex,
-		createImage:      image.Create,
-		createSandbox:    sandbox.Create,
-		destroySandbox:   sandbox.Destroy,
-		runSession:       session.Run,
-		syncWorkspace:    workspace.Sync,
-		runServer:        server.Run,
+		loadConfig:         config.Load,
+		ensureNetwork:      network.Ensure,
+		renderProfile:      profiles.Render,
+		runProxy:           proxy.RunContext,
+		initCA:             proxy.InitCA,
+		loginOpenAICodex:   proxy.LoginOpenAICodex,
+		createImage:        image.Create,
+		createSandbox:      sandbox.Create,
+		destroySandbox:     sandbox.Destroy,
+		runSession:         session.Run,
+		syncRepos:          workspace.Sync,
+		syncIncusWorkspace: incusworkspace.Sync,
+		runServer:          server.Run,
 	}
 }
 
