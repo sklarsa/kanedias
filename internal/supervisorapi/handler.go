@@ -23,6 +23,7 @@ type Service interface {
 	CallRPC(context.Context, string, json.RawMessage) (json.RawMessage, error)
 	AnswerQuestion(context.Context, string, string, json.RawMessage) error
 	Subscribe(context.Context) (supervisor.Subscription, error)
+	CreateChild(context.Context, string, contract.CreateChildRequest) (supervisor.TerminalResult, error)
 	Stop(context.Context, string) error
 }
 
@@ -61,6 +62,30 @@ func NewHandler(service Service) http.Handler {
 			return
 		}
 		writeRawJSON(w, http.StatusOK, response)
+	})
+	router.Post("/v1/sessions/{sessionID}/children", func(w http.ResponseWriter, request *http.Request) {
+		var childRequest contract.CreateChildRequest
+		if err := decodeStrictJSONBody(w, request, &childRequest); err != nil {
+			writeError(w, err)
+			return
+		}
+		if err := childRequest.Validate(); err != nil {
+			writeError(w, err)
+			return
+		}
+		result, err := service.CreateChild(request.Context(), chi.URLParam(request, "sessionID"), childRequest)
+		if err != nil {
+			writeError(w, err)
+			return
+		}
+		switch {
+		case result.Read != nil && result.Write == nil:
+			writeJSON(w, http.StatusOK, result.Read)
+		case result.Write != nil && result.Read == nil:
+			writeJSON(w, http.StatusOK, result.Write)
+		default:
+			writeError(w, errors.New("service returned an invalid terminal child result"))
+		}
 	})
 	router.Post("/v1/sessions/{sessionID}/questions/{questionID}/response", func(w http.ResponseWriter, request *http.Request) {
 		body, err := readJSONBody(w, request)
@@ -122,6 +147,22 @@ func readJSONBody(w http.ResponseWriter, request *http.Request) (json.RawMessage
 		return nil, contract.NewError(contract.ErrorInvalidRequest, "request body must contain exactly one JSON value")
 	}
 	return append(json.RawMessage(nil), body...), nil
+}
+
+func decodeStrictJSONBody(w http.ResponseWriter, request *http.Request, target any) error {
+	body, err := readJSONBody(w, request)
+	if err != nil {
+		return err
+	}
+	decoder := json.NewDecoder(bytes.NewReader(body))
+	decoder.DisallowUnknownFields()
+	if err := decoder.Decode(target); err != nil {
+		return contract.NewError(contract.ErrorInvalidRequest, "invalid request body: "+err.Error())
+	}
+	if decoder.More() {
+		return contract.NewError(contract.ErrorInvalidRequest, "request body must contain exactly one JSON value")
+	}
+	return nil
 }
 
 type httpBoundaryError struct {

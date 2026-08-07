@@ -150,7 +150,7 @@ func TestNewRootRejectsSocketThatIsNotReadyBeforeProvisioning(t *testing.T) {
 	} {
 		t.Run(test.name, func(t *testing.T) {
 			fake := &fakeRootProvisioner{resources: &provision.Resources{SessionID: "root-1", RPCAddr: "rpc"}}
-			node, err := NewRoot(testRootIdentity(t), Dependencies{Provisioner: fake, SocketPath: test.prepare(t), DialRPC: func(context.Context, string) (io.ReadWriteCloser, error) { t.Fatal("DialRPC called"); return nil, nil }, Workers: fakeWorkers{}}, NewEventBroker())
+			node, err := NewRoot(testRootIdentity(t), Dependencies{Provisioner: fake, SocketPath: test.prepare(t), DialRPC: func(context.Context, string) (io.ReadWriteCloser, error) { t.Fatal("DialRPC called"); return nil, nil }, Workers: fakeWorkers{}, CloseListener: func(context.Context) error { return nil }}, NewEventBroker())
 			if test.name == "empty" || test.name == "relative" {
 				if err == nil || node != nil {
 					t.Fatalf("NewRoot() = (%v, %v), want validation error", node, err)
@@ -181,7 +181,7 @@ func TestRootNodeProvisioningFailureNeverDialsRPC(t *testing.T) {
 			t.Fatal("DialRPC called after provisioning failure")
 			return nil, nil
 		},
-		Workers: fakeWorkers{},
+		Workers: fakeWorkers{}, CloseListener: func(context.Context) error { return nil },
 	}, nil)
 	if err != nil {
 		t.Fatal(err)
@@ -198,7 +198,7 @@ func TestRootNodeTCPConnectionAloneIsNotReady(t *testing.T) {
 	path, _ := boundSocket(t)
 	host, peer := net.Pipe()
 	fake := &fakeRootProvisioner{resources: &provision.Resources{SessionID: "root-1", RPCAddr: "rpc"}}
-	node, err := NewRoot(testRootIdentity(t), Dependencies{Provisioner: fake, SocketPath: path, DialRPC: func(context.Context, string) (io.ReadWriteCloser, error) { return host, nil }, Workers: fakeWorkers{}}, nil)
+	node, err := NewRoot(testRootIdentity(t), Dependencies{Provisioner: fake, SocketPath: path, DialRPC: func(context.Context, string) (io.ReadWriteCloser, error) { return host, nil }, Workers: fakeWorkers{}, CloseListener: func(context.Context) error { return nil }}, nil)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -222,7 +222,7 @@ func TestRootNodeBindsOnlyAfterGetStateAndBuffersInitialEvent(t *testing.T) {
 	defer peer.Close()
 	fake := &fakeRootProvisioner{resources: &provision.Resources{SessionID: "root-1", Pool: "btrfs", Instance: "i", Volume: "v", RPCAddr: "rpc"}}
 	broker := NewEventBroker()
-	node, err := NewRoot(testRootIdentity(t), Dependencies{Provisioner: fake, SocketPath: path, DialRPC: func(context.Context, string) (io.ReadWriteCloser, error) { return host, nil }, Workers: fakeWorkers{}}, broker)
+	node, err := NewRoot(testRootIdentity(t), Dependencies{Provisioner: fake, SocketPath: path, DialRPC: func(context.Context, string) (io.ReadWriteCloser, error) { return host, nil }, Workers: fakeWorkers{}, CloseListener: func(context.Context) error { return nil }}, broker)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -262,7 +262,7 @@ func TestRootNodeForbiddenRPCIsNotWritten(t *testing.T) {
 	host, peer := net.Pipe()
 	defer peer.Close()
 	fake := &fakeRootProvisioner{resources: &provision.Resources{SessionID: "root-1", RPCAddr: "rpc"}}
-	node, err := NewRoot(testRootIdentity(t), Dependencies{Provisioner: fake, SocketPath: path, DialRPC: func(context.Context, string) (io.ReadWriteCloser, error) { return host, nil }, Workers: fakeWorkers{}}, nil)
+	node, err := NewRoot(testRootIdentity(t), Dependencies{Provisioner: fake, SocketPath: path, DialRPC: func(context.Context, string) (io.ReadWriteCloser, error) { return host, nil }, Workers: fakeWorkers{}, CloseListener: func(context.Context) error { return nil }}, nil)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -286,7 +286,7 @@ func TestRootNodeEOFEndsPendingCallAndFailsNode(t *testing.T) {
 	path, _ := boundSocket(t)
 	host, peer := net.Pipe()
 	fake := &fakeRootProvisioner{resources: &provision.Resources{SessionID: "root-1", RPCAddr: "rpc"}}
-	node, err := NewRoot(testRootIdentity(t), Dependencies{Provisioner: fake, SocketPath: path, DialRPC: func(context.Context, string) (io.ReadWriteCloser, error) { return host, nil }, Workers: fakeWorkers{}}, nil)
+	node, err := NewRoot(testRootIdentity(t), Dependencies{Provisioner: fake, SocketPath: path, DialRPC: func(context.Context, string) (io.ReadWriteCloser, error) { return host, nil }, Workers: fakeWorkers{}, CloseListener: func(context.Context) error { return nil }}, nil)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -322,7 +322,7 @@ func TestRootNodeWaitsForBufferedPiEventsBeforeDoneAndCleanup(t *testing.T) {
 	host, peer := net.Pipe()
 	fake := &fakeRootProvisioner{resources: &provision.Resources{SessionID: "root-1", Instance: "i", Volume: "v", RPCAddr: "rpc"}}
 	broker := NewEventBroker()
-	node, err := NewRoot(testRootIdentity(t), Dependencies{Provisioner: fake, SocketPath: path, DialRPC: func(context.Context, string) (io.ReadWriteCloser, error) { return host, nil }, Workers: fakeWorkers{}}, broker)
+	node, err := NewRoot(testRootIdentity(t), Dependencies{Provisioner: fake, SocketPath: path, DialRPC: func(context.Context, string) (io.ReadWriteCloser, error) { return host, nil }, Workers: fakeWorkers{}, CloseListener: func(context.Context) error { return nil }}, broker)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -367,12 +367,24 @@ func TestRootNodeStopIsIdempotentAndClosesPiBeforeDestroy(t *testing.T) {
 	defer peer.Close()
 	tracked := &trackedConn{ReadWriteCloser: host}
 	fake := &fakeRootProvisioner{resources: &provision.Resources{SessionID: "root-1", RPCAddr: "rpc"}}
+	var orderMu sync.Mutex
+	var order []string
 	fake.onDestroy = func() {
 		if !tracked.closed.Load() {
 			t.Error("Destroy called before Pi connection closed")
 		}
+		orderMu.Lock()
+		order = append(order, "destroy")
+		orderMu.Unlock()
 	}
-	node, err := NewRoot(testRootIdentity(t), Dependencies{Provisioner: fake, SocketPath: path, DialRPC: func(context.Context, string) (io.ReadWriteCloser, error) { return tracked, nil }, Workers: fakeWorkers{}}, nil)
+	listenerCalls := 0
+	node, err := NewRoot(testRootIdentity(t), Dependencies{Provisioner: fake, SocketPath: path, DialRPC: func(context.Context, string) (io.ReadWriteCloser, error) { return tracked, nil }, Workers: fakeWorkers{}, CloseListener: func(context.Context) error {
+		orderMu.Lock()
+		defer orderMu.Unlock()
+		listenerCalls++
+		order = append(order, "listener")
+		return nil
+	}}, nil)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -389,6 +401,20 @@ func TestRootNodeStopIsIdempotentAndClosesPiBeforeDestroy(t *testing.T) {
 	if fake.destroyed != 1 {
 		t.Fatalf("Destroy called %d times", fake.destroyed)
 	}
+	orderMu.Lock()
+	defer orderMu.Unlock()
+	if listenerCalls != 1 || strings.Join(order, ",") != "destroy,listener" {
+		t.Fatalf("shutdown order=%v listener calls=%d", order, listenerCalls)
+	}
+}
+
+func TestNewRootRequiresListenerLifecycleHook(t *testing.T) {
+	path, _ := boundSocket(t)
+	fake := &fakeRootProvisioner{}
+	node, err := NewRoot(testRootIdentity(t), Dependencies{Provisioner: fake, SocketPath: path, DialRPC: func(context.Context, string) (io.ReadWriteCloser, error) { return nil, nil }, Workers: fakeWorkers{}}, nil)
+	if err == nil || node != nil {
+		t.Fatalf("NewRoot without CloseListener = (%v, %v)", node, err)
+	}
 }
 
 func TestRootNodeStopBeforeStartPreventsProvisioning(t *testing.T) {
@@ -399,7 +425,7 @@ func TestRootNodeStopBeforeStartPreventsProvisioning(t *testing.T) {
 		DialRPC: func(context.Context, string) (io.ReadWriteCloser, error) {
 			t.Fatal("DialRPC called after stop-before-start")
 			return nil, nil
-		}, Workers: fakeWorkers{},
+		}, Workers: fakeWorkers{}, CloseListener: func(context.Context) error { return nil },
 	}, nil)
 	if err != nil {
 		t.Fatal(err)
@@ -430,7 +456,7 @@ func TestRootNodeStopWhileProvisioningDestroysLateResourcesWithoutDialing(t *tes
 		DialRPC: func(context.Context, string) (io.ReadWriteCloser, error) {
 			t.Fatal("DialRPC called after stop won provisioning race")
 			return nil, nil
-		}, Workers: fakeWorkers{},
+		}, Workers: fakeWorkers{}, CloseListener: func(context.Context) error { return nil },
 	}, nil)
 	if err != nil {
 		t.Fatal(err)
@@ -477,7 +503,7 @@ func TestRootNodeExpiredStopStillFinalizesLateProvisioning(t *testing.T) {
 		DialRPC: func(context.Context, string) (io.ReadWriteCloser, error) {
 			dialed.Store(true)
 			return nil, errors.New("unexpected Pi dial")
-		}, Workers: fakeWorkers{},
+		}, Workers: fakeWorkers{}, CloseListener: func(context.Context) error { return nil },
 	}, nil)
 	if err != nil {
 		t.Fatal(err)
@@ -528,7 +554,7 @@ func TestRootNodeChangedPiIdentityIsTerminalAndCleansResources(t *testing.T) {
 	path, _ := boundSocket(t)
 	host, peer := net.Pipe()
 	fake := &fakeRootProvisioner{resources: &provision.Resources{SessionID: "root-1", Instance: "i", Volume: "v", RPCAddr: "rpc"}}
-	node, err := NewRoot(testRootIdentity(t), Dependencies{Provisioner: fake, SocketPath: path, DialRPC: func(context.Context, string) (io.ReadWriteCloser, error) { return host, nil }, Workers: fakeWorkers{}}, nil)
+	node, err := NewRoot(testRootIdentity(t), Dependencies{Provisioner: fake, SocketPath: path, DialRPC: func(context.Context, string) (io.ReadWriteCloser, error) { return host, nil }, Workers: fakeWorkers{}, CloseListener: func(context.Context) error { return nil }}, nil)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -572,15 +598,16 @@ func TestRootNodeStartJoinsBindingAndCleanupErrors(t *testing.T) {
 	path, _ := boundSocket(t)
 	host, peer := net.Pipe()
 	cleanupErr := errors.New("cleanup failed")
+	listenerErr := errors.New("listener cleanup failed")
 	fake := &fakeRootProvisioner{resources: &provision.Resources{SessionID: "root-1", RPCAddr: "rpc"}, destroyErr: cleanupErr}
-	node, err := NewRoot(testRootIdentity(t), Dependencies{Provisioner: fake, SocketPath: path, DialRPC: func(context.Context, string) (io.ReadWriteCloser, error) { return host, nil }, Workers: fakeWorkers{}}, nil)
+	node, err := NewRoot(testRootIdentity(t), Dependencies{Provisioner: fake, SocketPath: path, DialRPC: func(context.Context, string) (io.ReadWriteCloser, error) { return host, nil }, Workers: fakeWorkers{}, CloseListener: func(context.Context) error { return listenerErr }}, nil)
 	if err != nil {
 		t.Fatal(err)
 	}
 	go func() { _, _ = bufio.NewReader(peer).ReadBytes('\n'); _ = peer.Close() }()
 	err = node.Start(context.Background())
-	if err == nil || !errors.Is(err, cleanupErr) {
-		t.Fatalf("Start() error = %v, want joined cleanup error", err)
+	if err == nil || !errors.Is(err, cleanupErr) || !errors.Is(err, listenerErr) {
+		t.Fatalf("Start() error = %v, want joined resource and listener cleanup errors", err)
 	}
 	if fake.destroyed != 1 {
 		t.Fatalf("Destroy called %d times", fake.destroyed)

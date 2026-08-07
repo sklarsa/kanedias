@@ -12,6 +12,7 @@ import (
 	"os"
 	"os/exec"
 	"sync"
+	"syscall"
 	"time"
 
 	"github.com/sklarsa/kanedias/internal/supervisor/contract"
@@ -30,15 +31,19 @@ type reportEvent struct {
 }
 
 type Child struct {
-	command       *exec.Cmd
-	bootstrap     Bootstrap
-	liveness      *os.File
-	reports       chan reportEvent
-	probeInterval time.Duration
-	waitDone      chan struct{}
-	waitErr       error
-	closeOnce     sync.Once
-	killOnce      sync.Once
+	command         *exec.Cmd
+	bootstrap       Bootstrap
+	liveness        *os.File
+	reports         chan reportEvent
+	probeInterval   time.Duration
+	waitDone        chan struct{}
+	waitErr         error
+	closeOnce       sync.Once
+	killOnce        sync.Once
+	reportReader    *os.File
+	reportStop      chan struct{}
+	reportDone      chan struct{}
+	reportCloseOnce sync.Once
 }
 
 func (spawner Spawner) Spawn(ctx context.Context, bootstrap Bootstrap) (*Child, error) {
@@ -87,6 +92,10 @@ func (spawner Spawner) Spawn(ctx context.Context, bootstrap Bootstrap) (*Child, 
 
 	command := exec.CommandContext(ctx, executable,
 		"session-child", "--bootstrap-fd", "3", "--liveness-fd", "4", "--report-fd", "5")
+	// A child supervisor owns its complete descendant process tree. Isolating it
+	// in a process group lets the direct parent escalate without leaving a
+	// grandchild behind.
+	command.SysProcAttr = &syscall.SysProcAttr{Setpgid: true}
 	// ExtraFiles is the complete descriptor allowlist beyond stdin/out/err.
 	command.ExtraFiles = []*os.File{bootstrapRead, livenessRead, reportWrite}
 	if err := command.Start(); err != nil {
@@ -128,6 +137,7 @@ func (spawner Spawner) Spawn(ctx context.Context, bootstrap Bootstrap) (*Child, 
 	child := &Child{
 		command: command, bootstrap: bootstrap, liveness: livenessWrite,
 		reports: make(chan reportEvent, 1), probeInterval: interval, waitDone: make(chan struct{}),
+		reportReader: reportRead, reportStop: make(chan struct{}), reportDone: make(chan struct{}),
 	}
 	go child.readReports(reportRead)
 	go func() { child.waitErr = command.Wait(); close(child.waitDone) }()
@@ -137,35 +147,47 @@ func (spawner Spawner) Spawn(ctx context.Context, bootstrap Bootstrap) (*Child, 
 func (child *Child) readReports(reader *os.File) {
 	defer reader.Close()
 	defer close(child.reports)
+	defer close(child.reportDone)
 	buffered := bufio.NewReaderSize(reader, MaxRecordBytes+1)
 	for {
 		record, err := buffered.ReadSlice('\n')
 		if errors.Is(err, bufio.ErrBufferFull) {
-			child.reports <- reportEvent{err: ErrRecordTooLarge}
+			child.sendReport(reportEvent{err: ErrRecordTooLarge})
 			return
 		}
 		if errors.Is(err, io.EOF) {
 			if len(record) != 0 {
-				child.reports <- reportEvent{err: fmt.Errorf("child report ended with a partial JSONL record")}
+				child.sendReport(reportEvent{err: fmt.Errorf("child report ended with a partial JSONL record")})
 			} else {
-				child.reports <- reportEvent{err: io.EOF}
+				child.sendReport(reportEvent{err: io.EOF})
 			}
 			return
 		}
 		if err != nil {
-			child.reports <- reportEvent{err: fmt.Errorf("read child report: %w", err)}
+			child.sendReport(reportEvent{err: fmt.Errorf("read child report: %w", err)})
 			return
 		}
 		if len(record) > MaxRecordBytes {
-			child.reports <- reportEvent{err: ErrRecordTooLarge}
+			child.sendReport(reportEvent{err: ErrRecordTooLarge})
 			return
 		}
 		message, decodeErr := DecodeChildMessage(bytes.NewReader(record[:len(record)-1]))
 		if decodeErr != nil {
-			child.reports <- reportEvent{err: decodeErr}
+			child.sendReport(reportEvent{err: decodeErr})
 			return
 		}
-		child.reports <- reportEvent{message: message}
+		if !child.sendReport(reportEvent{message: message}) {
+			return
+		}
+	}
+}
+
+func (child *Child) sendReport(event reportEvent) bool {
+	select {
+	case child.reports <- event:
+		return true
+	case <-child.reportStop:
+		return false
 	}
 }
 
@@ -212,9 +234,40 @@ func (child *Child) CloseLiveness() error {
 	return err
 }
 
+func (child *Child) CloseReports() error {
+	var err error
+	child.reportCloseOnce.Do(func() {
+		close(child.reportStop)
+		err = child.reportReader.Close()
+	})
+	<-child.reportDone
+	if errors.Is(err, os.ErrClosed) {
+		return nil
+	}
+	return err
+}
+
+func (child *Child) Done() <-chan struct{} { return child.waitDone }
+
 func (child *Child) Wait() error {
 	<-child.waitDone
 	return child.waitErr
+}
+
+func (child *Child) Terminate() error {
+	_ = child.CloseLiveness()
+	select {
+	case <-child.waitDone:
+		return nil
+	default:
+	}
+	if child.command.Process == nil {
+		return nil
+	}
+	if err := syscall.Kill(-child.command.Process.Pid, syscall.SIGTERM); err != nil && !errors.Is(err, syscall.ESRCH) {
+		return err
+	}
+	return nil
 }
 
 func (child *Child) Kill() error {
@@ -224,11 +277,16 @@ func (child *Child) Kill() error {
 		select {
 		case <-child.waitDone:
 		default:
-			err = child.command.Process.Kill()
+			if child.command.Process != nil {
+				err = syscall.Kill(-child.command.Process.Pid, syscall.SIGKILL)
+				if errors.Is(err, syscall.ESRCH) {
+					err = nil
+				}
+			}
 		}
 	})
 	<-child.waitDone
-	return err
+	return errors.Join(err, child.CloseReports())
 }
 
 func probeTree(ctx context.Context, socketPath string, interval time.Duration) error {

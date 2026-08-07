@@ -2,6 +2,8 @@ package supervisor
 
 import (
 	"context"
+	"crypto/rand"
+	"encoding/hex"
 	"encoding/json"
 	"errors"
 	"fmt"
@@ -9,17 +11,24 @@ import (
 	"os"
 	"path/filepath"
 	"sync"
+	"time"
 
 	"github.com/sklarsa/kanedias/internal/supervisor/contract"
 	"github.com/sklarsa/kanedias/internal/supervisor/pirpc"
+	"github.com/sklarsa/kanedias/internal/supervisor/process"
 	"github.com/sklarsa/kanedias/internal/supervisor/provision"
 )
 
 type Dependencies struct {
-	Provisioner provision.RootProvisioner
-	DialRPC     func(context.Context, string) (io.ReadWriteCloser, error)
-	Workers     WorkerCatalog
-	SocketPath  string
+	Provisioner      provision.RootProvisioner
+	DialRPC          func(context.Context, string) (io.ReadWriteCloser, error)
+	Workers          WorkerCatalog
+	SocketPath       string
+	SpawnChild       ChildSpawner
+	DescendantClient DescendantClientFactory
+	NewSessionID     func() (string, error)
+	ChildStopTimeout time.Duration
+	CloseListener    func(context.Context) error
 }
 
 type Node struct {
@@ -36,6 +45,7 @@ type Node struct {
 	local           *LocalSession
 	resources       *provision.Resources
 	state           LifecycleState
+	children        *childRegistry
 
 	stopFinalizerOnce sync.Once
 	finishOnce        sync.Once
@@ -57,6 +67,9 @@ func NewRoot(identity Identity, deps Dependencies, broker *EventBroker) (*Node, 
 	if deps.Workers == nil {
 		return nil, invariantf("worker catalog is required")
 	}
+	if deps.CloseListener == nil {
+		return nil, invariantf("listener lifecycle hook is required")
+	}
 	if deps.SocketPath == "" || !filepath.IsAbs(deps.SocketPath) {
 		return nil, invariantf("root supervisor socket path must be absolute")
 	}
@@ -68,6 +81,7 @@ func NewRoot(identity Identity, deps Dependencies, broker *EventBroker) (*Node, 
 		deps:        deps,
 		broker:      broker,
 		state:       LifecycleProvisioning,
+		children:    newChildRegistry(),
 		startupDone: make(chan struct{}),
 		done:        make(chan struct{}),
 	}, nil
@@ -169,6 +183,151 @@ func (node *Node) Start(ctx context.Context) error {
 	}
 	go node.watchRPC(rpc, local)
 	return nil
+}
+
+func (node *Node) childStopTimeout() time.Duration {
+	if node.deps.ChildStopTimeout > 0 {
+		return node.deps.ChildStopTimeout
+	}
+	return stopCleanupTimeout
+}
+
+func (node *Node) childEscalationGrace() time.Duration {
+	grace := node.childStopTimeout() / 10
+	if grace < 10*time.Millisecond {
+		return 10 * time.Millisecond
+	}
+	if grace > 250*time.Millisecond {
+		return 250 * time.Millisecond
+	}
+	return grace
+}
+
+func randomSessionID() (string, error) {
+	var value [16]byte
+	if _, err := rand.Read(value[:]); err != nil {
+		return "", fmt.Errorf("generate child session ID: %w", err)
+	}
+	return "session-" + hex.EncodeToString(value[:]), nil
+}
+
+func (node *Node) CreateChild(ctx context.Context, parent string, request contract.CreateChildRequest) (TerminalResult, error) {
+	identity := node.identity.Snapshot()
+	if parent != identity.SessionID {
+		return TerminalResult{}, contract.NewError(contract.ErrorNotFound, "children may only be created by their direct parent")
+	}
+	if err := request.Validate(); err != nil {
+		return TerminalResult{}, err
+	}
+	// Resolve trusted worker policy before allocating an ID, socket, registry
+	// entry, or process.
+	worker, err := node.deps.Workers.Resolve(request.WorkerType)
+	if err != nil {
+		return TerminalResult{}, err
+	}
+	if node.deps.SpawnChild == nil || node.deps.DescendantClient == nil {
+		return TerminalResult{}, contract.NewError(contract.ErrorInternal, "child runtime dependencies are unavailable")
+	}
+	newID := node.deps.NewSessionID
+	if newID == nil {
+		newID = randomSessionID
+	}
+	childID, idErr := newID()
+	if idErr != nil {
+		return TerminalResult{}, idErr
+	}
+
+	node.mu.Lock()
+	if node.stopRequested || node.state == LifecycleStopping || node.state == LifecycleStopped || node.state == LifecycleFailed {
+		node.mu.Unlock()
+		return TerminalResult{}, contract.NewError(contract.ErrorSessionStopping, "session is not accepting new children")
+	}
+	resources := node.resources
+	if resources == nil {
+		node.mu.Unlock()
+		return TerminalResult{}, contract.NewError(contract.ErrorChildUnavailable, "parent resources are not ready")
+	}
+	childSocket := filepath.Join(filepath.Dir(node.deps.SocketPath), childID+".sock")
+	spawnCtx, spawnCancel := context.WithCancel(context.WithoutCancel(ctx))
+	entry := &childEntry{
+		id: childID, socket: childSocket, spawnCancel: spawnCancel,
+		fallback: NodeSnapshot{
+			SessionID: childID, ParentSessionID: identity.SessionID, RootSessionID: identity.RootID,
+			Kind: request.Kind, Context: request.Context, WorkerType: request.WorkerType,
+			Model:     contract.ModelProfile{Provider: worker.Provider, Model: worker.Model, ThinkingLevel: worker.ThinkingLevel},
+			Lifecycle: string(LifecycleStarting), Questions: []QuestionSummary{}, Children: []NodeSnapshot{},
+		},
+	}
+	if err := node.children.add(entry); err != nil {
+		node.mu.Unlock()
+		return TerminalResult{}, err
+	}
+	node.mu.Unlock()
+
+	bootstrap := process.Bootstrap{
+		SessionID: childID, ParentID: identity.SessionID, RootID: identity.RootID,
+		SocketPath: childSocket, SourceInstance: resources.Instance, SourceVolume: resources.Volume,
+		Worker: worker, Request: request,
+	}
+	child, err := node.deps.SpawnChild(spawnCtx, bootstrap)
+	if err != nil {
+		entry.markSpawnDone()
+		return TerminalResult{}, errors.Join(contract.NewError(contract.ErrorChildFailed, "start child supervisor failed"), node.failChildCreation(ctx, entry, err))
+	}
+	entry.setProcess(child)
+	if err := child.WaitReady(ctx); err != nil {
+		return TerminalResult{}, node.failChildCreation(ctx, entry, err)
+	}
+	client, err := node.deps.DescendantClient(childSocket)
+	if err != nil {
+		return TerminalResult{}, node.failChildCreation(ctx, entry, childUnavailable(childID, err))
+	}
+	entry.setClient(client)
+	node.startChildEventForwarder(entry)
+
+	message, err := child.NextMessage(ctx)
+	if err != nil {
+		return TerminalResult{}, node.failChildCreation(ctx, entry, err)
+	}
+	if message.SessionID != childID {
+		return TerminalResult{}, node.failChildCreation(ctx, entry, fmt.Errorf("terminal report session ID %q does not match %q", message.SessionID, childID))
+	}
+	var result TerminalResult
+	var terminalErr error
+	switch message.Type {
+	case process.MessageRead:
+		result.Read = message.Read
+	case process.MessageWrite:
+		result.Write = message.Write
+	case process.MessageFailure:
+		terminalErr = contract.NewError(message.Error.Code, message.Error.Message)
+	default:
+		terminalErr = contract.NewError(contract.ErrorChildFailed, "child returned a non-terminal report")
+	}
+
+	select {
+	case <-child.Done():
+		cleanupCtx, cancel := context.WithTimeout(context.WithoutCancel(ctx), node.childStopTimeout())
+		cleanupErr := node.cleanupChild(cleanupCtx, entry, false)
+		cancel()
+		if cleanupErr != nil && terminalErr == nil {
+			terminalErr = contract.NewError(contract.ErrorChildFailed, "child process or resource cleanup failed")
+		}
+		return result, errors.Join(terminalErr, cleanupErr)
+	case <-ctx.Done():
+		return TerminalResult{}, node.failChildCreation(ctx, entry, ctx.Err())
+	}
+}
+
+func (node *Node) failChildCreation(requestCtx context.Context, entry *childEntry, primary error) error {
+	cleanupCtx, cancel := context.WithTimeout(context.WithoutCancel(requestCtx), node.childStopTimeout())
+	defer cancel()
+	cleanupErr := node.cleanupChild(cleanupCtx, entry, true)
+	var typed *contract.Error
+	if !errors.As(primary, &typed) {
+		primary = errors.Join(contract.NewError(contract.ErrorChildFailed, "child supervisor failed"), primary)
+	}
+	return errors.Join(primary, cleanupErr)
 }
 
 func (node *Node) CallRPC(ctx context.Context, command json.RawMessage) (json.RawMessage, error) {
@@ -294,12 +453,18 @@ func (node *Node) markStartupDone() {
 
 func (node *Node) finish(ctx context.Context, primary error, terminal LifecycleState, closeRPC bool) {
 	node.finishOnce.Do(func() {
-		node.mu.RLock()
+		// Closing admission precedes the child snapshot. The registry itself is
+		// never held while child HTTP, process waits, or cleanup runs.
+		node.mu.Lock()
+		node.stopRequested = true
 		local := node.local
 		resources := node.resources
-		node.mu.RUnlock()
+		node.mu.Unlock()
 
 		var cleanupErr error
+		if node.children != nil {
+			cleanupErr = errors.Join(cleanupErr, node.stopChildren(ctx))
+		}
 		if local != nil {
 			if closeRPC {
 				cleanupErr = errors.Join(cleanupErr, local.StopRPC())
@@ -310,6 +475,9 @@ func (node *Node) finish(ctx context.Context, primary error, terminal LifecycleS
 		}
 		if resources != nil {
 			cleanupErr = errors.Join(cleanupErr, node.deps.Provisioner.Destroy(ctx, resources))
+		}
+		if node.deps.CloseListener != nil {
+			cleanupErr = errors.Join(cleanupErr, node.deps.CloseListener(ctx))
 		}
 
 		node.mu.Lock()

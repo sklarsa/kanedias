@@ -153,6 +153,9 @@ func TestSpawnerUsesOnlyInheritedProtocolDescriptorsAndProbesSocket(t *testing.T
 	if err := child.Wait(); err != nil {
 		t.Fatal(err)
 	}
+	if err := child.CloseReports(); err != nil {
+		t.Fatal(err)
+	}
 }
 
 func TestSpawnerRejectsReadyUntilSessionAndSocketAreVerified(t *testing.T) {

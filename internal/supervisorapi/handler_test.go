@@ -32,6 +32,10 @@ type fakeService struct {
 	stopSession    string
 	stopCalled     chan struct{}
 	stopMayObserve <-chan struct{}
+	childRequest   contract.CreateChildRequest
+	childResult    supervisor.TerminalResult
+	childStarted   chan struct{}
+	childRelease   <-chan struct{}
 	err            error
 }
 
@@ -53,6 +57,23 @@ func (service *fakeService) AnswerQuestion(_ context.Context, session, id string
 }
 func (service *fakeService) Subscribe(context.Context) (supervisor.Subscription, error) {
 	return service.sub, service.err
+}
+func (service *fakeService) CreateChild(ctx context.Context, session string, request contract.CreateChildRequest) (supervisor.TerminalResult, error) {
+	service.mu.Lock()
+	service.stopSession = session
+	service.childRequest = request
+	service.mu.Unlock()
+	if service.childStarted != nil {
+		close(service.childStarted)
+	}
+	if service.childRelease != nil {
+		select {
+		case <-service.childRelease:
+		case <-ctx.Done():
+			return supervisor.TerminalResult{}, ctx.Err()
+		}
+	}
+	return service.childResult, service.err
 }
 func (service *fakeService) Stop(_ context.Context, session string) error {
 	if service.stopMayObserve != nil {
@@ -117,6 +138,37 @@ func TestHandlerRootRoutes(t *testing.T) {
 	}
 	if service.answerSession != "self" || service.answerID != "q-1" || string(service.answerBody) != `{"confirmed":true}` {
 		t.Errorf("answer routed as (%q, %q, %s)", service.answerSession, service.answerID, service.answerBody)
+	}
+}
+
+func TestHandlerCreateChildStrictlyDecodesAndBlocksForTerminalResult(t *testing.T) {
+	started := make(chan struct{})
+	release := make(chan struct{})
+	service := &fakeService{
+		childStarted: started,
+		childRelease: release,
+		childResult:  supervisor.TerminalResult{Read: &contract.ReadChildResult{Kind: contract.ChildKindRead, WorkerType: "reviewer", SessionID: "child-1", Output: "done"}},
+	}
+	handler := NewHandler(service)
+	responseDone := make(chan *httptest.ResponseRecorder, 1)
+	go func() {
+		responseDone <- jsonRequest(t, handler, http.MethodPost, "/v1/sessions/self/children", `{"workerType":"reviewer","kind":"read","context":"fresh","task":"review"}`)
+	}()
+	<-started
+	select {
+	case <-responseDone:
+		t.Fatal("POST /children returned before the terminal result")
+	default:
+	}
+	close(release)
+	response := <-responseDone
+	if response.Code != http.StatusOK || !strings.Contains(response.Body.String(), `"output":"done"`) {
+		t.Fatalf("response = %d %s", response.Code, response.Body.String())
+	}
+
+	unknown := jsonRequest(t, handler, http.MethodPost, "/v1/sessions/self/children", `{"workerType":"reviewer","kind":"read","context":"fresh","task":"review","model":"forbidden"}`)
+	if unknown.Code != http.StatusBadRequest || !strings.Contains(unknown.Body.String(), `"code":"invalid_request"`) {
+		t.Fatalf("unknown field response = %d %s", unknown.Code, unknown.Body.String())
 	}
 }
 
@@ -256,6 +308,79 @@ func TestDeleteFlushesResponseOverUnixBeforeStopObservation(t *testing.T) {
 	cancel()
 	if err := <-serverDone; err != nil {
 		t.Fatal(err)
+	}
+}
+
+func TestDescendantClientUsesUnixAPIForSnapshotEventsAndRouting(t *testing.T) {
+	path := filepath.Join(t.TempDir(), "child.sock")
+	closed := make(chan supervisor.EventEnvelope)
+	close(closed)
+	service := &fakeService{
+		snapshot:   supervisor.NodeSnapshot{SessionID: "child", RootSessionID: "root", Children: []supervisor.NodeSnapshot{}},
+		sub:        supervisor.Subscription{Replay: []supervisor.EventEnvelope{{Seq: 4, SessionID: "grandchild", SourceSeq: 2, Kind: "pi", Payload: json.RawMessage(`{"type":"agent_start"}`)}}, Events: closed, Close: func() {}},
+		stopCalled: make(chan struct{}),
+	}
+	ctx, cancel := context.WithCancel(context.Background())
+	serverDone := make(chan error, 1)
+	go func() { serverDone <- ServeUnix(ctx, path, NewHandler(service)) }()
+	waitForSocket(t, path)
+
+	seam, err := NewDescendantClient(path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	snapshot, err := seam.Snapshot(context.Background())
+	if err != nil || snapshot.SessionID != "child" {
+		t.Fatalf("Snapshot = %#v, %v", snapshot, err)
+	}
+	if _, err := seam.CallRPC(context.Background(), "grandchild", json.RawMessage(`{"type":"get_state"}`)); err != nil {
+		t.Fatal(err)
+	}
+	if err := seam.AnswerQuestion(context.Background(), "grandchild", "q-1", json.RawMessage(`{"confirmed":true}`)); err != nil {
+		t.Fatal(err)
+	}
+	subscription, err := seam.Subscribe(context.Background())
+	if err != nil {
+		t.Fatal(err)
+	}
+	select {
+	case event := <-subscription.Events:
+		if event.SessionID != "grandchild" || event.SourceSeq != 2 {
+			t.Fatalf("event = %#v", event)
+		}
+	case <-time.After(time.Second):
+		t.Fatal("descendant SSE event missing")
+	}
+	subscription.Close()
+	if err := seam.Stop(context.Background(), "grandchild"); err != nil {
+		t.Fatal(err)
+	}
+	select {
+	case <-service.stopCalled:
+	case <-time.After(time.Second):
+		t.Fatal("routed stop missing")
+	}
+
+	service.mu.Lock()
+	if service.rpcSession != "grandchild" || service.answerSession != "grandchild" {
+		t.Fatalf("rpc=%q answer=%q", service.rpcSession, service.answerSession)
+	}
+	service.mu.Unlock()
+	cancel()
+	if err := <-serverDone; err != nil {
+		t.Fatal(err)
+	}
+}
+
+func TestDescendantClientMapsSocketFailureToGatewayError(t *testing.T) {
+	seam, err := NewDescendantClient(filepath.Join(t.TempDir(), "missing.sock"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	_, err = seam.Snapshot(context.Background())
+	var typed *contract.Error
+	if !errors.As(err, &typed) || typed.Code != contract.ErrorChildUnavailable {
+		t.Fatalf("error = %v", err)
 	}
 }
 
