@@ -1,5 +1,5 @@
 import assert from "node:assert/strict";
-import { chmod, mkdtemp, rm } from "node:fs/promises";
+import { chmod, mkdtemp, readFile, rm, writeFile } from "node:fs/promises";
 import http from "node:http";
 import os from "node:os";
 import path from "node:path";
@@ -31,6 +31,27 @@ test("fresh delegation discovers workers, posts canonical DTO, and returns typed
   assert.deepEqual(seen, [{ workerType: "reviewer", kind: "read", context: "fresh", task: "Review" }]);
   assert.equal(result.content[0].text, "review result");
   assert.equal(result.details.sessionId, "child");
+});
+
+test("empty, legacy-unpersisted, and mixed-malformed forks leave source bytes unchanged and make zero HTTP requests", async (t) => {
+  let requests = 0;
+  const fixture = await server((_req, res) => { requests++; res.setHeader("content-type", "application/json"); res.end(JSON.stringify([{ workerType: "reviewer", description: "Reviews", profile: { provider: "anthropic", model: "claude" } }])); }); t.after(fixture.close);
+  const dir = await mkdtemp(path.join(os.tmpdir(), "kanedias-preflight-")); t.after(() => rm(dir, { recursive: true, force: true }));
+  const files = [
+    { name: "empty.jsonl", content: "", leaf: "leaf" },
+    { name: "legacy.jsonl", content: JSON.stringify({ type: "session", version: 1, id: "legacy", timestamp: new Date(0).toISOString(), cwd: "/workspace" }) + "\n" + JSON.stringify({ type: "message", timestamp: new Date(1).toISOString(), message: { role: "assistant", content: [{ type: "text", text: "legacy" }] } }) + "\n", leaf: "legacy-leaf" },
+    { name: "mixed.jsonl", content: [JSON.stringify({ type: "session", version: 3, id: "parent", timestamp: new Date(0).toISOString(), cwd: "/workspace" }), JSON.stringify({ type: "message", id: "leaf", parentId: null, timestamp: new Date(1).toISOString(), message: { role: "assistant", provider: "anthropic", model: "claude", content: [{ type: "text", text: "valid" }] } }), "{malformed"].join("\n") + "\n", leaf: "leaf" },
+  ];
+
+  for (const input of files) {
+    const file = path.join(dir, input.name); await writeFile(file, input.content, { mode: 0o600 });
+    const before = await readFile(file);
+    const tools: Tool[] = [];
+    extension({ registerTool: (tool: Tool) => tools.push(tool) } as any, { env: { KANEDIAS_SESSION_ID: "parent", KANEDIAS_SUPERVISOR_SOCKET: fixture.socket, KANEDIAS_PI_SESSION_FILE: file } });
+    await assert.rejects(tools[0]!.execute("call", { workerType: "reviewer", kind: "read", context: "fork", task: "Review" }, undefined, undefined, { sessionManager: { getSessionFile: () => file, getLeafId: () => input.leaf } }));
+    assert.deepEqual(await readFile(file), before, input.name);
+  }
+  assert.equal(requests, 0);
 });
 
 test("an unpersisted fork fails before contacting the supervisor", async (t) => {

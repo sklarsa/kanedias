@@ -1,5 +1,5 @@
 import assert from "node:assert/strict";
-import { chmod, mkdtemp, rm } from "node:fs/promises";
+import { chmod, lstat, mkdtemp, rm } from "node:fs/promises";
 import http from "node:http";
 import os from "node:os";
 import path from "node:path";
@@ -27,6 +27,18 @@ test("client uses only a mode-0600 Unix socket and JSON", async (t) => {
   assert.equal(workers[0]?.workerType, "reviewer");
   await chmod(fixture.socket, 0o666);
   await assert.rejects(new SupervisorClient(fixture.socket).workers(), /0600/);
+});
+
+test("client rejects a mode-0600 Unix socket owned by a different effective uid", async (t) => {
+  const geteuid = process.geteuid;
+  if (typeof geteuid !== "function") { t.skip("effective uid is unavailable on this platform"); return; }
+  const fixture = await socketServer((_req, res) => { res.setHeader("content-type", "application/json"); res.end("[]"); });
+  t.after(fixture.close);
+  const stat = async (socketPath: string) => {
+    const actual = await lstat(socketPath);
+    return { isSocket: () => actual.isSocket(), mode: actual.mode, uid: geteuid() + 1 };
+  };
+  await assert.rejects(new SupervisorClient(fixture.socket, { stat }).workers(), /owner|uid/i);
 });
 
 test("client rejects non-JSON, redirects, and bodies over 1 MiB", async (t) => {

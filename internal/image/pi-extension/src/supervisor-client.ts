@@ -7,15 +7,26 @@ import type { ChildResult, CreateChildRequest, RepositoryHandoff, WorkerSummary 
 const MAX_RESPONSE_BYTES = 1024 * 1024;
 const DEFAULT_BOUNDED_TIMEOUT_MS = 10_000;
 
-interface ClientOptions { boundedTimeoutMs?: number }
+interface SocketStat {
+  isSocket(): boolean;
+  mode: number;
+  uid: number;
+}
+
+interface ClientOptions {
+  boundedTimeoutMs?: number;
+  stat?: (path: string) => Promise<SocketStat>;
+}
 
 export class SupervisorClient {
   readonly #socketPath: string;
   readonly #boundedTimeoutMs: number;
+  readonly #stat: (path: string) => Promise<SocketStat>;
 
   constructor(socketPath = "/run/kanedias/supervisor.sock", options: ClientOptions = {}) {
     this.#socketPath = socketPath;
     this.#boundedTimeoutMs = options.boundedTimeoutMs ?? DEFAULT_BOUNDED_TIMEOUT_MS;
+    this.#stat = options.stat ?? lstat;
   }
 
   async workers(signal?: AbortSignal): Promise<WorkerSummary[]> {
@@ -50,9 +61,12 @@ export class SupervisorClient {
   }
 
   async #request(method: string, requestPath: string, body: unknown, signal?: AbortSignal, timeoutMs?: number): Promise<unknown> {
-    const info = await lstat(this.#socketPath);
+    const info = await this.#stat(this.#socketPath);
     if (!info.isSocket()) throw new Error(`supervisor endpoint is not a Unix socket: ${this.#socketPath}`);
     if ((info.mode & 0o777) !== 0o600) throw new Error(`supervisor Unix socket must have mode 0600: ${this.#socketPath}`);
+    if (typeof process.geteuid === "function" && info.uid !== process.geteuid()) {
+      throw new Error(`supervisor Unix socket owner uid must match effective uid: ${this.#socketPath}`);
+    }
 
     const timeout = timeoutMs === undefined ? undefined : AbortSignal.timeout(timeoutMs);
     const combinedSignal = signal && timeout ? AbortSignal.any([signal, timeout]) : signal ?? timeout;

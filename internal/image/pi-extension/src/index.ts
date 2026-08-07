@@ -1,6 +1,7 @@
 import type { ExtensionAPI, ExtensionContext } from "@earendil-works/pi-coding-agent";
 import { Value } from "typebox/value";
 import { prepareFork, validateForkSource } from "./fork.ts";
+import type { ForkSourceSnapshot } from "./fork.ts";
 import { durableHandoff } from "./git-handoff.ts";
 import { delegateSessionSchema, handoffSchema } from "./schemas.ts";
 import { SupervisorClient } from "./supervisor-client.ts";
@@ -37,13 +38,12 @@ export default function kanediasExtension(pi: ExtensionAPI, options: ExtensionOp
     async execute(_toolCallId, params, signal, _onUpdate, ctx) {
       if (!Value.Check(delegateSessionSchema, params)) throw new Error("invalid delegate_session arguments");
       const input = params as DelegateSessionInput;
-      let forkSource: { sessionFile: string; leafEntryId: string } | undefined;
+      let forkSource: ForkSourceSnapshot | undefined;
       if (input.context === "fork") {
         const sessionFile = env.KANEDIAS_PI_SESSION_FILE ?? ctx.sessionManager.getSessionFile();
         const leafEntryId = ctx.sessionManager.getLeafId();
         if (!sessionFile || !leafEntryId) throw new Error("fork requires a persisted current session and leaf");
-        await validateForkSource(sessionFile, leafEntryId);
-        forkSource = { sessionFile, leafEntryId };
+        forkSource = await validateForkSource(sessionFile, leafEntryId);
       }
 
       const workers = await client.workers(signal);
@@ -52,7 +52,7 @@ export default function kanediasExtension(pi: ExtensionAPI, options: ExtensionOp
 
       const request: CreateChildRequest = { ...input };
       if (forkSource) {
-        request.fork = await prepareFork(forkSource.sessionFile, forkSource.leafEntryId, worker.profile);
+        request.fork = await prepareFork(forkSource, worker.profile);
       }
 
       const result = await client.createChild(requiredEnvironment(env, "KANEDIAS_SESSION_ID"), request, signal);
