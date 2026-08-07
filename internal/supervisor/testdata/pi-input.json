@@ -1,0 +1,7 @@
+{
+  "type": "extension_ui_request",
+  "id": "uuid-3",
+  "method": "input",
+  "title": "Enter a value",
+  "placeholder": "type something..."
+}
