@@ -326,12 +326,3 @@ func AwaitSubmittedOperation(ctx context.Context, err error) error {
 	}
 	return fmt.Errorf("error does not retain a submitted operation waiter")
 }
-
-// AwaitSubmittedRemoteOperation preserves the Task 4 remote-copy seam.
-func AwaitSubmittedRemoteOperation(ctx context.Context, err error) error {
-	var submitted *submittedOperationError
-	if !errors.As(err, &submitted) || submitted.remote == nil {
-		return fmt.Errorf("error does not retain a submitted remote operation")
-	}
-	return AwaitSubmittedOperation(ctx, err)
-}

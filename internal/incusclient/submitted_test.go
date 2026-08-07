@@ -111,7 +111,7 @@ func TestSubmittedRemoteOperationCanBeAwaitedAfterCancellation(t *testing.T) {
 
 	awaitDone := make(chan error, 1)
 	go func() {
-		awaitDone <- AwaitSubmittedRemoteOperation(context.Background(), copyErr)
+		awaitDone <- AwaitSubmittedOperation(context.Background(), copyErr)
 	}()
 	select {
 	case err := <-awaitDone:
@@ -120,7 +120,7 @@ func TestSubmittedRemoteOperationCanBeAwaitedAfterCancellation(t *testing.T) {
 	}
 	close(operation.waitRelease)
 	if err := <-awaitDone; err != nil {
-		t.Fatalf("AwaitSubmittedRemoteOperation() error = %v, want terminal success", err)
+		t.Fatalf("AwaitSubmittedOperation() error = %v, want terminal success", err)
 	}
 }
 

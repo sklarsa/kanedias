@@ -374,7 +374,7 @@ func destroy(ctx context.Context, cfg config.Config, name string, stdout, _ io.W
 		}
 	}
 
-	deleteVolume := func(volume, seed, description string, delete func(context.Context, incusworkspace.VolumeClient, string, string, string) error) error {
+	deleteVolume := func(volume, seed, description string, del func(context.Context, incusworkspace.VolumeClient, string, string, string) error) error {
 		_, err := client.GetStorageVolume(ctx, pool, volume)
 		if incusclient.IsNotFound(err) {
 			return nil
@@ -383,7 +383,7 @@ func destroy(ctx context.Context, cfg config.Config, name string, stdout, _ io.W
 			return err
 		}
 		_, _ = fmt.Fprintf(stdout, "Deleting %s %s...\n", description, volume)
-		if err := delete(ctx, client, pool, seed, volume); err != nil && !incusclient.IsNotFound(err) {
+		if err := del(ctx, client, pool, seed, volume); err != nil && !incusclient.IsNotFound(err) {
 			return err
 		}
 		return nil
