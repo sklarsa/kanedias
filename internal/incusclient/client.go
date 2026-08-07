@@ -275,10 +275,6 @@ func submitAndWaitRemoteOperationUntilTerminal(ctx context.Context, submit func(
 	return nil
 }
 
-func waitRemoteOperation(ctx context.Context, operation remoteOperationWaiter) error {
-	return waitRemoteOperationUntilTerminal(ctx, operation, startRemoteOperation(operation))
-}
-
 func waitRemoteOperationUntilTerminal(ctx context.Context, operation remoteOperationWaiter, remote *submittedRemoteOperation) error {
 	select {
 	case <-remote.done:

@@ -148,37 +148,6 @@ func (o *fakeRemoteOperation) CancelTarget() error {
 	return o.cancelErr
 }
 
-func TestRemoteVolumeWaitCancelsTargetButWaitsForTerminalResult(t *testing.T) {
-	waitErr := errors.New("remote operation cancelled")
-	op := &fakeRemoteOperation{
-		waitStarted: make(chan struct{}),
-		waitRelease: make(chan struct{}),
-		cancelled:   make(chan struct{}),
-		waitErr:     waitErr,
-	}
-	ctx, cancel := context.WithCancel(context.Background())
-	done := make(chan error, 1)
-	go func() { done <- waitRemoteOperation(ctx, op) }()
-	<-op.waitStarted
-	cancel()
-
-	select {
-	case <-op.cancelled:
-	case <-time.After(time.Second):
-		t.Fatal("CancelTarget was not called")
-	}
-	select {
-	case err := <-done:
-		t.Fatalf("waitRemoteOperation returned before the remote operation was terminal: %v", err)
-	default:
-	}
-
-	close(op.waitRelease)
-	if err := <-done; !errors.Is(err, context.Canceled) || !errors.Is(err, waitErr) {
-		t.Fatalf("waitRemoteOperation() error = %v, want context.Canceled joined with remote wait error", err)
-	}
-}
-
 type storageRemoteOperation struct {
 	incus.RemoteOperation
 	fake *fakeRemoteOperation

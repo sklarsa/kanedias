@@ -117,9 +117,7 @@ func (entry *childEntry) setStreamError(err error) {
 
 func (entry *childEntry) expectEventStreamClose() {
 	entry.mu.Lock()
-	if !entry.eventCloseExpected {
-		entry.eventCloseExpected = true
-	}
+	entry.eventCloseExpected = true
 	cancel := entry.eventCancel
 	entry.mu.Unlock()
 	if cancel != nil {

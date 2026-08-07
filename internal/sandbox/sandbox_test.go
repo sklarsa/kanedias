@@ -534,12 +534,8 @@ func testDependencies(client *recordingClient) dependencies {
 			client.calls = append(client.calls, "clone-incus "+seed+" "+result.Name)
 			return result, client.cloneIncusErr
 		},
-		waitNestedIncus: func(ctx context.Context, executor incusworkspace.Executor, instance string, timeout time.Duration) error {
-			return incusworkspace.WaitReady(ctx, executor, instance, timeout)
-		},
-		verifyNestedIncus: func(ctx context.Context, executor incusworkspace.Executor, instance string) error {
-			return incusworkspace.VerifyNativeBtrfs(ctx, executor, instance)
-		},
+		waitNestedIncus:       incusworkspace.WaitReady,
+		verifyNestedIncus:     incusworkspace.VerifyNativeBtrfs,
 		operationWasSubmitted: func(err error) bool { return client.submittedErr != nil && errors.Is(err, client.submittedErr) },
 		awaitSubmittedOperation: func(context.Context, error) error {
 			return nil
@@ -565,7 +561,6 @@ type recordingClient struct {
 	calls                []string
 	createRequest        api.InstancesPost
 	instance             *api.Instance
-	volume               *api.StorageVolume
 	getInstanceErr       error
 	getVolumeErr         error
 	copyErr              error
@@ -577,9 +572,6 @@ type recordingClient struct {
 	startErr             error
 	startFunc            func(context.Context) error
 	nestedWaitErr        error
-	nestedVerifyErr      error
-	systemdState         string
-	systemdErr           error
 	systemdResponses     []execResponse
 	systemdAttempted     chan<- struct{}
 	running              bool
@@ -613,9 +605,6 @@ func (c *recordingClient) GetStorageVolume(_ context.Context, _, name string) (*
 	c.calls = append(c.calls, "get-volume "+name)
 	if c.getVolumeErr != nil {
 		return nil, c.getVolumeErr
-	}
-	if c.volume != nil {
-		return c.volume, nil
 	}
 	return &api.StorageVolume{Name: name}, nil
 }
@@ -703,11 +692,7 @@ func (c *recordingClient) Exec(ctx context.Context, _ string, request incusclien
 			}
 			return response.stdout, response.stderr, response.err
 		}
-		state := c.systemdState
-		if state == "" {
-			state = "running\n"
-		}
-		return state, "", c.systemdErr
+		return "running\n", "", nil
 	}
 	if err := ctx.Err(); err != nil {
 		return "", "", err
@@ -716,9 +701,6 @@ func (c *recordingClient) Exec(ctx context.Context, _ string, request incusclien
 	case "incus admin waitready --timeout 60":
 		return "", "", c.nestedWaitErr
 	case "incus query /1.0/storage-pools/default":
-		if c.nestedVerifyErr != nil {
-			return "", "", c.nestedVerifyErr
-		}
 		return `{"driver":"btrfs","config":{"source":"/var/lib/incus/storage-pools/default"}}`, "", nil
 	}
 	return "", "", nil

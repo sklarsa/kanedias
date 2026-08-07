@@ -210,7 +210,7 @@ func (provisioner *IncusRootProvisioner) ProvisionRoot(ctx context.Context, requ
 		InstancePut: api.InstancePut{
 			Profiles: []string{"default", rootSandboxProfile},
 			Config: map[string]string{
-				metaKind:                                 "root",
+				metaKind:                                 string(contract.ChildKindRoot),
 				metaContext:                              string(contract.ContextRoot),
 				metaSessionID:                            request.SessionID,
 				metaParentID:                             "",
@@ -219,20 +219,20 @@ func (provisioner *IncusRootProvisioner) ProvisionRoot(ctx context.Context, requ
 				"user.kanedias.rpc.port":                 rootRPCPort,
 				"user.kanedias.workspace_volume":         volume,
 				"environment.KANEDIAS_SESSION_ID":        request.SessionID,
-				"environment.KANEDIAS_SESSION_KIND":      "root",
+				"environment.KANEDIAS_SESSION_KIND":      string(contract.ChildKindRoot),
 				"environment.KANEDIAS_WORKER_TYPE":       "",
 				"environment.KANEDIAS_PI_PROVIDER":       "",
 				"environment.KANEDIAS_PI_MODEL":          "",
 				"environment.KANEDIAS_PI_THINKING":       "",
 				"environment.KANEDIAS_PI_SESSION_FILE":   "",
-				"environment.KANEDIAS_SUPERVISOR_SOCKET": "/run/kanedias/supervisor.sock",
+				"environment.KANEDIAS_SUPERVISOR_SOCKET": guestSupervisorSocket,
 			},
 			Devices: api.DevicesMap{
 				"root":      {"type": "disk", "pool": pool, "path": "/"},
 				"workspace": {"type": "disk", "pool": pool, "source": volume, "path": "/workspace"},
 				"supervisor": {
 					"type": "proxy", "bind": "instance",
-					"listen":  "unix:/run/kanedias/supervisor.sock",
+					"listen":  "unix:" + guestSupervisorSocket,
 					"connect": "unix:" + request.SocketPath,
 					"uid":     "1000", "gid": "1000", "mode": "0600",
 				},

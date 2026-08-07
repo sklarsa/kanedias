@@ -25,10 +25,6 @@ func (client *recordingVolumeClient) GetStorageVolume(_ context.Context, pool, v
 	return client.volume, client.getErr
 }
 
-func (client *recordingVolumeClient) CopyStorageVolume(context.Context, string, string, string) error {
-	return errors.New("unexpected retained-submission copy")
-}
-
 func (client *recordingVolumeClient) CopyStorageVolumeUntilTerminal(ctx context.Context, pool, source, target string) error {
 	client.calls = append(client.calls, "copy-terminal "+pool+" "+source+" "+target)
 	if client.onCopy != nil {

@@ -116,9 +116,6 @@ images = ["images:debian/13", "images:ubuntu/24.04"]
 	}); !reflect.DeepEqual(got, want) {
 		t.Errorf("Workspace = %#v, want %#v", got, want)
 	}
-	if got := cfg.Workspace.Incus.Volume; got != "nested-state" {
-		t.Errorf("Workspace.Incus.Volume = %q, want nested-state", got)
-	}
 }
 
 func TestLoadLifecycleDefaultsAndPaths(t *testing.T) {

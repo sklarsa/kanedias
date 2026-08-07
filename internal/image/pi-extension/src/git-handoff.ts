@@ -16,7 +16,7 @@ interface VerificationOptions {
   signal?: AbortSignal;
 }
 
-export function durableHandoff(input: HandoffInput): DurableHandoff {
+function durableHandoff(input: HandoffInput): DurableHandoff {
   return {
     repositories: input.repositories.map(({ path: _path, ...repository }) => repository),
     summary: input.summary,

@@ -122,11 +122,6 @@ func (client *DescendantClient) Close() error {
 	return nil
 }
 
-func (client *DescendantClient) Probe(ctx context.Context) error {
-	_, err := client.Snapshot(ctx)
-	return err
-}
-
 func (client *DescendantClient) CallRPC(ctx context.Context, sessionID string, command json.RawMessage) (json.RawMessage, error) {
 	ctx, cancel := client.unaryContext(ctx)
 	defer cancel()

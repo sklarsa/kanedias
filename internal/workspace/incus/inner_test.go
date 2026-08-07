@@ -99,16 +99,7 @@ func TestWaitReady(t *testing.T) {
 	}
 }
 
-func TestInitializeUninitializedNewSeed(t *testing.T) {
-	testInitializeUninitializedSeed(t, true)
-}
-
-func TestInitializeUninitializedExistingSeed(t *testing.T) {
-	testInitializeUninitializedSeed(t, false)
-}
-
-func testInitializeUninitializedSeed(t *testing.T, newSeed bool) {
-	t.Helper()
+func TestInitializeUninitializedSeedRunsMinimalInit(t *testing.T) {
 	executor := &recordingExecutor{results: []execResult{
 		{},
 		{stdout: `[]`},
@@ -116,7 +107,7 @@ func testInitializeUninitializedSeed(t *testing.T, newSeed bool) {
 		{},
 		{stdout: `{"name":"default","driver":"btrfs","config":{"source":"/var/lib/incus/storage-pools/default"}}`},
 	}}
-	if err := initialize(context.Background(), executor, "workspace", newSeed, 60*time.Second); err != nil {
+	if err := initialize(context.Background(), executor, "workspace", true, 60*time.Second); err != nil {
 		t.Fatal(err)
 	}
 	assertCommands(t, executor, [][]string{

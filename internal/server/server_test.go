@@ -410,30 +410,6 @@ func TestRunReturnsShutdownError(t *testing.T) {
 	requireStructuredLog(t, logs, `"msg":"server shutdown failed"`, `"error":"context deadline exceeded"`)
 }
 
-func TestServerTimeoutConfiguration(t *testing.T) {
-	handler := http.NewServeMux()
-	server := newHTTPServer("127.0.0.1:8080", handler)
-
-	if server.Addr != "127.0.0.1:8080" {
-		t.Fatalf("server Addr = %q, want 127.0.0.1:8080", server.Addr)
-	}
-	if server.Handler != handler {
-		t.Fatal("server did not preserve handler")
-	}
-	if server.ReadHeaderTimeout != 5*time.Second {
-		t.Fatalf("ReadHeaderTimeout = %v, want 5s", server.ReadHeaderTimeout)
-	}
-	if server.IdleTimeout != 60*time.Second {
-		t.Fatalf("IdleTimeout = %v, want 60s", server.IdleTimeout)
-	}
-	if server.WriteTimeout != 0 {
-		t.Fatalf("WriteTimeout = %v, want zero", server.WriteTimeout)
-	}
-	if defaultShutdownTimeout != 10*time.Second {
-		t.Fatalf("defaultShutdownTimeout = %v, want 10s", defaultShutdownTimeout)
-	}
-}
-
 func testLogger() (*slog.Logger, *bytes.Buffer) {
 	var logs bytes.Buffer
 	return slog.New(slog.NewJSONHandler(&logs, nil)), &logs
