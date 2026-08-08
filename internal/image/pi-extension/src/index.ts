@@ -38,7 +38,10 @@ export default async function kanediasExtension(pi: ExtensionAPI, options: Exten
   // the E2E controlled question would never surface.
   if (env.KANEDIAS_E2E_RUN_ID && env.KANEDIAS_SESSION_KIND === "root") {
     pi.on("session_start", (event, ctx) => {
-      if (event.reason !== "startup") return;
+      // A fresh session reports reason "startup" (pi default) or "new"
+      // (agent-session-runtime for a brand-new session). Resume/fork/reload
+      // must not re-run the E2E controlled question.
+      if (event.reason !== "startup" && event.reason !== "new") return;
       // Do not block extension startup: RPC input must be live before the
       // controlled dialog can receive its routed response.
       setTimeout(async () => {
