@@ -677,3 +677,33 @@ func TestDescendantUnaryOperationsHaveInternalDeadline(t *testing.T) {
 		t.Fatal("server did not close")
 	}
 }
+
+func TestDescendantClientResponseBoundaryRejectsTrailingData(t *testing.T) {
+	path := filepath.Join(t.TempDir(), "boundary.sock")
+	snapshot := supervisor.NodeSnapshot{SessionID: "self", RootSessionID: "self", Children: []supervisor.NodeSnapshot{}}
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+	done := make(chan error, 1)
+	go func() {
+		done <- ServeUnix(ctx, path, http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
+			w.Header().Set("Content-Type", "application/json")
+			enc := json.NewEncoder(w)
+			_ = enc.Encode(snapshot)
+			// Write a second JSON value — whole-body unmarshal must reject this.
+			_ = enc.Encode(map[string]string{"extra": "field"})
+		}))
+	}()
+	waitForSocket(t, path)
+	client, err := NewClient(path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	_, err = client.Snapshot(context.Background())
+	if err == nil {
+		t.Fatal("client accepted response with trailing JSON data")
+	}
+	var typed *contract.Error
+	if !errors.As(err, &typed) || typed.Code != contract.ErrorChildUnavailable {
+		t.Fatalf("error = %v, want child_unavailable", err)
+	}
+}
