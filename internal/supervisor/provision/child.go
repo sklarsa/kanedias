@@ -4,7 +4,6 @@ import (
 	"context"
 	"errors"
 	"fmt"
-	"regexp"
 	"strings"
 	"time"
 
@@ -27,8 +26,6 @@ const (
 	guestSupervisorSocket = "/run/kanedias/supervisor.sock"
 	childCleanupTimeout   = 30 * time.Second
 )
-
-var incusNamePattern = regexp.MustCompile(`^[A-Za-z0-9](?:[A-Za-z0-9-]{0,61}[A-Za-z0-9])?$`)
 
 type childIncusClient interface {
 	ResolvePool(context.Context, string) (string, error)
@@ -405,7 +402,7 @@ func (p *IncusChildProvisioner) step(name string) error {
 
 func validateChildRequestNames(request ChildRequest, instanceName, volumeName string) error {
 	for label, value := range map[string]string{"child instance": instanceName, "child volume": volumeName} {
-		if !incusNamePattern.MatchString(value) {
+		if !incusclient.ValidIncusName(value) {
 			return fmt.Errorf("%s name %q is not a valid Incus name", label, value)
 		}
 	}
