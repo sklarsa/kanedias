@@ -65,7 +65,7 @@ func (m *Manager) actionableClient(sessionID string) (rootClient, error) {
 	}
 	for _, h := range m.roots {
 		if h.rootID == rootID {
-			if !h.actionable {
+			if !h.actionable || h.stale {
 				return nil, fmt.Errorf("session %q root is not actionable", sessionID)
 			}
 			return h.client, nil
@@ -84,7 +84,7 @@ func (m *Manager) actionableClientAndNode(sessionID string) (rootClient, supervi
 	}
 	for _, h := range m.roots {
 		if h.rootID == rootID {
-			if !h.actionable {
+			if !h.actionable || h.stale {
 				return nil, supervisor.NodeSnapshot{}, fmt.Errorf("session %q root is not actionable", sessionID)
 			}
 			node, found := findNode(h.tree, sessionID)

@@ -116,14 +116,20 @@ func New(opts Options) (*Manager, error) {
 		opts.ConfigPath = clean
 	}
 
-	// Validate SessionBinary (required for spawning, but optional at construction time).
-	if opts.SessionBinary != "" {
-		resolved, err := resolveExecutable(opts.SessionBinary)
+	// Resolve SessionBinary to the current executable by default so the normal
+	// configuration can spawn independent roots without an explicit override.
+	if opts.SessionBinary == "" {
+		binary, err := os.Executable()
 		if err != nil {
-			return nil, fmt.Errorf("manager: session binary: %w", err)
+			return nil, fmt.Errorf("manager: resolve current executable: %w", err)
 		}
-		opts.SessionBinary = resolved
+		opts.SessionBinary = binary
 	}
+	resolvedBinary, err := resolveExecutable(opts.SessionBinary)
+	if err != nil {
+		return nil, fmt.Errorf("manager: session binary: %w", err)
+	}
+	opts.SessionBinary = resolvedBinary
 
 	// Apply default intervals.
 	if opts.DiscoveryInterval == 0 {

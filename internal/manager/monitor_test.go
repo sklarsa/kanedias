@@ -5,6 +5,7 @@ import (
 	"encoding/json"
 	"errors"
 	"os"
+	"path/filepath"
 	"testing"
 	"time"
 
@@ -233,6 +234,58 @@ func TestStoppingTransitionNotifiesFleet(t *testing.T) {
 
 // ---- ManagerStart / ManagerClose tests ----
 
+func TestReplacementHandleIgnoresOldMonitorMutations(t *testing.T) {
+	m := fakeManager(nil)
+	path := "/tmp/replaced.root.sock"
+	old := &rootHandle{socketPath: path, rootID: "old"}
+	replacementTree := rootTree("replacement")
+	replacement := &rootHandle{
+		socketPath: path, rootID: "replacement", tree: replacementTree,
+		actionable: true, streamConnected: true,
+	}
+	m.roots[path] = replacement
+
+	m.markStale(old, true)
+	m.setStreamConnected(old, false)
+	terminal := rootTree("old")
+	terminal.Lifecycle = string(supervisor.LifecycleStopped)
+	m.updateRetainedTree(old, terminal, false)
+
+	if replacement.stale || !replacement.streamConnected || !replacement.actionable {
+		t.Fatalf("old monitor mutated replacement state: %+v", replacement)
+	}
+	if replacement.tree.SessionID != "replacement" {
+		t.Fatalf("old monitor replaced tree with %q", replacement.tree.SessionID)
+	}
+}
+
+func TestEventLoopBacksOffAfterImmediateEOF(t *testing.T) {
+	closed := make(chan struct{})
+	close(closed)
+	client := &fakeClient{snapshot: rootTree("eof"), closeChan: closed, closed: true}
+	m := fakeManager(nil)
+	handle := &rootHandle{
+		socketPath: "/tmp/eof-loop.root.sock", rootID: "eof", client: client,
+		actionable: true, tree: rootTree("eof"),
+		mirror: newEventMirror(supervisor.EventBrokerOptions{MaxEvents: 100}),
+	}
+	m.roots[handle.socketPath] = handle
+	m.routes["eof"] = "eof"
+	if m.monitorRoot(handle) != monitorStarted {
+		t.Fatal("monitorRoot did not start")
+	}
+	t.Cleanup(func() {
+		ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+		defer cancel()
+		_ = m.Close(ctx)
+	})
+
+	time.Sleep(250 * time.Millisecond)
+	if got := client.callCount("Subscribe"); got < 2 || got > 4 {
+		t.Fatalf("immediate EOF reconnect count = %d, want bounded 2..4", got)
+	}
+}
+
 func TestManagerStartAndClose(t *testing.T) {
 	// Use short dirs: the path-length probe uses a 32-char token placeholder.
 	dir, logDir := shortTempDirs(t)
@@ -247,6 +300,9 @@ func TestManagerStartAndClose(t *testing.T) {
 	})
 	if err != nil {
 		t.Fatal(err)
+	}
+	if m.opts.SessionBinary == "" || !filepath.IsAbs(m.opts.SessionBinary) {
+		t.Fatalf("default SessionBinary = %q, want absolute current executable", m.opts.SessionBinary)
 	}
 	ctx := context.Background()
 	if err := m.Start(ctx); err != nil {
@@ -378,15 +434,20 @@ func TestManagerFleetFanoutPublishesOnDiscovery(t *testing.T) {
 	if err := os.Chmod(dir, 0o700); err != nil {
 		t.Fatal(err)
 	}
-	makeRootSocket(t, dir, "fan.root.sock")
+	socketPath := makeRootSocket(t, dir, "fan.root.sock")
 	tree := rootTree("fan")
 	client := &fakeClient{snapshot: tree}
 	m := fakeManager(func(_ string) (rootClient, error) { return client, nil })
 	m.opts.RootSocketDir = dir
+	t.Cleanup(func() {
+		ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+		defer cancel()
+		_ = m.Close(ctx)
+	})
 
 	sub := m.SubscribeFleet()
+	defer sub.Close()
 	m.discoverOnce(context.Background())
-	m.bumpFleetRevision()
 
 	select {
 	case rev := <-sub.Updates:
@@ -394,7 +455,45 @@ func TestManagerFleetFanoutPublishesOnDiscovery(t *testing.T) {
 			t.Fatal("received zero revision")
 		}
 	case <-time.After(time.Second):
-		t.Fatal("fleet fanout did not publish after discovery")
+		t.Fatal("fleet fanout did not publish after admission")
 	}
-	sub.Close()
+
+	deadline := time.Now().Add(time.Second)
+	for !m.Fleet().Roots[0].StreamConnected {
+		if time.Now().After(deadline) {
+			t.Fatal("event stream did not connect")
+		}
+		time.Sleep(time.Millisecond)
+	}
+
+	// Drain connection-state notifications, then prove an unchanged scan is
+	// silent before testing the disappearance notification.
+drain:
+	for {
+		select {
+		case <-sub.Updates:
+		default:
+			break drain
+		}
+	}
+	m.discoverOnce(context.Background())
+	select {
+	case rev := <-sub.Updates:
+		t.Fatalf("unchanged discovery published revision %d", rev)
+	case <-time.After(50 * time.Millisecond):
+	}
+
+	beforeRemoval := m.Fleet().Revision
+	if err := os.Remove(socketPath); err != nil {
+		t.Fatal(err)
+	}
+	m.discoverOnce(context.Background())
+	select {
+	case rev := <-sub.Updates:
+		if rev <= beforeRemoval {
+			t.Fatalf("removal revision = %d, want > %d", rev, beforeRemoval)
+		}
+	case <-time.After(time.Second):
+		t.Fatal("fleet fanout did not publish after removal")
+	}
 }

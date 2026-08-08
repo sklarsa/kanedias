@@ -143,12 +143,21 @@ func (m *Manager) eventLoop(handle *rootHandle) {
 		}
 		m.setStreamConnected(handle, true)
 		accepted := m.consumeSubscription(handle, sub)
+		m.setStreamConnected(handle, false)
+
+		// A successfully established stream can still close immediately. Apply a
+		// bounded delay on every reconnect path so repeated EOFs cannot form a hot
+		// accept/close loop.
+		delay := backoff
 		if accepted {
 			backoff = backoffMin
+			delay = backoffMin
 		} else {
 			backoff = nextBackoff(backoff)
 		}
-		m.setStreamConnected(handle, false)
+		if !m.sleep(ctx, delay) {
+			return
+		}
 	}
 }
 
@@ -229,27 +238,36 @@ func (m *Manager) consumeSubscription(handle *rootHandle, sub supervisor.Subscri
 // markStale sets or clears the stale flag for a root handle and notifies.
 func (m *Manager) markStale(handle *rootHandle, stale bool) {
 	m.mu.Lock()
-	if h, ok := m.roots[handle.socketPath]; ok {
+	changed := false
+	if h, ok := m.roots[handle.socketPath]; ok && h == handle && h.stale != stale {
 		h.stale = stale
+		changed = true
 	}
 	m.mu.Unlock()
-	m.bumpFleetRevision()
+	if changed {
+		m.bumpFleetRevision()
+	}
 }
 
 // setStreamConnected updates the StreamConnected field for a root.
 func (m *Manager) setStreamConnected(handle *rootHandle, connected bool) {
 	m.mu.Lock()
-	if h, ok := m.roots[handle.socketPath]; ok {
+	changed := false
+	if h, ok := m.roots[handle.socketPath]; ok && h == handle && h.streamConnected != connected {
 		h.streamConnected = connected
+		changed = true
 	}
 	m.mu.Unlock()
+	if changed {
+		m.bumpFleetRevision()
+	}
 }
 
 // updateRetainedTree replaces the tree for a stopping/failed root without
 // updating routes (since routes have been removed).
 func (m *Manager) updateRetainedTree(handle *rootHandle, tree supervisor.NodeSnapshot, actionable bool) {
 	m.mu.Lock()
-	if h, ok := m.roots[handle.socketPath]; ok {
+	if h, ok := m.roots[handle.socketPath]; ok && h == handle {
 		h.tree = tree
 		h.actionable = actionable
 	}

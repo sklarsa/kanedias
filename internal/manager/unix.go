@@ -21,11 +21,13 @@ func validatePrivateDir(path string) error {
 	return nil
 }
 
-// socketIdentity captures device+inode so the manager can confirm a socket
-// has not been replaced between inspections.
+// socketIdentity captures a socket generation. Device+inode alone is not
+// sufficient because filesystems may immediately reuse an inode after unlink;
+// the generation's metadata timestamp distinguishes that replacement.
 type socketIdentity struct {
-	dev uint64
-	ino uint64
+	dev       uint64
+	ino       uint64
+	mtimeNano int64
 }
 
 // inspectRootSocket validates that path names a non-symlink Unix-domain socket
@@ -52,19 +54,13 @@ func inspectRootSocket(path string, lstatFn func(string) (os.FileInfo, error), e
 	if int(stat.Uid) != euid {
 		return socketIdentity{}, fmt.Errorf("root socket %q is owned by UID %d, not EUID %d", path, stat.Uid, euid)
 	}
-	return socketIdentity{dev: stat.Dev, ino: stat.Ino}, nil
+	return socketIdentity{dev: stat.Dev, ino: stat.Ino, mtimeNano: info.ModTime().UnixNano()}, nil
 }
 
-// sameIdentity returns true when the socket at path still has the same
-// device+inode as the recorded identity.
+// sameIdentity returns true when the socket at path is still the recorded
+// generation. Re-run the complete socket validation so a replaced path cannot
+// pass merely because its inode number was recycled.
 func sameIdentity(path string, id socketIdentity) bool {
-	info, err := os.Lstat(path)
-	if err != nil {
-		return false
-	}
-	stat, ok := info.Sys().(*syscall.Stat_t)
-	if !ok {
-		return false
-	}
-	return stat.Dev == id.dev && stat.Ino == id.ino
+	current, err := inspectRootSocket(path, os.Lstat, os.Geteuid())
+	return err == nil && current == id
 }

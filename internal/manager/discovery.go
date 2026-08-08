@@ -6,6 +6,7 @@ import (
 	"fmt"
 	"os"
 	"path/filepath"
+	"slices"
 	"strings"
 	"sync"
 
@@ -91,6 +92,7 @@ func (m *Manager) discoverOnce(ctx context.Context) {
 	m.mu.Unlock()
 
 	var newIssues []DiscoveryIssue
+	changed := false
 
 	for _, entry := range entries {
 		name := entry.Name()
@@ -109,15 +111,24 @@ func (m *Manager) discoverOnce(ctx context.Context) {
 			continue
 		}
 
-		// If we already know this exact socket (same device+inode), check if
-		// it still exists.
 		if handle, ok := known[socketPath]; ok && handle.identity == identity {
-			// Socket is unchanged. Nothing to do for existing admitted roots.
+			// Socket generation is unchanged. Its independent snapshot loop owns
+			// tree refresh, so discovery has nothing to do.
 			delete(known, socketPath)
 			continue
 		}
-		// New or replaced socket — probe it.
-		m.probeRoot(ctx, socketPath, identity, &newIssues)
+
+		// A client dials by pathname, so once the path names a different socket
+		// generation the old handle must be retired before probing it. Keeping a
+		// cancelled handle would retain an unusable client indefinitely when the
+		// replacement cannot be admitted.
+		if displaced := m.removeReplacedSocket(socketPath, identity); displaced != nil {
+			changed = true
+			m.drainAndCloseDisplaced(displaced)
+		}
+		if m.probeRoot(ctx, socketPath, identity, &newIssues) {
+			changed = true
+		}
 		delete(known, socketPath)
 	}
 
@@ -129,19 +140,37 @@ func (m *Manager) discoverOnce(ctx context.Context) {
 	for socketPath := range known {
 		if h := m.removeRootLocked(socketPath); h != nil {
 			removed = append(removed, h)
+			changed = true
 		}
 	}
-	// Replace discovery issues list.
+	issuesChanged := !slices.Equal(m.discoveryIssues, newIssues)
 	m.discoveryIssues = newIssues
 	m.mu.Unlock()
 	for _, h := range removed {
 		m.drainAndCloseDisplaced(h)
 	}
+	if changed || issuesChanged {
+		m.bumpFleetRevision()
+	}
+}
+
+// removeReplacedSocket retires the old handle before a new socket generation
+// at the same path is probed. The caller drains and closes the returned handle
+// outside m.mu.
+func (m *Manager) removeReplacedSocket(socketPath string, identity socketIdentity) *rootHandle {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	handle, ok := m.roots[socketPath]
+	if !ok || handle.identity == identity {
+		return nil
+	}
+	return m.removeRootLocked(socketPath)
 }
 
 // probeRoot connects to a candidate root socket, fetches a snapshot, validates
-// it, and attempts to commit the tree atomically.
-func (m *Manager) probeRoot(ctx context.Context, socketPath string, identity socketIdentity, issues *[]DiscoveryIssue) {
+// it, and attempts to commit the tree atomically. It reports whether fleet state
+// changed so discovery can publish one coalesced revision.
+func (m *Manager) probeRoot(ctx context.Context, socketPath string, identity socketIdentity, issues *[]DiscoveryIssue) bool {
 	name := filepath.Base(socketPath)
 
 	client, err := m.factory(socketPath)
@@ -149,22 +178,16 @@ func (m *Manager) probeRoot(ctx context.Context, socketPath string, identity soc
 		*issues = append(*issues, DiscoveryIssue{
 			SocketName: name, Code: "connect_failed", Message: err.Error(),
 		})
-		return
+		return false
 	}
 
 	snapshot, err := client.Snapshot(ctx)
 	if err != nil {
 		_ = client.Close()
-		// Retain existing root on transient failure.
-		m.mu.Lock()
-		if _, ok := m.roots[socketPath]; ok {
-			m.roots[socketPath].actionable = admissible(m.roots[socketPath].tree)
-		}
-		m.mu.Unlock()
 		*issues = append(*issues, DiscoveryIssue{
 			SocketName: name, Code: "probe_failed", Message: err.Error(),
 		})
-		return
+		return false
 	}
 
 	// Re-check socket identity after the probe to guard against TOCTOU.
@@ -174,7 +197,7 @@ func (m *Manager) probeRoot(ctx context.Context, socketPath string, identity soc
 		*issues = append(*issues, DiscoveryIssue{
 			SocketName: name, Code: "identity_changed", Message: "socket was replaced during probe",
 		})
-		return
+		return false
 	}
 
 	lc := supervisor.LifecycleState(snapshot.Lifecycle)
@@ -182,21 +205,20 @@ func (m *Manager) probeRoot(ctx context.Context, socketPath string, identity soc
 	case supervisor.LifecycleProvisioning, supervisor.LifecycleStarting:
 		// Retry next cycle.
 		_ = client.Close()
-		return
+		return false
 	case supervisor.LifecycleReady, supervisor.LifecycleRunning:
 		// Attempt full admission.
 	case supervisor.LifecycleStopping, supervisor.LifecycleFailed,
 		supervisor.LifecycleStopped, supervisor.LifecycleCompleted:
 		// Retain as non-actionable.
-		m.commitStoppingRoot(socketPath, identity, snapshot, client, issues)
-		return
+		return m.commitStoppingRoot(socketPath, identity, snapshot, client, issues)
 	default:
 		_ = client.Close()
 		*issues = append(*issues, DiscoveryIssue{
 			SocketName: name, Code: "malformed",
 			Message: fmt.Sprintf("unrecognised root lifecycle %q", snapshot.Lifecycle),
 		})
-		return
+		return false
 	}
 
 	// Validate full tree.
@@ -206,7 +228,7 @@ func (m *Manager) probeRoot(ctx context.Context, socketPath string, identity soc
 		*issues = append(*issues, DiscoveryIssue{
 			SocketName: name, Code: "malformed", Message: "tree validation: " + err.Error(),
 		})
-		return
+		return false
 	}
 	if !admissible(snapshot) {
 		_ = client.Close()
@@ -214,7 +236,7 @@ func (m *Manager) probeRoot(ctx context.Context, socketPath string, identity soc
 			SocketName: name, Code: "malformed",
 			Message: "root is ready/running but lacks Pi binding",
 		})
-		return
+		return false
 	}
 
 	handle := &rootHandle{
@@ -230,12 +252,13 @@ func (m *Manager) probeRoot(ctx context.Context, socketPath string, identity soc
 		*issues = append(*issues, DiscoveryIssue{
 			SocketName: name, Code: "route_conflict", Message: err.Error(),
 		})
-		return
+		return false
 	}
 	// If a replaced-inode handle was displaced, drain its loops and close its old
 	// client outside the lock (MGR-A).
 	m.drainAndCloseDisplaced(res.displaced)
 	m.admitCommitted(res.handle, handle)
+	return true
 }
 
 // admitCommitted starts monitoring the just-committed handle and cleans up only
@@ -253,7 +276,7 @@ func (m *Manager) admitCommitted(committed, ownHandle *rootHandle) {
 }
 
 // commitStoppingRoot records a stopping/failed root as non-actionable.
-func (m *Manager) commitStoppingRoot(socketPath string, identity socketIdentity, snapshot supervisor.NodeSnapshot, client rootClient, issues *[]DiscoveryIssue) {
+func (m *Manager) commitStoppingRoot(socketPath string, identity socketIdentity, snapshot supervisor.NodeSnapshot, client rootClient, issues *[]DiscoveryIssue) bool {
 	name := filepath.Base(socketPath)
 	normalized, candidate, err := validateRootTree(snapshot)
 	if err != nil {
@@ -261,7 +284,7 @@ func (m *Manager) commitStoppingRoot(socketPath string, identity socketIdentity,
 		*issues = append(*issues, DiscoveryIssue{
 			SocketName: name, Code: "malformed", Message: "stopping tree validation: " + err.Error(),
 		})
-		return
+		return false
 	}
 	handle := &rootHandle{
 		socketPath: socketPath,
@@ -276,10 +299,11 @@ func (m *Manager) commitStoppingRoot(socketPath string, identity socketIdentity,
 		*issues = append(*issues, DiscoveryIssue{
 			SocketName: name, Code: "route_conflict", Message: err.Error(),
 		})
-		return
+		return false
 	}
 	m.drainAndCloseDisplaced(res.displaced)
 	m.admitCommitted(res.handle, handle)
+	return true
 }
 
 // commitResult is what commitTree returns to the caller so any needed
@@ -329,11 +353,23 @@ func (m *Manager) commitTree(handle *rootHandle, tree supervisor.NodeSnapshot, c
 		return commitResult{}, errHandleCancelled
 	}
 
+	// A root identity belongs to exactly one socket. Without this check, two
+	// handles with the same rootID coexist and route lookup picks a client by
+	// nondeterministic map iteration.
+	for socketPath, existing := range m.roots {
+		if existing != handle && socketPath != handle.socketPath && existing.rootID == handle.rootID {
+			return commitResult{}, fmt.Errorf("duplicate root ID %q on sockets %q and %q", handle.rootID, existing.socketPath, handle.socketPath)
+		}
+	}
+
 	// Determine the rootID that currently owns this socket path (if any). Routes
 	// belonging to that existing root are NOT conflicts — they will be removed by
 	// removeRoutesLocked before the new routes are installed.
 	var reuseRootID string
 	if existing, ok := m.roots[handle.socketPath]; ok && existing != handle {
+		if existing.identity == handle.identity && existing.rootID != handle.rootID {
+			return commitResult{}, fmt.Errorf("root ID changed from %q to %q without a socket replacement", existing.rootID, handle.rootID)
+		}
 		reuseRootID = existing.rootID
 	}
 

@@ -389,6 +389,31 @@ func TestPiControlsRejectNonActionableRoot(t *testing.T) {
 	}
 }
 
+func TestPiControlsRejectStaleRoot(t *testing.T) {
+	tree := rootTree("root")
+	client := &piControlClient{}
+	m := piManagerWithSession("root", client, tree)
+	for _, handle := range m.roots {
+		handle.stale = true
+	}
+
+	if err := m.Interrupt(context.Background(), "root"); err == nil {
+		t.Fatal("Interrupt accepted stale root")
+	}
+	if err := m.StopSession(context.Background(), "root"); err == nil {
+		t.Fatal("StopSession accepted stale root")
+	}
+	if err := m.AnswerQuestion(context.Background(), "root", "q-1", json.RawMessage(`{"confirmed":true}`)); err == nil {
+		t.Fatal("AnswerQuestion accepted stale root")
+	}
+	if _, err := m.SessionStats(context.Background(), "root"); err == nil {
+		t.Fatal("SessionStats accepted stale root")
+	}
+	if len(client.callLog) != 0 {
+		t.Fatalf("stale controls reached client: %#v", client.callLog)
+	}
+}
+
 func TestPiControlsRejectUnknownSession(t *testing.T) {
 	m := fakeManager(nil)
 	if err := m.Interrupt(context.Background(), "missing"); err == nil {
