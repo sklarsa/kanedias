@@ -136,6 +136,18 @@ func (provisioner *IncusRootProvisioner) ProvisionRoot(ctx context.Context, requ
 		return nil, err
 	}
 
+	// Expose the host Lemonade model service inside every session. Children are
+	// created by cloning the root, so the profile's proxy device on the root
+	// instance propagates to all descendants (verified live). The proxy device is
+	// inert when no host Lemonade is listening.
+	var lemonade bytes.Buffer
+	if err := provisioner.deps.renderProfile(&lemonade, string(profiles.Lemonade), provisioner.config); err != nil {
+		return nil, err
+	}
+	if err := client.EnsureProfile(ctx, string(profiles.Lemonade), lemonade.Bytes()); err != nil {
+		return nil, err
+	}
+
 	// The proxy check is deliberately before the first session-owned create/copy.
 	if err := provisioner.deps.checkProxy(ctx, provisioner.config); err != nil {
 		return nil, fmt.Errorf("%w: %w", contract.NewError(contract.ErrorProxyUnavailable, "configured proxy listener is unavailable"), err)
@@ -210,7 +222,7 @@ func (provisioner *IncusRootProvisioner) ProvisionRoot(ctx context.Context, requ
 	instanceRequest := api.InstancesPost{
 		Name: name,
 		InstancePut: api.InstancePut{
-			Profiles: []string{"default", rootSandboxProfile},
+			Profiles: []string{"default", rootSandboxProfile, string(profiles.Lemonade)},
 			Config: map[string]string{
 				metaKind:                                 string(contract.ChildKindRoot),
 				metaContext:                              string(contract.ContextRoot),
