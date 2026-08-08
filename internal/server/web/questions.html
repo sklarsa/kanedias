@@ -1,16 +1,25 @@
 {{define "questions.html"}}
 <div id="question-panel">
   {{range .Questions}}
-  <div class="qcard" data-question-id="{{.ID}}">
+  {{/* Capture the question ID into a scoped variable so it is reachable inside
+       the {{range .Options}} block below, where $ is the top-level panel view
+       (which has no .ID field). */}}
+  {{$qid := .ID}}
+  <div class="qcard" data-question-id="{{$qid}}">
     <div class="qhead"><span class="diamond">◇</span> {{if .Title}}{{.Title}}{{else}}Question{{end}}</div>
     {{if .Message}}
     <div class="qtext">{{.Message}}</div>
     {{end}}
+    {{/* Action controls only render for questions whose ID passed the manager's
+         safe-charset check. Untrusted IDs never reach a JS/URL context: the ID
+         and option value travel as html/template attribute-escaped data-*
+         attributes and are read back via el.dataset (data, never code). */}}
+    {{if .Answerable}}
     {{if .Options}}
     <div class="qopts">
       {{range $i, $opt := .Options}}
-      <button class="qopt"
-        data-on:click="@post('/ui/sessions/'+$selectedSessionId+'/questions/{{$.ID}}', {payload:{value:{{$opt | js}}}})">
+      <button class="qopt" data-question-id="{{$qid}}" data-option-value="{{$opt}}"
+        data-on:click="@post('/ui/sessions/'+$selectedSessionId+'/questions/'+el.dataset.questionId, {payload:{value:el.dataset.optionValue}})">
         <span class="key">{{$i}}</span> {{$opt}}
       </button>
       {{end}}
@@ -18,22 +27,24 @@
     {{end}}
     {{if eq .Method "confirm"}}
     <div class="qconfirm">
-      <button class="qopt confirm"
-        data-on:click="@post('/ui/sessions/'+$selectedSessionId+'/questions/{{.ID}}', {payload:{confirmed:true}})">
+      <button class="qopt confirm" data-question-id="{{$qid}}"
+        data-on:click="@post('/ui/sessions/'+$selectedSessionId+'/questions/'+el.dataset.questionId, {payload:{confirmed:true}})">
         Confirm
       </button>
-      <button class="qopt deny"
-        data-on:click="@post('/ui/sessions/'+$selectedSessionId+'/questions/{{.ID}}', {payload:{confirmed:false}})">
+      <button class="qopt deny" data-question-id="{{$qid}}"
+        data-on:click="@post('/ui/sessions/'+$selectedSessionId+'/questions/'+el.dataset.questionId, {payload:{confirmed:false}})">
         Deny
       </button>
     </div>
     {{end}}
     <div class="qwrite">
-      <input type="text" placeholder="{{if .Placeholder}}{{.Placeholder}}{{else}}Write an answer…{{end}}" aria-label="Write answer" id="qinput-{{.ID}}">
-      <button data-on:click="@post('/ui/sessions/'+$selectedSessionId+'/questions/{{.ID}}', {payload:{value:document.getElementById('qinput-{{.ID}}').value}})">Send</button>
-      <button class="cancel"
-        data-on:click="@post('/ui/sessions/'+$selectedSessionId+'/questions/{{.ID}}', {payload:{cancelled:true}})">Cancel</button>
+      <input type="text" placeholder="{{if .Placeholder}}{{.Placeholder}}{{else}}Write an answer…{{end}}" aria-label="Write answer">
+      <button data-question-id="{{$qid}}"
+        data-on:click="@post('/ui/sessions/'+$selectedSessionId+'/questions/'+el.dataset.questionId, {payload:{value:el.closest('.qwrite').querySelector('input').value}})">Send</button>
+      <button class="cancel" data-question-id="{{$qid}}"
+        data-on:click="@post('/ui/sessions/'+$selectedSessionId+'/questions/'+el.dataset.questionId, {payload:{cancelled:true}})">Cancel</button>
     </div>
+    {{end}}
   </div>
   {{else}}
   <div class="qempty" aria-hidden="true"></div>

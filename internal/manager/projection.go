@@ -2,9 +2,30 @@ package manager
 
 import (
 	"encoding/json"
+	"regexp"
 
 	"github.com/sklarsa/kanedias/internal/supervisor"
 )
+
+// questionIDPattern constrains question IDs to a safe charset before they are
+// exposed to the web view. A supervisor is untrusted: its question IDs arrive
+// raw from /v1/tree and are interpolated into browser contexts (URLs, DOM
+// attributes). Restricting the charset here — at the data boundary — is the
+// load-bearing defense against an ID like `'); fetch(...)//` breaking out of a
+// string literal that the browser later re-decodes and evaluates.
+//
+// The charset deliberately excludes quotes, slashes, angle brackets, and
+// whitespace so an ID can never terminate an attribute, a URL segment, or a JS
+// string literal. IDs longer than 128 bytes are also rejected.
+var questionIDPattern = regexp.MustCompile(`^[A-Za-z0-9_.:-]{1,128}$`)
+
+// ValidQuestionID reports whether id is a safe question identifier: 1..128
+// characters drawn only from [A-Za-z0-9_.:-]. IDs that fail this check must be
+// treated as non-answerable and must never be interpolated into a browser
+// context.
+func ValidQuestionID(id string) bool {
+	return questionIDPattern.MatchString(id)
+}
 
 // activityProjector accumulates a sequence of events into a list of
 // ActivityItems, tracking tool state by toolCallId.

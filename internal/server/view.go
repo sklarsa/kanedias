@@ -53,8 +53,15 @@ type issueView struct {
 }
 
 // questionSummaryView is the safe projection of one pending question.
+//
+// Answerable is false when the question's ID failed the manager's safe-charset
+// check. A non-answerable question renders its prompt text (still HTML-escaped)
+// but no action controls, so a hostile/compromised supervisor cannot smuggle a
+// malicious ID into a browser URL, attribute, or JS expression. When Answerable
+// is false, ID is cleared to a safe empty string.
 type questionSummaryView struct {
 	ID          string
+	Answerable  bool
 	Method      string
 	Title       string
 	Options     []string
@@ -191,8 +198,18 @@ func newNodeView(n supervisor.NodeSnapshot) nodeView {
 }
 
 func newQuestionSummaryView(q supervisor.QuestionSummary) questionSummaryView {
+	// Constrain the untrusted supervisor-supplied ID at the data boundary. An ID
+	// that does not match the safe charset is neutered: the question is marked
+	// non-answerable and its ID is dropped so it can never reach a browser URL,
+	// DOM attribute, or JS expression. This is the load-bearing XSS defense.
+	answerable := manager.ValidQuestionID(q.ID)
+	id := q.ID
+	if !answerable {
+		id = ""
+	}
 	return questionSummaryView{
-		ID:          q.ID,
+		ID:          id,
+		Answerable:  answerable,
 		Method:      q.Method,
 		Title:       q.Title,
 		Options:     q.Options,
