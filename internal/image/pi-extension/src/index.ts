@@ -28,11 +28,12 @@ function boundedText(text: string): string {
 export default async function kanediasExtension(pi: ExtensionAPI, options: ExtensionOptions = {}): Promise<void> {
   const env = options.env ?? process.env;
   const client = new SupervisorClient(env.KANEDIAS_SUPERVISOR_SOCKET ?? "/run/kanedias/supervisor.sock");
-  const configuredWorkers = await client.workers();
-  const workerDescription = configuredWorkers
-    .map((worker) => `${worker.workerType}: ${worker.description}`)
-    .join("; ");
 
+  // Register the E2E controlled-question handler before the supervisor
+  // /v1/workers call below, which can block or fail if pi boots before the
+  // supervisor socket is serving. If registration happened after that await and
+  // it was slow, the handler would miss the session_start (startup) event and
+  // the E2E controlled question would never surface.
   if (env.KANEDIAS_E2E_RUN_ID && env.KANEDIAS_SESSION_KIND === "root") {
     pi.on("session_start", (event, ctx) => {
       if (event.reason !== "startup") return;
@@ -46,6 +47,11 @@ export default async function kanediasExtension(pi: ExtensionAPI, options: Exten
       }, 0);
     });
   }
+
+  const configuredWorkers = await client.workers();
+  const workerDescription = configuredWorkers
+    .map((worker) => `${worker.workerType}: ${worker.description}`)
+    .join("; ");
 
   pi.registerTool({
     name: "delegate_session",
