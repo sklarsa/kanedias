@@ -26,6 +26,19 @@ func subscriptionFromReplay(replay []supervisor.EventEnvelope) supervisor.Subscr
 
 // subscriptionWithLiveEvents returns a Subscription that delivers events from
 // a channel and then closes.
+type contextBlockingClient struct {
+	*fakeClient
+	entered chan struct{}
+	exited  chan struct{}
+}
+
+func (client *contextBlockingClient) Snapshot(ctx context.Context) (supervisor.NodeSnapshot, error) {
+	close(client.entered)
+	defer close(client.exited)
+	<-ctx.Done()
+	return supervisor.NodeSnapshot{}, ctx.Err()
+}
+
 func subscriptionWithLiveEvents(events []supervisor.EventEnvelope, closeErr error) supervisor.Subscription {
 	ch := make(chan supervisor.EventEnvelope, len(events)+1)
 	for _, e := range events {
@@ -196,6 +209,11 @@ func TestStoppingTransitionNotifiesFleet(t *testing.T) {
 
 	fleetSub := m.SubscribeFleet()
 	defer fleetSub.Close()
+	sessionSub, err := m.SubscribeSession("stop")
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer sessionSub.Close()
 
 	if m.monitorRoot(handle) != monitorStarted {
 		t.Fatal("monitorRoot refused to start")
@@ -214,6 +232,11 @@ func TestStoppingTransitionNotifiesFleet(t *testing.T) {
 	case <-time.After(2 * time.Second):
 		t.Fatal("no fleet notify after retained-tree transition")
 	}
+	select {
+	case <-sessionSub.Updates:
+	case <-time.After(2 * time.Second):
+		t.Fatal("no session notify after retained-tree transition")
+	}
 
 	// The handle must be marked non-actionable after the retained update.
 	deadline := time.After(2 * time.Second)
@@ -229,6 +252,79 @@ func TestStoppingTransitionNotifiesFleet(t *testing.T) {
 			t.Fatal("retained root still marked actionable")
 		case <-time.After(10 * time.Millisecond):
 		}
+	}
+
+	// A later admissible snapshot must restore actionability; before the
+	// explicit actionability commit this transition stayed disabled forever.
+	client.mu.Lock()
+	client.snapshot = rootTree("stop")
+	client.mu.Unlock()
+	deadline = time.After(2 * time.Second)
+	for {
+		m.mu.Lock()
+		actionable := m.roots[handle.socketPath].actionable
+		m.mu.Unlock()
+		if actionable {
+			break
+		}
+		select {
+		case <-deadline:
+			t.Fatal("recovered retained root did not become actionable")
+		case <-time.After(10 * time.Millisecond):
+		}
+	}
+	if _, err := m.actionableClient("stop"); err != nil {
+		t.Fatalf("recovered retained root still rejects actions: %v", err)
+	}
+}
+
+func TestSnapshotLoopKeepsInadmissibleRefreshNonActionableAndRecovers(t *testing.T) {
+	starting := rootTree("root")
+	starting.Lifecycle = string(supervisor.LifecycleStarting)
+	starting.PiSessionID = ""
+	starting.SessionFile = ""
+	client := &fakeClient{snapshot: starting}
+	m := fakeManager(nil)
+	m.opts.SnapshotInterval = 5 * time.Millisecond
+	handle := &rootHandle{
+		socketPath: "/tmp/refresh.root.sock", rootID: "root", actionable: true,
+		client: client, tree: rootTree("root"), mirror: newEventMirror(m.opts.EventLimits),
+	}
+	m.roots[handle.socketPath] = handle
+	m.routes["root"] = "root"
+	if m.monitorRoot(handle) != monitorStarted {
+		t.Fatal("monitorRoot did not start")
+	}
+	t.Cleanup(func() {
+		ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+		defer cancel()
+		_ = m.Close(ctx)
+	})
+
+	deadline := time.Now().Add(time.Second)
+	for !m.Fleet().Roots[0].Stale && time.Now().Before(deadline) {
+		time.Sleep(time.Millisecond)
+	}
+	state := m.Fleet().Roots[0]
+	if !state.Stale {
+		t.Fatal("inadmissible refresh did not mark root stale")
+	}
+	if state.Tree.Lifecycle != string(supervisor.LifecycleReady) {
+		t.Fatalf("inadmissible refresh replaced last good tree with %q", state.Tree.Lifecycle)
+	}
+	if err := m.Interrupt(context.Background(), "root"); err == nil {
+		t.Fatal("control reached root after inadmissible refresh")
+	}
+
+	client.mu.Lock()
+	client.snapshot = rootTree("root")
+	client.mu.Unlock()
+	deadline = time.Now().Add(time.Second)
+	for m.Fleet().Roots[0].Stale && time.Now().Before(deadline) {
+		time.Sleep(time.Millisecond)
+	}
+	if m.Fleet().Roots[0].Stale {
+		t.Fatal("admissible refresh did not recover stale root")
 	}
 }
 
@@ -332,6 +428,83 @@ func TestManagerCloseDoesNotStopAdmittedRoots(t *testing.T) {
 		if call == "Stop" {
 			t.Fatal("Close() called Stop on admitted root — must not")
 		}
+	}
+}
+
+func TestManagerQuiesceRejectsActionsAndStopsSnapshotPolling(t *testing.T) {
+	client := &fakeClient{snapshot: rootTree("root")}
+	m := fakeManager(nil)
+	m.opts.SnapshotInterval = 5 * time.Millisecond
+	handle := &rootHandle{
+		socketPath: "/tmp/quiesce.root.sock", rootID: "root", actionable: true,
+		client: client, tree: rootTree("root"), mirror: newEventMirror(m.opts.EventLimits),
+	}
+	m.roots[handle.socketPath] = handle
+	m.routes["root"] = "root"
+	if m.monitorRoot(handle) != monitorStarted {
+		t.Fatal("monitorRoot did not start")
+	}
+
+	deadline := time.Now().Add(time.Second)
+	for client.callCount("Snapshot") == 0 && time.Now().Before(deadline) {
+		time.Sleep(time.Millisecond)
+	}
+	if err := m.Quiesce(context.Background()); err != nil {
+		t.Fatal(err)
+	}
+	if err := m.Interrupt(context.Background(), "root"); err == nil {
+		t.Fatal("action succeeded after Quiesce")
+	}
+
+	// Allow an already-completing call to settle, then prove no new polls start.
+	time.Sleep(20 * time.Millisecond)
+	calls := client.callCount("Snapshot")
+	time.Sleep(30 * time.Millisecond)
+	if got := client.callCount("Snapshot"); got != calls {
+		t.Fatalf("snapshot polling continued after Quiesce: %d -> %d", calls, got)
+	}
+
+	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+	defer cancel()
+	if err := m.Close(ctx); err != nil {
+		t.Fatal(err)
+	}
+}
+
+func TestManagerQuiesceCancelsInFlightSnapshot(t *testing.T) {
+	client := &contextBlockingClient{
+		fakeClient: &fakeClient{snapshot: rootTree("root")},
+		entered:    make(chan struct{}),
+		exited:     make(chan struct{}),
+	}
+	m := fakeManager(nil)
+	m.opts.SnapshotInterval = time.Millisecond
+	handle := &rootHandle{
+		socketPath: "/tmp/blocked.root.sock", rootID: "root", actionable: true,
+		client: client, tree: rootTree("root"), mirror: newEventMirror(m.opts.EventLimits),
+	}
+	m.roots[handle.socketPath] = handle
+	m.routes["root"] = "root"
+	if m.monitorRoot(handle) != monitorStarted {
+		t.Fatal("monitorRoot did not start")
+	}
+	select {
+	case <-client.entered:
+	case <-time.After(time.Second):
+		t.Fatal("snapshot did not enter blocked call")
+	}
+	if err := m.Quiesce(context.Background()); err != nil {
+		t.Fatal(err)
+	}
+	select {
+	case <-client.exited:
+	case <-time.After(time.Second):
+		t.Fatal("Quiesce did not cancel in-flight snapshot")
+	}
+	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+	defer cancel()
+	if err := m.Close(ctx); err != nil {
+		t.Fatal(err)
 	}
 }
 

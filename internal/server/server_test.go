@@ -9,6 +9,7 @@ import (
 	"log/slog"
 	"net"
 	"net/http"
+	"slices"
 	"strings"
 	"testing"
 	"time"
@@ -504,6 +505,56 @@ func (f *fakeFleetManager) Quiesce(context.Context) error {
 func (f *fakeFleetManager) Close(context.Context) error {
 	f.events <- "close"
 	return nil
+}
+
+func TestManagerClosedOnServerStartupAndServeFailures(t *testing.T) {
+	logger, _ := testLogger()
+	failure := errors.New("boom")
+	tests := []struct {
+		name        string
+		listen      listenFunc
+		makeHandler handlerFactory
+	}{
+		{
+			name:   "listen",
+			listen: func(string, string) (net.Listener, error) { return nil, failure },
+			makeHandler: func(string, context.Context) (http.Handler, error) {
+				return http.NotFoundHandler(), nil
+			},
+		},
+		{
+			name: "handler",
+			listen: func(string, string) (net.Listener, error) {
+				return &acceptErrorListener{err: failure}, nil
+			},
+			makeHandler: func(string, context.Context) (http.Handler, error) { return nil, failure },
+		},
+		{
+			name: "serve",
+			listen: func(string, string) (net.Listener, error) {
+				return &acceptErrorListener{err: failure}, nil
+			},
+			makeHandler: func(string, context.Context) (http.Handler, error) {
+				return http.NotFoundHandler(), nil
+			},
+		},
+	}
+	for _, tc := range tests {
+		t.Run(tc.name, func(t *testing.T) {
+			fleet := newFakeFleetManager()
+			err := runWithManager(context.Background(), Options{ListenAddress: "127.0.0.1:0", Logger: logger}, fleet, tc.makeHandler, tc.listen, time.Second)
+			if err == nil {
+				t.Fatal("runWithManager returned nil")
+			}
+			var got []string
+			for len(fleet.events) > 0 {
+				got = append(got, <-fleet.events)
+			}
+			if !slices.Equal(got, []string{"quiesce", "close"}) {
+				t.Fatalf("manager cleanup events = %v, want [quiesce close]", got)
+			}
+		})
+	}
 }
 
 // TestManagerLifecycleOrder verifies the phased shutdown ordering:

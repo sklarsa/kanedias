@@ -3,6 +3,7 @@ package manager
 import (
 	"context"
 	"encoding/json"
+	"errors"
 	"fmt"
 
 	"github.com/sklarsa/kanedias/internal/supervisor"
@@ -59,6 +60,9 @@ func mustJSON(v any) json.RawMessage {
 func (m *Manager) actionableClient(sessionID string) (rootClient, error) {
 	m.mu.Lock()
 	defer m.mu.Unlock()
+	if m.quiesced || m.closed {
+		return nil, errors.New("manager: quiesced, actions are disabled")
+	}
 	rootID, ok := m.routes[sessionID]
 	if !ok {
 		return nil, fmt.Errorf("session %q not found", sessionID)
@@ -78,6 +82,9 @@ func (m *Manager) actionableClient(sessionID string) (rootClient, error) {
 func (m *Manager) actionableClientAndNode(sessionID string) (rootClient, supervisor.NodeSnapshot, error) {
 	m.mu.Lock()
 	defer m.mu.Unlock()
+	if m.quiesced || m.closed {
+		return nil, supervisor.NodeSnapshot{}, errors.New("manager: quiesced, actions are disabled")
+	}
 	rootID, ok := m.routes[sessionID]
 	if !ok {
 		return nil, supervisor.NodeSnapshot{}, fmt.Errorf("session %q not found", sessionID)

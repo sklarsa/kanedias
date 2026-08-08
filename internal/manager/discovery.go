@@ -16,7 +16,10 @@ import (
 // errHandleCancelled is returned by commitTree when the caller's handle has
 // already been cancelled (removed/displaced). It signals a stale monitor loop to
 // exit quietly rather than mark the (already-gone) root stale.
-var errHandleCancelled = errors.New("manager: root handle cancelled")
+var (
+	errHandleCancelled = errors.New("manager: root handle cancelled")
+	errManagerQuiesced = errors.New("manager: quiesced")
+)
 
 // rootHandle is the manager's in-memory record for one admitted root socket.
 //
@@ -103,10 +106,11 @@ func (m *Manager) discoverOnce(ctx context.Context) {
 		// Pre-probe identity check.
 		identity, err := inspectRootSocket(socketPath, os.Lstat, os.Geteuid())
 		if err != nil {
+			m.opts.Logger.Warn("discovery: candidate inspection failed", "socket", name, "err", err)
 			newIssues = append(newIssues, DiscoveryIssue{
 				SocketName: name,
 				Code:       "inspect_failed",
-				Message:    err.Error(),
+				Message:    "candidate validation failed",
 			})
 			continue
 		}
@@ -175,8 +179,9 @@ func (m *Manager) probeRoot(ctx context.Context, socketPath string, identity soc
 
 	client, err := m.factory(socketPath)
 	if err != nil {
+		m.opts.Logger.Warn("discovery: candidate connection failed", "socket", name, "err", err)
 		*issues = append(*issues, DiscoveryIssue{
-			SocketName: name, Code: "connect_failed", Message: err.Error(),
+			SocketName: name, Code: "connect_failed", Message: "candidate connection failed",
 		})
 		return false
 	}
@@ -184,8 +189,9 @@ func (m *Manager) probeRoot(ctx context.Context, socketPath string, identity soc
 	snapshot, err := client.Snapshot(ctx)
 	if err != nil {
 		_ = client.Close()
+		m.opts.Logger.Warn("discovery: candidate snapshot failed", "socket", name, "err", err)
 		*issues = append(*issues, DiscoveryIssue{
-			SocketName: name, Code: "probe_failed", Message: err.Error(),
+			SocketName: name, Code: "probe_failed", Message: "candidate snapshot failed",
 		})
 		return false
 	}
@@ -214,9 +220,10 @@ func (m *Manager) probeRoot(ctx context.Context, socketPath string, identity soc
 		return m.commitStoppingRoot(socketPath, identity, snapshot, client, issues)
 	default:
 		_ = client.Close()
+		m.opts.Logger.Warn("discovery: candidate has unrecognised lifecycle", "socket", name, "lifecycle", snapshot.Lifecycle)
 		*issues = append(*issues, DiscoveryIssue{
 			SocketName: name, Code: "malformed",
-			Message: fmt.Sprintf("unrecognised root lifecycle %q", snapshot.Lifecycle),
+			Message: "candidate snapshot has an unrecognised lifecycle",
 		})
 		return false
 	}
@@ -225,8 +232,9 @@ func (m *Manager) probeRoot(ctx context.Context, socketPath string, identity soc
 	normalized, candidate, err := validateRootTree(snapshot)
 	if err != nil {
 		_ = client.Close()
+		m.opts.Logger.Warn("discovery: malformed candidate tree", "socket", name, "err", err)
 		*issues = append(*issues, DiscoveryIssue{
-			SocketName: name, Code: "malformed", Message: "tree validation: " + err.Error(),
+			SocketName: name, Code: "malformed", Message: "candidate snapshot is malformed",
 		})
 		return false
 	}
@@ -249,8 +257,9 @@ func (m *Manager) probeRoot(ctx context.Context, socketPath string, identity soc
 	res, err := m.commitTree(handle, normalized, candidate)
 	if err != nil {
 		_ = client.Close()
+		m.opts.Logger.Warn("discovery: candidate route conflict", "socket", name, "err", err)
 		*issues = append(*issues, DiscoveryIssue{
-			SocketName: name, Code: "route_conflict", Message: err.Error(),
+			SocketName: name, Code: "route_conflict", Message: "candidate conflicts with an admitted root",
 		})
 		return false
 	}
@@ -281,8 +290,9 @@ func (m *Manager) commitStoppingRoot(socketPath string, identity socketIdentity,
 	normalized, candidate, err := validateRootTree(snapshot)
 	if err != nil {
 		_ = client.Close()
+		m.opts.Logger.Warn("discovery: malformed retained candidate tree", "socket", name, "err", err)
 		*issues = append(*issues, DiscoveryIssue{
-			SocketName: name, Code: "malformed", Message: "stopping tree validation: " + err.Error(),
+			SocketName: name, Code: "malformed", Message: "candidate snapshot is malformed",
 		})
 		return false
 	}
@@ -296,8 +306,9 @@ func (m *Manager) commitStoppingRoot(socketPath string, identity socketIdentity,
 	res, err := m.commitTree(handle, normalized, candidate)
 	if err != nil {
 		_ = client.Close()
+		m.opts.Logger.Warn("discovery: retained candidate route conflict", "socket", name, "err", err)
 		*issues = append(*issues, DiscoveryIssue{
-			SocketName: name, Code: "route_conflict", Message: err.Error(),
+			SocketName: name, Code: "route_conflict", Message: "candidate conflicts with an admitted root",
 		})
 		return false
 	}
@@ -342,8 +353,18 @@ type commitResult struct {
 //     outside the lock (MGR-A). This never Closes a client a running loop may
 //     still call under the lock.
 func (m *Manager) commitTree(handle *rootHandle, tree supervisor.NodeSnapshot, candidate map[string]string) (commitResult, error) {
+	return m.commitTreeWithActionability(handle, tree, candidate, handle.actionable)
+}
+
+func (m *Manager) commitTreeWithActionability(handle *rootHandle, tree supervisor.NodeSnapshot, candidate map[string]string, actionable bool) (commitResult, error) {
 	m.mu.Lock()
 	defer m.mu.Unlock()
+
+	// Quiesce is an admission barrier: probes or spawns already in flight must
+	// not register a root after shutdown has begun.
+	if m.quiesced || m.closed {
+		return commitResult{}, errManagerQuiesced
+	}
 
 	// Guard against a stale monitor loop: if the caller's handle has already been
 	// cancelled (removed or displaced), its in-flight snapshot iteration must NOT
@@ -394,8 +415,10 @@ func (m *Manager) commitTree(handle *rootHandle, tree supervisor.NodeSnapshot, c
 			if handle.client != nil && handle.client != existing.client {
 				_ = handle.client.Close()
 			}
-			existing.rootID = handle.rootID
-			existing.actionable = handle.actionable
+			// Identity equality above also guarantees rootID equality. Keep rootID
+			// immutable once monitoring starts so event-loop reads cannot race a
+			// redundant same-value write from concurrent discovery.
+			existing.actionable = actionable
 			target = existing
 		} else {
 			// Socket was replaced (new inode) under the same name. We must NOT
@@ -422,6 +445,7 @@ func (m *Manager) commitTree(handle *rootHandle, tree supervisor.NodeSnapshot, c
 		m.routes[sessionID] = rootID
 	}
 	target.tree = tree
+	target.actionable = actionable
 	if target.mirror == nil {
 		target.mirror = newEventMirror(m.opts.EventLimits)
 	}

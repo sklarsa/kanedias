@@ -187,6 +187,25 @@ func TestValidateRootTreeRejectsWrongRootID(t *testing.T) {
 	}
 }
 
+func TestValidateRootTreeRejectsRootParentAndContext(t *testing.T) {
+	tests := []struct {
+		name string
+		edit func(*supervisor.NodeSnapshot)
+	}{
+		{name: "parent", edit: func(tree *supervisor.NodeSnapshot) { tree.ParentSessionID = "parent" }},
+		{name: "context", edit: func(tree *supervisor.NodeSnapshot) { tree.Context = contract.ContextFresh }},
+	}
+	for _, tc := range tests {
+		t.Run(tc.name, func(t *testing.T) {
+			tree := rootTree("root")
+			tc.edit(&tree)
+			if _, _, err := validateRootTree(tree); err == nil {
+				t.Fatalf("accepted root with invalid %s", tc.name)
+			}
+		})
+	}
+}
+
 func TestValidateRootTreeRejectsRootKindBelowTop(t *testing.T) {
 	child := childTree("child", "root")
 	child.Kind = contract.ChildKindRoot
@@ -574,6 +593,26 @@ func TestDiscoverOnceMalformedTreeExposesIssue(t *testing.T) {
 	}
 }
 
+func TestDiscoveryIssuesDoNotExposeAbsoluteSocketPaths(t *testing.T) {
+	dir := t.TempDir()
+	if err := os.Chmod(dir, 0o700); err != nil {
+		t.Fatal(err)
+	}
+	candidate := filepath.Join(dir, "invalid.root.sock")
+	if err := os.WriteFile(candidate, []byte("not a socket"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	m := fakeManager(nil)
+	m.opts.RootSocketDir = dir
+	m.discoverOnce(context.Background())
+	if len(m.discoveryIssues) != 1 {
+		t.Fatalf("issues = %#v", m.discoveryIssues)
+	}
+	if strings.Contains(m.discoveryIssues[0].Message, dir) || strings.Contains(m.discoveryIssues[0].Message, candidate) {
+		t.Fatalf("public discovery issue exposed absolute path: %#v", m.discoveryIssues[0])
+	}
+}
+
 func TestDiscoverOnceNeverCallsOsRemove(t *testing.T) {
 	// This test verifies os.Remove is never called by checking that a symlink
 	// candidate is simply ignored, not deleted.
@@ -606,6 +645,20 @@ func TestCommitTreeRouteConflictReturnsError(t *testing.T) {
 	candidate := map[string]string{"shared": "root-b"}
 	if _, err := m.commitTree(handle, supervisor.NodeSnapshot{}, candidate); err == nil {
 		t.Fatal("expected route conflict error")
+	}
+}
+
+func TestCommitTreeRejectsAdmissionAfterQuiesce(t *testing.T) {
+	m := fakeManager(nil)
+	if err := m.Quiesce(context.Background()); err != nil {
+		t.Fatal(err)
+	}
+	handle := &rootHandle{socketPath: "/tmp/late.root.sock", rootID: "late", actionable: true}
+	if _, err := m.commitTree(handle, rootTree("late"), map[string]string{"late": "late"}); !errors.Is(err, errManagerQuiesced) {
+		t.Fatalf("commitTree error = %v, want errManagerQuiesced", err)
+	}
+	if len(m.roots) != 0 || len(m.routes) != 0 {
+		t.Fatalf("quiesced commit mutated manager: roots=%d routes=%d", len(m.roots), len(m.routes))
 	}
 }
 

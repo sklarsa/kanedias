@@ -29,6 +29,7 @@ import (
 
 	incus "github.com/lxc/incus/v7/client"
 	"github.com/lxc/incus/v7/shared/api"
+	"github.com/pelletier/go-toml/v2"
 	"github.com/sklarsa/kanedias/internal/config"
 	"github.com/sklarsa/kanedias/internal/incusclient"
 	"github.com/sklarsa/kanedias/internal/supervisor"
@@ -47,6 +48,45 @@ const (
 	metadataVolume  = "user.kanedias.workspace_volume"
 	metadataRun     = "user.kanedias.e2e_run"
 )
+
+func TestWriteManagedConfigMergesExistingTables(t *testing.T) {
+	dir := t.TempDir()
+	source := filepath.Join(dir, "source.toml")
+	if err := os.WriteFile(source, []byte(`
+[server]
+discovery_interval = "7s"
+root_socket_dir = "/old"
+
+[supervisor.events]
+max_events = 1
+
+[extra]
+value = "preserved"
+`), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	h := &liveAcceptance{t: t, runDir: dir, configPath: source, binary: "/tmp/kanedias"}
+	generated := h.writeManagedConfig("/tmp/roots", "/tmp/logs")
+	data, err := os.ReadFile(generated)
+	if err != nil {
+		t.Fatal(err)
+	}
+	var document map[string]any
+	if err := toml.Unmarshal(data, &document); err != nil {
+		t.Fatalf("generated config is invalid TOML: %v\n%s", err, data)
+	}
+	serverTable := document["server"].(map[string]any)
+	if serverTable["root_socket_dir"] != "/tmp/roots" || serverTable["discovery_interval"] != "7s" {
+		t.Fatalf("server table was not merged: %#v", serverTable)
+	}
+	eventsTable := document["supervisor"].(map[string]any)["events"].(map[string]any)
+	if eventsTable["max_events"] != int64(256) || eventsTable["max_bytes"] != int64(4<<20) {
+		t.Fatalf("event table was not overridden: %#v", eventsTable)
+	}
+	if document["extra"].(map[string]any)["value"] != "preserved" {
+		t.Fatalf("unrelated table was not preserved: %#v", document)
+	}
+}
 
 // requireLiveSupervisorAuthorization gates any live Incus acceptance test.
 // It must be the first call in every test body so that the skip fires before
@@ -123,9 +163,10 @@ type liveAcceptance struct {
 	client   *incusclient.Client
 	baseline resourceSnapshot
 
-	proxy   *acceptanceProcess
-	roots   []*acceptanceProcess
-	streams []*sseCapture
+	proxy     *acceptanceProcess
+	roots     []*acceptanceProcess
+	processes []*acceptanceProcess
+	streams   []*sseCapture
 
 	// managedSocketDir is the short root-socket directory used by the
 	// server-managed lifecycle test (kept short to stay under UNIX_PATH_MAX).
@@ -321,8 +362,14 @@ func (h *liveAcceptance) run() {
 }
 
 func (h *liveAcceptance) close() {
-	for _, root := range h.roots {
-		h.stopProcess(root, syscall.SIGTERM, 30*time.Second)
+	// Managed roots are not children tracked by startProcess; stop them through
+	// their own sockets before tearing down server processes or Incus resources.
+	h.stopManagedRoots()
+	h.mu.Lock()
+	processes := append([]*acceptanceProcess(nil), h.processes...)
+	h.mu.Unlock()
+	for i := len(processes) - 1; i >= 0; i-- {
+		h.stopProcess(processes[i], syscall.SIGTERM, 30*time.Second)
 	}
 	h.stopProxy()
 	for _, stream := range h.streams {
@@ -361,6 +408,57 @@ func (h *liveAcceptance) close() {
 		return
 	}
 	h.t.Logf("persistent live acceptance failure artifacts: %s", h.runDir)
+}
+
+func (h *liveAcceptance) stopManagedRoots() {
+	if h.managedSocketDir == "" {
+		return
+	}
+	entries, err := os.ReadDir(h.managedSocketDir)
+	if err != nil {
+		if !errors.Is(err, os.ErrNotExist) {
+			h.t.Errorf("read managed socket dir during cleanup: %v", err)
+		}
+		return
+	}
+	var sockets []string
+	for _, entry := range entries {
+		if !strings.HasSuffix(entry.Name(), ".root.sock") {
+			continue
+		}
+		socketPath := filepath.Join(h.managedSocketDir, entry.Name())
+		var tree supervisor.NodeSnapshot
+		if err := unixJSON(unixHTTPClient(socketPath), http.MethodGet, "/v1/tree", nil, &tree); err != nil || tree.SessionID == "" {
+			continue
+		}
+		var accepted struct {
+			Status string `json:"status"`
+		}
+		if err := unixJSON(unixHTTPClient(socketPath), http.MethodDelete, "/v1/sessions/"+url.PathEscape(tree.SessionID), nil, &accepted); err != nil {
+			h.t.Errorf("stop managed root %s during cleanup: %v", tree.SessionID, err)
+			continue
+		}
+		sockets = append(sockets, socketPath)
+	}
+
+	deadline := time.Now().Add(30 * time.Second)
+	for len(sockets) > 0 && time.Now().Before(deadline) {
+		remaining := sockets[:0]
+		for _, socketPath := range sockets {
+			if _, err := os.Lstat(socketPath); err == nil {
+				remaining = append(remaining, socketPath)
+			} else if !errors.Is(err, os.ErrNotExist) {
+				h.t.Errorf("inspect managed root socket during cleanup: %v", err)
+			}
+		}
+		sockets = remaining
+		if len(sockets) > 0 {
+			time.Sleep(100 * time.Millisecond)
+		}
+	}
+	if len(sockets) > 0 {
+		h.t.Errorf("managed root sockets remained after cleanup: %v", sockets)
+	}
 }
 
 func (h *liveAcceptance) buildReviewedCheckout() {
@@ -1138,6 +1236,9 @@ func (h *liveAcceptance) startProcess(label, executable string, arguments ...str
 		_ = log.Close()
 		close(process.done)
 	}()
+	h.mu.Lock()
+	h.processes = append(h.processes, process)
+	h.mu.Unlock()
 	return process
 }
 
@@ -1604,9 +1705,11 @@ func (h *liveAcceptance) runServerManaged() {
 	roots := h.waitForManagedRoots(rootSocketDir, serverOrigin, server, 2)
 	h.t.Logf("managed roots discovered: %v", roots)
 
-	// Steer each idle root so their event buffers advance.
+	// Answer each root's controlled blocking-question fixture through the server,
+	// then steer it so the event buffer advances before restart.
 	for _, root := range roots {
 		h.trackSession(root.SessionID)
+		h.answerManagedQuestion(client, serverOrigin, root.SessionID, "deterministic-answer")
 		h.postDatastar(client, serverOrigin+"/ui/sessions/"+url.PathEscape(root.SessionID)+"/steer",
 			map[string]any{"message": "Reply with exactly MANAGED_ROOT_OK."})
 	}
@@ -1637,8 +1740,7 @@ func (h *liveAcceptance) runServerManaged() {
 	h.trackSession(descendant.SessionID)
 	h.t.Logf("managed descendant discovered: session=%s", descendant.SessionID)
 
-	// Steer, interrupt, then answer a question on the descendant (question may not
-	// materialise if the model does not block; we attempt anyway and ignore 404).
+	// Steer, interrupt, then answer the descendant's controlled question.
 	h.postDatastar(restartedClient, actionURL(restartedOrigin, descendant.SessionID, "steer"),
 		map[string]any{"message": "Focus on the acceptance marker."})
 	h.postDatastar(restartedClient, actionURL(restartedOrigin, descendant.SessionID, "interrupt"),
@@ -1661,27 +1763,38 @@ func (h *liveAcceptance) runServerManaged() {
 	h.success = true
 }
 
-// writeManagedConfig copies the authorized config to a run-local file and
-// appends [server] and [supervisor.events] sections that point to private
-// run-local directories. Returns the absolute path to the generated config file.
+// writeManagedConfig merges run-local server and event settings into the
+// authorized config. Re-encoding avoids invalid duplicate TOML table
+// declarations when the source already contains [server] or
+// [supervisor.events]. Returns the generated config's absolute path.
 func (h *liveAcceptance) writeManagedConfig(rootSocketDir, sessionLogDir string) string {
 	src, err := os.ReadFile(h.configPath)
 	if err != nil {
 		h.t.Fatal(err)
 	}
-	// Append run-local overrides. The TOML decoder takes the last value wins for
-	// duplicate keys within the same table, but to be safe we build new tables.
-	appendix := fmt.Sprintf(`
-[server]
-root_socket_dir = %q
-session_log_dir = %q
-session_binary  = %q
-
-[supervisor.events]
-max_events = 256
-max_bytes  = 4194304
-`, rootSocketDir, sessionLogDir, h.binary)
-	combined := append(append([]byte(nil), src...), []byte(appendix)...)
+	var document map[string]any
+	if err := toml.Unmarshal(src, &document); err != nil {
+		h.t.Fatalf("decode managed acceptance config: %v", err)
+	}
+	table := func(parent map[string]any, name string) map[string]any {
+		if existing, ok := parent[name].(map[string]any); ok {
+			return existing
+		}
+		created := make(map[string]any)
+		parent[name] = created
+		return created
+	}
+	serverTable := table(document, "server")
+	serverTable["root_socket_dir"] = rootSocketDir
+	serverTable["session_log_dir"] = sessionLogDir
+	serverTable["session_binary"] = h.binary
+	eventsTable := table(table(document, "supervisor"), "events")
+	eventsTable["max_events"] = int64(256)
+	eventsTable["max_bytes"] = int64(4 << 20)
+	combined, err := toml.Marshal(document)
+	if err != nil {
+		h.t.Fatalf("encode managed acceptance config: %v", err)
+	}
 	dest := filepath.Join(h.runDir, "managed-config.toml")
 	if err := os.WriteFile(dest, combined, 0o600); err != nil {
 		h.t.Fatal(err)
@@ -1821,7 +1934,17 @@ func (h *liveAcceptance) postDatastar(client *http.Client, fullURL string, body 
 	if err != nil {
 		h.t.Fatalf("postDatastar: POST %s: %v", fullURL, err)
 	}
+	responseBody, readErr := io.ReadAll(io.LimitReader(resp.Body, 1<<20))
 	_ = resp.Body.Close()
+	if readErr != nil {
+		h.t.Fatalf("postDatastar: read POST %s response: %v", fullURL, readErr)
+	}
+	if resp.StatusCode < 200 || resp.StatusCode >= 300 {
+		h.t.Fatalf("postDatastar: POST %s status=%d body=%s", fullURL, resp.StatusCode, responseBody)
+	}
+	if !bytes.Contains(responseBody, []byte("Command sent.")) {
+		h.t.Fatalf("postDatastar: POST %s did not acknowledge success: %s", fullURL, responseBody)
+	}
 }
 
 // waitForManagedRoots polls rootSocketDir until exactly n *.root.sock files
@@ -1942,7 +2065,10 @@ func (h *liveAcceptance) assertFleetContainsExactly(client *http.Client, serverO
 		_ = resp.Body.Close()
 		body := buf.String()
 		for _, root := range roots {
-			if !strings.Contains(body, root.SessionID) {
+			// data-root is emitted once on the top-level <details>; counting that
+			// stable marker avoids false positives from repeated text/data fields.
+			marker := `data-root="` + root.SessionID + `"`
+			if strings.Count(body, marker) != 1 {
 				return false
 			}
 		}
@@ -1974,52 +2100,30 @@ func actionURL(serverOrigin, sessionID, action string) string {
 	return serverOrigin + "/ui/sessions/" + url.PathEscape(sessionID) + "/" + action
 }
 
-// answerManagedQuestion probes the root socket for a pending question and posts
-// the answer to the server. If no question is present the call is a no-op.
+// answerManagedQuestion waits for the controlled pending question and answers it
+// through the server. Absence is a test failure: this acceptance path promises
+// to prove browser-to-supervisor question routing.
 func (h *liveAcceptance) answerManagedQuestion(client *http.Client, serverOrigin, sessionID, answer string) {
-	// Resolve the root socket path from the session ID.
-	var rootSocketPath string
-	for _, root := range h.roots {
-		// h.roots holds the supervisor processes started by startRoot; for
-		// managed roots we need to scan the socket dir directly.
-		_ = root
-	}
-	// We don't have a direct roots index for managed roots, so look up via
-	// the fleet. Locate the managed socket from the short managed socket dir.
-	managedSocketDir := h.managedSocketDir
-	entries, err := os.ReadDir(managedSocketDir)
-	if err != nil {
-		return
-	}
-	for _, entry := range entries {
-		if !strings.HasSuffix(entry.Name(), ".root.sock") {
-			continue
+	var question supervisor.QuestionSummary
+	h.poll(time.Minute, "managed question for session "+sessionID, func() bool {
+		entries, err := os.ReadDir(h.managedSocketDir)
+		if err != nil {
+			return false
 		}
-		sockPath := filepath.Join(managedSocketDir, entry.Name())
-		uc := unixHTTPClient(sockPath)
-		var tree supervisor.NodeSnapshot
-		if unixJSON(uc, http.MethodGet, "/v1/tree", nil, &tree) != nil {
-			continue
+		for _, entry := range entries {
+			if !strings.HasSuffix(entry.Name(), ".root.sock") {
+				continue
+			}
+			sockPath := filepath.Join(h.managedSocketDir, entry.Name())
+			var tree supervisor.NodeSnapshot
+			if unixJSON(unixHTTPClient(sockPath), http.MethodGet, "/v1/tree", nil, &tree) != nil || !treeContainsSession(tree, sessionID) {
+				continue
+			}
+			question = findQuestion(tree, sessionID)
+			return question.ID != ""
 		}
-		if treeContainsSession(tree, sessionID) {
-			rootSocketPath = sockPath
-			break
-		}
-	}
-	if rootSocketPath == "" {
-		// Session not found; skip answering.
-		return
-	}
-	uc := unixHTTPClient(rootSocketPath)
-	var tree supervisor.NodeSnapshot
-	if unixJSON(uc, http.MethodGet, "/v1/tree", nil, &tree) != nil {
-		return
-	}
-	question := findQuestion(tree, sessionID)
-	if question.ID == "" {
-		// No pending question; nothing to answer.
-		return
-	}
+		return false
+	})
 	h.postDatastar(client, serverOrigin+"/ui/sessions/"+url.PathEscape(sessionID)+"/questions/"+url.PathEscape(question.ID),
 		map[string]any{"value": answer})
 }

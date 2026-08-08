@@ -50,6 +50,12 @@ func validateRootTree(root supervisor.NodeSnapshot) (supervisor.NodeSnapshot, ma
 	if root.RootSessionID != root.SessionID {
 		return supervisor.NodeSnapshot{}, nil, fmt.Errorf("root node RootSessionID %q != SessionID %q", root.RootSessionID, root.SessionID)
 	}
+	if root.ParentSessionID != "" {
+		return supervisor.NodeSnapshot{}, nil, fmt.Errorf("root node has ParentSessionID %q", root.ParentSessionID)
+	}
+	if root.Context != contract.ContextRoot {
+		return supervisor.NodeSnapshot{}, nil, fmt.Errorf("root node context %q is not root", root.Context)
+	}
 	if root.SessionID == "" {
 		return supervisor.NodeSnapshot{}, nil, fmt.Errorf("root node has empty SessionID")
 	}
