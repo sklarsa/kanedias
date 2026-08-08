@@ -209,7 +209,15 @@ func newLiveAcceptance(t *testing.T) *liveAcceptance {
 	t.Helper()
 	ctx, cancel := context.WithTimeout(context.Background(), liveTimeout)
 	repoRoot := commandOutput(t, "git", "rev-parse", "--show-toplevel")
-	configPath, err := filepath.Abs(os.Getenv("KANEDIAS_CONFIG"))
+	// Resolve KANEDIAS_CONFIG relative to the repo root, not the test process's
+	// working directory (which go test sets to the package dir, so the documented
+	// "./config.toml" would otherwise resolve to a nonexistent package-local path).
+	configEnv := os.Getenv("KANEDIAS_CONFIG")
+	configPath := configEnv
+	if !filepath.IsAbs(configPath) {
+		configPath = filepath.Join(repoRoot, configPath)
+	}
+	configPath, err := filepath.Abs(configPath)
 	if err != nil {
 		cancel()
 		t.Fatal(err)
