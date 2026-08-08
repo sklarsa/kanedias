@@ -144,6 +144,7 @@ func TestCreateRunsImageWorkflowInOrder(t *testing.T) {
 		"push /root/assets/authorized_hosts",
 		"push /root/assets/pi-settings.json",
 		"push /root/assets/pi-auth.json",
+		"push /root/assets/pi-models.json",
 		"push /root/assets/cobalt-ember.json",
 		"push /root/assets/tmux.conf",
 		"push /root/assets/kanedias-pi.socket",
@@ -390,6 +391,7 @@ func imageConfig(t *testing.T, hosts []string) config.Config {
 	for name, content := range map[string]string{
 		"pi-settings.json":  "settings",
 		"pi-auth.json":      "auth",
+		"pi-models.json":    "models",
 		"cobalt-ember.json": "theme",
 		"tmux.conf":         "tmux",
 	} {

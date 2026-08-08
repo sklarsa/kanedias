@@ -20,6 +20,7 @@ managed_home="/home/$managed_user"
 authorized_hosts_file="$assets_dir/authorized_hosts"
 pi_settings_file="$assets_dir/pi-settings.json"
 pi_auth_file="$assets_dir/pi-auth.json"
+pi_models_file="$assets_dir/pi-models.json"
 pi_theme_file="$assets_dir/cobalt-ember.json"
 tmux_config_file="$assets_dir/tmux.conf"
 pi_rpc_socket_file="$assets_dir/kanedias-pi.socket"
@@ -28,7 +29,7 @@ pi_rpc_launcher_file="$assets_dir/kanedias-pi-rpc"
 pi_extension_dir="$assets_dir/pi-extension"
 
 for required_file in \
-    "$authorized_hosts_file" "$pi_settings_file" "$pi_auth_file" \
+    "$authorized_hosts_file" "$pi_settings_file" "$pi_auth_file" "$pi_models_file" \
     "$pi_theme_file" "$tmux_config_file" "$pi_rpc_socket_file" "$pi_rpc_service_file" \
     "$pi_rpc_launcher_file"; do
     if [[ ! -f $required_file ]]; then
@@ -492,6 +493,8 @@ EOF
         "$pi_settings_file" "$managed_home/.pi/agent/settings.json"
     install -m 0600 -o "$managed_user" -g "$managed_user" \
         "$pi_auth_file" "$managed_home/.pi/agent/auth.json"
+    install -m 0644 -o "$managed_user" -g "$managed_user" \
+        "$pi_models_file" "$managed_home/.pi/agent/models.json"
     install -m 0644 -o "$managed_user" -g "$managed_user" \
         "$pi_theme_file" "$managed_home/.pi/agent/themes/cobalt-ember.json"
 }
