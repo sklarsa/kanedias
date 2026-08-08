@@ -1566,6 +1566,11 @@ func (h *liveAcceptance) shortSocketDir() string {
 func (h *liveAcceptance) runServerManaged() {
 	h.buildReviewedCheckout()
 
+	// Spawned roots require the egress proxy listener to be reachable before they
+	// provision; without it every SpawnRoot dies with proxy_unavailable and no
+	// root socket is ever created. close() stops the owned proxy at teardown.
+	h.startProxy()
+
 	// Create a run-local managed config that overlays server and supervisor.events
 	// directories onto the authorized config. Logs land in the isolated runDir, but
 	// the root socket dir MUST be short: a root socket is <32-hex-token>.root.sock
