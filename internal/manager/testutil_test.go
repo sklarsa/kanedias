@@ -4,7 +4,10 @@ import (
 	"context"
 	"encoding/json"
 	"log/slog"
+	"os"
+	"path/filepath"
 	"sync"
+	"testing"
 
 	"github.com/sklarsa/kanedias/internal/supervisor"
 	"github.com/sklarsa/kanedias/internal/supervisor/contract"
@@ -112,4 +115,24 @@ func fakeManager(factory clientFactory) *Manager {
 
 func discardLogger() *slog.Logger {
 	return slog.New(slog.DiscardHandler)
+}
+
+// shortTempDirs creates two short-path temporary directories suitable for
+// use as RootSocketDir and SessionLogDir in spawn tests. Unix socket paths
+// are limited to 107 bytes on Linux, so we use /tmp directly.
+func shortTempDirs(t *testing.T) (rootDir, logDir string) {
+	t.Helper()
+	base, err := os.MkdirTemp("/tmp", "kmgr-")
+	if err != nil {
+		t.Fatalf("shortTempDirs MkdirTemp: %v", err)
+	}
+	t.Cleanup(func() { os.RemoveAll(base) })
+	rootDir = filepath.Join(base, "r")
+	logDir = filepath.Join(base, "l")
+	for _, d := range []string{rootDir, logDir} {
+		if err := os.Mkdir(d, 0o700); err != nil {
+			t.Fatalf("shortTempDirs Mkdir: %v", err)
+		}
+	}
+	return rootDir, logDir
 }

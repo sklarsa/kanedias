@@ -31,6 +31,7 @@ type Manager struct {
 	routes          map[string]string      // sessionID -> rootID
 	discoveryIssues []DiscoveryIssue
 	factory         clientFactory
+	starter         processStarter
 	closed          bool
 	quiesced        bool
 	// monitoring infrastructure
@@ -137,6 +138,7 @@ func New(opts Options) (*Manager, error) {
 		roots:         make(map[string]*rootHandle),
 		routes:        make(map[string]string),
 		factory:       defaultClientFactory,
+		starter:       osProcessStarter{},
 		closeCtx:      ctx,
 		closeCancel:   cancel,
 		fleetFanout:   newChangeFanout(supervisor.DefaultSubscriberMailboxCapacity),
@@ -333,11 +335,6 @@ func (m *Manager) SubscribeSession(sessionID string) (ChangeSubscription, error)
 		return ChangeSubscription{}, errNotImplemented
 	}
 	return m.sessionFanout.Subscribe(), nil
-}
-
-// SpawnRoot launches a detached root supervisor and admits it.
-func (m *Manager) SpawnRoot(ctx context.Context) (string, error) {
-	return "", errNotImplemented
 }
 
 // Steer sends a streaming steer or an idle prompt to a session.
