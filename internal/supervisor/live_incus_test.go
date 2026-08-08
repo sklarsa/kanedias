@@ -739,6 +739,28 @@ func (h *liveAcceptance) startNestedDelegation(client *http.Client, rootID, labe
 	}()
 }
 
+// spawnManagedChild deterministically creates one read-only descendant of rootID by
+// POSTing to the root supervisor's /v1/sessions/{id}/children seam — the same seam that
+// delegate_session (and pi-subagents' child spawn, via SupervisorClient.createChild)
+// exercises — so the descendant does not depend on a model choosing to call the tool.
+// The POST runs in the background because the supervisor responds only once the child
+// reaches a terminal result; the caller polls /v1/tree for the child's appearance and
+// may steer/interrupt/stop it while it is still live.
+func (h *liveAcceptance) spawnManagedChild(client *http.Client, rootID, label string) {
+	request := map[string]any{
+		"workerType": "reviewer",
+		"kind":       "read",
+		"context":    "fresh",
+		"task":       "Reply with exactly KANEDIAS_E2E_MANAGED_DESCENDANT_OK.",
+	}
+	h.async.Add(1)
+	go func() {
+		defer h.async.Done()
+		status, body, err := unixRequest(client, http.MethodPost, "/v1/sessions/"+rootID+"/children", request)
+		h.writeJSON(label+"-managed-child-result.json", map[string]any{"status": status, "body": string(body), "error": errorString(err)})
+	}()
+}
+
 func (h *liveAcceptance) rpc(client *http.Client, sessionID string, command map[string]any) map[string]any {
 	var response map[string]any
 	if err := unixJSON(client, http.MethodPost, "/v1/sessions/"+sessionID+"/rpc", command, &response); err != nil {
@@ -1627,11 +1649,12 @@ func (h *liveAcceptance) runServerManaged() {
 	h.assertFleetContainsExactly(restartedClient, restartedOrigin, roots)
 
 	// --- Exercise real controls and cleanup ---
-	// Have the first root create a controlled descendant by steering it with a
-	// delegate_session request.
-	descendantTask := "Use delegate_session exactly once with workerType reviewer, kind read, context fresh, task \"Reply KANEDIAS_E2E_MANAGED_DESCENDANT_OK exactly\". After it returns reproduce its answer."
-	h.postDatastar(restartedClient, actionURL(restartedOrigin, roots[0].SessionID, "steer"),
-		map[string]any{"message": descendantTask})
+	// Have the first root create a controlled descendant deterministically through
+	// the root supervisor's /v1/sessions/{id}/children seam (the same seam that
+	// delegate_session — and pi-subagents' child spawn — uses), instead of steering
+	// the root with a natural-language prompt and depending on the model choosing
+	// to call delegate_session.
+	h.spawnManagedChild(unixHTTPClient(roots[0].SocketPath), roots[0].SessionID, "managed-descendant")
 
 	descendant := h.waitForManagedDescendant(roots[0].SocketPath, roots[0].SessionID)
 	h.trackSession(descendant.SessionID)
@@ -1653,6 +1676,13 @@ func (h *liveAcceptance) runServerManaged() {
 		h.postDatastar(restartedClient, actionURL(restartedOrigin, root.SessionID, "stop"), map[string]any{})
 	}
 
+	// Stop actions are asynchronous; wait until every session's Incus resources are
+	// actually released before asserting the baseline so the assertion is not racing
+	// the background teardown.
+	h.poll(2*time.Minute, "managed descendant and root resource cleanup", func() bool {
+		return h.sessionsAbsent([]string{roots[0].SessionID, roots[1].SessionID, descendant.SessionID})
+	})
+
 	// Stop the second server cleanly.
 	h.stopProcess(restarted, syscall.SIGTERM, 30*time.Second)
 
@@ -1661,16 +1691,81 @@ func (h *liveAcceptance) runServerManaged() {
 	h.success = true
 }
 
+// dropTables returns a copy of the TOML text with any top-level tables whose names
+// are in dropped removed (including their nested keys). This lets run-local overrides
+// be appended without hitting the TOML error "table already exists" when the base
+// config already declares the same section (e.g. [server] or [supervisor.events]).
+func dropTables(src string, dropped ...string) string {
+	drop := make(map[string]bool, len(dropped))
+	for _, name := range dropped {
+		drop[name] = true
+	}
+	lines := strings.Split(src, "\n")
+	var out []string
+	for i := 0; i < len(lines); i++ {
+		line := lines[i]
+		if strings.HasPrefix(line, "[") {
+			// Capture the leading table name, e.g. "[server]" or "[workspace.incus]".
+			if end := strings.IndexByte(line, ']'); end >= 0 {
+				name := strings.TrimSpace(line[1:end])
+				if drop[name] || dropsSubtableOf(drop, name) {
+					// Skip until the next table header at column 0.
+					i++
+					for i < len(lines) && !strings.HasPrefix(lines[i], "[") {
+						i++
+					}
+					i-- // let the loop consume the next header normally
+					continue
+				}
+			}
+		}
+		out = append(out, line)
+	}
+	return strings.Join(out, "\n")
+}
+
+// dropsSubtableOf reports whether name is a nested subtable (e.g. "server.details")
+// of a dropped parent table ("server"); every matching name prefix is also dropped.
+func dropsSubtableOf(drop map[string]bool, name string) bool {
+	for parent := range drop {
+		if strings.HasPrefix(name, parent+".") {
+			return true
+		}
+	}
+	return false
+}
+
 // writeManagedConfig copies the authorized config to a run-local file and
-// appends [server] and [supervisor.events] sections that point to private
-// run-local directories. Returns the absolute path to the generated config file.
+// appends [server], [supervisor.events], and (optionally) [workers.*] sections
+// that point to private run-local directories, dropping any existing copies of the
+// overridden tables so the TOML stays valid. Returns the absolute path to the
+// generated config file.
+//
+// When KANEDIAS_E2E_WORKER_PROVIDER and KANEDIAS_E2E_WORKER_MODEL are set, every
+// worker (including the reviewer worker a spawnManagedChild descendant uses) is
+// pointed at that provider/model. This lets the live E2E tests run against a free
+// local model without editing the committed config.toml.
 func (h *liveAcceptance) writeManagedConfig(rootSocketDir, sessionLogDir string) string {
 	src, err := os.ReadFile(h.configPath)
 	if err != nil {
 		h.t.Fatal(err)
 	}
-	// Append run-local overrides. The TOML decoder takes the last value wins for
-	// duplicate keys within the same table, but to be safe we build new tables.
+	// Drop any existing [server] / [supervisor.events] tables (which the appended
+	// overrides replace) so a base config that already declares them does not fail
+	// with a "table already exists" parse error.
+	dropped := []string{"server", "supervisor.events"}
+
+	provider := strings.TrimSpace(os.Getenv("KANEDIAS_E2E_WORKER_PROVIDER"))
+	model := strings.TrimSpace(os.Getenv("KANEDIAS_E2E_WORKER_MODEL"))
+	if provider != "" && model != "" && h.cfg.Workers != nil {
+		// The worker override replaces every [workers.*] table.
+		for name := range h.cfg.Workers {
+			dropped = append(dropped, "workers."+name)
+		}
+	}
+	base := dropTables(string(src), dropped...)
+
+	// Append run-local overrides.
 	appendix := fmt.Sprintf(`
 [server]
 root_socket_dir = %q
@@ -1681,7 +1776,18 @@ session_binary  = %q
 max_events = 256
 max_bytes  = 4194304
 `, rootSocketDir, sessionLogDir, h.binary)
-	combined := append(append([]byte(nil), src...), []byte(appendix)...)
+
+	var b strings.Builder
+	for name, profile := range h.cfg.Workers {
+		fmt.Fprintf(&b, "\n[workers.%s]\ndescription = %q\nprovider = %q\nmodel = %q\n", name, profile.Description, provider, model)
+		if profile.ThinkingLevel != "" {
+			fmt.Fprintf(&b, "thinking_level = %q\n", profile.ThinkingLevel)
+		}
+	}
+	appendix += b.String()
+
+	combined := append([]byte(nil), base...)
+	combined = append(combined, appendix...)
 	dest := filepath.Join(h.runDir, "managed-config.toml")
 	if err := os.WriteFile(dest, combined, 0o600); err != nil {
 		h.t.Fatal(err)
