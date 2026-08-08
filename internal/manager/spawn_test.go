@@ -232,15 +232,25 @@ func TestSpawnRootProcessExitBeforeAdmission(t *testing.T) {
 
 // ---- Cleanup escalation tests ----
 
+// shortCleanupTimeouts is a fast escalation budget for tests.
+var shortCleanupTimeouts = cleanupTimeouts{
+	overall:  2 * time.Second,
+	stop:     10 * time.Millisecond,
+	termWait: 10 * time.Millisecond,
+	killWait: 20 * time.Millisecond,
+}
+
+// TestCleanupEscalationOrder drives the REAL cleanupFailedSpawnWithTimeouts and
+// asserts the mandated Stop-if-known → SIGTERM → SIGKILL ordering, including the
+// graceful Stop when the root became responsive (rootID set).
 func TestCleanupEscalationOrder(t *testing.T) {
-	// Use a custom cleanup function with very short timeouts to keep test fast.
 	process := newFakeProcess(12345)
 	client := &fakeClient{}
 	pending := &pendingRoot{
 		socketPath: "/tmp/nonexistent-cleanup.root.sock",
 		process:    process,
 		client:     client,
-		rootID:     "test-root",
+		rootID:     "test-root", // responsive: graceful Stop must be attempted
 	}
 
 	// The fake process exits only after it receives SIGKILL (index 1).
@@ -254,8 +264,32 @@ func TestCleanupEscalationOrder(t *testing.T) {
 		}
 	}()
 
-	// Run cleanup with injected short timeouts to make the test fast.
-	cleanupEscalateWithTimeouts(pending, 10*time.Millisecond, 20*time.Millisecond)
+	m := fakeManager(nil)
+	start := time.Now()
+	m.cleanupFailedSpawnWithTimeouts(pending, shortCleanupTimeouts)
+	if elapsed := time.Since(start); elapsed > shortCleanupTimeouts.overall {
+		t.Fatalf("cleanup exceeded budget: %v > %v", elapsed, shortCleanupTimeouts.overall)
+	}
+
+	// Graceful Stop must have been called on the client (rootID was set).
+	client.mu.Lock()
+	sawStop := false
+	sawClose := false
+	for _, call := range client.callLog {
+		if call == "Stop" {
+			sawStop = true
+		}
+		if call == "Close" {
+			sawClose = true
+		}
+	}
+	client.mu.Unlock()
+	if !sawStop {
+		t.Fatal("graceful Stop was not attempted despite known root ID")
+	}
+	if !sawClose {
+		t.Fatal("client was not closed during cleanup")
+	}
 
 	process.mu.Lock()
 	sigs := append([]syscall.Signal(nil), process.signals...)
@@ -271,44 +305,29 @@ func TestCleanupEscalationOrder(t *testing.T) {
 	}
 }
 
-// cleanupEscalateWithTimeouts runs the cleanup escalation with configurable
-// wait durations for testing.
-func cleanupEscalateWithTimeouts(pending *pendingRoot, termWait, killWait time.Duration) {
-	waitUntil := func(ctx context.Context, done <-chan struct{}, duration time.Duration) bool {
-		timer := time.NewTimer(duration)
-		defer timer.Stop()
-		select {
-		case <-done:
-			return true
-		case <-timer.C:
-			return false
-		case <-ctx.Done():
-			return false
+// TestCleanupSkipsStopWhenRootUnknown proves the graceful Stop is skipped when
+// the root never became responsive (rootID empty), going straight to signals.
+func TestCleanupSkipsStopWhenRootUnknown(t *testing.T) {
+	process := newFakeProcess(12347)
+	client := &fakeClient{}
+	pending := &pendingRoot{
+		socketPath: "/tmp/nonexistent-cleanup2.root.sock",
+		process:    process,
+		client:     client,
+		// rootID intentionally empty
+	}
+	process.exit(nil) // already dead: no signals needed
+
+	m := fakeManager(nil)
+	m.cleanupFailedSpawnWithTimeouts(pending, shortCleanupTimeouts)
+
+	client.mu.Lock()
+	defer client.mu.Unlock()
+	for _, call := range client.callLog {
+		if call == "Stop" {
+			t.Fatal("Stop must not be called when root ID is unknown")
 		}
 	}
-
-	cleanupCtx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
-	defer cancel()
-
-	// Skip stop attempt if no client.
-	if pending.client != nil {
-		stopCtx, stopCancel := context.WithTimeout(cleanupCtx, 5*time.Millisecond)
-		_ = pending.stopIfResponsive(stopCtx)
-		stopCancel()
-	}
-	if pending.client != nil {
-		_ = pending.client.Close()
-		pending.client = nil
-	}
-
-	if !waitUntil(cleanupCtx, pending.process.Done(), termWait) {
-		_ = pending.process.SignalGroup(syscall.SIGTERM)
-	}
-	if !waitUntil(cleanupCtx, pending.process.Done(), killWait) {
-		_ = pending.process.SignalGroup(syscall.SIGKILL)
-	}
-	<-pending.process.Done()
-	_ = pending.process.WaitErr()
 }
 
 func TestCleanupNeverUnlinksReplacedSocket(t *testing.T) {

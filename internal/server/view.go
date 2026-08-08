@@ -73,6 +73,7 @@ type detailView struct {
 	StreamConnected bool
 	Incomplete      bool
 	GapText         string
+	Stats           statsView
 }
 
 // questionPanelView is the template data for questions.html.
@@ -105,18 +106,21 @@ type deckStatusView struct {
 	Success bool
 }
 
-// contextView holds nullable context metrics.
-// Used by newStatsView which is wired in Task 9 action handlers.
-type contextView struct { //nolint:unused
+// contextView holds nullable context metrics for the Astrolabe dial.
+type contextView struct {
 	HasPercent bool
 	Percent    float64
-	HasTokens  bool
-	Tokens     float64
+	// PercentText is the human display of Percent, or "—" when unavailable.
+	PercentText string
+	// DialDegrees maps Percent (0..100) onto the alidade rotation (0..360°).
+	// It is 0 when Percent is unavailable.
+	DialDegrees float64
+	HasTokens   bool
+	Tokens      float64
 }
 
 // statsView is the template data for session stats.
-// Used by newStatsView which is wired in Task 9 action handlers.
-type statsView struct { //nolint:unused
+type statsView struct {
 	TotalMessages     int
 	UserMessages      int
 	AssistantMessages int
@@ -198,8 +202,9 @@ func newQuestionSummaryView(q supervisor.QuestionSummary) questionSummaryView {
 	}
 }
 
-// newDetailView converts a SessionState into the detail template data.
-func newDetailView(state manager.SessionState) detailView {
+// newDetailView converts a SessionState and (optional) stats into the detail
+// template data. A zero statsView (HasStats false) renders metrics as "—".
+func newDetailView(state manager.SessionState, stats statsView) detailView {
 	gapText := ""
 	if state.Gap != nil {
 		gapText = fmt.Sprintf("replay gap: expected seq %d, first available %d",
@@ -214,6 +219,7 @@ func newDetailView(state manager.SessionState) detailView {
 		StreamConnected: state.StreamConnected,
 		Incomplete:      state.Incomplete,
 		GapText:         gapText,
+		Stats:           stats,
 	}
 }
 
@@ -255,16 +261,25 @@ func newActivityView(state manager.SessionState) activityView {
 	}
 }
 
-// newStatsView converts SessionStats into the stats view.
-// Wired in Task 9 action handlers.
-//
-//nolint:unused
+// newStatsView converts SessionStats into the stats view, computing the
+// Astrolabe dial display for the nullable context percentage.
 func newStatsView(stats manager.SessionStats) statsView {
-	ctx := contextView{}
+	ctx := contextView{PercentText: "—"}
 	if stats.ContextUsage != nil {
 		if stats.ContextUsage.Percent != nil {
+			p := *stats.ContextUsage.Percent
 			ctx.HasPercent = true
-			ctx.Percent = *stats.ContextUsage.Percent
+			ctx.Percent = p
+			ctx.PercentText = fmt.Sprintf("%.0f%%", p)
+			// Clamp to [0,100] before mapping onto the 0..360° alidade sweep.
+			clamped := p
+			if clamped < 0 {
+				clamped = 0
+			}
+			if clamped > 100 {
+				clamped = 100
+			}
+			ctx.DialDegrees = clamped * 3.6
 		}
 		if stats.ContextUsage.Tokens != nil {
 			ctx.HasTokens = true

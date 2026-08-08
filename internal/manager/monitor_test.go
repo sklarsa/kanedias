@@ -119,17 +119,123 @@ func TestConsumeSubscriptionEOFDoesNotLossPreviousEvents(t *testing.T) {
 	}
 }
 
+// TestConsumeSubscriptionNotifiesAfterReplayDrain is the M3 regression test:
+// after draining a non-empty replay batch, session subscribers get one notify so
+// a reconnect refreshes the activity tail without waiting for a live event.
+func TestConsumeSubscriptionNotifiesAfterReplayDrain(t *testing.T) {
+	m := fakeManager(nil)
+	handle := &rootHandle{
+		socketPath: "/tmp/replay-notify.root.sock",
+		rootID:     "replay-root",
+		mirror:     newEventMirror(supervisor.EventBrokerOptions{MaxEvents: 100}),
+	}
+
+	subscription := m.sessionFanout.Subscribe()
+	defer subscription.Close()
+
+	replay := subscriptionFromReplay([]supervisor.EventEnvelope{
+		envelope(1, "replay-root"),
+		envelope(2, "replay-root"),
+	})
+	m.consumeSubscription(handle, replay)
+
+	select {
+	case rev := <-subscription.Updates:
+		if rev == 0 {
+			t.Fatal("received zero session revision after replay drain")
+		}
+	case <-time.After(time.Second):
+		t.Fatal("no session notify after replay drain")
+	}
+}
+
+// TestConsumeSubscriptionNoNotifyOnEmptyReplay ensures the M3 notify is only
+// issued when the replay actually delivered new events.
+func TestConsumeSubscriptionNoNotifyOnEmptyReplay(t *testing.T) {
+	m := fakeManager(nil)
+	handle := &rootHandle{
+		socketPath: "/tmp/replay-empty.root.sock",
+		rootID:     "empty-root",
+		mirror:     newEventMirror(supervisor.EventBrokerOptions{MaxEvents: 100}),
+	}
+	subscription := m.sessionFanout.Subscribe()
+	defer subscription.Close()
+
+	m.consumeSubscription(handle, subscriptionFromReplay(nil))
+
+	select {
+	case <-subscription.Updates:
+		t.Fatal("unexpected session notify on empty replay drain")
+	case <-time.After(100 * time.Millisecond):
+		// expected: no notify
+	}
+}
+
+// TestStoppingTransitionNotifiesFleet is the M1 regression test: when a monitored
+// root transitions to a retained (stopping/failed) lifecycle, snapshotLoop must
+// bump the fleet revision so the UI refreshes the non-actionable transition.
+func TestStoppingTransitionNotifiesFleet(t *testing.T) {
+	stopping := rootTree("stop")
+	stopping.Lifecycle = string(supervisor.LifecycleStopping)
+	client := &fakeClient{snapshot: stopping}
+
+	m := fakeManager(func(_ string) (rootClient, error) { return client, nil })
+	m.opts.SnapshotInterval = 10 * time.Millisecond
+
+	handle := &rootHandle{
+		socketPath: "/tmp/stopping.root.sock",
+		rootID:     "stop",
+		actionable: true,
+		client:     client,
+		mirror:     newEventMirror(supervisor.EventBrokerOptions{MaxEvents: 100}),
+		tree:       rootTree("stop"),
+	}
+	m.roots[handle.socketPath] = handle
+	m.routes["stop"] = "stop"
+
+	fleetSub := m.SubscribeFleet()
+	defer fleetSub.Close()
+
+	if !m.monitorRoot(handle) {
+		t.Fatal("monitorRoot refused to start")
+	}
+	t.Cleanup(func() {
+		ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+		defer cancel()
+		_ = m.Close(ctx)
+	})
+
+	select {
+	case rev := <-fleetSub.Updates:
+		if rev == 0 {
+			t.Fatal("received zero fleet revision on stopping transition")
+		}
+	case <-time.After(2 * time.Second):
+		t.Fatal("no fleet notify after retained-tree transition")
+	}
+
+	// The handle must be marked non-actionable after the retained update.
+	deadline := time.After(2 * time.Second)
+	for {
+		m.mu.Lock()
+		actionable := m.roots[handle.socketPath].actionable
+		m.mu.Unlock()
+		if !actionable {
+			break
+		}
+		select {
+		case <-deadline:
+			t.Fatal("retained root still marked actionable")
+		case <-time.After(10 * time.Millisecond):
+		}
+	}
+}
+
 // ---- ManagerStart / ManagerClose tests ----
 
 func TestManagerStartAndClose(t *testing.T) {
-	dir := t.TempDir()
-	if err := os.Chmod(dir, 0o700); err != nil {
-		t.Fatal(err)
-	}
-	logDir := t.TempDir()
-	if err := os.Chmod(logDir, 0o700); err != nil {
-		t.Fatal(err)
-	}
+	// Use short dirs: the path-length probe now uses a 64-char token placeholder.
+	dir, logDir := shortTempDirs(t)
 	m, err := New(Options{
 		RootSocketDir:     dir,
 		SessionLogDir:     logDir,
@@ -170,6 +276,100 @@ func TestManagerCloseDoesNotStopAdmittedRoots(t *testing.T) {
 		if call == "Stop" {
 			t.Fatal("Close() called Stop on admitted root — must not")
 		}
+	}
+}
+
+// TestPeriodicallyDiscoveredRootIsMonitored is the C1 regression test: a root
+// that first appears AFTER Start (via the periodic discovery loop) must have its
+// monitoring loops launched, not just be added as a dead fleet entry.
+func TestPeriodicallyDiscoveredRootIsMonitored(t *testing.T) {
+	rootDir, logDir := shortTempDirs(t)
+
+	client := &fakeClient{snapshot: rootTree("late")}
+	m, err := New(Options{
+		RootSocketDir:     rootDir,
+		SessionLogDir:     logDir,
+		EventLimits:       supervisor.EventBrokerOptions{MaxEvents: 100},
+		Logger:            discardLogger(),
+		DiscoveryInterval: 20 * time.Millisecond,
+		SnapshotInterval:  20 * time.Millisecond,
+		SpawnTimeout:      5 * time.Second,
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	// Inject the fake client for whatever socket appears.
+	m.factory = func(_ string) (rootClient, error) { return client, nil }
+
+	ctx := context.Background()
+	if err := m.Start(ctx); err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() {
+		closeCtx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+		defer cancel()
+		_ = m.Close(closeCtx)
+	})
+
+	// Nothing should be admitted yet (empty dir at Start).
+	if got := len(m.Fleet().Roots); got != 0 {
+		t.Fatalf("expected empty fleet at Start, got %d roots", got)
+	}
+
+	// Now create the root socket; the periodic loop must admit AND monitor it.
+	makeRootSocket(t, rootDir, "late.root.sock")
+
+	deadline := time.After(5 * time.Second)
+	for {
+		fleet := m.Fleet()
+		if len(fleet.Roots) == 1 && fleet.Roots[0].StreamConnected &&
+			client.callCount("Subscribe") >= 1 && client.callCount("Snapshot") >= 2 {
+			// >=2 Snapshot calls: one at admission probe, at least one from the
+			// running snapshotLoop (proving the tree keeps refreshing).
+			break
+		}
+		select {
+		case <-deadline:
+			t.Fatalf("root discovered via periodic loop was not monitored: roots=%d subscribe=%d snapshot=%d streamConnected=%v",
+				len(fleet.Roots), client.callCount("Subscribe"), client.callCount("Snapshot"),
+				len(fleet.Roots) == 1 && fleet.Roots[0].StreamConnected)
+		case <-time.After(10 * time.Millisecond):
+		}
+	}
+
+	// Re-committing on later scans must NOT launch duplicate loops. Give the
+	// discovery loop a few cycles and assert exactly one monitoring start by
+	// checking the handle's monitoring flag stays a single pair of goroutines
+	// (indirectly: Subscribe should not explode). Subscribe count should stay
+	// bounded because eventLoop parks on the open Events channel.
+	subAfter := client.callCount("Subscribe")
+	time.Sleep(120 * time.Millisecond)
+	if got := client.callCount("Subscribe"); got > subAfter+1 {
+		t.Fatalf("duplicate event loops detected: Subscribe went %d -> %d over several discovery cycles", subAfter, got)
+	}
+}
+
+// TestMonitorRootRefusesAfterClose is the I1 guard: once the manager is closed,
+// monitorRoot must not start loops (which Close would never wait on) and must
+// report failure so the caller can clean up the orphaned handle.
+func TestMonitorRootRefusesAfterClose(t *testing.T) {
+	m := fakeManager(nil)
+	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+	defer cancel()
+	if err := m.Close(ctx); err != nil {
+		t.Fatalf("Close: %v", err)
+	}
+
+	handle := &rootHandle{
+		socketPath: "/tmp/afterclose.root.sock",
+		rootID:     "afterclose",
+		client:     &fakeClient{snapshot: rootTree("afterclose")},
+	}
+	if m.monitorRoot(handle) {
+		t.Fatal("monitorRoot must refuse to start loops after Close")
+	}
+	if handle.monitoring {
+		t.Fatal("handle marked monitoring despite refusal")
 	}
 }
 

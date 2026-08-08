@@ -13,12 +13,32 @@ const (
 	jitterPct  = 0.20
 )
 
-// monitorRoot launches independent snapshot and event loops for handle.
-// Both goroutines are tracked in m.monitorWG.
-func (m *Manager) monitorRoot(handle *rootHandle) {
+// monitorRoot launches independent snapshot and event loops for handle exactly
+// once, serialized against Close so the WaitGroup Add happens-before Wait.
+//
+// It returns false without launching any loops if the manager is already closed
+// (in which case the handle is left for the caller to clean up), or if the
+// handle is already being monitored (guarding against duplicate loops when a
+// root's tree is re-committed on a later discovery cycle).
+func (m *Manager) monitorRoot(handle *rootHandle) bool {
+	m.mu.Lock()
+	if m.closed || m.closeCtx.Err() != nil {
+		m.mu.Unlock()
+		return false
+	}
+	if handle.monitoring {
+		m.mu.Unlock()
+		return false
+	}
+	handle.monitoring = true
+	// Add under m.mu so this Add happens-before Close's Wait (which acquires
+	// m.mu via closeClients only after the WaitGroup drains).
 	m.monitorWG.Add(2)
+	m.mu.Unlock()
+
 	go func() { defer m.monitorWG.Done(); m.snapshotLoop(handle) }()
 	go func() { defer m.monitorWG.Done(); m.eventLoop(handle) }()
+	return true
 }
 
 // snapshotLoop periodically fetches the root snapshot and updates the tree.
@@ -42,9 +62,10 @@ func (m *Manager) snapshotLoop(handle *rootHandle) {
 			}
 			if retainable(snapshot) && !admissible(snapshot) {
 				m.updateRetainedTree(handle, normalized, false)
+				m.bumpFleetRevision()
 				continue
 			}
-			if err := m.commitTree(handle, normalized, candidate); err != nil {
+			if _, err := m.commitTree(handle, normalized, candidate); err != nil {
 				m.markStale(handle, true)
 				continue
 			}
@@ -88,12 +109,19 @@ func (m *Manager) consumeSubscription(handle *rootHandle, sub supervisor.Subscri
 
 	// Drain replay first.
 	m.mu.Lock()
+	replayAccepted := false
 	for _, event := range sub.Replay {
 		if handle.mirror.Accept(event) {
 			accepted = true
+			replayAccepted = true
 		}
 	}
 	m.mu.Unlock()
+	// Notify session subscribers once after the replay drain so a reconnect
+	// refreshes the activity tail without waiting for the next live event.
+	if replayAccepted {
+		m.bumpSessionRevision(handle.rootID)
+	}
 
 	// Then live events.
 	for {

@@ -4,15 +4,16 @@
     <div class="detail-inner">
       {{if .SessionID}}
       <div class="det-head">
-        <div class="instrument" aria-hidden="true">
+        <div class="instrument" role="img" aria-label="context usage {{.Stats.Context.PercentText}}">
           <div class="dial"></div>
           <div class="ticks"></div>
           <div class="ticks major"></div>
           <div class="inner-ring"></div>
           <div class="inner-ring2"></div>
-          <div class="alidade" id="alidade"></div>
+          <div class="alidade" id="alidade"{{if .Stats.Context.HasPercent}} style="transform: rotate({{.Stats.Context.DialDegrees}}deg)"{{end}}></div>
           <div class="hub"></div>
           <div class="dial-cap">context</div>
+          <div class="dial-value" id="contextValue">{{.Stats.Context.PercentText}}</div>
         </div>
         <div class="det-ident">
           <div class="breadcrumb" id="breadcrumb">
@@ -34,6 +35,10 @@
         <div class="metric"><div class="k">State</div><div class="v">
           {{if .RootStale}}stale{{else if not .StreamConnected}}disconnected{{else}}{{.Lifecycle}}{{end}}
         </div></div>
+        <div class="metric"><div class="k">Context</div><div class="v num" id="detContext">{{.Stats.Context.PercentText}}</div></div>
+        <div class="metric"><div class="k">Messages</div><div class="v num">{{if .Stats.HasStats}}{{.Stats.TotalMessages}}{{else}}—{{end}}</div></div>
+        <div class="metric"><div class="k">Tool calls</div><div class="v num">{{if .Stats.HasStats}}{{.Stats.ToolCalls}}{{else}}—{{end}}</div></div>
+        <div class="metric"><div class="k">Cost</div><div class="v num">{{if .Stats.HasStats}}${{printf "%.4f" .Stats.Cost}}{{else}}—{{end}}</div></div>
         {{if .GapText}}<div class="metric gap-warning"><div class="k">Warning</div><div class="v">{{.GapText}}</div></div>{{end}}
         {{if .Incomplete}}<div class="metric"><div class="k">Replay</div><div class="v">incomplete</div></div>{{end}}
       </div>

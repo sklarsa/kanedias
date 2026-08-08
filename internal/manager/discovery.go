@@ -22,6 +22,10 @@ type rootHandle struct {
 	// actionable is false for stopping/failed/stopped/completed snapshots.
 	actionable bool
 	client     rootClient
+	// monitoring is true once monitorRoot has launched this handle's snapshot
+	// and event loops. It guards against double-starting the loops when a root's
+	// tree is re-committed on a later discovery/snapshot cycle. Guarded by m.mu.
+	monitoring bool
 }
 
 // discoverOnce scans opts.RootSocketDir for *.root.sock files, probes each
@@ -167,12 +171,20 @@ func (m *Manager) probeRoot(ctx context.Context, socketPath string, identity soc
 		actionable: true,
 		client:     client,
 	}
-	if err := m.commitTree(handle, normalized, candidate); err != nil {
+	committed, err := m.commitTree(handle, normalized, candidate)
+	if err != nil {
 		_ = client.Close()
 		*issues = append(*issues, DiscoveryIssue{
 			SocketName: name, Code: "route_conflict", Message: err.Error(),
 		})
 		return
+	}
+	// Start monitoring newly-admitted roots exactly once. Roots re-committed on a
+	// later scan already have monitoring running; monitorRoot is a no-op for them.
+	if !m.monitorRoot(committed) && committed == handle {
+		// Manager is closing and this is a brand-new handle that will never be
+		// monitored — release its client to avoid a leak.
+		m.removeRootBySocketPath(handle.socketPath, handle)
 	}
 }
 
@@ -194,36 +206,91 @@ func (m *Manager) commitStoppingRoot(socketPath string, identity socketIdentity,
 		actionable: false,
 		client:     client,
 	}
-	if err := m.commitTree(handle, normalized, candidate); err != nil {
+	committed, err := m.commitTree(handle, normalized, candidate)
+	if err != nil {
 		_ = client.Close()
 		*issues = append(*issues, DiscoveryIssue{
 			SocketName: name, Code: "route_conflict", Message: err.Error(),
 		})
+		return
+	}
+	if !m.monitorRoot(committed) && committed == handle {
+		m.removeRootBySocketPath(handle.socketPath, handle)
 	}
 }
 
 // commitTree atomically commits a validated root tree and its routes, or
 // nothing on conflict. It replaces routes from the previous rootID if the
 // handle is already known.
-func (m *Manager) commitTree(handle *rootHandle, tree supervisor.NodeSnapshot, candidate map[string]string) error {
+//
+// If a live handle for the same socket path already exists (e.g. one just
+// created by a concurrent SpawnRoot, or the handle currently being monitored),
+// commitTree updates that existing handle in place rather than overwriting it
+// with a second handle. This avoids leaking the prior handle's client and
+// orphaning its monitor goroutines. commitTree returns the committed handle
+// (the one now recorded in m.roots) so callers can start monitoring exactly the
+// admitted instance.
+func (m *Manager) commitTree(handle *rootHandle, tree supervisor.NodeSnapshot, candidate map[string]string) (*rootHandle, error) {
 	m.mu.Lock()
 	defer m.mu.Unlock()
+
+	// Reuse a live handle for the same socket path if one already exists and it
+	// is a different instance than the caller's (Q1 orphan guard). Reusing the
+	// existing instance keeps its already-running monitor goroutines valid (they
+	// look themselves up by pointer/socket path) and avoids leaking clients.
+	target := handle
+	if existing, ok := m.roots[handle.socketPath]; ok && existing != handle {
+		if existing.identity == handle.identity {
+			// Same socket (e.g. concurrent SpawnRoot already admitted it):
+			// discard the caller's redundant client, keep the existing one.
+			if handle.client != nil && handle.client != existing.client {
+				_ = handle.client.Close()
+			}
+		} else {
+			// Socket was replaced (new inode) under the same name: swap the fresh
+			// client into the existing (monitored) handle and close the stale one.
+			if existing.client != nil && existing.client != handle.client {
+				_ = existing.client.Close()
+			}
+			existing.client = handle.client
+			existing.identity = handle.identity
+		}
+		existing.rootID = handle.rootID
+		existing.actionable = handle.actionable
+		target = existing
+	}
+
 	for sessionID, rootID := range candidate {
 		if existing, ok := m.routes[sessionID]; ok && existing != rootID {
-			return fmt.Errorf("route conflict for session %q (owned by %q, new root %q)", sessionID, existing, rootID)
+			return nil, fmt.Errorf("route conflict for session %q (owned by %q, new root %q)", sessionID, existing, rootID)
 		}
 	}
 	// Remove old routes for this root if the root already existed.
-	m.removeRoutesLocked(handle.rootID)
+	m.removeRoutesLocked(target.rootID)
 	for sessionID, rootID := range candidate {
 		m.routes[sessionID] = rootID
 	}
-	handle.tree = tree
-	if handle.mirror == nil {
-		handle.mirror = newEventMirror(m.opts.EventLimits)
+	target.tree = tree
+	if target.mirror == nil {
+		target.mirror = newEventMirror(m.opts.EventLimits)
 	}
-	m.roots[handle.socketPath] = handle
-	return nil
+	m.roots[target.socketPath] = target
+	return target, nil
+}
+
+// removeRootBySocketPath removes a just-committed handle that will never be
+// monitored (manager closing) so its client is not leaked. It only removes the
+// entry if it is still the exact handle we committed.
+func (m *Manager) removeRootBySocketPath(socketPath string, handle *rootHandle) {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	if h, ok := m.roots[socketPath]; ok && h == handle {
+		m.removeRoutesLocked(handle.rootID)
+		delete(m.roots, socketPath)
+		if handle.client != nil {
+			_ = handle.client.Close()
+		}
+	}
 }
 
 // removeRootLocked removes the root at socketPath and all its routes from the

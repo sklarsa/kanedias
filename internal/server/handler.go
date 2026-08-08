@@ -183,7 +183,7 @@ func makeSessionHandler(fleet fleetManager, templates *template.Template, logger
 			defer cancel()
 			sse := datastar.NewSSE(w, r, datastar.WithContext(streamCtx))
 			emptyState := emptySessionState()
-			_ = patchTemplate(sse, templates, templateDetail, "detail-panel", newDetailView(emptyState))
+			_ = patchTemplate(sse, templates, templateDetail, "detail-panel", newDetailView(emptyState, statsView{}))
 			_ = patchTemplate(sse, templates, templateQuestions, "question-panel", newQuestionPanelView(emptyState))
 			_ = patchTemplate(sse, templates, templateActivity, "activity-panel", newActivityView(emptyState))
 			return
@@ -209,8 +209,14 @@ func makeSessionHandler(fleet fleetManager, templates *template.Template, logger
 
 		sse := datastar.NewSSE(w, r, datastar.WithContext(streamCtx))
 
+		// Throttled stats fetcher: at most one get_session_stats per second,
+		// only for actionable, non-stale nodes. The last successful stats are
+		// reused between refreshes so a burst of activity revisions does not turn
+		// into a burst of stats RPCs.
+		statsFetcher := newStatsFetcher(streamCtx, fleet, sessionID, logger)
+
 		// Initial render.
-		if err := patchSessionTargets(sse, templates, state); err != nil {
+		if err := patchSessionTargets(sse, templates, state, statsFetcher.get(state)); err != nil {
 			return
 		}
 
@@ -231,7 +237,7 @@ func makeSessionHandler(fleet fleetManager, templates *template.Template, logger
 				if err != nil {
 					return
 				}
-				if err := patchTemplate(sse, templates, templateDetail, "detail-panel", newDetailView(state)); err != nil {
+				if err := patchTemplate(sse, templates, templateDetail, "detail-panel", newDetailView(state, statsFetcher.get(state))); err != nil {
 					return
 				}
 				if err := patchTemplate(sse, templates, templateQuestions, "question-panel", newQuestionPanelView(state)); err != nil {
@@ -250,9 +256,80 @@ func makeSessionHandler(fleet fleetManager, templates *template.Template, logger
 	}
 }
 
+// statsThrottle bounds how often get_session_stats is called per session stream.
+const statsThrottle = time.Second
+
+// sessionStatsFetcher fetches SessionStats subject to a per-stream throttle and
+// reuses the last successful result between refreshes.
+type sessionStatsFetcher struct {
+	ctx       context.Context
+	fleet     fleetManager
+	sessionID string
+	logger    *slog.Logger
+	now       func() time.Time
+
+	haveStats bool
+	last      statsView
+	lastFetch time.Time
+	fetched   bool
+}
+
+func newStatsFetcher(ctx context.Context, fleet fleetManager, sessionID string, logger *slog.Logger) *sessionStatsFetcher {
+	return &sessionStatsFetcher{
+		ctx:       ctx,
+		fleet:     fleet,
+		sessionID: sessionID,
+		logger:    logger,
+		now:       time.Now,
+	}
+}
+
+// get returns the stats view for the current state, fetching fresh stats at most
+// once per statsThrottle. It skips fetching for stale or non-actionable nodes and
+// falls back to the last successful stats (or an empty view rendering "—").
+func (s *sessionStatsFetcher) get(state manager.SessionState) statsView {
+	if !actionableForStats(state) {
+		return s.last
+	}
+	// Throttle: reuse the last result unless a full interval has elapsed since
+	// the previous fetch attempt.
+	if s.fetched && s.now().Sub(s.lastFetch) < statsThrottle {
+		return s.last
+	}
+	s.fetched = true
+	s.lastFetch = s.now()
+	stats, err := s.fleet.SessionStats(s.ctx, s.sessionID)
+	if err != nil {
+		if s.logger != nil && s.ctx.Err() == nil {
+			s.logger.Debug("fetch session stats", "sessionID", s.sessionID, "error", err)
+		}
+		// Keep the last successful stats (or empty view) rather than clearing.
+		return s.last
+	}
+	s.haveStats = true
+	s.last = newStatsView(stats)
+	return s.last
+}
+
+// actionableForStats reports whether a session is a candidate for a stats fetch:
+// its root must not be stale and the node lifecycle must be one Pi can serve
+// get_session_stats for (ready/running/awaiting-handoff/question). Terminal
+// lifecycles are skipped to avoid pointless RPCs.
+func actionableForStats(state manager.SessionState) bool {
+	if state.RootStale {
+		return false
+	}
+	switch state.Node.Lifecycle {
+	case "stopping", "failed", "stopped", "completed", "":
+		return false
+	default:
+		return true
+	}
+}
+
 // patchSessionTargets patches all three session-detail targets.
-func patchSessionTargets(sse *datastar.ServerSentEventGenerator, templates *template.Template, state manager.SessionState) error {
-	if err := patchTemplate(sse, templates, templateDetail, "detail-panel", newDetailView(state)); err != nil {
+func patchSessionTargets(sse *datastar.ServerSentEventGenerator, templates *template.Template, state manager.SessionState, stats statsView) error {
+	if err := patchTemplate(sse, templates, templateDetail, "detail-panel", newDetailView(state, stats)); err != nil {
 		return err
 	}
 	if err := patchTemplate(sse, templates, templateQuestions, "question-panel", newQuestionPanelView(state)); err != nil {

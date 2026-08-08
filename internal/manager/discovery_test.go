@@ -489,7 +489,7 @@ func TestCommitTreeRouteConflictReturnsError(t *testing.T) {
 
 	handle := &rootHandle{socketPath: "/tmp/b.root.sock", rootID: "root-b"}
 	candidate := map[string]string{"shared": "root-b"}
-	if err := m.commitTree(handle, supervisor.NodeSnapshot{}, candidate); err == nil {
+	if _, err := m.commitTree(handle, supervisor.NodeSnapshot{}, candidate); err == nil {
 		t.Fatal("expected route conflict error")
 	}
 }

@@ -31,7 +31,8 @@ type Manager struct {
 	discoveryIssues []DiscoveryIssue
 	factory         clientFactory
 	starter         processStarter
-	closed          bool
+	closed          bool // set once Close begins; blocks new monitor loops
+	clientsClosed   bool // set once clients have been closed (idempotency)
 	quiesced        bool
 	// monitoring infrastructure
 	closeCtx        context.Context
@@ -94,7 +95,8 @@ func New(opts Options) (*Manager, error) {
 	}
 
 	// Validate unix path length for a plausible socket file inside RootSocketDir.
-	testPath := filepath.Join(opts.RootSocketDir, strings.Repeat("a", 32)+".root.sock")
+	// The real spawn token is 64 hex chars (32 random bytes), so probe with 64.
+	testPath := filepath.Join(opts.RootSocketDir, strings.Repeat("a", 64)+".root.sock")
 	if err := validateUnixPathLength(testPath); err != nil {
 		return nil, fmt.Errorf("manager: root socket dir path too long: %w", err)
 	}
@@ -349,6 +351,13 @@ func (m *Manager) Quiesce(context.Context) error {
 // closes clients without stopping admitted roots.
 func (m *Manager) Close(ctx context.Context) error {
 	_ = m.Quiesce(ctx)
+	// Mark closed under m.mu before waiting so that any concurrent monitorRoot
+	// either completes its WaitGroup.Add before this point (and is waited on) or
+	// observes closed==true and refuses to Add. This makes Add happen-before
+	// Wait per the sync.WaitGroup contract.
+	m.mu.Lock()
+	m.closed = true
+	m.mu.Unlock()
 	m.closeCancel()
 	done := make(chan struct{})
 	go func() { m.monitorWG.Wait(); close(done) }()
@@ -363,10 +372,10 @@ func (m *Manager) Close(ctx context.Context) error {
 func (m *Manager) closeClients() error {
 	m.mu.Lock()
 	defer m.mu.Unlock()
-	if m.closed {
+	if m.clientsClosed {
 		return nil
 	}
-	m.closed = true
+	m.clientsClosed = true
 	m.fleetFanout.Close()
 	m.sessionFanout.Close()
 	for socketPath, handle := range m.roots {

@@ -8,6 +8,7 @@ import (
 	"path/filepath"
 	"sync"
 	"testing"
+	"time"
 
 	"github.com/sklarsa/kanedias/internal/supervisor"
 	"github.com/sklarsa/kanedias/internal/supervisor/contract"
@@ -39,11 +40,12 @@ func childTree(id, parent string, children ...supervisor.NodeSnapshot) superviso
 
 // fakeClient is an injected rootClient for testing discovery without real sockets.
 type fakeClient struct {
-	mu       sync.Mutex
-	snapshot supervisor.NodeSnapshot
-	err      error
-	closed   bool
-	callLog  []string
+	mu        sync.Mutex
+	snapshot  supervisor.NodeSnapshot
+	err       error
+	closed    bool
+	callLog   []string
+	closeChan chan struct{} // closed by Close() to unblock a parked Subscribe
 }
 
 func (fc *fakeClient) Snapshot(_ context.Context) (supervisor.NodeSnapshot, error) {
@@ -53,17 +55,43 @@ func (fc *fakeClient) Snapshot(_ context.Context) (supervisor.NodeSnapshot, erro
 	return fc.snapshot, fc.err
 }
 
+// callCount returns how many times the named method was invoked.
+func (fc *fakeClient) callCount(name string) int {
+	fc.mu.Lock()
+	defer fc.mu.Unlock()
+	n := 0
+	for _, c := range fc.callLog {
+		if c == name {
+			n++
+		}
+	}
+	return n
+}
+
 func (fc *fakeClient) Subscribe(_ context.Context) (supervisor.Subscription, error) {
 	fc.mu.Lock()
 	defer fc.mu.Unlock()
 	fc.callLog = append(fc.callLog, "Subscribe")
-	closed := make(chan supervisor.EventEnvelope)
-	close(closed)
+	if fc.err != nil {
+		return supervisor.Subscription{}, fc.err
+	}
+	if fc.closeChan == nil {
+		fc.closeChan = make(chan struct{})
+	}
+	closeChan := fc.closeChan
+	// Events stays open until the client is closed, so eventLoop parks on a
+	// select instead of spinning in a tight reconnect loop during tests.
+	events := make(chan supervisor.EventEnvelope)
+	go func() {
+		<-closeChan
+		close(events)
+	}()
 	return supervisor.Subscription{
 		Replay: []supervisor.EventEnvelope{},
-		Events: closed,
+		Events: events,
 		Close:  func() {},
-	}, fc.err
+		Err:    func() error { return nil },
+	}, nil
 }
 
 func (fc *fakeClient) CallRPC(_ context.Context, _ string, _ json.RawMessage) (json.RawMessage, error) {
@@ -91,6 +119,9 @@ func (fc *fakeClient) Close() error {
 	fc.mu.Lock()
 	defer fc.mu.Unlock()
 	fc.callLog = append(fc.callLog, "Close")
+	if !fc.closed && fc.closeChan != nil {
+		close(fc.closeChan)
+	}
 	fc.closed = true
 	return nil
 }
@@ -100,8 +131,9 @@ func fakeManager(factory clientFactory) *Manager {
 	ctx, cancel := context.WithCancel(context.Background())
 	return &Manager{
 		opts: Options{
-			EventLimits: supervisor.EventBrokerOptions{MaxEvents: 100},
-			Logger:      discardLogger(),
+			EventLimits:      supervisor.EventBrokerOptions{MaxEvents: 100},
+			Logger:           discardLogger(),
+			SnapshotInterval: time.Hour, // long: monitoring loops must not fire during unit tests
 		},
 		roots:         make(map[string]*rootHandle),
 		routes:        make(map[string]string),

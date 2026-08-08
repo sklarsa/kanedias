@@ -378,7 +378,7 @@ func TestTemplatesDefineStableRoots(t *testing.T) {
 	}
 
 	// Render the detail template with an empty state.
-	detailHTML, err := renderTemplate(templates, templateDetail, newDetailView(emptySessionState()))
+	detailHTML, err := renderTemplate(templates, templateDetail, newDetailView(emptySessionState(), statsView{}))
 	if err != nil {
 		t.Fatalf("render detail.html: %v", err)
 	}
@@ -435,7 +435,7 @@ func TestTemplatesExcludeMockContent(t *testing.T) {
 	}
 	cases := []templateCase{
 		{templateFleet, newFleetView(emptyFleetSnapshot())},
-		{templateDetail, newDetailView(emptySessionState())},
+		{templateDetail, newDetailView(emptySessionState(), statsView{})},
 		{templateQuestions, newQuestionPanelView(emptySessionState())},
 		{templateActivity, newActivityView(emptySessionState())},
 		{templateDeckStatus, newDeckStatusView(nil)},
@@ -525,6 +525,9 @@ type streamFakeFleet struct {
 	sessionUpdates map[string]chan uint64
 	sessions       map[string]manager.SessionState
 	snapshot       manager.FleetSnapshot
+	stats          manager.SessionStats
+	statsErr       error
+	statsCalls     int
 }
 
 func newStreamFakeFleet() *streamFakeFleet {
@@ -572,7 +575,16 @@ func (f *streamFakeFleet) AnswerQuestion(context.Context, string, string, json.R
 	return nil
 }
 func (f *streamFakeFleet) SessionStats(context.Context, string) (manager.SessionStats, error) {
-	return manager.SessionStats{}, nil
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	f.statsCalls++
+	return f.stats, f.statsErr
+}
+
+func (f *streamFakeFleet) statsCallCount() int {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	return f.statsCalls
 }
 func (f *streamFakeFleet) Quiesce(context.Context) error { return nil }
 func (f *streamFakeFleet) Close(context.Context) error   { return nil }
@@ -765,6 +777,152 @@ func TestSessionStreamSendsInitialState(t *testing.T) {
 	}
 	if !strings.Contains(body, "activity-panel") {
 		t.Errorf("session stream body does not patch #activity-panel:\n%s", body)
+	}
+}
+
+// ptrFloat is a small helper for building nullable metric fields.
+func ptrFloat(v float64) *float64 { return &v }
+
+// TestSessionStreamRendersStatsForActionableNode is the I4 regression test: the
+// selected-detail stream fetches SessionStats for an actionable node and renders
+// the context percentage into the detail panel.
+func TestSessionStreamRendersStatsForActionableNode(t *testing.T) {
+	fleet := newStreamFakeFleet()
+	sessionID := "session-stats"
+	fleet.sessions[sessionID] = manager.SessionState{
+		Node: supervisor.NodeSnapshot{
+			SessionID: sessionID,
+			Lifecycle: "running",
+		},
+		StreamConnected: true,
+	}
+	fleet.sessionUpdates[sessionID] = make(chan uint64, 4)
+	fleet.stats = manager.SessionStats{
+		TotalMessages: 12,
+		ToolCalls:     3,
+		Cost:          0.4211,
+		ContextUsage:  &manager.ContextUsage{Percent: ptrFloat(42)},
+	}
+
+	handler, cookie := mustNewHandlerWithFleetAuth(t, fleet)
+	ctx, cancel := context.WithTimeout(context.Background(), 3*time.Second)
+	defer cancel()
+
+	req := httptest.NewRequest(http.MethodGet, "/ui/session?datastar=%7B%22selectedSessionId%22%3A%22session-stats%22%7D", nil).WithContext(ctx)
+	req.AddCookie(cookie)
+	w := httptest.NewRecorder()
+
+	done := make(chan struct{})
+	go func() {
+		defer close(done)
+		handler.ServeHTTP(w, req)
+	}()
+	close(fleet.sessionUpdates[sessionID])
+
+	select {
+	case <-done:
+	case <-time.After(3 * time.Second):
+		t.Fatal("session stream did not return after channel close")
+	}
+
+	if fleet.statsCallCount() == 0 {
+		t.Fatal("SessionStats was never called for an actionable node")
+	}
+	body := w.Body.String()
+	if !strings.Contains(body, "42%") {
+		t.Errorf("detail body does not render context percentage:\n%s", body)
+	}
+}
+
+// TestSessionStreamStatsThrottled is the I4 throttle test: a burst of many
+// activity revisions must not produce one get_session_stats call per revision.
+func TestSessionStreamStatsThrottled(t *testing.T) {
+	fleet := newStreamFakeFleet()
+	sessionID := "session-burst"
+	fleet.sessions[sessionID] = manager.SessionState{
+		Node:            supervisor.NodeSnapshot{SessionID: sessionID, Lifecycle: "running"},
+		StreamConnected: true,
+	}
+	updates := make(chan uint64, 64)
+	fleet.sessionUpdates[sessionID] = updates
+	fleet.stats = manager.SessionStats{
+		ContextUsage: &manager.ContextUsage{Percent: ptrFloat(10)},
+	}
+
+	handler, cookie := mustNewHandlerWithFleetAuth(t, fleet)
+	ctx, cancel := context.WithTimeout(context.Background(), 3*time.Second)
+	defer cancel()
+
+	req := httptest.NewRequest(http.MethodGet, "/ui/session?datastar=%7B%22selectedSessionId%22%3A%22session-burst%22%7D", nil).WithContext(ctx)
+	req.AddCookie(cookie)
+	w := httptest.NewRecorder()
+
+	done := make(chan struct{})
+	go func() {
+		defer close(done)
+		handler.ServeHTTP(w, req)
+	}()
+
+	// Fire a burst of 40 revisions quickly, then end the stream.
+	for i := 0; i < 40; i++ {
+		updates <- uint64(i + 1)
+	}
+	// Give the handler a moment to process the burst well within one throttle
+	// window, then close to finish.
+	time.Sleep(200 * time.Millisecond)
+	close(updates)
+
+	select {
+	case <-done:
+	case <-time.After(3 * time.Second):
+		t.Fatal("session stream did not return")
+	}
+
+	// Initial render fetches once; the burst all falls within one throttle
+	// window (1s), so at most a couple more fetches are allowed — certainly not
+	// one per revision.
+	if got := fleet.statsCallCount(); got > 3 {
+		t.Fatalf("stats fetched %d times for a 40-revision burst; throttle not holding", got)
+	}
+}
+
+// TestSessionStreamNullableContextRendersDash is the I4 nullable test: when the
+// context percentage is absent, the dial renders "—".
+func TestSessionStreamNullableContextRendersDash(t *testing.T) {
+	fleet := newStreamFakeFleet()
+	sessionID := "session-nullctx"
+	fleet.sessions[sessionID] = manager.SessionState{
+		Node:            supervisor.NodeSnapshot{SessionID: sessionID, Lifecycle: "running"},
+		StreamConnected: true,
+	}
+	fleet.sessionUpdates[sessionID] = make(chan uint64, 4)
+	// Stats present but no context usage → nullable percent.
+	fleet.stats = manager.SessionStats{TotalMessages: 5}
+
+	handler, cookie := mustNewHandlerWithFleetAuth(t, fleet)
+	ctx, cancel := context.WithTimeout(context.Background(), 3*time.Second)
+	defer cancel()
+
+	req := httptest.NewRequest(http.MethodGet, "/ui/session?datastar=%7B%22selectedSessionId%22%3A%22session-nullctx%22%7D", nil).WithContext(ctx)
+	req.AddCookie(cookie)
+	w := httptest.NewRecorder()
+
+	done := make(chan struct{})
+	go func() {
+		defer close(done)
+		handler.ServeHTTP(w, req)
+	}()
+	close(fleet.sessionUpdates[sessionID])
+
+	select {
+	case <-done:
+	case <-time.After(3 * time.Second):
+		t.Fatal("session stream did not return")
+	}
+
+	body := w.Body.String()
+	if !strings.Contains(body, "—") {
+		t.Errorf("nullable context did not render em-dash:\n%s", body)
 	}
 }
 

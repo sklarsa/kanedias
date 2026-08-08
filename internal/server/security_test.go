@@ -165,6 +165,37 @@ func TestValidBootstrapRedirectsAndSetsCookie(t *testing.T) {
 	}
 }
 
+// TestBootstrapSetsNoStoreAndNoReferrer is the I3 regression test: the bootstrap
+// response must set Cache-Control: no-store and Referrer-Policy: no-referrer so
+// the capability in the query string is neither cached nor leaked via Referer.
+func TestBootstrapSetsNoStoreAndNoReferrer(t *testing.T) {
+	var out bytes.Buffer
+	store, err := newCapabilityStore(newDeterministicReader(), &out)
+	if err != nil {
+		t.Fatalf("newCapabilityStore: %v", err)
+	}
+	output := out.String()
+	idx := strings.Index(output, bootstrapQueryName+"=")
+	if idx == -1 {
+		t.Fatal("no capability= found in bootstrap output")
+	}
+	token := strings.TrimSpace(output[idx+len(bootstrapQueryName)+1:])
+
+	req := httptest.NewRequest(http.MethodGet, "/bootstrap?"+bootstrapQueryName+"="+token, nil)
+	w := httptest.NewRecorder()
+	store.serveBootstrap(w, req)
+
+	if w.Code != http.StatusSeeOther {
+		t.Fatalf("bootstrap status = %d, want %d", w.Code, http.StatusSeeOther)
+	}
+	if got := w.Header().Get("Cache-Control"); got != "no-store" {
+		t.Errorf("Cache-Control = %q, want no-store", got)
+	}
+	if got := w.Header().Get("Referrer-Policy"); got != "no-referrer" {
+		t.Errorf("Referrer-Policy = %q, want no-referrer", got)
+	}
+}
+
 func TestSessionCookieIssuedByValidBootstrap(t *testing.T) {
 	var out bytes.Buffer
 	store, err := newCapabilityStore(newDeterministicReader(), &out)

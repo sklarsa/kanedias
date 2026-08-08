@@ -251,6 +251,13 @@ func (m *Manager) admitRoot(ctx context.Context, pending *pendingRoot) (string, 
 				continue
 			}
 			pending.identity = postIdentity
+			// Record the root's session ID as soon as a valid snapshot is
+			// obtained (before the admissible/commit checks) so that a later
+			// cleanup can issue a graceful Stop for a responsive-but-unadmitted
+			// root instead of jumping straight to signals.
+			if snapshot.SessionID != "" {
+				pending.rootID = snapshot.SessionID
+			}
 
 			lc := supervisor.LifecycleState(snapshot.Lifecycle)
 			if lc == supervisor.LifecycleProvisioning || lc == supervisor.LifecycleStarting {
@@ -279,27 +286,55 @@ func (m *Manager) commitSpawn(pending *pendingRoot, snapshot supervisor.NodeSnap
 		actionable: true,
 		client:     pending.client,
 	}
-	if err := m.commitTree(handle, normalized, candidate); err != nil {
+	committed, err := m.commitTree(handle, normalized, candidate)
+	if err != nil {
 		return "", fmt.Errorf("spawn admission route conflict: %w", err)
 	}
-	// Transfer client ownership — pending.client is now owned by the handle.
+	// Transfer client ownership — pending.client is now owned by the handle
+	// (unless commitTree reused an existing handle and closed our client).
 	pending.client = nil
 
-	// Start monitoring the newly admitted root.
-	m.mu.Lock()
-	h := m.roots[pending.socketPath]
-	m.mu.Unlock()
-	if h != nil {
-		m.monitorRoot(h)
+	// Start monitoring the newly admitted root. If the manager is closing, the
+	// loops are not started; remove the orphaned handle so its client is closed
+	// and the spawn fails cleanly rather than being silently unmonitored.
+	if !m.monitorRoot(committed) && committed == handle {
+		m.removeRootBySocketPath(handle.socketPath, handle)
+		return "", errors.New("manager: closing, cannot admit spawned root")
 	}
 	m.bumpFleetRevision()
 	return snapshot.SessionID, nil
 }
 
-// cleanupFailedSpawn runs the 30-second cleanup escalation sequence. This
-// function runs in a goroutine that is intentionally NOT tracked in monitorWG
-// (as per the plan: spawn waiter excluded from manager shutdown waits).
+// cleanupTimeouts configures the graceful-cleanup escalation budget. Production
+// uses defaultCleanupTimeouts; tests inject short durations to keep runs fast.
+type cleanupTimeouts struct {
+	overall  time.Duration // total budget for the whole escalation
+	stop     time.Duration // graceful root Stop attempt
+	termWait time.Duration // wait after Stop before SIGTERM
+	killWait time.Duration // wait after SIGTERM before SIGKILL
+}
+
+// defaultCleanupTimeouts is the production escalation budget:
+// Stop-if-known → wait 5s → SIGTERM → wait 10s → SIGKILL → reap, within 30s.
+var defaultCleanupTimeouts = cleanupTimeouts{
+	overall:  30 * time.Second,
+	stop:     5 * time.Second,
+	termWait: 5 * time.Second,
+	killWait: 10 * time.Second,
+}
+
+// cleanupFailedSpawn runs the cleanup escalation sequence with the production
+// timeout budget. This function runs in a goroutine that is intentionally NOT
+// tracked in monitorWG (as per the plan: spawn waiter excluded from manager
+// shutdown waits).
 func (m *Manager) cleanupFailedSpawn(pending *pendingRoot) {
+	m.cleanupFailedSpawnWithTimeouts(pending, defaultCleanupTimeouts)
+}
+
+// cleanupFailedSpawnWithTimeouts performs the mandated cleanup ordering:
+// graceful Stop (if the root ID is known) → wait → SIGTERM → wait → SIGKILL →
+// reap and best-effort socket unlink. Timeouts are injectable for tests.
+func (m *Manager) cleanupFailedSpawnWithTimeouts(pending *pendingRoot, t cleanupTimeouts) {
 	waitUntil := func(ctx context.Context, done <-chan struct{}, duration time.Duration) bool {
 		timer := time.NewTimer(duration)
 		defer timer.Stop()
@@ -313,10 +348,11 @@ func (m *Manager) cleanupFailedSpawn(pending *pendingRoot) {
 		}
 	}
 
-	cleanupCtx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
+	cleanupCtx, cancel := context.WithTimeout(context.Background(), t.overall)
 	defer cancel()
 
-	stopCtx, stopCancel := context.WithTimeout(cleanupCtx, 5*time.Second)
+	// Graceful stop first if the root became responsive and reported its ID.
+	stopCtx, stopCancel := context.WithTimeout(cleanupCtx, t.stop)
 	_ = pending.stopIfResponsive(stopCtx)
 	stopCancel()
 
@@ -326,10 +362,10 @@ func (m *Manager) cleanupFailedSpawn(pending *pendingRoot) {
 		pending.client = nil
 	}
 
-	if !waitUntil(cleanupCtx, pending.process.Done(), 5*time.Second) {
+	if !waitUntil(cleanupCtx, pending.process.Done(), t.termWait) {
 		_ = pending.process.SignalGroup(syscall.SIGTERM)
 	}
-	if !waitUntil(cleanupCtx, pending.process.Done(), 10*time.Second) {
+	if !waitUntil(cleanupCtx, pending.process.Done(), t.killWait) {
 		_ = pending.process.SignalGroup(syscall.SIGKILL)
 	}
 	select {

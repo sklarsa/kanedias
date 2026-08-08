@@ -92,6 +92,11 @@ func (s *capabilityStore) serveBootstrap(w http.ResponseWriter, r *http.Request)
 	}
 	s.addSession(browserDigest)
 
+	// The bootstrap URL carries the capability in the query string; prevent it
+	// from being cached or leaking via the Referer header on the redirect.
+	w.Header().Set("Cache-Control", "no-store")
+	w.Header().Set("Referrer-Policy", "no-referrer")
+
 	http.SetCookie(w, &http.Cookie{
 		Name:     sessionCookieName,
 		Value:    browserToken,
