@@ -32,26 +32,22 @@ export default async function kanediasExtension(pi: ExtensionAPI, options: Exten
   const client = new SupervisorClient(env.KANEDIAS_SUPERVISOR_SOCKET ?? "/run/kanedias/supervisor.sock");
 
   // Register the E2E controlled-question handler before the supervisor
-  // /v1/workers call below, which can block or fail if pi boots before the
-  // supervisor socket is serving. If registration happened after that await and
-  // it was slow, the handler would miss the session_start (startup) event and
-  // the E2E controlled question would never surface.
-  if (env.KANEDIAS_E2E_RUN_ID && env.KANEDIAS_SESSION_KIND === "root") {
-    pi.on("session_start", (event, ctx) => {
-      // A fresh session reports reason "startup" (pi default) or "new"
-      // (agent-session-runtime for a brand-new session). Resume/fork/reload
-      // must not re-run the E2E controlled question.
-      if (event.reason !== "startup" && event.reason !== "new") return;
-      // Do not block extension startup: RPC input must be live before the
-      // controlled dialog can receive its routed response.
-      setTimeout(async () => {
-        const configuredTimeout = Number(env.KANEDIAS_E2E_QUESTION_TIMEOUT_MS ?? "60000");
-        const timeout = Number.isFinite(configuredTimeout) && configuredTimeout > 0 && configuredTimeout <= 60_000 ? configuredTimeout : 60_000;
-        const answer = await ctx.ui.input(`Kanedias E2E controlled question ${env.KANEDIAS_E2E_RUN_ID}`, "deterministic answer", { timeout });
-        ctx.ui.notify(`KANEDIAS_E2E_QUESTION_ANSWER:${answer ?? "cancelled"}`, "info");
-      }, 0);
-    });
-  }
+  // E2E controlled question — presented DETERMINISTICALLY on supervisor command,
+  // not via the timing-sensitive session_start event. The supervisor drives it
+  // by sending a "prompt /present_e2e_question" RPC after the root binds; pi
+  // executes this registered slash command (prompt() runs a leading-/ as an
+  // extension command), which presents the ui.input question. This removes the
+  // fragile dependency on pi's headless-RPC session_start emission timing.
+  pi.registerCommand("present_e2e_question", {
+    description: "Present the E2E controlled question and await the operator answer.",
+    handler: async (args, ctx) => {
+      const title = (args.trim() || `Kanedias E2E controlled question ${env.KANEDIAS_E2E_RUN_ID ?? ""}`).trim();
+      const configuredTimeout = Number(env.KANEDIAS_E2E_QUESTION_TIMEOUT_MS ?? "60000");
+      const timeout = Number.isFinite(configuredTimeout) && configuredTimeout > 0 && configuredTimeout <= 60_000 ? configuredTimeout : 60_000;
+      const answer = await ctx.ui.input(title, "deterministic answer", { timeout });
+      ctx.ui.notify(`KANEDIAS_E2E_QUESTION_ANSWER:${answer ?? "cancelled"}`, "info");
+    },
+  });
 
   // Fetch the configured worker catalog. Retry for a while (the supervisor
   // socket can take a moment to start serving) and NEVER throw: a rejection here
