@@ -200,7 +200,41 @@ func TestOpenAICodexOAuthSerializesRefreshAcrossSources(t *testing.T) {
 	}
 }
 
-func TestDirectoryLockHeartbeatsAndDoesNotRemoveSuccessor(t *testing.T) {
+func TestDirectoryLockHeartbeatPreventsStaleTakeover(t *testing.T) {
+	lockPath := filepath.Join(t.TempDir(), "credential.lock")
+	ctx, cancel := context.WithTimeout(context.Background(), time.Second)
+	defer cancel()
+	lock, err := acquireDirectoryLock(ctx, lockPath, 200*time.Millisecond, 50*time.Millisecond)
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	// Wait deterministically for the holder's heartbeat to refresh the directory
+	// mtime (instead of a fixed sleep), so the stale-takeover check below does not
+	// race a slow or contended runner.
+	initial := lock.info.ModTime()
+	deadline := time.Now().Add(time.Second)
+	heartbeated := false
+	for time.Now().Before(deadline) {
+		if info, statErr := os.Stat(lockPath); statErr == nil && info.ModTime().After(initial) {
+			heartbeated = true
+			break
+		}
+		time.Sleep(10 * time.Millisecond)
+	}
+	if !heartbeated {
+		t.Fatal("lock did not refresh its heartbeat")
+	}
+
+	secondCtx, secondCancel := context.WithTimeout(context.Background(), 100*time.Millisecond)
+	defer secondCancel()
+	if second, err := acquireDirectoryLock(secondCtx, lockPath, 200*time.Millisecond, 50*time.Millisecond); err == nil {
+		second.Release()
+		t.Fatal("heartbeat did not prevent stale-lock takeover")
+	}
+}
+
+func TestDirectoryLockReleaseDoesNotRemoveSuccessor(t *testing.T) {
 	// The successor assertion relies on the filesystem giving a *different*
 	// inode to the directory recreated at the lock path, so that Release()'s
 	// os.SameFile check declines to remove it. GitHub-hosted runners reuse
@@ -216,15 +250,6 @@ func TestDirectoryLockHeartbeatsAndDoesNotRemoveSuccessor(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-
-	time.Sleep(350 * time.Millisecond)
-	secondCtx, secondCancel := context.WithTimeout(context.Background(), 100*time.Millisecond)
-	defer secondCancel()
-	if second, err := acquireDirectoryLock(secondCtx, lockPath, 200*time.Millisecond, 50*time.Millisecond); err == nil {
-		second.Release()
-		t.Fatal("heartbeat did not prevent stale-lock takeover")
-	}
-
 	if err := os.Remove(lockPath); err != nil {
 		t.Fatal(err)
 	}
