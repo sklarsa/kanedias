@@ -1630,7 +1630,7 @@ func (h *liveAcceptance) runServerManaged() {
 	// Have the first root create a controlled descendant by steering it with a
 	// delegate_session request.
 	descendantTask := "Use delegate_session exactly once with workerType reviewer, kind read, context fresh, task \"Reply KANEDIAS_E2E_MANAGED_DESCENDANT_OK exactly\". After it returns reproduce its answer."
-	h.postDatastar(restartedClient, serverOrigin+"/ui/sessions/"+url.PathEscape(roots[0].SessionID)+"/steer",
+	h.postDatastar(restartedClient, actionURL(restartedOrigin, roots[0].SessionID, "steer"),
 		map[string]any{"message": descendantTask})
 
 	descendant := h.waitForManagedDescendant(roots[0].SocketPath, roots[0].SessionID)
