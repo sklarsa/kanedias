@@ -58,7 +58,7 @@ apt-get install -y --no-install-recommends \
     diffutils \
     file \
     findutils \
-    fd \
+    fd-find \
     gcc \
     gh \
     git \
