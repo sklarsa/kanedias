@@ -8,6 +8,7 @@ import (
 	"net/http/httptest"
 	"strings"
 	"testing"
+	"time"
 )
 
 // deterministicReader always returns the same byte pattern.
@@ -69,9 +70,9 @@ func TestCapabilityStoreOnlyRetainsDigests(t *testing.T) {
 	if strings.Contains(output, string(store.bootstrapDigest[:])) {
 		t.Error("raw bootstrap digest appeared in bootstrap output")
 	}
-	// The session digests slice starts empty.
-	if len(store.sessionDigests) != 0 {
-		t.Errorf("initial sessionDigests = %d, want 0", len(store.sessionDigests))
+	// The session records slice starts empty.
+	if len(store.sessions) != 0 {
+		t.Errorf("initial sessions = %d, want 0", len(store.sessions))
 	}
 }
 
@@ -244,53 +245,63 @@ func TestSessionCookieIssuedByValidBootstrap(t *testing.T) {
 	}
 }
 
-func TestBootstrapCanIssueSecondBrowserSession(t *testing.T) {
+func TestBootstrapIsSingleUse(t *testing.T) {
 	var out bytes.Buffer
 	store, err := newCapabilityStore(newDeterministicReader(), &out)
 	if err != nil {
 		t.Fatalf("newCapabilityStore: %v", err)
 	}
 
-	// Obtain bootstrap token.
+	// Obtain the bootstrap token.
 	output := out.String()
 	idx := strings.Index(output, bootstrapQueryName+"=")
 	token := strings.TrimSpace(output[idx+len(bootstrapQueryName)+1:])
 
-	// Issue two browser sessions.
-	var tokens []string
-	for range 2 {
-		req := httptest.NewRequest(http.MethodGet, "/bootstrap?"+bootstrapQueryName+"="+token, nil)
-		w := httptest.NewRecorder()
-		store.serveBootstrap(w, req)
-		if w.Code != http.StatusSeeOther {
-			t.Fatalf("bootstrap status = %d, want %d", w.Code, http.StatusSeeOther)
-		}
-		for _, h := range w.Header()["Set-Cookie"] {
-			if strings.HasPrefix(h, sessionCookieName+"=") {
-				parts := strings.SplitN(h, "=", 2)
-				if len(parts) == 2 {
-					tokens = append(tokens, strings.Split(parts[1], ";")[0])
-				}
-				break
-			}
+	// First bootstrap exchange mints a session cookie.
+	first := httptest.NewRequest(http.MethodGet, "/bootstrap?"+bootstrapQueryName+"="+token, nil)
+	w1 := httptest.NewRecorder()
+	store.serveBootstrap(w1, first)
+	if w1.Code != http.StatusSeeOther {
+		t.Fatalf("first bootstrap status = %d, want %d", w1.Code, http.StatusSeeOther)
+	}
+	var cookies []string
+	for _, h := range w1.Header()["Set-Cookie"] {
+		if strings.HasPrefix(h, sessionCookieName+"=") {
+			cookies = append(cookies, h)
 		}
 	}
-	if len(tokens) != 2 {
-		t.Fatalf("expected 2 tokens, got %d", len(tokens))
+	if len(cookies) != 1 {
+		t.Fatalf("first bootstrap set %d session cookies, want 1", len(cookies))
 	}
 
-	// Both tokens must be valid.
-	protected := store.requireSession(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
-		w.WriteHeader(http.StatusOK)
-	}))
-	for _, tok := range tokens {
-		req := httptest.NewRequest(http.MethodGet, "/", nil)
-		req.AddCookie(&http.Cookie{Name: sessionCookieName, Value: tok})
-		w := httptest.NewRecorder()
-		protected.ServeHTTP(w, req)
-		if w.Code != http.StatusOK {
-			t.Errorf("token %q: status = %d, want 200", tok, w.Code)
-		}
+	// The one-time bootstrap token must NOT be replayable.
+	second := httptest.NewRequest(http.MethodGet, "/bootstrap?"+bootstrapQueryName+"="+token, nil)
+	w2 := httptest.NewRecorder()
+	store.serveBootstrap(w2, second)
+	if w2.Code != http.StatusForbidden {
+		t.Fatalf("replayed bootstrap status = %d, want %d (one-time token)", w2.Code, http.StatusForbidden)
+	}
+}
+
+func TestSessionExpiresAfterTTL(t *testing.T) {
+	var out bytes.Buffer
+	store, err := newCapabilityStore(newDeterministicReader(), &out)
+	if err != nil {
+		t.Fatalf("newCapabilityStore: %v", err)
+	}
+	token, digest, err := newCapability(newDeterministicReader())
+	if err != nil {
+		t.Fatal(err)
+	}
+	// A TTL already expired should make the session immediately invalid.
+	store.sessionTTL = -time.Second
+	store.addSession(digest)
+	if store.validSession(token) {
+		t.Fatal("expired session was accepted")
+	}
+	// After purging, the session store is empty.
+	if len(store.sessions) != 0 {
+		t.Fatalf("expired sessions not purged: %d remain", len(store.sessions))
 	}
 }
 

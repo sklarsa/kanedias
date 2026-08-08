@@ -10,13 +10,23 @@ import (
 	"mime"
 	"net/http"
 	"sync"
+	"time"
 )
 
 const (
 	bootstrapQueryName = "capability"
 	sessionCookieName  = "kanedias_session"
 	capabilityBytes    = 32
+	// defaultSessionTTL bounds how long a minted browser session is accepted by
+	// the server, so a leaked cookie does not remain valid forever.
+	defaultSessionTTL = 6 * time.Hour
 )
+
+// sessionRecord stores a session digest plus its expiry.
+type sessionRecord struct {
+	digest    [sha256.Size]byte
+	expiresAt time.Time
+}
 
 // capabilityStore manages bootstrap and browser session capabilities.
 // It stores only SHA-256 digests of issued tokens.
@@ -24,7 +34,9 @@ type capabilityStore struct {
 	mu              sync.RWMutex
 	random          io.Reader
 	bootstrapDigest [sha256.Size]byte
-	sessionDigests  [][sha256.Size]byte
+	bootstrapUsed   bool
+	sessions        []sessionRecord
+	sessionTTL      time.Duration
 	output          io.Writer
 }
 
@@ -40,6 +52,7 @@ func newCapabilityStore(random io.Reader, output io.Writer) (*capabilityStore, e
 	return &capabilityStore{
 		random:          random,
 		bootstrapDigest: digest,
+		sessionTTL:      defaultSessionTTL,
 		output:          output,
 	}, nil
 }
@@ -56,20 +69,34 @@ func newCapability(r io.Reader) (token string, digest [sha256.Size]byte, err err
 	return token, digest, nil
 }
 
-// addSession stores a new browser session digest.
+// addSession stores a new browser session digest, expiring after the store's TTL.
 func (s *capabilityStore) addSession(digest [sha256.Size]byte) {
 	s.mu.Lock()
 	defer s.mu.Unlock()
-	s.sessionDigests = append(s.sessionDigests, digest)
+	s.purgeLocked()
+	s.sessions = append(s.sessions, sessionRecord{digest: digest, expiresAt: time.Now().Add(s.sessionTTL)})
 }
 
-// validSession reports whether the token matches any stored session digest.
+// purgeLocked removes expired session records. Callers must hold s.mu.
+func (s *capabilityStore) purgeLocked() {
+	now := time.Now()
+	kept := s.sessions[:0]
+	for _, rec := range s.sessions {
+		if rec.expiresAt.After(now) {
+			kept = append(kept, rec)
+		}
+	}
+	s.sessions = kept
+}
+
+// validSession reports whether the token matches any unexpired stored session digest.
 func (s *capabilityStore) validSession(token string) bool {
 	digest := sha256.Sum256([]byte(token))
-	s.mu.RLock()
-	defer s.mu.RUnlock()
-	for _, stored := range s.sessionDigests {
-		if subtle.ConstantTimeCompare(digest[:], stored[:]) == 1 {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	s.purgeLocked()
+	for _, rec := range s.sessions {
+		if subtle.ConstantTimeCompare(digest[:], rec.digest[:]) == 1 {
 			return true
 		}
 	}
@@ -80,10 +107,16 @@ func (s *capabilityStore) validSession(token string) bool {
 // bootstrap capability query parameter and issues a browser session cookie.
 func (s *capabilityStore) serveBootstrap(w http.ResponseWriter, r *http.Request) {
 	provided := sha256.Sum256([]byte(r.URL.Query().Get(bootstrapQueryName)))
-	if subtle.ConstantTimeCompare(provided[:], s.bootstrapDigest[:]) != 1 {
+	s.mu.Lock()
+	if s.bootstrapUsed || subtle.ConstantTimeCompare(provided[:], s.bootstrapDigest[:]) != 1 {
+		s.mu.Unlock()
 		http.Error(w, "Forbidden", http.StatusForbidden)
 		return
 	}
+	// The bootstrap is a one-time exchange: the first successful use invalidates
+	// the token so it cannot be replayed to mint unlimited sessions.
+	s.bootstrapUsed = true
+	s.mu.Unlock()
 
 	browserToken, browserDigest, err := newCapability(s.random)
 	if err != nil {
@@ -103,6 +136,7 @@ func (s *capabilityStore) serveBootstrap(w http.ResponseWriter, r *http.Request)
 		Path:     "/",
 		HttpOnly: true,
 		SameSite: http.SameSiteStrictMode,
+		MaxAge:   int(s.sessionTTL.Seconds()),
 	})
 	http.Redirect(w, r, "/", http.StatusSeeOther)
 }
