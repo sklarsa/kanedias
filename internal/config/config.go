@@ -19,11 +19,13 @@ type WorkerProfile struct {
 }
 
 type Config struct {
-	Network   Network                  `toml:"network"`
-	BaseImage BaseImage                `toml:"base_image"`
-	Workspace Workspace                `toml:"workspace"`
-	Workers   map[string]WorkerProfile `toml:"workers"`
-	Dir       string                   `toml:"-"`
+	Network    Network                  `toml:"network"`
+	BaseImage  BaseImage                `toml:"base_image"`
+	Workspace  Workspace                `toml:"workspace"`
+	Workers    map[string]WorkerProfile `toml:"workers"`
+	Server     ServerConfig             `toml:"server"`
+	Supervisor SupervisorConfig         `toml:"supervisor"`
+	Dir        string                   `toml:"-"`
 }
 
 var validThinkingLevels = map[string]struct{}{
@@ -109,6 +111,9 @@ func (cfg Config) WorkerNames() []string {
 
 func (cfg Config) ValidateSupervisor() error {
 	if err := cfg.ValidateLifecycle(); err != nil {
+		return err
+	}
+	if _, err := cfg.Supervisor.Events.Limits(); err != nil {
 		return err
 	}
 	if len(cfg.Workers) == 0 {

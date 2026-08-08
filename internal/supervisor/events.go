@@ -2,6 +2,7 @@ package supervisor
 
 import (
 	"encoding/json"
+	"fmt"
 	"sync"
 )
 
@@ -57,6 +58,31 @@ type eventSubscriber struct {
 
 func NewEventBroker() *EventBroker {
 	return newEventBrokerWithByteCapacity(DefaultEventRingCapacity, DefaultSubscriberMailboxCapacity, DefaultEventRingByteCapacity)
+}
+
+// EventBrokerOptions configures independent broker eviction limits. A zero
+// field disables that limit; at least one limit must be positive.
+type EventBrokerOptions struct {
+	MaxEvents int
+	MaxBytes  int
+}
+
+// NewEventBrokerWithOptions constructs a broker with configured limits.
+// Zero-valued fields fall back to the defaults until the eviction loop
+// supports independent limits (config lane completes that change).
+func NewEventBrokerWithOptions(options EventBrokerOptions) (*EventBroker, error) {
+	if options.MaxEvents <= 0 && options.MaxBytes <= 0 {
+		return nil, fmt.Errorf("at least one of MaxEvents or MaxBytes must be positive")
+	}
+	maxEvents := options.MaxEvents
+	if maxEvents <= 0 {
+		maxEvents = DefaultEventRingCapacity
+	}
+	maxBytes := options.MaxBytes
+	if maxBytes <= 0 {
+		maxBytes = DefaultEventRingByteCapacity
+	}
+	return newEventBrokerWithByteCapacity(maxEvents, DefaultSubscriberMailboxCapacity, maxBytes), nil
 }
 
 func newEventBroker(ringCapacity, mailboxCapacity int) *EventBroker {
