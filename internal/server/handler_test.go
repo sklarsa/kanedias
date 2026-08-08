@@ -593,7 +593,13 @@ func (f *streamFakeFleet) Close(context.Context) error   { return nil }
 // and returns a valid session cookie.
 func mustNewHandlerWithFleetAuth(t *testing.T, fleet fleetManager) (http.Handler, *http.Cookie) {
 	t.Helper()
-	logger := slog.New(slog.NewTextHandler(&bytes.Buffer{}, nil))
+	return mustNewHandlerWithFleetAuthLogger(t, fleet, slog.New(slog.NewTextHandler(&bytes.Buffer{}, nil)))
+}
+
+// mustNewHandlerWithFleetAuthLogger is mustNewHandlerWithFleetAuth with an
+// explicit logger so tests can assert what the server records server-side.
+func mustNewHandlerWithFleetAuthLogger(t *testing.T, fleet fleetManager, logger *slog.Logger) (http.Handler, *http.Cookie) {
+	t.Helper()
 	var bootstrapOut bytes.Buffer
 	streamCtx, cancel := context.WithCancel(context.Background())
 	t.Cleanup(cancel)

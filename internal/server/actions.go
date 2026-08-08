@@ -12,7 +12,15 @@ import (
 
 // patchDeckStatus renders the deck-status template and patches #deck-status
 // on the SSE stream. err may be nil (success) or non-nil (mapped to operator copy).
+//
+// The operator only ever sees the sanitized operatorMessage, so the underlying
+// error is logged here (server-side only) with request context; otherwise a
+// failed command surfaces as generic copy with no record of the real cause.
 func patchDeckStatusAction(w http.ResponseWriter, r *http.Request, templates *template.Template, logger *slog.Logger, err error) {
+	if err != nil {
+		logger.Error("action failed",
+			"method", r.Method, "path", r.URL.Path, "error", err)
+	}
 	view := newDeckStatusView(err)
 	html, renderErr := renderTemplate(templates, templateDeckStatus, view)
 	if renderErr != nil {
@@ -32,7 +40,6 @@ func makeSteerHandler(fleet fleetManager, templates *template.Template, logger *
 		sessionID := chi.URLParam(r, "sessionID")
 		signals, err := decodeSignals[steerSignals](w, r)
 		if err != nil {
-			logger.Error("decode steer signals", "error", err)
 			patchDeckStatusAction(w, r, templates, logger, err)
 			return
 		}
@@ -74,7 +81,6 @@ func makeAnswerQuestionHandler(fleet fleetManager, templates *template.Template,
 		questionID := chi.URLParam(r, "questionID")
 		signals, err := decodeSignals[answerSignals](w, r)
 		if err != nil {
-			logger.Error("decode answer signals", "error", err)
 			patchDeckStatusAction(w, r, templates, logger, err)
 			return
 		}

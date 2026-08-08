@@ -279,3 +279,33 @@ func TestErrorFromNonContractErrorPatchesDeckStatusWithGenericMessage(t *testing
 		t.Errorf("generic error response leaked internal error detail:\n%s", body)
 	}
 }
+
+// TestActionErrorIsLoggedServerSide verifies that a failed manager command
+// records its real (unsanitized) error server-side even though the operator
+// only sees generic copy — otherwise failures are undiagnosable.
+func TestActionErrorIsLoggedServerSide(t *testing.T) {
+	var logBuf bytes.Buffer
+	logger := slog.New(slog.NewTextHandler(&logBuf, &slog.HandlerOptions{Level: slog.LevelError}))
+	ef := &errFleet{
+		streamFakeFleet: newStreamFakeFleet(),
+		mutationErr:     errors.New("root is not actionable: real cause"),
+	}
+	handler, cookie := mustNewHandlerWithFleetAuthLogger(t, ef, logger)
+
+	resp := serveActionRequest(t, handler, "/ui/sessions/sess-1/steer", `{}`, cookie)
+	if resp.Code != http.StatusOK {
+		t.Fatalf("status = %d, want %d", resp.Code, http.StatusOK)
+	}
+	// Browser must NOT see the real cause.
+	if strings.Contains(resp.Body.String(), "real cause") {
+		t.Errorf("response leaked real cause to browser:\n%s", resp.Body.String())
+	}
+	// Server log MUST record the real cause with request context.
+	logged := logBuf.String()
+	if !strings.Contains(logged, "real cause") {
+		t.Errorf("server log did not record the real error cause:\n%s", logged)
+	}
+	if !strings.Contains(logged, "/ui/sessions/sess-1/steer") {
+		t.Errorf("server log did not record the request path:\n%s", logged)
+	}
+}
