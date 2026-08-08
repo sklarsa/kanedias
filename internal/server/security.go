@@ -8,7 +8,10 @@ import (
 	"fmt"
 	"io"
 	"mime"
+	"net"
 	"net/http"
+	"net/url"
+	"strings"
 	"sync"
 	"time"
 )
@@ -160,28 +163,66 @@ func (s *capabilityStore) requireSession(next http.Handler) http.Handler {
 // requestBoundary enforces same-origin write boundary checks.
 // Host and Origin are derived only from the listener's effective address.
 type requestBoundary struct {
-	Host   string
-	Origin string
+	Host string
 }
 
-// newRequestBoundary derives the expected Host and Origin from the effective address string.
+// newRequestBoundary derives the expected Host from the effective address string.
 func newRequestBoundary(effectiveAddress string) requestBoundary {
-	return requestBoundary{
-		Host:   effectiveAddress,
-		Origin: "http://" + effectiveAddress,
+	return requestBoundary{Host: effectiveAddress}
+}
+
+// isLoopbackHost reports whether host (without port) is a loopback address:
+// localhost or any loopback IP. These are all the same machine (the server is
+// loopback-only), so they are interchangeable for the same-origin boundary.
+func isLoopbackHost(host string) bool {
+	if ip := net.ParseIP(host); ip != nil {
+		return ip.IsLoopback()
 	}
+	return strings.EqualFold(host, "localhost")
+}
+
+// boundaryHostMatches reports whether the request Host is acceptable: it must
+// share the port with the expected effective address and name a loopback host.
+// This lets operators reach the console via localhost, 127.0.0.1, or ::1
+// interchangeably without admitting an external Host.
+func boundaryHostMatches(host, expected string) bool {
+	if host == expected {
+		return true
+	}
+	expectedHost, expectedPort, err := net.SplitHostPort(expected)
+	if err != nil {
+		return false
+	}
+	h, port, err := net.SplitHostPort(host)
+	if err != nil || port != expectedPort {
+		return false
+	}
+	return isLoopbackHost(h) && isLoopbackHost(expectedHost)
+}
+
+// boundaryOriginMatches reports whether the Origin header's host is an
+// acceptable loopback alias of the server's effective address.
+func boundaryOriginMatches(origin, expected string) bool {
+	u, err := url.Parse(origin)
+	if err != nil {
+		return false
+	}
+	if u.Scheme != "http" && u.Scheme != "https" {
+		return false
+	}
+	return boundaryHostMatches(u.Host, expected)
 }
 
 // requireWriteBoundary is a middleware that enforces same-origin write constraints.
 // It checks Host, Origin, Sec-Fetch-Site, and Content-Type: application/json.
 func (b requestBoundary) requireWriteBoundary(next http.Handler) http.Handler {
 	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-		if r.Host != b.Host {
+		if !boundaryHostMatches(r.Host, b.Host) {
 			http.Error(w, "Forbidden", http.StatusForbidden)
 			return
 		}
 		origin := r.Header.Get("Origin")
-		if origin != "" && origin != b.Origin {
+		if origin != "" && !boundaryOriginMatches(origin, b.Host) {
 			http.Error(w, "Forbidden", http.StatusForbidden)
 			return
 		}
