@@ -158,12 +158,48 @@ func (m *Manager) Interrupt(ctx context.Context, sessionID string) error {
 	return err
 }
 
-// StopSession stops one session subtree through its owning root.
+// StopSession stops one session subtree through its owning root. If the owning
+// root is not actionable (stale or otherwise unreachable — e.g. it crashed and
+// left an orphaned socket), Stop cannot reach it, so the root is evicted from
+// the fleet immediately rather than leaving its card lingering until the next
+// discovery pass notices the socket is gone (#11). Stop on a live root keeps the
+// graceful RPC stop.
 func (m *Manager) StopSession(ctx context.Context, sessionID string) error {
-	client, err := m.actionableClient(sessionID)
-	if err != nil {
-		return err
+	m.mu.Lock()
+	if m.quiesced || m.closed {
+		m.mu.Unlock()
+		return errors.New("manager: quiesced, actions are disabled")
 	}
+	rootID, ok := m.routes[sessionID]
+	if !ok {
+		m.mu.Unlock()
+		return fmt.Errorf("session %q not found", sessionID)
+	}
+	var target *rootHandle
+	var socketPath string
+	for sp, h := range m.roots {
+		if h.rootID == rootID {
+			target, socketPath = h, sp
+			break
+		}
+	}
+	if target == nil {
+		m.mu.Unlock()
+		return fmt.Errorf("root %q not found for session %q", rootID, sessionID)
+	}
+	if !target.actionable || target.stale {
+		// Evict immediately: Stop can't reach a stale/unreachable root, so drop
+		// it from the fleet now instead of waiting for discovery to notice.
+		removed := m.removeRootLocked(socketPath)
+		m.mu.Unlock()
+		if removed != nil {
+			m.drainAndCloseDisplaced(removed)
+			m.bumpFleetRevision()
+		}
+		return nil
+	}
+	client := target.client
+	m.mu.Unlock()
 	return client.Stop(ctx, sessionID)
 }
 
