@@ -40,12 +40,18 @@ export default async function kanediasExtension(pi: ExtensionAPI, options: Exten
   // fragile dependency on pi's headless-RPC session_start emission timing.
   pi.registerCommand("present_e2e_question", {
     description: "Present the E2E controlled question and await the operator answer.",
-    handler: async (args, ctx) => {
+    handler: (args, ctx) => {
       const title = (args.trim() || `Kanedias E2E controlled question ${env.KANEDIAS_E2E_RUN_ID ?? ""}`).trim();
       const configuredTimeout = Number(env.KANEDIAS_E2E_QUESTION_TIMEOUT_MS ?? "60000");
       const timeout = Number.isFinite(configuredTimeout) && configuredTimeout > 0 && configuredTimeout <= 60_000 ? configuredTimeout : 60_000;
-      const answer = await ctx.ui.input(title, "deterministic answer", { timeout });
-      ctx.ui.notify(`KANEDIAS_E2E_QUESTION_ANSWER:${answer ?? "cancelled"}`, "info");
+      // Present the question and await the answer on a detached promise, so the
+      // dialog outlives the completing prompt/command and is not cancelled when
+      // the invoking RPC command finishes. The answer still routes back.
+      void (async () => {
+        const answer = await ctx.ui.input(title, "deterministic answer", { timeout });
+        ctx.ui.notify(`KANEDIAS_E2E_QUESTION_ANSWER:${answer ?? "cancelled"}`, "info");
+      })();
+      return;
     },
   });
 
