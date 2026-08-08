@@ -2,7 +2,6 @@ package manager
 
 import (
 	"context"
-	"encoding/json"
 	"errors"
 	"fmt"
 	"log/slog"
@@ -335,31 +334,6 @@ func (m *Manager) SubscribeSession(sessionID string) (ChangeSubscription, error)
 		return ChangeSubscription{}, errNotImplemented
 	}
 	return m.sessionFanout.Subscribe(), nil
-}
-
-// Steer sends a streaming steer or an idle prompt to a session.
-func (m *Manager) Steer(ctx context.Context, sessionID string, message string) error {
-	return errNotImplemented
-}
-
-// Interrupt aborts the current turn of a session.
-func (m *Manager) Interrupt(ctx context.Context, sessionID string) error {
-	return errNotImplemented
-}
-
-// StopSession stops one session subtree through its owning root.
-func (m *Manager) StopSession(ctx context.Context, sessionID string) error {
-	return errNotImplemented
-}
-
-// AnswerQuestion forwards a raw answer to one pending question.
-func (m *Manager) AnswerQuestion(ctx context.Context, sessionID string, questionID string, answer json.RawMessage) error {
-	return errNotImplemented
-}
-
-// SessionStats returns typed Pi metrics for one actionable session.
-func (m *Manager) SessionStats(ctx context.Context, sessionID string) (SessionStats, error) {
-	return SessionStats{}, errNotImplemented
 }
 
 // Quiesce rejects new writes and stops discovery/polling while event drains
