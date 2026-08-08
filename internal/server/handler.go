@@ -110,11 +110,19 @@ func newHandlerWithOptions(logger *slog.Logger, effectiveAddress string, bootstr
 	router.Group(func(write chi.Router) {
 		write.Use(auth.requireSession)
 		write.Use(boundary.requireWriteBoundary)
-		write.Post("/ui/sessions", http.NotFoundHandler().ServeHTTP)
-		write.Post("/ui/sessions/{sessionID}/steer", http.NotFoundHandler().ServeHTTP)
-		write.Post("/ui/sessions/{sessionID}/interrupt", http.NotFoundHandler().ServeHTTP)
-		write.Post("/ui/sessions/{sessionID}/stop", http.NotFoundHandler().ServeHTTP)
-		write.Post("/ui/sessions/{sessionID}/questions/{questionID}", http.NotFoundHandler().ServeHTTP)
+		if fleet != nil {
+			write.Post("/ui/sessions", makeNewSessionHandler(fleet, templates, logger))
+			write.Post("/ui/sessions/{sessionID}/steer", makeSteerHandler(fleet, templates, logger))
+			write.Post("/ui/sessions/{sessionID}/interrupt", makeInterruptHandler(fleet, templates, logger))
+			write.Post("/ui/sessions/{sessionID}/stop", makeStopSessionHandler(fleet, templates, logger))
+			write.Post("/ui/sessions/{sessionID}/questions/{questionID}", makeAnswerQuestionHandler(fleet, templates, logger))
+		} else {
+			write.Post("/ui/sessions", http.NotFoundHandler().ServeHTTP)
+			write.Post("/ui/sessions/{sessionID}/steer", http.NotFoundHandler().ServeHTTP)
+			write.Post("/ui/sessions/{sessionID}/interrupt", http.NotFoundHandler().ServeHTTP)
+			write.Post("/ui/sessions/{sessionID}/stop", http.NotFoundHandler().ServeHTTP)
+			write.Post("/ui/sessions/{sessionID}/questions/{questionID}", http.NotFoundHandler().ServeHTTP)
+		}
 	})
 
 	return router, nil

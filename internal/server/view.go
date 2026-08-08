@@ -1,10 +1,12 @@
 package server
 
 import (
+	"errors"
 	"fmt"
 
 	"github.com/sklarsa/kanedias/internal/manager"
 	"github.com/sklarsa/kanedias/internal/supervisor"
+	"github.com/sklarsa/kanedias/internal/supervisor/contract"
 )
 
 // Template names — each corresponds to a fragment file.
@@ -296,11 +298,37 @@ func newDeckStatusView(err error) deckStatusView {
 
 // operatorMessage converts an internal error to a safe operator-facing message.
 // Typed contract errors map to stable copy; all others produce a generic message.
+// Never includes socket paths, session files, capabilities, or panic values.
 func operatorMessage(err error) string {
 	if err == nil {
 		return ""
 	}
-	// Contract errors are handled in Task 9 with typed switch.
-	// This base implementation provides the generic fallback.
+	var ce *contract.Error
+	if errors.As(err, &ce) {
+		switch ce.Code {
+		case contract.ErrorSessionStopping:
+			return "The session is already stopping."
+		case contract.ErrorNotFound:
+			return "The session could not be found."
+		case contract.ErrorSaturated:
+			return "The system is at capacity. Try again shortly."
+		case contract.ErrorConflict:
+			return "The command could not be applied to the current session state."
+		case contract.ErrorInvalidRequest:
+			return "The command was not valid."
+		case contract.ErrorUnknownWorkerType:
+			return "The session worker type is not supported."
+		case contract.ErrorForbiddenRPC:
+			return "The command is not permitted for this session."
+		case contract.ErrorProxyUnavailable, contract.ErrorChildUnavailable:
+			return "The session is temporarily unavailable."
+		case contract.ErrorProvisioningFailed:
+			return "The session could not be started."
+		case contract.ErrorChildFailed, contract.ErrorChildAborted:
+			return "The session ended unexpectedly."
+		case contract.ErrorHandoffRefMissing, contract.ErrorHandoffRefMismatch:
+			return "The session handoff could not be completed."
+		}
+	}
 	return "The supervisor command could not be completed."
 }
