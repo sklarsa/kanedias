@@ -564,6 +564,7 @@ func (h *liveAcceptance) exerciseRootRPC(root supervisor.NodeSnapshot, socket st
 
 func (h *liveAcceptance) exerciseQuestionFixture(root supervisor.NodeSnapshot, socket string, stream *sseCapture) {
 	client := unixHTTPClient(socket)
+	h.presentControlledQuestion(client, root.SessionID)
 	var question supervisor.QuestionSummary
 	h.poll(time.Minute, "controlled Pi question in root tree", func() bool {
 		var current supervisor.NodeSnapshot
@@ -2161,7 +2162,24 @@ func actionURL(serverOrigin, sessionID, action string) string {
 // answerManagedQuestion waits for the controlled pending question and answers it
 // through the server. Absence is a test failure: this acceptance path promises
 // to prove browser-to-supervisor question routing.
+// presentControlledQuestion deterministically triggers the E2E controlled question
+// by invoking the extension's present_e2e_question slash command via a prompt RPC
+// (routed through the session's owning supervisor). pi runs a leading-"/" prompt
+// as an extension command, so the question appears reliably after the session binds
+// instead of depending on pi's timing-sensitive session_start auto-emit.
+func (h *liveAcceptance) presentControlledQuestion(client *http.Client, sessionID string) {
+	h.rpc(client, sessionID, map[string]any{"type": "prompt", "message": "/present_e2e_question"})
+}
+
 func (h *liveAcceptance) answerManagedQuestion(client *http.Client, serverOrigin, sessionID, answer string) {
+	// Resolve the managed root socket that owns this session, then deterministically
+	// trigger the controlled question through it.
+	sockPath := h.managedSocketForSession(sessionID)
+	if sockPath == "" {
+		h.t.Fatalf("managed session %s has no root socket", sessionID)
+	}
+	h.presentControlledQuestion(unixHTTPClient(sockPath), sessionID)
+
 	var question supervisor.QuestionSummary
 	h.poll(time.Minute, "managed question for session "+sessionID, func() bool {
 		entries, err := os.ReadDir(h.managedSocketDir)
@@ -2184,6 +2202,28 @@ func (h *liveAcceptance) answerManagedQuestion(client *http.Client, serverOrigin
 	})
 	h.postDatastar(client, serverOrigin+"/ui/sessions/"+url.PathEscape(sessionID)+"/questions/"+url.PathEscape(question.ID),
 		map[string]any{"value": answer})
+}
+
+// managedSocketForSession returns the managed root socket path whose tree contains
+// the given session (descendants route through their owning root). Empty when the
+// session cannot be found.
+func (h *liveAcceptance) managedSocketForSession(sessionID string) string {
+	entries, err := os.ReadDir(h.managedSocketDir)
+	if err != nil {
+		return ""
+	}
+	for _, entry := range entries {
+		if !strings.HasSuffix(entry.Name(), ".root.sock") {
+			continue
+		}
+		sockPath := filepath.Join(h.managedSocketDir, entry.Name())
+		var tree supervisor.NodeSnapshot
+		if unixJSON(unixHTTPClient(sockPath), http.MethodGet, "/v1/tree", nil, &tree) != nil || !treeContainsSession(tree, sessionID) {
+			continue
+		}
+		return sockPath
+	}
+	return ""
 }
 
 // treeContainsSession returns true if tree or any descendant has the given session ID.
