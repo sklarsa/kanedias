@@ -505,3 +505,39 @@ func TestRequireSessionRejectsUnknownCookie(t *testing.T) {
 		t.Errorf("unknown cookie status = %d, want 401", w.Code)
 	}
 }
+
+func TestRequestBoundaryAcceptsLoopbackAlias(t *testing.T) {
+	boundary := newRequestBoundary("127.0.0.1:43127")
+	handler := boundary.requireWriteBoundary(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
+		w.WriteHeader(http.StatusOK)
+	}))
+
+	for _, host := range []string{"localhost:43127", "127.0.0.1:43127", "[::1]:43127"} {
+		req := httptest.NewRequest(http.MethodPost, "/ui/sessions", nil)
+		req.Host = host
+		req.Header.Set("Origin", "http://"+host)
+		req.Header.Set("Sec-Fetch-Site", "same-origin")
+		req.Header.Set("Content-Type", "application/json")
+		w := httptest.NewRecorder()
+		handler.ServeHTTP(w, req)
+		if w.Code != http.StatusOK {
+			t.Errorf("host %q status = %d, want 200 (loopback alias)", host, w.Code)
+		}
+	}
+}
+
+func TestRequestBoundaryRejectsLoopbackAliasWithWrongPort(t *testing.T) {
+	boundary := newRequestBoundary("127.0.0.1:43127")
+	handler := boundary.requireWriteBoundary(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
+		w.WriteHeader(http.StatusOK)
+	}))
+	req := httptest.NewRequest(http.MethodPost, "/ui/sessions", nil)
+	req.Host = "localhost:9999"
+	req.Header.Set("Origin", "http://localhost:9999")
+	req.Header.Set("Content-Type", "application/json")
+	w := httptest.NewRecorder()
+	handler.ServeHTTP(w, req)
+	if w.Code != http.StatusForbidden {
+		t.Errorf("wrong port alias status = %d, want 403", w.Code)
+	}
+}
