@@ -120,7 +120,7 @@ func TestRunContextShutsDownSiblingOnServerError(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	defer metricsL.Close()
+	defer func() { _ = metricsL.Close() }()
 
 	ctx, cancel := context.WithCancel(context.Background())
 	defer cancel()
