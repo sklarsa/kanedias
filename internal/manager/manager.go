@@ -4,7 +4,6 @@ import (
 	"context"
 	"errors"
 	"fmt"
-	"log/slog"
 	"net"
 	"os"
 	"os/user"
@@ -17,9 +16,9 @@ import (
 	"github.com/sklarsa/kanedias/internal/supervisorapi"
 )
 
-// errNotImplemented marks interface-locked stubs replaced by the manager
-// implementation lane; it never ships once the lane merges.
-var errNotImplemented = errors.New("manager: not implemented")
+// errNotFound is returned when a requested session/route does not exist; the
+// server maps it to an HTTP 404.
+var errNotFound = errors.New("manager: not found")
 
 // Manager is the root-only control plane between the recursive supervisor
 // API and the web server.
@@ -281,7 +280,7 @@ func (m *Manager) Session(sessionID string) (SessionState, error) {
 	rootID, ok := m.routes[sessionID]
 	if !ok {
 		m.mu.Unlock()
-		return SessionState{}, errNotImplemented
+		return SessionState{}, errNotFound
 	}
 	var handle *rootHandle
 	for _, h := range m.roots {
@@ -292,12 +291,12 @@ func (m *Manager) Session(sessionID string) (SessionState, error) {
 	}
 	if handle == nil {
 		m.mu.Unlock()
-		return SessionState{}, errNotImplemented
+		return SessionState{}, errNotFound
 	}
 	node, found := findNode(handle.tree, sessionID)
 	if !found {
 		m.mu.Unlock()
-		return SessionState{}, errNotImplemented
+		return SessionState{}, errNotFound
 	}
 	var events []supervisor.EventEnvelope
 	var gap *ReplayGap
@@ -344,7 +343,7 @@ func (m *Manager) SubscribeSession(sessionID string) (ChangeSubscription, error)
 	_, ok := m.routes[sessionID]
 	m.mu.Unlock()
 	if !ok {
-		return ChangeSubscription{}, errNotImplemented
+		return ChangeSubscription{}, errNotFound
 	}
 	return m.sessionFanout.Subscribe(), nil
 }
@@ -412,18 +411,9 @@ func (m *Manager) closeClients() error {
 	return nil
 }
 
-// ensure the skeleton keeps referenced imports alive across lane merges.
-var (
-	_ = supervisor.NewEventBroker
-	_ clientFactory
-)
-
 // Default interval constants.
 const (
 	defaultDiscoveryInterval = 5e9   // 5s
 	defaultSnapshotInterval  = 10e9  // 10s
 	defaultSpawnTimeout      = 120e9 // 2m
 )
-
-// ensure slog is referenced
-var _ *slog.Logger
