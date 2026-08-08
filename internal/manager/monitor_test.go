@@ -5,6 +5,7 @@ import (
 	"encoding/json"
 	"errors"
 	"os"
+	"path/filepath"
 	"testing"
 	"time"
 
@@ -25,6 +26,19 @@ func subscriptionFromReplay(replay []supervisor.EventEnvelope) supervisor.Subscr
 
 // subscriptionWithLiveEvents returns a Subscription that delivers events from
 // a channel and then closes.
+type contextBlockingClient struct {
+	*fakeClient
+	entered chan struct{}
+	exited  chan struct{}
+}
+
+func (client *contextBlockingClient) Snapshot(ctx context.Context) (supervisor.NodeSnapshot, error) {
+	close(client.entered)
+	defer close(client.exited)
+	<-ctx.Done()
+	return supervisor.NodeSnapshot{}, ctx.Err()
+}
+
 func subscriptionWithLiveEvents(events []supervisor.EventEnvelope, closeErr error) supervisor.Subscription {
 	ch := make(chan supervisor.EventEnvelope, len(events)+1)
 	for _, e := range events {
@@ -195,6 +209,11 @@ func TestStoppingTransitionNotifiesFleet(t *testing.T) {
 
 	fleetSub := m.SubscribeFleet()
 	defer fleetSub.Close()
+	sessionSub, err := m.SubscribeSession("stop")
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer sessionSub.Close()
 
 	if m.monitorRoot(handle) != monitorStarted {
 		t.Fatal("monitorRoot refused to start")
@@ -213,6 +232,11 @@ func TestStoppingTransitionNotifiesFleet(t *testing.T) {
 	case <-time.After(2 * time.Second):
 		t.Fatal("no fleet notify after retained-tree transition")
 	}
+	select {
+	case <-sessionSub.Updates:
+	case <-time.After(2 * time.Second):
+		t.Fatal("no session notify after retained-tree transition")
+	}
 
 	// The handle must be marked non-actionable after the retained update.
 	deadline := time.After(2 * time.Second)
@@ -229,9 +253,134 @@ func TestStoppingTransitionNotifiesFleet(t *testing.T) {
 		case <-time.After(10 * time.Millisecond):
 		}
 	}
+
+	// A later admissible snapshot must restore actionability; before the
+	// explicit actionability commit this transition stayed disabled forever.
+	client.mu.Lock()
+	client.snapshot = rootTree("stop")
+	client.mu.Unlock()
+	deadline = time.After(2 * time.Second)
+	for {
+		m.mu.Lock()
+		actionable := m.roots[handle.socketPath].actionable
+		m.mu.Unlock()
+		if actionable {
+			break
+		}
+		select {
+		case <-deadline:
+			t.Fatal("recovered retained root did not become actionable")
+		case <-time.After(10 * time.Millisecond):
+		}
+	}
+	if _, err := m.actionableClient("stop"); err != nil {
+		t.Fatalf("recovered retained root still rejects actions: %v", err)
+	}
+}
+
+func TestSnapshotLoopKeepsInadmissibleRefreshNonActionableAndRecovers(t *testing.T) {
+	starting := rootTree("root")
+	starting.Lifecycle = string(supervisor.LifecycleStarting)
+	starting.PiSessionID = ""
+	starting.SessionFile = ""
+	client := &fakeClient{snapshot: starting}
+	m := fakeManager(nil)
+	m.opts.SnapshotInterval = 5 * time.Millisecond
+	handle := &rootHandle{
+		socketPath: "/tmp/refresh.root.sock", rootID: "root", actionable: true,
+		client: client, tree: rootTree("root"), mirror: newEventMirror(m.opts.EventLimits),
+	}
+	m.roots[handle.socketPath] = handle
+	m.routes["root"] = "root"
+	if m.monitorRoot(handle) != monitorStarted {
+		t.Fatal("monitorRoot did not start")
+	}
+	t.Cleanup(func() {
+		ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+		defer cancel()
+		_ = m.Close(ctx)
+	})
+
+	deadline := time.Now().Add(time.Second)
+	for !m.Fleet().Roots[0].Stale && time.Now().Before(deadline) {
+		time.Sleep(time.Millisecond)
+	}
+	state := m.Fleet().Roots[0]
+	if !state.Stale {
+		t.Fatal("inadmissible refresh did not mark root stale")
+	}
+	if state.Tree.Lifecycle != string(supervisor.LifecycleReady) {
+		t.Fatalf("inadmissible refresh replaced last good tree with %q", state.Tree.Lifecycle)
+	}
+	if err := m.Interrupt(context.Background(), "root"); err == nil {
+		t.Fatal("control reached root after inadmissible refresh")
+	}
+
+	client.mu.Lock()
+	client.snapshot = rootTree("root")
+	client.mu.Unlock()
+	deadline = time.Now().Add(time.Second)
+	for m.Fleet().Roots[0].Stale && time.Now().Before(deadline) {
+		time.Sleep(time.Millisecond)
+	}
+	if m.Fleet().Roots[0].Stale {
+		t.Fatal("admissible refresh did not recover stale root")
+	}
 }
 
 // ---- ManagerStart / ManagerClose tests ----
+
+func TestReplacementHandleIgnoresOldMonitorMutations(t *testing.T) {
+	m := fakeManager(nil)
+	path := "/tmp/replaced.root.sock"
+	old := &rootHandle{socketPath: path, rootID: "old"}
+	replacementTree := rootTree("replacement")
+	replacement := &rootHandle{
+		socketPath: path, rootID: "replacement", tree: replacementTree,
+		actionable: true, streamConnected: true,
+	}
+	m.roots[path] = replacement
+
+	m.markStale(old, true)
+	m.setStreamConnected(old, false)
+	terminal := rootTree("old")
+	terminal.Lifecycle = string(supervisor.LifecycleStopped)
+	m.updateRetainedTree(old, terminal, false)
+
+	if replacement.stale || !replacement.streamConnected || !replacement.actionable {
+		t.Fatalf("old monitor mutated replacement state: %+v", replacement)
+	}
+	if replacement.tree.SessionID != "replacement" {
+		t.Fatalf("old monitor replaced tree with %q", replacement.tree.SessionID)
+	}
+}
+
+func TestEventLoopBacksOffAfterImmediateEOF(t *testing.T) {
+	closed := make(chan struct{})
+	close(closed)
+	client := &fakeClient{snapshot: rootTree("eof"), closeChan: closed, closed: true}
+	m := fakeManager(nil)
+	handle := &rootHandle{
+		socketPath: "/tmp/eof-loop.root.sock", rootID: "eof", client: client,
+		actionable: true, tree: rootTree("eof"),
+		mirror: newEventMirror(supervisor.EventBrokerOptions{MaxEvents: 100}),
+	}
+	m.roots[handle.socketPath] = handle
+	m.routes["eof"] = "eof"
+	if m.monitorRoot(handle) != monitorStarted {
+		t.Fatal("monitorRoot did not start")
+	}
+	t.Cleanup(func() {
+		ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+		defer cancel()
+		_ = m.Close(ctx)
+	})
+
+	time.Sleep(250 * time.Millisecond)
+	if got := client.callCount("Subscribe"); got < 2 || got > 4 {
+		t.Fatalf("immediate EOF reconnect count = %d, want bounded 2..4", got)
+	}
+}
 
 func TestManagerStartAndClose(t *testing.T) {
 	// Use short dirs: the path-length probe uses a 32-char token placeholder.
@@ -247,6 +396,9 @@ func TestManagerStartAndClose(t *testing.T) {
 	})
 	if err != nil {
 		t.Fatal(err)
+	}
+	if m.opts.SessionBinary == "" || !filepath.IsAbs(m.opts.SessionBinary) {
+		t.Fatalf("default SessionBinary = %q, want absolute current executable", m.opts.SessionBinary)
 	}
 	ctx := context.Background()
 	if err := m.Start(ctx); err != nil {
@@ -276,6 +428,83 @@ func TestManagerCloseDoesNotStopAdmittedRoots(t *testing.T) {
 		if call == "Stop" {
 			t.Fatal("Close() called Stop on admitted root — must not")
 		}
+	}
+}
+
+func TestManagerQuiesceRejectsActionsAndStopsSnapshotPolling(t *testing.T) {
+	client := &fakeClient{snapshot: rootTree("root")}
+	m := fakeManager(nil)
+	m.opts.SnapshotInterval = 5 * time.Millisecond
+	handle := &rootHandle{
+		socketPath: "/tmp/quiesce.root.sock", rootID: "root", actionable: true,
+		client: client, tree: rootTree("root"), mirror: newEventMirror(m.opts.EventLimits),
+	}
+	m.roots[handle.socketPath] = handle
+	m.routes["root"] = "root"
+	if m.monitorRoot(handle) != monitorStarted {
+		t.Fatal("monitorRoot did not start")
+	}
+
+	deadline := time.Now().Add(time.Second)
+	for client.callCount("Snapshot") == 0 && time.Now().Before(deadline) {
+		time.Sleep(time.Millisecond)
+	}
+	if err := m.Quiesce(context.Background()); err != nil {
+		t.Fatal(err)
+	}
+	if err := m.Interrupt(context.Background(), "root"); err == nil {
+		t.Fatal("action succeeded after Quiesce")
+	}
+
+	// Allow an already-completing call to settle, then prove no new polls start.
+	time.Sleep(20 * time.Millisecond)
+	calls := client.callCount("Snapshot")
+	time.Sleep(30 * time.Millisecond)
+	if got := client.callCount("Snapshot"); got != calls {
+		t.Fatalf("snapshot polling continued after Quiesce: %d -> %d", calls, got)
+	}
+
+	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+	defer cancel()
+	if err := m.Close(ctx); err != nil {
+		t.Fatal(err)
+	}
+}
+
+func TestManagerQuiesceCancelsInFlightSnapshot(t *testing.T) {
+	client := &contextBlockingClient{
+		fakeClient: &fakeClient{snapshot: rootTree("root")},
+		entered:    make(chan struct{}),
+		exited:     make(chan struct{}),
+	}
+	m := fakeManager(nil)
+	m.opts.SnapshotInterval = time.Millisecond
+	handle := &rootHandle{
+		socketPath: "/tmp/blocked.root.sock", rootID: "root", actionable: true,
+		client: client, tree: rootTree("root"), mirror: newEventMirror(m.opts.EventLimits),
+	}
+	m.roots[handle.socketPath] = handle
+	m.routes["root"] = "root"
+	if m.monitorRoot(handle) != monitorStarted {
+		t.Fatal("monitorRoot did not start")
+	}
+	select {
+	case <-client.entered:
+	case <-time.After(time.Second):
+		t.Fatal("snapshot did not enter blocked call")
+	}
+	if err := m.Quiesce(context.Background()); err != nil {
+		t.Fatal(err)
+	}
+	select {
+	case <-client.exited:
+	case <-time.After(time.Second):
+		t.Fatal("Quiesce did not cancel in-flight snapshot")
+	}
+	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+	defer cancel()
+	if err := m.Close(ctx); err != nil {
+		t.Fatal(err)
 	}
 }
 
@@ -378,15 +607,20 @@ func TestManagerFleetFanoutPublishesOnDiscovery(t *testing.T) {
 	if err := os.Chmod(dir, 0o700); err != nil {
 		t.Fatal(err)
 	}
-	makeRootSocket(t, dir, "fan.root.sock")
+	socketPath := makeRootSocket(t, dir, "fan.root.sock")
 	tree := rootTree("fan")
 	client := &fakeClient{snapshot: tree}
 	m := fakeManager(func(_ string) (rootClient, error) { return client, nil })
 	m.opts.RootSocketDir = dir
+	t.Cleanup(func() {
+		ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+		defer cancel()
+		_ = m.Close(ctx)
+	})
 
 	sub := m.SubscribeFleet()
+	defer sub.Close()
 	m.discoverOnce(context.Background())
-	m.bumpFleetRevision()
 
 	select {
 	case rev := <-sub.Updates:
@@ -394,7 +628,45 @@ func TestManagerFleetFanoutPublishesOnDiscovery(t *testing.T) {
 			t.Fatal("received zero revision")
 		}
 	case <-time.After(time.Second):
-		t.Fatal("fleet fanout did not publish after discovery")
+		t.Fatal("fleet fanout did not publish after admission")
 	}
-	sub.Close()
+
+	deadline := time.Now().Add(time.Second)
+	for !m.Fleet().Roots[0].StreamConnected {
+		if time.Now().After(deadline) {
+			t.Fatal("event stream did not connect")
+		}
+		time.Sleep(time.Millisecond)
+	}
+
+	// Drain connection-state notifications, then prove an unchanged scan is
+	// silent before testing the disappearance notification.
+drain:
+	for {
+		select {
+		case <-sub.Updates:
+		default:
+			break drain
+		}
+	}
+	m.discoverOnce(context.Background())
+	select {
+	case rev := <-sub.Updates:
+		t.Fatalf("unchanged discovery published revision %d", rev)
+	case <-time.After(50 * time.Millisecond):
+	}
+
+	beforeRemoval := m.Fleet().Revision
+	if err := os.Remove(socketPath); err != nil {
+		t.Fatal(err)
+	}
+	m.discoverOnce(context.Background())
+	select {
+	case rev := <-sub.Updates:
+		if rev <= beforeRemoval {
+			t.Fatalf("removal revision = %d, want > %d", rev, beforeRemoval)
+		}
+	case <-time.After(time.Second):
+		t.Fatal("fleet fanout did not publish after removal")
+	}
 }

@@ -213,8 +213,26 @@ func runWithManager(
 	makeHandler handlerFactory,
 	listen listenFunc,
 	shutdownTimeout time.Duration,
-) error {
+) (resultErr error) {
 	logger := options.Logger
+	managerClosed := false
+	defer func() {
+		if managerClosed {
+			return
+		}
+		cleanupTimeout := shutdownTimeout
+		if cleanupTimeout <= 0 {
+			cleanupTimeout = defaultShutdownTimeout
+		}
+		cleanupCtx, cleanupCancel := context.WithTimeout(context.Background(), cleanupTimeout)
+		defer cleanupCancel()
+		quiesceErr := fleet.Quiesce(cleanupCtx)
+		closeErr := fleet.Close(cleanupCtx)
+		if quiesceErr != nil || closeErr != nil {
+			logger.Error("manager failure-path cleanup failed", "error", errors.Join(quiesceErr, closeErr))
+		}
+		resultErr = errors.Join(resultErr, quiesceErr, closeErr)
+	}()
 	requestedAddress := options.ListenAddress
 	listenAddress := requestedAddress
 	if host, port, splitErr := net.SplitHostPort(requestedAddress); splitErr == nil && strings.EqualFold(host, "localhost") {
@@ -291,6 +309,7 @@ func runWithManager(
 		_ = httpServer.Close()
 	}
 	managerErr := fleet.Close(shutdownCtx)
+	managerClosed = managerErr == nil
 	serveErr = <-serveResult
 
 	if shutdownErr != nil {

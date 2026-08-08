@@ -23,7 +23,7 @@
           <h1 id="detName">{{if .WorkerType}}{{.WorkerType}}{{else}}{{.SessionID}}{{end}}</h1>
           <div class="det-badges">
             <span class="state-badge {{.Lifecycle}}" id="detState">
-              {{if eq .Lifecycle "question"}}◇ question{{else if eq .Lifecycle "complete"}}○ complete{{else}}● {{.Lifecycle}}{{end}}
+              {{if eq .Lifecycle "question"}}◇ question{{else if eq .Lifecycle "completed"}}○ complete{{else}}● {{.Lifecycle}}{{end}}
             </span>
             <span class="type-badge" id="detType">session</span>
           </div>

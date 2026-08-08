@@ -37,6 +37,8 @@ type Manager struct {
 	// monitoring infrastructure
 	closeCtx        context.Context
 	closeCancel     context.CancelFunc
+	snapshotCtx     context.Context
+	snapshotCancel  context.CancelFunc
 	monitorWG       sync.WaitGroup
 	fleetFanout     *changeFanout
 	sessionFanout   *changeFanout
@@ -116,14 +118,20 @@ func New(opts Options) (*Manager, error) {
 		opts.ConfigPath = clean
 	}
 
-	// Validate SessionBinary (required for spawning, but optional at construction time).
-	if opts.SessionBinary != "" {
-		resolved, err := resolveExecutable(opts.SessionBinary)
+	// Resolve SessionBinary to the current executable by default so the normal
+	// configuration can spawn independent roots without an explicit override.
+	if opts.SessionBinary == "" {
+		binary, err := os.Executable()
 		if err != nil {
-			return nil, fmt.Errorf("manager: session binary: %w", err)
+			return nil, fmt.Errorf("manager: resolve current executable: %w", err)
 		}
-		opts.SessionBinary = resolved
+		opts.SessionBinary = binary
 	}
+	resolvedBinary, err := resolveExecutable(opts.SessionBinary)
+	if err != nil {
+		return nil, fmt.Errorf("manager: session binary: %w", err)
+	}
+	opts.SessionBinary = resolvedBinary
 
 	// Apply default intervals.
 	if opts.DiscoveryInterval == 0 {
@@ -140,16 +148,19 @@ func New(opts Options) (*Manager, error) {
 	}
 
 	ctx, cancel := context.WithCancel(context.Background())
+	snapshotCtx, snapshotCancel := context.WithCancel(ctx)
 	m := &Manager{
-		opts:          opts,
-		roots:         make(map[string]*rootHandle),
-		routes:        make(map[string]string),
-		factory:       defaultClientFactory,
-		starter:       osProcessStarter{},
-		closeCtx:      ctx,
-		closeCancel:   cancel,
-		fleetFanout:   newChangeFanout(supervisor.DefaultSubscriberMailboxCapacity),
-		sessionFanout: newChangeFanout(supervisor.DefaultSubscriberMailboxCapacity),
+		opts:           opts,
+		roots:          make(map[string]*rootHandle),
+		routes:         make(map[string]string),
+		factory:        defaultClientFactory,
+		starter:        osProcessStarter{},
+		closeCtx:       ctx,
+		closeCancel:    cancel,
+		snapshotCtx:    snapshotCtx,
+		snapshotCancel: snapshotCancel,
+		fleetFanout:    newChangeFanout(supervisor.DefaultSubscriberMailboxCapacity),
+		sessionFanout:  newChangeFanout(supervisor.DefaultSubscriberMailboxCapacity),
 	}
 	return m, nil
 }
@@ -230,16 +241,10 @@ func (m *Manager) discoveryLoop() {
 	defer ticker.Stop()
 	for {
 		select {
-		case <-m.closeCtx.Done():
+		case <-m.snapshotCtx.Done():
 			return
 		case <-ticker.C:
-			m.mu.Lock()
-			q := m.quiesced
-			m.mu.Unlock()
-			if q {
-				return
-			}
-			m.discoverOnce(m.closeCtx)
+			m.discoverOnce(m.snapshotCtx)
 		}
 	}
 }
@@ -344,11 +349,14 @@ func (m *Manager) SubscribeSession(sessionID string) (ChangeSubscription, error)
 	return m.sessionFanout.Subscribe(), nil
 }
 
-// Quiesce rejects new writes and stops discovery/polling while event drains
-// continue until Close.
+// Quiesce rejects new writes and stops discovery/snapshot polling while event
+// drains continue until Close.
 func (m *Manager) Quiesce(context.Context) error {
 	m.mu.Lock()
-	m.quiesced = true
+	if !m.quiesced {
+		m.quiesced = true
+		m.snapshotCancel()
+	}
 	m.mu.Unlock()
 	return nil
 }

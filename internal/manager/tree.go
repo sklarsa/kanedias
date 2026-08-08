@@ -2,6 +2,7 @@ package manager
 
 import (
 	"fmt"
+	"regexp"
 	"sort"
 
 	"github.com/sklarsa/kanedias/internal/supervisor"
@@ -10,6 +11,8 @@ import (
 
 // knownLifecycles is the set of lifecycle strings accepted from a root
 // supervisor snapshot.
+var sessionIDPattern = regexp.MustCompile(`^[A-Za-z0-9_.:-]{1,128}$`)
+
 var knownLifecycles = map[string]struct{}{
 	string(supervisor.LifecycleProvisioning):    {},
 	string(supervisor.LifecycleStarting):        {},
@@ -47,6 +50,12 @@ func validateRootTree(root supervisor.NodeSnapshot) (supervisor.NodeSnapshot, ma
 	if root.RootSessionID != root.SessionID {
 		return supervisor.NodeSnapshot{}, nil, fmt.Errorf("root node RootSessionID %q != SessionID %q", root.RootSessionID, root.SessionID)
 	}
+	if root.ParentSessionID != "" {
+		return supervisor.NodeSnapshot{}, nil, fmt.Errorf("root node has ParentSessionID %q", root.ParentSessionID)
+	}
+	if root.Context != contract.ContextRoot {
+		return supervisor.NodeSnapshot{}, nil, fmt.Errorf("root node context %q is not root", root.Context)
+	}
 	if root.SessionID == "" {
 		return supervisor.NodeSnapshot{}, nil, fmt.Errorf("root node has empty SessionID")
 	}
@@ -59,6 +68,9 @@ func validateRootTree(root supervisor.NodeSnapshot) (supervisor.NodeSnapshot, ma
 
 		node := item.node
 
+		if !validSessionID(node.SessionID) {
+			return supervisor.NodeSnapshot{}, nil, fmt.Errorf("session ID %q is not a safe URL path segment", node.SessionID)
+		}
 		if _, dup := routes[node.SessionID]; dup {
 			return supervisor.NodeSnapshot{}, nil, fmt.Errorf("duplicate session ID %q in tree", node.SessionID)
 		}
@@ -93,6 +105,10 @@ func validateRootTree(root supervisor.NodeSnapshot) (supervisor.NodeSnapshot, ma
 	}
 
 	return root, routes, nil
+}
+
+func validSessionID(id string) bool {
+	return id != "." && id != ".." && sessionIDPattern.MatchString(id)
 }
 
 // admissible returns true when the root snapshot has a lifecycle that the

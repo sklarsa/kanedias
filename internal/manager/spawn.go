@@ -126,8 +126,8 @@ func (pending *pendingRoot) stopIfResponsive(ctx context.Context) error {
 	return pending.client.Stop(ctx, pending.rootID)
 }
 
-// safeUnlinkOwnedSocket removes the socket file only if it still has the exact
-// same device+inode as when the manager created it.
+// safeUnlinkOwnedSocket removes the socket file only if it is still the exact
+// socket generation observed during admission.
 func (pending *pendingRoot) safeUnlinkOwnedSocket() error {
 	if !sameIdentity(pending.socketPath, pending.identity) {
 		return nil

@@ -97,6 +97,29 @@ func TestQuestionsRejectsMaliciousQuestionID(t *testing.T) {
 	}
 }
 
+func TestCompletedLifecycleUsesTerminalRendering(t *testing.T) {
+	templates, err := parseTemplates(webFiles)
+	if err != nil {
+		t.Fatal(err)
+	}
+	fleetHTML, err := renderTemplate(templates, templateFleet, fleetView{Roots: []rootView{{
+		RootSessionID: "finished", Lifecycle: "completed",
+	}}})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !strings.Contains(fleetHTML, `st-completed`) || !strings.Contains(fleetHTML, `<span class="glyph">○</span>`) {
+		t.Fatalf("completed fleet row did not use terminal style/glyph:\n%s", fleetHTML)
+	}
+	detailHTML, err := renderTemplate(templates, templateDetail, detailView{SessionID: "finished", Lifecycle: "completed"})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !strings.Contains(detailHTML, `state-badge completed`) || !strings.Contains(detailHTML, `○ complete`) {
+		t.Fatalf("completed detail did not use terminal style/glyph:\n%s", detailHTML)
+	}
+}
+
 // TestQuestionsRenderSelectOptions is the UI-F1 regression. A select-method
 // question WITH options must render one button per option, each carrying the
 // correct (safe) question ID and wired to the question answer route. Before the
@@ -147,6 +170,12 @@ func TestQuestionsRenderSelectOptions(t *testing.T) {
 	}
 	if !strings.Contains(rendered, "el.dataset.optionValue") {
 		t.Errorf("action does not read the option value from the dataset:\n%s", rendered)
+	}
+	if !strings.Contains(rendered, `data-session-id="session-under-test"`) || !strings.Contains(rendered, "el.dataset.sessionId") {
+		t.Errorf("action is not bound to the session that rendered the question:\n%s", rendered)
+	}
+	if strings.Contains(rendered, "$selectedSessionId") {
+		t.Errorf("question action targets mutable global selection:\n%s", rendered)
 	}
 	// The ID must NOT be concatenated into the action expression as a literal.
 	if strings.Contains(rendered, "/questions/select-q.1") {
