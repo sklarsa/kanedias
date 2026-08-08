@@ -17,22 +17,101 @@ import (
 	"time"
 )
 
+// mustNewHandlerWithAuth creates a handler and returns a valid session cookie
+// by going through the bootstrap flow. This allows tests to exercise protected routes.
+func mustNewHandlerWithAuth(t *testing.T, logger *slog.Logger) (http.Handler, *http.Cookie) {
+	t.Helper()
+	var bootstrapOut bytes.Buffer
+	handler, err := newHandlerWithOptions(logger, "127.0.0.1:0", &bootstrapOut)
+	if err != nil {
+		t.Fatalf("newHandlerWithOptions: %v", err)
+	}
+
+	// Extract bootstrap token from the output.
+	output := bootstrapOut.String()
+	idx := strings.Index(output, bootstrapQueryName+"=")
+	if idx == -1 {
+		t.Fatalf("bootstrap output does not contain token: %q", output)
+	}
+	token := strings.TrimSpace(output[idx+len(bootstrapQueryName)+1:])
+
+	// Exchange the bootstrap token for a session cookie.
+	req := httptest.NewRequest(http.MethodGet, "/bootstrap?"+bootstrapQueryName+"="+token, nil)
+	w := httptest.NewRecorder()
+	handler.ServeHTTP(w, req)
+	if w.Code != http.StatusSeeOther {
+		t.Fatalf("bootstrap status = %d, want %d", w.Code, http.StatusSeeOther)
+	}
+
+	var cookie *http.Cookie
+	for _, h := range w.Header()["Set-Cookie"] {
+		if strings.HasPrefix(h, sessionCookieName+"=") {
+			parts := strings.SplitN(h, "=", 2)
+			if len(parts) == 2 {
+				cookie = &http.Cookie{
+					Name:  sessionCookieName,
+					Value: strings.Split(parts[1], ";")[0],
+				}
+			}
+			break
+		}
+	}
+	if cookie == nil {
+		t.Fatal("bootstrap did not set session cookie")
+	}
+	return handler, cookie
+}
+
+// serveRequest sends an unauthenticated request to the handler.
+func serveRequest(handler http.Handler, method, path string) *httptest.ResponseRecorder {
+	response := httptest.NewRecorder()
+	handler.ServeHTTP(response, httptest.NewRequest(method, path, nil))
+	return response
+}
+
+// serveAuthenticatedRequest sends a request with a valid session cookie.
+func serveAuthenticatedRequest(t *testing.T, handler http.Handler, method, path string, cookie *http.Cookie) *httptest.ResponseRecorder {
+	t.Helper()
+	response := httptest.NewRecorder()
+	req := httptest.NewRequest(method, path, nil)
+	if cookie != nil {
+		req.AddCookie(cookie)
+	}
+	handler.ServeHTTP(response, req)
+	return response
+}
+
+// indexBody returns the body of an authenticated GET /.
+func indexBody(t *testing.T) string {
+	t.Helper()
+	handler, cookie := mustNewHandlerWithAuth(t, slog.New(slog.NewTextHandler(&bytes.Buffer{}, nil)))
+	response := serveAuthenticatedRequest(t, handler, http.MethodGet, "/", cookie)
+	if response.Code != http.StatusOK {
+		t.Fatalf("GET / status = %d, want 200; body = %q", response.Code, response.Body.String())
+	}
+	return response.Body.String()
+}
+
 func TestHandlerRoutes(t *testing.T) {
-	handler := mustNewHandler(t, slog.New(slog.NewTextHandler(&bytes.Buffer{}, nil)))
+	handler, cookie := mustNewHandlerWithAuth(t, slog.New(slog.NewTextHandler(&bytes.Buffer{}, nil)))
 
 	tests := []struct {
-		name        string
-		path        string
-		status      int
-		contentType string
-		body        string
-		contains    []string
+		name          string
+		path          string
+		method        string
+		authenticated bool
+		status        int
+		contentType   string
+		body          string
+		contains      []string
 	}{
 		{
-			name:        "index",
-			path:        "/",
-			status:      http.StatusOK,
-			contentType: "text/html; charset=utf-8",
+			name:          "index",
+			path:          "/",
+			method:        http.MethodGet,
+			authenticated: true,
+			status:        http.StatusOK,
+			contentType:   "text/html; charset=utf-8",
 			contains: []string{
 				"<title>Kanedias — Circle of the Fleet</title>",
 				`id="sidebar"`,
@@ -41,47 +120,65 @@ func TestHandlerRoutes(t *testing.T) {
 			},
 		},
 		{
+			name:   "index unauthenticated",
+			path:   "/",
+			method: http.MethodGet,
+			status: http.StatusUnauthorized,
+		},
+		{
 			name:        "health",
 			path:        "/healthz",
+			method:      http.MethodGet,
 			status:      http.StatusOK,
 			contentType: "text/plain; charset=utf-8",
 			body:        "ok\n",
 		},
 		{
-			name:        "status",
-			path:        "/ui/status",
-			status:      http.StatusOK,
-			contentType: "text/event-stream",
-			contains:    []string{"id=\"server-status\"", "role=\"status\"", "Running"},
+			name:          "status",
+			path:          "/ui/status",
+			method:        http.MethodGet,
+			authenticated: true,
+			status:        http.StatusOK,
+			contentType:   "text/event-stream",
+			contains:      []string{"id=\"server-status\"", "role=\"status\"", "Running"},
 		},
 		{
 			name:        "stylesheet",
 			path:        "/assets/app.css",
+			method:      http.MethodGet,
 			status:      http.StatusOK,
 			contentType: "text/css; charset=utf-8",
 		},
 		{
 			name:        "terminal stylesheet",
 			path:        "/assets/terminal.css",
+			method:      http.MethodGet,
 			status:      http.StatusOK,
 			contentType: "text/css; charset=utf-8",
 		},
 		{
 			name:        "javascript",
 			path:        "/assets/datastar.js",
+			method:      http.MethodGet,
 			status:      http.StatusOK,
 			contentType: "text/javascript; charset=utf-8",
 		},
 		{
 			name:   "unknown",
 			path:   "/unknown",
+			method: http.MethodGet,
 			status: http.StatusNotFound,
 		},
 	}
 
 	for _, tt := range tests {
 		t.Run(tt.name, func(t *testing.T) {
-			response := serveRequest(handler, http.MethodGet, tt.path)
+			var response *httptest.ResponseRecorder
+			if tt.authenticated {
+				response = serveAuthenticatedRequest(t, handler, tt.method, tt.path, cookie)
+			} else {
+				response = serveRequest(handler, tt.method, tt.path)
+			}
 			if response.Code != tt.status {
 				t.Fatalf("status = %d, want %d; body = %q", response.Code, tt.status, response.Body.String())
 			}
@@ -106,7 +203,7 @@ func TestHandlerRoutes(t *testing.T) {
 					t.Errorf("body does not contain %q", want)
 				}
 			}
-			if tt.path == "/ui/status" {
+			if tt.path == "/ui/status" && tt.authenticated {
 				const event = "event: datastar-patch-elements"
 				if got := strings.Count(response.Body.String(), event); got != 1 {
 					t.Errorf("status event count = %d, want 1; body = %q", got, response.Body.String())
@@ -117,21 +214,29 @@ func TestHandlerRoutes(t *testing.T) {
 }
 
 func TestHandlerRejectsUnsupportedMethods(t *testing.T) {
-	handler := mustNewHandler(t, slog.New(slog.NewTextHandler(&bytes.Buffer{}, nil)))
-	paths := []string{
-		"/",
-		"/healthz",
-		"/ui/status",
-		"/assets/terminal.css",
-		"/assets/app.css",
-		"/assets/datastar.js",
+	handler, cookie := mustNewHandlerWithAuth(t, slog.New(slog.NewTextHandler(&bytes.Buffer{}, nil)))
+	paths := []struct {
+		path          string
+		authenticated bool
+	}{
+		{"/healthz", false},
+		{"/assets/terminal.css", false},
+		{"/assets/app.css", false},
+		{"/assets/datastar.js", false},
+		{"/", true},
+		{"/ui/status", true},
 	}
 	methods := []string{http.MethodPost, http.MethodPut, http.MethodPatch, http.MethodDelete}
 
-	for _, path := range paths {
+	for _, p := range paths {
 		for _, method := range methods {
-			t.Run(method+" "+path, func(t *testing.T) {
-				response := serveRequest(handler, method, path)
+			t.Run(method+" "+p.path, func(t *testing.T) {
+				var response *httptest.ResponseRecorder
+				if p.authenticated {
+					response = serveAuthenticatedRequest(t, handler, method, p.path, cookie)
+				} else {
+					response = serveRequest(handler, method, p.path)
+				}
 				if response.Code != http.StatusMethodNotAllowed {
 					t.Fatalf("status = %d, want %d", response.Code, http.StatusMethodNotAllowed)
 				}
@@ -308,7 +413,7 @@ func TestAstrolabeGroupsNestedSubagentsUnderParents(t *testing.T) {
 }
 
 func TestAssetsAreEmbedded(t *testing.T) {
-	handler := mustNewHandler(t, slog.New(slog.NewTextHandler(&bytes.Buffer{}, nil)))
+	handler, cookie := mustNewHandlerWithAuth(t, slog.New(slog.NewTextHandler(&bytes.Buffer{}, nil)))
 	originalDirectory, err := os.Getwd()
 	if err != nil {
 		t.Fatal(err)
@@ -322,17 +427,15 @@ func TestAssetsAreEmbedded(t *testing.T) {
 		}
 	})
 
-	for _, path := range []string{
-		"/",
-		"/healthz",
-		"/ui/status",
-		"/assets/terminal.css",
-		"/assets/app.css",
-		"/assets/datastar.js",
-	} {
+	// Unauthenticated paths.
+	for _, path := range []string{"/healthz", "/assets/terminal.css", "/assets/app.css", "/assets/datastar.js"} {
 		if response := serveRequest(handler, http.MethodGet, path); response.Code != http.StatusOK {
 			t.Errorf("GET %s status = %d, want %d", path, response.Code, http.StatusOK)
 		}
+	}
+	// Authenticated paths.
+	if response := serveAuthenticatedRequest(t, handler, http.MethodGet, "/", cookie); response.Code != http.StatusOK {
+		t.Errorf("GET / status = %d, want %d", response.Code, http.StatusOK)
 	}
 }
 
@@ -491,11 +594,38 @@ func TestRequestLogging(t *testing.T) {
 	}
 }
 
+func TestRequestLoggingOmitsTokensAndCookies(t *testing.T) {
+	var logs bytes.Buffer
+	logger := slog.New(slog.NewJSONHandler(&logs, nil))
+	handler := requestLogger(logger)(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
+		w.WriteHeader(http.StatusOK)
+	}))
+
+	secretToken := "supersecretbootstraptoken12345678"
+	req := httptest.NewRequest(http.MethodGet, "/bootstrap?"+bootstrapQueryName+"="+secretToken, nil)
+	req.Header.Set("Cookie", sessionCookieName+"=sessionvalue987654")
+	response := httptest.NewRecorder()
+	handler.ServeHTTP(response, req)
+
+	output := logs.String()
+	// Must contain path — but NOT the token or cookie value.
+	if !strings.Contains(output, `"path":"/bootstrap"`) {
+		t.Errorf("log does not contain path: %s", output)
+	}
+	if strings.Contains(output, secretToken) {
+		t.Errorf("log leaked bootstrap token: %s", output)
+	}
+	if strings.Contains(output, "sessionvalue987654") {
+		t.Errorf("log leaked session cookie value: %s", output)
+	}
+}
+
 func TestStatusStreamHonorsCanceledRequest(t *testing.T) {
-	handler := mustNewHandler(t, slog.New(slog.NewTextHandler(&bytes.Buffer{}, nil)))
+	handler, cookie := mustNewHandlerWithAuth(t, slog.New(slog.NewTextHandler(&bytes.Buffer{}, nil)))
 	ctx, cancel := context.WithCancel(context.Background())
 	cancel()
 	req := httptest.NewRequest(http.MethodGet, "/ui/status", nil).WithContext(ctx)
+	req.AddCookie(cookie)
 	response := httptest.NewRecorder()
 	done := make(chan struct{})
 	go func() {
@@ -526,29 +656,4 @@ func TestHandlerParsesTemplatesAtConstruction(t *testing.T) {
 	if _, err := parseTemplates(fs.FS(invalid)); err == nil {
 		t.Fatal("parseTemplates accepted invalid template")
 	}
-}
-
-func mustNewHandler(t *testing.T, logger *slog.Logger) http.Handler {
-	t.Helper()
-	handler, err := newHandler(logger)
-	if err != nil {
-		t.Fatalf("newHandler: %v", err)
-	}
-	return handler
-}
-
-func serveRequest(handler http.Handler, method, path string) *httptest.ResponseRecorder {
-	response := httptest.NewRecorder()
-	handler.ServeHTTP(response, httptest.NewRequest(method, path, nil))
-	return response
-}
-
-func indexBody(t *testing.T) string {
-	t.Helper()
-	handler := mustNewHandler(t, slog.New(slog.NewTextHandler(&bytes.Buffer{}, nil)))
-	response := serveRequest(handler, http.MethodGet, "/")
-	if response.Code != http.StatusOK {
-		t.Fatalf("GET / status = %d, want %d", response.Code, http.StatusOK)
-	}
-	return response.Body.String()
 }

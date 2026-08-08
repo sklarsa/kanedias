@@ -6,6 +6,7 @@ import (
 	"errors"
 	"fmt"
 	"html/template"
+	"io"
 	"io/fs"
 	"log/slog"
 	"net/http"
@@ -23,11 +24,29 @@ func newHandler(logger *slog.Logger) (http.Handler, error) {
 	if logger == nil {
 		return nil, errors.New("logger is required")
 	}
+	return newHandlerWithOptions(logger, "", io.Discard)
+}
+
+// newHandlerWithOptions builds the full handler with security wiring.
+// effectiveAddress is the listener's address used for same-origin checks.
+// bootstrapOutput receives the one-time bootstrap token.
+func newHandlerWithOptions(logger *slog.Logger, effectiveAddress string, bootstrapOutput io.Writer) (http.Handler, error) {
+	if logger == nil {
+		return nil, errors.New("logger is required")
+	}
 
 	templates, err := parseTemplates(webFiles)
 	if err != nil {
 		return nil, fmt.Errorf("parse web templates: %w", err)
 	}
+
+	// Capability store: prints bootstrap token once to bootstrapOutput.
+	auth, err := newCapabilityStore(defaultRandom, bootstrapOutput)
+	if err != nil {
+		return nil, fmt.Errorf("create capability store: %w", err)
+	}
+
+	boundary := newRequestBoundary(effectiveAddress)
 
 	serveIndex := func(w http.ResponseWriter, _ *http.Request) {
 		w.Header().Set("Content-Type", "text/html; charset=utf-8")
@@ -54,12 +73,36 @@ func newHandler(logger *slog.Logger) (http.Handler, error) {
 
 	router := chi.NewRouter()
 	router.Use(requestLogger(logger), recoverPanics(logger))
-	router.Get("/", serveIndex)
+
+	// Unauthenticated routes.
 	router.Get("/healthz", serveHealth)
-	router.Get("/ui/status", serveStatus)
+	router.Get("/bootstrap", auth.serveBootstrap)
 	router.Get("/assets/terminal.css", serveTerminalCSS)
 	router.Get("/assets/app.css", serveCSS)
 	router.Get("/assets/datastar.js", serveJavaScript)
+
+	// Protected routes (require session cookie).
+	router.Group(func(protected chi.Router) {
+		protected.Use(auth.requireSession)
+		protected.Get("/", serveIndex)
+		protected.Route("/ui", func(ui chi.Router) {
+			ui.Get("/status", serveStatus)
+			ui.Get("/fleet", http.NotFoundHandler().ServeHTTP)
+			ui.Get("/session", http.NotFoundHandler().ServeHTTP)
+		})
+	})
+
+	// Write boundary applied to all action POSTs.
+	router.Group(func(write chi.Router) {
+		write.Use(auth.requireSession)
+		write.Use(boundary.requireWriteBoundary)
+		write.Post("/ui/sessions", http.NotFoundHandler().ServeHTTP)
+		write.Post("/ui/sessions/{sessionID}/steer", http.NotFoundHandler().ServeHTTP)
+		write.Post("/ui/sessions/{sessionID}/interrupt", http.NotFoundHandler().ServeHTTP)
+		write.Post("/ui/sessions/{sessionID}/stop", http.NotFoundHandler().ServeHTTP)
+		write.Post("/ui/sessions/{sessionID}/questions/{questionID}", http.NotFoundHandler().ServeHTTP)
+	})
+
 	return router, nil
 }
 

@@ -149,8 +149,12 @@ func runApplication(
 		)
 	}
 
+	bootstrapOutput := normalizedOptions.BootstrapOutput
+	if bootstrapOutput == nil {
+		bootstrapOutput = io.Discard
+	}
 	handlerFn := func(effectiveAddress string, streamCtx context.Context) (http.Handler, error) {
-		return newHandler(normalizedOptions.Logger)
+		return newHandlerWithOptions(normalizedOptions.Logger, effectiveAddress, bootstrapOutput)
 	}
 
 	return runWithManager(ctx, normalizedOptions, fleet, handlerFn, listen, defaultShutdownTimeout)
