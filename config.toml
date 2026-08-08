@@ -29,6 +29,7 @@ repos = [
     "questdb/tsbs",
     "questdb/zfs-builds",
     "sklarsa/incus-azure-pipelines",
+    "sklarsa/kanedias-testing",
     "sklarsa/kanedias"
 ]
 

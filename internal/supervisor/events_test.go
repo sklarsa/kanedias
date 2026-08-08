@@ -3,6 +3,7 @@ package supervisor
 import (
 	"encoding/json"
 	"runtime"
+	"strings"
 	"sync"
 	"testing"
 	"time"
@@ -392,6 +393,76 @@ func TestEventBrokerEvictsOldestUntilCountAndByteBudgetsHold(t *testing.T) {
 		if sub.Replay[index].Seq != sub.Replay[index-1].Seq+1 {
 			t.Fatalf("replay is not the monotonic newest tail: %#v", sub.Replay)
 		}
+	}
+}
+
+func TestEventBrokerCountAndByteLimitsAreIndependent(t *testing.T) {
+	countOnly, err := NewEventBrokerWithOptions(EventBrokerOptions{MaxEvents: 2})
+	if err != nil {
+		t.Fatal(err)
+	}
+	byteOnly, err := NewEventBrokerWithOptions(EventBrokerOptions{MaxBytes: 100})
+	if err != nil {
+		t.Fatal(err)
+	}
+	for range 3 {
+		countOnly.PublishLocal("root", "pi", json.RawMessage(`{"n":1}`))
+		byteOnly.PublishLocal("root", "pi", json.RawMessage(`{"payload":"12345678901234567890"}`))
+	}
+	if got := len(countOnly.Subscribe().Replay); got != 2 {
+		t.Fatalf("count replay = %d", got)
+	}
+	if got := len(byteOnly.Subscribe().Replay); got == 0 || got >= 3 {
+		t.Fatalf("byte replay = %d", got)
+	}
+}
+
+func TestEventBrokerWithOptionsRejectsBothZero(t *testing.T) {
+	_, err := NewEventBrokerWithOptions(EventBrokerOptions{})
+	if err == nil || !strings.Contains(err.Error(), "at least one") {
+		t.Fatalf("error = %v, want at-least-one error", err)
+	}
+}
+
+func TestEventBrokerWithOptionsRejectsNegative(t *testing.T) {
+	_, err := NewEventBrokerWithOptions(EventBrokerOptions{MaxEvents: -1, MaxBytes: 100})
+	if err == nil {
+		t.Fatalf("error = nil, want rejection of negative MaxEvents")
+	}
+	_, err = NewEventBrokerWithOptions(EventBrokerOptions{MaxEvents: 100, MaxBytes: -1})
+	if err == nil {
+		t.Fatalf("error = nil, want rejection of negative MaxBytes")
+	}
+}
+
+func TestEventBrokerOversizedEventIsDeliveredLiveNotRetained(t *testing.T) {
+	// byte cap of 10 — any real payload exceeds it; event must still get a sequence
+	// and arrive live, but the ring must stay within budget.
+	broker, err := NewEventBrokerWithOptions(EventBrokerOptions{MaxBytes: 10})
+	if err != nil {
+		t.Fatal(err)
+	}
+	sub := broker.Subscribe()
+	defer sub.Close()
+
+	envelope := broker.PublishLocal("root", "pi", json.RawMessage(`{"large":"payload_that_exceeds_cap"}`))
+	if envelope.Seq == 0 {
+		t.Fatalf("oversized event has no sequence number")
+	}
+
+	select {
+	case event := <-sub.Events:
+		if event.Seq != envelope.Seq {
+			t.Fatalf("live event Seq = %d, want %d", event.Seq, envelope.Seq)
+		}
+	case <-time.After(time.Second):
+		t.Fatal("oversized event was not delivered live")
+	}
+
+	replay := broker.Subscribe()
+	defer replay.Close()
+	if len(replay.Replay) != 0 {
+		t.Fatalf("oversized event retained in replay ring, want empty")
 	}
 }
 

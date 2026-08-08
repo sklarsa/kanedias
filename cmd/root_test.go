@@ -273,7 +273,7 @@ func TestHiddenSessionChildMarksProtocolDescriptorsCloseOnExec(t *testing.T) {
 
 func TestServerCommandRejectsPositionalArguments(t *testing.T) {
 	service := serverServicesThatRejectDependencies(t)
-	service.runServer = func(context.Context, server.Options) error {
+	service.runServer = func(context.Context, config.Config, server.Options) error {
 		t.Fatal("runServer called with positional arguments")
 		return nil
 	}
@@ -291,7 +291,7 @@ func TestServerCommandRejectsUnsafeListenAddressBeforeDelegation(t *testing.T) {
 	for _, address := range []string{"0.0.0.0:8080", "192.0.2.1:8080", ":8080"} {
 		t.Run(address, func(t *testing.T) {
 			service := serverServicesThatRejectDependencies(t)
-			service.runServer = func(context.Context, server.Options) error {
+			service.runServer = func(context.Context, config.Config, server.Options) error {
 				t.Fatal("runServer called with an unsafe listen address")
 				return nil
 			}
@@ -318,9 +318,24 @@ func TestServerCommandDelegates(t *testing.T) {
 	runErr := errors.New("run server sentinel")
 	var stderr bytes.Buffer
 	calls := 0
+	loadCalls := 0
+
+	configDir := t.TempDir()
+	configFile := filepath.Join(configDir, "test.toml")
+	if err := os.WriteFile(configFile, []byte("[network]\nipv4 = \"10.0.0.1/24\"\n"), 0600); err != nil {
+		t.Fatal(err)
+	}
 
 	service := serverServicesThatRejectDependencies(t)
-	service.runServer = func(gotContext context.Context, options server.Options) error {
+	service.loadConfig = func(path string) (config.Config, error) {
+		loadCalls++
+		absWant, _ := filepath.Abs(configFile)
+		if path != absWant {
+			t.Errorf("loadConfig path = %q, want absolute %q", path, absWant)
+		}
+		return config.Config{Network: config.Network{IPv4: "10.0.0.1/24"}}, nil
+	}
+	service.runServer = func(gotContext context.Context, gotConfig config.Config, options server.Options) error {
 		calls++
 		if gotContext != ctx {
 			t.Error("runServer did not receive the exact command context")
@@ -331,6 +346,12 @@ func TestServerCommandDelegates(t *testing.T) {
 		if options.Logger == nil {
 			t.Fatal("runServer received a nil logger")
 		}
+		if options.BootstrapOutput == nil {
+			t.Fatal("runServer received nil BootstrapOutput")
+		}
+		if options.ConfigPath == "" {
+			t.Fatal("runServer received empty ConfigPath")
+		}
 		options.Logger.Info("server command test", "answer", 42)
 		return runErr
 	}
@@ -339,12 +360,15 @@ func TestServerCommandDelegates(t *testing.T) {
 	root.SetContext(ctx)
 	root.SetOut(io.Discard)
 	root.SetErr(&stderr)
-	root.SetArgs([]string{"server", "--listen", "localhost:9090"})
+	root.SetArgs([]string{"--config", configFile, "server", "--listen", "localhost:9090"})
 	if err := root.Execute(); !errors.Is(err, runErr) {
 		t.Fatalf("Execute() error = %v, want run server sentinel", err)
 	}
 	if calls != 1 {
 		t.Errorf("runServer calls = %d, want 1", calls)
+	}
+	if loadCalls != 1 {
+		t.Errorf("loadConfig calls = %d, want 1", loadCalls)
 	}
 	logOutput := stderr.String()
 	if !strings.Contains(logOutput, "msg=\"server command test\"") || !strings.Contains(logOutput, "answer=42") {
@@ -355,7 +379,10 @@ func TestServerCommandDelegates(t *testing.T) {
 func TestServerCommandUsesDefaultListenAddress(t *testing.T) {
 	service := serverServicesThatRejectDependencies(t)
 	calls := 0
-	service.runServer = func(_ context.Context, options server.Options) error {
+	service.loadConfig = func(string) (config.Config, error) {
+		return config.Config{Network: config.Network{IPv4: "10.0.0.1/24"}}, nil
+	}
+	service.runServer = func(_ context.Context, _ config.Config, options server.Options) error {
 		calls++
 		if options.ListenAddress != server.DefaultListenAddress {
 			t.Errorf("listen address = %q, want %q", options.ListenAddress, server.DefaultListenAddress)
@@ -381,7 +408,10 @@ func TestExecuteContextPropagatesCancellationToServer(t *testing.T) {
 
 	service := serverServicesThatRejectDependencies(t)
 	calls := 0
-	service.runServer = func(gotContext context.Context, _ server.Options) error {
+	service.loadConfig = func(string) (config.Config, error) {
+		return config.Config{Network: config.Network{IPv4: "10.0.0.1/24"}}, nil
+	}
+	service.runServer = func(gotContext context.Context, _ config.Config, _ server.Options) error {
 		calls++
 		if gotContext != ctx {
 			t.Error("runServer did not receive the exact execute context")
@@ -738,7 +768,7 @@ func stubServices() services {
 		syncIncusWorkspace: func(context.Context, config.Config, io.Writer, io.Writer) error {
 			return nil
 		},
-		runServer: func(context.Context, server.Options) error { return nil },
+		runServer: func(context.Context, config.Config, server.Options) error { return nil },
 		runSessionChild: func(context.Context, process.Bootstrap, *process.Reporter) error {
 			return nil
 		},

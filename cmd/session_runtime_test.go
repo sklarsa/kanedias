@@ -1,0 +1,128 @@
+package cmd
+
+import (
+	"context"
+	"errors"
+	"io"
+	"os"
+	"path/filepath"
+	"testing"
+
+	"github.com/sklarsa/kanedias/internal/config"
+	"github.com/sklarsa/kanedias/internal/supervisor"
+	"github.com/sklarsa/kanedias/internal/supervisor/contract"
+	"github.com/sklarsa/kanedias/internal/supervisor/process"
+)
+
+func validSupervisorConfig() config.Config {
+	return config.Config{
+		BaseImage: config.BaseImage{Name: "sandbox", Source: "images:", Image: "debian/13"},
+		Workers: map[string]config.WorkerProfile{"worker": {
+			Description: "work", Provider: "provider", Model: "model",
+		}},
+	}
+}
+
+func TestRunSupervisorSelectsConfiguredEventLimitsBeforeProvisioning(t *testing.T) {
+	maxEvents, maxBytes := 7, 1024
+	cfg := validSupervisorConfig()
+	cfg.Supervisor.Events = config.SupervisorEventsConfig{MaxEvents: &maxEvents, MaxBytes: &maxBytes}
+	sentinel := errors.New("broker sentinel")
+	err := runSupervisorWithBrokerFactory(context.Background(), cfg, SessionOptions{
+		SocketPath: filepath.Join(t.TempDir(), "root.sock"), ConfigPath: "/tmp/config.toml",
+	}, io.Discard, func(got supervisor.EventBrokerOptions) (*supervisor.EventBroker, error) {
+		if got != (supervisor.EventBrokerOptions{MaxEvents: 7, MaxBytes: 1024}) {
+			t.Fatalf("options = %#v", got)
+		}
+		return nil, sentinel
+	})
+	if !errors.Is(err, sentinel) {
+		t.Fatalf("error = %v", err)
+	}
+}
+
+func TestRunSupervisorDefaultEventLimitsWhenUnconfigured(t *testing.T) {
+	cfg := validSupervisorConfig()
+	sentinel := errors.New("broker sentinel")
+	err := runSupervisorWithBrokerFactory(context.Background(), cfg, SessionOptions{
+		SocketPath: filepath.Join(t.TempDir(), "root.sock"), ConfigPath: "/tmp/config.toml",
+	}, io.Discard, func(got supervisor.EventBrokerOptions) (*supervisor.EventBroker, error) {
+		want := supervisor.EventBrokerOptions{
+			MaxEvents: config.DefaultSupervisorEventMaxEvents,
+			MaxBytes:  config.DefaultSupervisorEventMaxBytes,
+		}
+		if got != want {
+			t.Fatalf("options = %#v, want %#v", got, want)
+		}
+		return nil, sentinel
+	})
+	if !errors.Is(err, sentinel) {
+		t.Fatalf("error = %v", err)
+	}
+}
+
+func TestRunSupervisorRejectsInvalidConfig(t *testing.T) {
+	called := false
+	err := runSupervisorWithBrokerFactory(context.Background(), config.Config{}, SessionOptions{
+		SocketPath: filepath.Join(t.TempDir(), "root.sock"), ConfigPath: "/tmp/config.toml",
+	}, io.Discard, func(supervisor.EventBrokerOptions) (*supervisor.EventBroker, error) {
+		called = true
+		return nil, nil
+	})
+	if err == nil {
+		t.Fatal("expected validation error, got nil")
+	}
+	if called {
+		t.Fatal("broker factory called before config validation")
+	}
+}
+
+func TestProductionChildRunnerSelectsConfiguredEventLimitsBeforeProvisioning(t *testing.T) {
+	content := `[network]
+ipv4 = "10.76.111.1/24"
+[base_image]
+name = "sandbox"
+source = "images:"
+image = "debian/13"
+[workers.worker]
+description = "work"
+provider = "provider"
+model = "model"
+
+[supervisor.events]
+max_events = 7
+max_bytes = 1024
+`
+	path := filepath.Join(t.TempDir(), "config.toml")
+	if err := os.WriteFile(path, []byte(content), 0o600); err != nil {
+		t.Fatalf("write config: %v", err)
+	}
+	t.Setenv("KANEDIAS_CONFIG", path)
+
+	sentinel := errors.New("broker sentinel")
+	bootstrap := process.Bootstrap{
+		SessionID: "session-test",
+		ParentID:  "session-test",
+		RootID:    "session-test",
+		Request: contract.CreateChildRequest{
+			Kind:       contract.ChildKindRead,
+			Context:    contract.ContextFresh,
+			WorkerType: "worker",
+			Task:       "test",
+		},
+		Worker: config.WorkerProfile{
+			Description: "work", Provider: "provider", Model: "model",
+		},
+		SocketPath: filepath.Join(t.TempDir(), "child.sock"),
+	}
+
+	err := productionChildRunnerWithBrokerFactory(context.Background(), bootstrap, nil, func(got supervisor.EventBrokerOptions) (*supervisor.EventBroker, error) {
+		if got != (supervisor.EventBrokerOptions{MaxEvents: 7, MaxBytes: 1024}) {
+			t.Fatalf("options = %#v", got)
+		}
+		return nil, sentinel
+	})
+	if !errors.Is(err, sentinel) {
+		t.Fatalf("error = %v", err)
+	}
+}

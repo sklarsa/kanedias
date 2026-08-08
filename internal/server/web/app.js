@@ -1,0 +1,112 @@
+(function () {
+  "use strict";
+
+  /* -------- Tab switching (delegated) -------- */
+  document.addEventListener("click", function (e) {
+    var tab = e.target.closest(".tab");
+    if (!tab) return;
+    var container = tab.closest(".tabs");
+    if (!container) return;
+    container.querySelectorAll(".tab").forEach(function (t) {
+      t.classList.remove("active");
+    });
+    tab.classList.add("active");
+    var name = tab.getAttribute("data-tab");
+    document.querySelectorAll(".tabpane").forEach(function (p) {
+      p.classList.remove("active");
+    });
+    var pane = document.querySelector('.tabpane[data-pane="' + name + '"]');
+    if (pane) pane.classList.add("active");
+  });
+
+  /* -------- Search / filter (delegated) -------- */
+  document.addEventListener("input", function (e) {
+    if (e.target.id !== "search") return;
+    var q = e.target.value.trim().toLowerCase();
+    document.querySelectorAll(".row").forEach(function (row) {
+      var hay = (
+        (row.getAttribute("data-session-id") || "") +
+        " " +
+        (row.getAttribute("data-lifecycle") || "") +
+        " " +
+        (row.getAttribute("data-worker-type") || "")
+      ).toLowerCase();
+      var match = !q || hay.indexOf(q) !== -1;
+      var container =
+        row.closest("details") && row.parentElement.tagName === "SUMMARY"
+          ? row.closest("details")
+          : row;
+      if (container === row) {
+        row.style.display = match ? "" : "none";
+      } else {
+        var anyChild = Array.prototype.some.call(
+          container.querySelectorAll(".row"),
+          function (cr) {
+            var h = (
+              (cr.getAttribute("data-session-id") || "") +
+              " " +
+              (cr.getAttribute("data-lifecycle") || "")
+            ).toLowerCase();
+            return !q || h.indexOf(q) !== -1;
+          }
+        );
+        container.style.display = anyChild ? "" : "none";
+        if (q && anyChild) container.setAttribute("open", "");
+      }
+    });
+  });
+
+  /* -------- Mobile slide-over (delegated) -------- */
+  document.addEventListener("click", function (e) {
+    var sidebar = document.getElementById("sidebar");
+    var scrim = document.getElementById("scrim");
+    if (!sidebar || !scrim) return;
+
+    if (e.target.id === "menuBtn" || e.target.closest("#menuBtn")) {
+      if (sidebar.classList.contains("open")) {
+        closeSheet(sidebar, scrim);
+      } else {
+        openSheet(sidebar, scrim);
+      }
+      return;
+    }
+    if (e.target === scrim || e.target.closest("#scrim") === scrim) {
+      closeSheet(sidebar, scrim);
+    }
+  });
+
+  function openSheet(sidebar, scrim) {
+    sidebar.classList.add("open");
+    scrim.classList.add("show");
+    var menuBtn = document.getElementById("menuBtn");
+    if (menuBtn) menuBtn.setAttribute("aria-expanded", "true");
+  }
+
+  function closeSheet(sidebar, scrim) {
+    sidebar.classList.remove("open");
+    scrim.classList.remove("show");
+    var menuBtn = document.getElementById("menuBtn");
+    if (menuBtn) menuBtn.setAttribute("aria-expanded", "false");
+  }
+
+  function closeSheetIfMobile(sidebar, scrim) {
+    if (window.matchMedia("(max-width:820px)").matches) closeSheet(sidebar, scrim);
+  }
+
+  /* -------- Alert banner jumps to first question (delegated) -------- */
+  document.addEventListener("click", function (e) {
+    if (!e.target.closest("#alertBanner")) return;
+    var firstQ = document.querySelector(".row[data-lifecycle='question']");
+    if (firstQ) {
+      var d = firstQ.closest("details");
+      while (d) {
+        d.setAttribute("open", "");
+        d = d.parentElement ? d.parentElement.closest("details") : null;
+      }
+      var sidebar = document.getElementById("sidebar");
+      var scrim = document.getElementById("scrim");
+      if (sidebar && scrim) openSheet(sidebar, scrim);
+      firstQ.scrollIntoView({ block: "center", behavior: "smooth" });
+    }
+  });
+})();

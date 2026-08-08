@@ -133,6 +133,12 @@ configure_managed_user() {
         > "$managed_home/.zshenv"
     chown "$managed_user:$managed_user" "$managed_home/.zshenv"
     chmod 0644 "$managed_home/.zshenv"
+
+    # Configure git to use the GitHub CLI as its HTTPS credential helper so that
+    # agents cloning or pushing over https://github.com authenticate with the
+    # user's gh token instead of prompting. --force lets this run at image-build
+    # time, before the sandbox has any authenticated gh host.
+    run_as_managed_user gh auth setup-git --hostname github.com --force
 }
 
 configure_managed_user

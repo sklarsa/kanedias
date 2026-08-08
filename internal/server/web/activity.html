@@ -1,0 +1,26 @@
+{{define "activity.html"}}
+<div id="activity-panel">
+  {{if .Items}}
+  <div class="block">
+    <div class="block-title">Recent activity</div>
+    <div class="transcript">
+      {{range .Items}}
+      <div class="t-turn {{if .IsError}}t-error{{end}}">
+        <span class="t-role {{.Kind}}">{{.Kind}}{{if .ToolName}} · {{.ToolName}}{{end}}</span>
+        <div class="t-body">{{.Text}}</div>
+      </div>
+      {{end}}
+    </div>
+    {{if .Incomplete}}<div class="replay-warning">⚠ Incomplete replay</div>{{end}}
+    {{if .GapText}}<div class="gap-warning">⚠ {{.GapText}}</div>{{end}}
+  </div>
+  {{else}}
+  <div class="block">
+    <div class="block-title">Recent activity</div>
+    <div class="t-empty">No activity recorded.</div>
+    {{if .Incomplete}}<div class="replay-warning">⚠ Incomplete replay</div>{{end}}
+    {{if .GapText}}<div class="gap-warning">⚠ {{.GapText}}</div>{{end}}
+  </div>
+  {{end}}
+</div>
+{{end}}

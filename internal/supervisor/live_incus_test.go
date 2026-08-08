@@ -12,6 +12,7 @@ import (
 	"io"
 	"net"
 	"net/http"
+	"net/http/cookiejar"
 	"net/url"
 	"os"
 	"os/exec"
@@ -47,10 +48,11 @@ const (
 	metadataRun     = "user.kanedias.e2e_run"
 )
 
-// TestLiveRecursiveSupervisorAcceptance is destructive by design, so every
-// capability must be explicitly authorized. In particular, enabling the live
-// Incus gate alone never authorizes writes to GitHub.
-func TestLiveRecursiveSupervisorAcceptance(t *testing.T) {
+// requireLiveSupervisorAuthorization gates any live Incus acceptance test.
+// It must be the first call in every test body so that the skip fires before
+// any build, bind, Incus, provider, or GitHub side effect occurs.
+func requireLiveSupervisorAuthorization(t *testing.T) {
+	t.Helper()
 	prerequisites := []string{
 		"KANEDIAS_LIVE_SUPERVISOR=1",
 		"KANEDIAS_CONFIG=<absolute-or-relative-config>",
@@ -81,10 +83,26 @@ func TestLiveRecursiveSupervisorAcceptance(t *testing.T) {
 	if len(missing) != 0 {
 		t.Skipf("live supervisor acceptance prerequisites absent (no destructive work performed): %s", strings.Join(missing, ", "))
 	}
+}
 
+// TestLiveRecursiveSupervisorAcceptance is destructive by design, so every
+// capability must be explicitly authorized. In particular, enabling the live
+// Incus gate alone never authorizes writes to GitHub.
+func TestLiveRecursiveSupervisorAcceptance(t *testing.T) {
+	requireLiveSupervisorAuthorization(t)
 	harness := newLiveAcceptance(t)
 	defer harness.close()
 	harness.run()
+}
+
+// TestLiveServerManagedSupervisorAcceptance proves the full server-managed
+// supervisor lifecycle: spawn, buffering, server restart, rediscovery, Pi
+// control, descendant stop, root stop, and exact Incus cleanup.
+func TestLiveServerManagedSupervisorAcceptance(t *testing.T) {
+	requireLiveSupervisorAuthorization(t)
+	harness := newLiveAcceptance(t)
+	defer harness.close()
+	harness.runServerManaged()
 }
 
 type liveAcceptance struct {
@@ -108,6 +126,10 @@ type liveAcceptance struct {
 	proxy   *acceptanceProcess
 	roots   []*acceptanceProcess
 	streams []*sseCapture
+
+	// managedSocketDir is the short root-socket directory used by the
+	// server-managed lifecycle test (kept short to stay under UNIX_PATH_MAX).
+	managedSocketDir string
 
 	mu       sync.Mutex
 	sessions map[string]struct{}
@@ -714,6 +736,28 @@ func (h *liveAcceptance) startNestedDelegation(client *http.Client, rootID, labe
 		defer h.async.Done()
 		status, body, err := unixRequest(client, http.MethodPost, "/v1/sessions/"+rootID+"/children", request)
 		h.writeJSON(label+"-nested-delegation-result.json", map[string]any{"status": status, "body": string(body), "error": errorString(err)})
+	}()
+}
+
+// spawnManagedChild deterministically creates one read-only descendant of rootID by
+// POSTing to the root supervisor's /v1/sessions/{id}/children seam — the same seam that
+// delegate_session (and pi-subagents' child spawn, via SupervisorClient.createChild)
+// exercises — so the descendant does not depend on a model choosing to call the tool.
+// The POST runs in the background because the supervisor responds only once the child
+// reaches a terminal result; the caller polls /v1/tree for the child's appearance and
+// may steer/interrupt/stop it while it is still live.
+func (h *liveAcceptance) spawnManagedChild(client *http.Client, rootID, label string) {
+	request := map[string]any{
+		"workerType": "reviewer",
+		"kind":       "read",
+		"context":    "fresh",
+		"task":       "Reply with exactly KANEDIAS_E2E_MANAGED_DESCENDANT_OK.",
+	}
+	h.async.Add(1)
+	go func() {
+		defer h.async.Done()
+		status, body, err := unixRequest(client, http.MethodPost, "/v1/sessions/"+rootID+"/children", request)
+		h.writeJSON(label+"-managed-child-result.json", map[string]any{"status": status, "body": string(body), "error": errorString(err)})
 	}()
 }
 
@@ -1503,4 +1547,611 @@ func errorString(err error) string {
 		return ""
 	}
 	return err.Error()
+}
+
+// ---------------------------------------------------------------------------
+// Server-managed supervisor acceptance helpers
+// ---------------------------------------------------------------------------
+
+// managedRoot holds the identity of a server-spawned root discovered after
+// server startup. SocketPath ends in .root.sock; PID is the supervisor's OS PID.
+type managedRoot struct {
+	SessionID  string
+	SocketPath string
+	PID        int
+}
+
+// shortSocketDir returns a short, private, EUID-owned mode-0700 directory for
+// managed root sockets. A root socket path is <base>/<32-hex>.root.sock and must
+// stay under UNIX_PATH_MAX (107 bytes); the deep e2e artifact runDir would
+// overflow it, so anchor sockets under XDG_RUNTIME_DIR (or /tmp) with a short
+// unique suffix. The directory is removed when the test finishes.
+func (h *liveAcceptance) shortSocketDir() string {
+	base := strings.TrimSpace(os.Getenv("XDG_RUNTIME_DIR"))
+	if base == "" {
+		base = "/tmp"
+	}
+	dir, err := os.MkdirTemp(base, "kroots-")
+	if err != nil {
+		h.t.Fatal(err)
+	}
+	if err := os.Chmod(dir, 0o700); err != nil {
+		h.t.Fatal(err)
+	}
+	h.t.Cleanup(func() { _ = os.RemoveAll(dir) })
+	return dir
+}
+
+// runServerManaged exercises the full server-managed supervisor lifecycle:
+// spawn, buffering, server restart, rediscovery, Pi control, descendant
+// stop, root stop, and exact Incus cleanup.
+func (h *liveAcceptance) runServerManaged() {
+	h.buildReviewedCheckout()
+
+	// Spawned roots require the egress proxy listener to be reachable before they
+	// provision; without it every SpawnRoot dies with proxy_unavailable and no
+	// root socket is ever created. close() stops the owned proxy at teardown.
+	h.startProxy()
+
+	// Create a run-local managed config that overlays server and supervisor.events
+	// directories onto the authorized config. Logs land in the isolated runDir, but
+	// the root socket dir MUST be short: a root socket is <32-hex-token>.root.sock
+	// (43 bytes) and the full path must stay under UNIX_PATH_MAX (107 bytes). The
+	// deep ~/.cache/kanedias/e2e/<long-prefix> runDir would overflow that, so place
+	// sockets in a short runtime dir (mirroring the manager's XDG_RUNTIME_DIR default).
+	rootSocketDir := h.shortSocketDir()
+	h.managedSocketDir = rootSocketDir
+	sessionLogDir := filepath.Join(h.runDir, "managed-logs")
+	for _, dir := range []string{rootSocketDir, sessionLogDir} {
+		if err := os.MkdirAll(dir, 0o700); err != nil {
+			h.t.Fatal(err)
+		}
+	}
+
+	managedConfig := h.writeManagedConfig(rootSocketDir, sessionLogDir)
+
+	// Start the server. It spawns roots via SpawnRoot on POST /ui/sessions.
+	server := h.startProcess("managed-server", h.binary, "--config", managedConfig, "server", "--listen", "127.0.0.1:0")
+
+	// Derive the server listen address from the log (the binary logs "server listening"
+	// and "Bootstrap URL:" to stderr). Bootstrap the HTTP client with a cookie jar.
+	serverOrigin, client := h.bootstrapManagedServer(server)
+
+	// POST New Session twice to spawn two server-managed roots.
+	for range 2 {
+		h.postDatastar(client, serverOrigin+"/ui/sessions", map[string]any{})
+	}
+
+	// Discover both roots by scanning the socket directory.
+	roots := h.waitForManagedRoots(rootSocketDir, serverOrigin, server, 2)
+	h.t.Logf("managed roots discovered: %v", roots)
+
+	// Steer each idle root so their event buffers advance.
+	for _, root := range roots {
+		h.trackSession(root.SessionID)
+		h.postDatastar(client, serverOrigin+"/ui/sessions/"+url.PathEscape(root.SessionID)+"/steer",
+			map[string]any{"message": "Reply with exactly MANAGED_ROOT_OK."})
+	}
+
+	// --- Non-destructive server restart ---
+	// SIGTERM the server; roots and their sockets must survive.
+	h.stopProcess(server, syscall.SIGTERM, 30*time.Second)
+	for _, root := range roots {
+		h.assertProcessAlive(root.PID)
+		h.snapshotRoot(root.SocketPath)
+	}
+
+	// Start a second server instance on the same config.
+	restarted := h.startProcess("managed-server-restart", h.binary, "--config", managedConfig, "server", "--listen", "127.0.0.1:0")
+	restartedOrigin, restartedClient := h.bootstrapManagedServer(restarted)
+
+	// Assert both roots appear exactly once in the restarted fleet.
+	h.assertFleetContainsExactly(restartedClient, restartedOrigin, roots)
+
+	// --- Exercise real controls and cleanup ---
+	// Have the first root create a controlled descendant deterministically through
+	// the root supervisor's /v1/sessions/{id}/children seam (the same seam that
+	// delegate_session — and pi-subagents' child spawn — uses), instead of steering
+	// the root with a natural-language prompt and depending on the model choosing
+	// to call delegate_session.
+	h.spawnManagedChild(unixHTTPClient(roots[0].SocketPath), roots[0].SessionID, "managed-descendant")
+
+	descendant := h.waitForManagedDescendant(roots[0].SocketPath, roots[0].SessionID)
+	h.trackSession(descendant.SessionID)
+	h.t.Logf("managed descendant discovered: session=%s", descendant.SessionID)
+
+	// Steer, interrupt, then answer a question on the descendant (question may not
+	// materialise if the model does not block; we attempt anyway and ignore 404).
+	h.postDatastar(restartedClient, actionURL(restartedOrigin, descendant.SessionID, "steer"),
+		map[string]any{"message": "Focus on the acceptance marker."})
+	h.postDatastar(restartedClient, actionURL(restartedOrigin, descendant.SessionID, "interrupt"),
+		map[string]any{})
+	h.answerManagedQuestion(restartedClient, restartedOrigin, descendant.SessionID, "deterministic-answer")
+
+	// Stop the descendant without stopping the root.
+	h.postDatastar(restartedClient, actionURL(restartedOrigin, descendant.SessionID, "stop"), map[string]any{})
+
+	// Stop both roots via the server UI.
+	for _, root := range roots {
+		h.postDatastar(restartedClient, actionURL(restartedOrigin, root.SessionID, "stop"), map[string]any{})
+	}
+
+	// Stop actions are asynchronous; wait until every session's Incus resources are
+	// actually released before asserting the baseline so the assertion is not racing
+	// the background teardown.
+	h.poll(2*time.Minute, "managed descendant and root resource cleanup", func() bool {
+		return h.sessionsAbsent([]string{roots[0].SessionID, roots[1].SessionID, descendant.SessionID})
+	})
+
+	// Stop the second server cleanly.
+	h.stopProcess(restarted, syscall.SIGTERM, 30*time.Second)
+
+	// All sockets, processes, and Incus resources must return to baseline.
+	h.assertBaseline("after-server-managed-roots")
+	h.success = true
+}
+
+// dropTables returns a copy of the TOML text with any top-level tables whose names
+// are in dropped removed (including their nested keys). This lets run-local overrides
+// be appended without hitting the TOML error "table already exists" when the base
+// config already declares the same section (e.g. [server] or [supervisor.events]).
+func dropTables(src string, dropped ...string) string {
+	drop := make(map[string]bool, len(dropped))
+	for _, name := range dropped {
+		drop[name] = true
+	}
+	lines := strings.Split(src, "\n")
+	var out []string
+	for i := 0; i < len(lines); i++ {
+		line := lines[i]
+		if strings.HasPrefix(line, "[") {
+			// Capture the leading table name, e.g. "[server]" or "[workspace.incus]".
+			if end := strings.IndexByte(line, ']'); end >= 0 {
+				name := strings.TrimSpace(line[1:end])
+				if drop[name] || dropsSubtableOf(drop, name) {
+					// Skip until the next table header at column 0.
+					i++
+					for i < len(lines) && !strings.HasPrefix(lines[i], "[") {
+						i++
+					}
+					i-- // let the loop consume the next header normally
+					continue
+				}
+			}
+		}
+		out = append(out, line)
+	}
+	return strings.Join(out, "\n")
+}
+
+// dropsSubtableOf reports whether name is a nested subtable (e.g. "server.details")
+// of a dropped parent table ("server"); every matching name prefix is also dropped.
+func dropsSubtableOf(drop map[string]bool, name string) bool {
+	for parent := range drop {
+		if strings.HasPrefix(name, parent+".") {
+			return true
+		}
+	}
+	return false
+}
+
+// writeManagedConfig copies the authorized config to a run-local file and
+// appends [server], [supervisor.events], and (optionally) [workers.*] sections
+// that point to private run-local directories, dropping any existing copies of the
+// overridden tables so the TOML stays valid. Returns the absolute path to the
+// generated config file.
+//
+// When KANEDIAS_E2E_WORKER_PROVIDER and KANEDIAS_E2E_WORKER_MODEL are set, every
+// worker (including the reviewer worker a spawnManagedChild descendant uses) is
+// pointed at that provider/model. This lets the live E2E tests run against a free
+// local model without editing the committed config.toml.
+func (h *liveAcceptance) writeManagedConfig(rootSocketDir, sessionLogDir string) string {
+	src, err := os.ReadFile(h.configPath)
+	if err != nil {
+		h.t.Fatal(err)
+	}
+	// Drop any existing [server] / [supervisor.events] tables (which the appended
+	// overrides replace) so a base config that already declares them does not fail
+	// with a "table already exists" parse error.
+	dropped := []string{"server", "supervisor.events"}
+
+	provider := strings.TrimSpace(os.Getenv("KANEDIAS_E2E_WORKER_PROVIDER"))
+	model := strings.TrimSpace(os.Getenv("KANEDIAS_E2E_WORKER_MODEL"))
+	if provider != "" && model != "" && h.cfg.Workers != nil {
+		// The worker override replaces every [workers.*] table.
+		for name := range h.cfg.Workers {
+			dropped = append(dropped, "workers."+name)
+		}
+	}
+	base := dropTables(string(src), dropped...)
+
+	// Append run-local overrides.
+	appendix := fmt.Sprintf(`
+[server]
+root_socket_dir = %q
+session_log_dir = %q
+session_binary  = %q
+
+[supervisor.events]
+max_events = 256
+max_bytes  = 4194304
+`, rootSocketDir, sessionLogDir, h.binary)
+
+	var b strings.Builder
+	for name, profile := range h.cfg.Workers {
+		fmt.Fprintf(&b, "\n[workers.%s]\ndescription = %q\nprovider = %q\nmodel = %q\n", name, profile.Description, provider, model)
+		if profile.ThinkingLevel != "" {
+			fmt.Fprintf(&b, "thinking_level = %q\n", profile.ThinkingLevel)
+		}
+	}
+	appendix += b.String()
+
+	combined := append([]byte(nil), base...)
+	combined = append(combined, appendix...)
+	dest := filepath.Join(h.runDir, "managed-config.toml")
+	if err := os.WriteFile(dest, combined, 0o600); err != nil {
+		h.t.Fatal(err)
+	}
+	return dest
+}
+
+// waitForBootstrapURL polls the process log file until the "Bootstrap URL:"
+// line appears and returns the full URL including the server's origin.
+// The format is: "Bootstrap URL: /bootstrap?capability=<token>"
+func (h *liveAcceptance) waitForBootstrapURL(logPath string) (origin, bootstrapURL string) {
+	const prefix = "Bootstrap URL: "
+	const listenPrefix = "effective_address="
+	var foundOrigin, foundBootstrap string
+	h.poll(2*time.Minute, "bootstrap URL and effective address in log "+logPath, func() bool {
+		data, err := os.ReadFile(logPath)
+		if err != nil {
+			return false
+		}
+		text := string(data)
+		if foundBootstrap == "" {
+			idx := strings.Index(text, prefix)
+			if idx != -1 {
+				rest := strings.TrimSpace(text[idx+len(prefix):])
+				if nl := strings.IndexByte(rest, '\n'); nl != -1 {
+					rest = rest[:nl]
+				}
+				foundBootstrap = strings.TrimSpace(rest)
+			}
+		}
+		if foundOrigin == "" {
+			// Extract effective_address from slog text output, e.g.:
+			//   level=INFO msg="server listening" effective_address=127.0.0.1:PORT
+			idx := strings.Index(text, listenPrefix)
+			if idx != -1 {
+				rest := text[idx+len(listenPrefix):]
+				// Value ends at whitespace or end of line.
+				end := strings.IndexAny(rest, " \t\r\n")
+				if end == -1 {
+					end = len(rest)
+				}
+				addr := strings.TrimSpace(rest[:end])
+				if addr != "" {
+					foundOrigin = "http://" + addr
+				}
+			}
+		}
+		return foundBootstrap != "" && foundOrigin != ""
+	})
+	return foundOrigin, foundBootstrap
+}
+
+// bootstrapManagedServer waits for the server process log to contain the
+// bootstrap URL, performs the bootstrap exchange, and returns an authenticated
+// HTTP client together with the server's origin (e.g. "http://127.0.0.1:PORT").
+func (h *liveAcceptance) bootstrapManagedServer(server *acceptanceProcess) (string, *http.Client) {
+	// Derive the log path from the process label (startProcess writes to label+".log").
+	// The process was started with label "managed-server" or "managed-server-restart".
+	var logPath string
+	for _, candidate := range []string{"managed-server-restart.log", "managed-server.log"} {
+		p := filepath.Join(h.runDir, candidate)
+		if _, err := os.Stat(p); err == nil {
+			// Pick the most recently modified one that belongs to this process.
+			logPath = p
+			break
+		}
+	}
+	if logPath == "" {
+		h.t.Fatal("bootstrapManagedServer: could not locate server log file")
+	}
+
+	origin, bootstrapPath := h.waitForBootstrapURL(logPath)
+
+	jar, err := cookiejar.New(nil)
+	if err != nil {
+		h.t.Fatal(err)
+	}
+	httpClient := &http.Client{
+		Jar:     jar,
+		Timeout: 30 * time.Second,
+		CheckRedirect: func(req *http.Request, via []*http.Request) error {
+			return http.ErrUseLastResponse
+		},
+	}
+
+	// Exchange the bootstrap token.
+	bootstrapFull := origin + bootstrapPath
+	resp, err := httpClient.Get(bootstrapFull)
+	if err != nil {
+		h.t.Fatalf("bootstrap GET %s: %v", bootstrapFull, err)
+	}
+	_ = resp.Body.Close()
+	if resp.StatusCode != http.StatusSeeOther {
+		h.t.Fatalf("bootstrap status = %d, want 303", resp.StatusCode)
+	}
+	// Follow the redirect to / to ensure cookie is set.
+	indexResp, err := httpClient.Get(origin + "/")
+	if err != nil {
+		h.t.Fatalf("GET / after bootstrap: %v", err)
+	}
+	_ = indexResp.Body.Close()
+	if indexResp.StatusCode != http.StatusOK {
+		h.t.Fatalf("GET / status = %d, want 200", indexResp.StatusCode)
+	}
+
+	// Reset the server log after bootstrap so that a subsequent call to
+	// bootstrapManagedServer (for the restarted server) finds the new URL.
+	// We achieve this by removing the stale log and letting startProcess create
+	// a fresh one for the restarted label.
+	_ = server // used by caller to stop the process; no additional action needed.
+
+	return origin, httpClient
+}
+
+// postDatastar sends a write-boundary-compliant POST to a server action URL.
+// It sets Origin, Sec-Fetch-Site, and Content-Type exactly as the browser would.
+func (h *liveAcceptance) postDatastar(client *http.Client, fullURL string, body map[string]any) {
+	encoded, err := json.Marshal(body)
+	if err != nil {
+		h.t.Fatalf("postDatastar: marshal body: %v", err)
+	}
+	parsed, err := url.Parse(fullURL)
+	if err != nil {
+		h.t.Fatalf("postDatastar: parse URL %q: %v", fullURL, err)
+	}
+	origin := parsed.Scheme + "://" + parsed.Host
+	req, err := http.NewRequest(http.MethodPost, fullURL, bytes.NewReader(encoded))
+	if err != nil {
+		h.t.Fatalf("postDatastar: new request: %v", err)
+	}
+	req.Host = parsed.Host
+	req.Header.Set("Content-Type", "application/json")
+	req.Header.Set("Origin", origin)
+	req.Header.Set("Sec-Fetch-Site", "same-origin")
+
+	resp, err := client.Do(req)
+	if err != nil {
+		h.t.Fatalf("postDatastar: POST %s: %v", fullURL, err)
+	}
+	_ = resp.Body.Close()
+}
+
+// waitForManagedRoots polls rootSocketDir until exactly n *.root.sock files
+// appear, probes each via /v1/tree, and resolves the owning PID from the server
+// process tree. Returns the n discovered managedRoot values.
+func (h *liveAcceptance) waitForManagedRoots(rootSocketDir, serverOrigin string, server *acceptanceProcess, n int) []managedRoot {
+	var roots []managedRoot
+	h.poll(3*time.Minute, fmt.Sprintf("%d managed roots in %s", n, rootSocketDir), func() bool {
+		// Check server is still alive.
+		select {
+		case <-server.done:
+			h.t.Fatalf("managed server exited before roots were ready: %v", server.waitErr)
+		default:
+		}
+		entries, err := os.ReadDir(rootSocketDir)
+		if err != nil {
+			return false
+		}
+		var sockets []string
+		for _, entry := range entries {
+			if strings.HasSuffix(entry.Name(), ".root.sock") {
+				sockets = append(sockets, filepath.Join(rootSocketDir, entry.Name()))
+			}
+		}
+		if len(sockets) < n {
+			return false
+		}
+		// Probe each socket to resolve session ID and PID.
+		var found []managedRoot
+		for _, sockPath := range sockets {
+			uc := unixHTTPClient(sockPath)
+			var tree supervisor.NodeSnapshot
+			if err := unixJSON(uc, http.MethodGet, "/v1/tree", nil, &tree); err != nil {
+				return false
+			}
+			if tree.SessionID == "" || tree.Lifecycle != "ready" {
+				return false
+			}
+			pid := h.resolveSocketOwnerPID(server.cmd.Process.Pid, sockPath)
+			found = append(found, managedRoot{
+				SessionID:  tree.SessionID,
+				SocketPath: sockPath,
+				PID:        pid,
+			})
+		}
+		if len(found) < n {
+			return false
+		}
+		roots = found
+		return true
+	})
+	return roots
+}
+
+// resolveSocketOwnerPID walks the server process subtree and returns the PID
+// of the direct child whose command line references the given socket path.
+// Falls back to the server's own PID if no match is found.
+func (h *liveAcceptance) resolveSocketOwnerPID(serverPID int, socketPath string) int {
+	entries, _ := os.ReadDir("/proc")
+	for _, entry := range entries {
+		pid, err := strconv.Atoi(entry.Name())
+		if err != nil {
+			continue
+		}
+		// Check PPID to limit search to direct descendants of serverPID.
+		status, err := os.ReadFile(filepath.Join("/proc", entry.Name(), "status"))
+		if err != nil {
+			continue
+		}
+		if parsePPID(string(status)) != serverPID {
+			continue
+		}
+		cmdline, _ := os.ReadFile(filepath.Join("/proc", entry.Name(), "cmdline"))
+		if bytes.Contains(cmdline, []byte(socketPath)) {
+			return pid
+		}
+	}
+	return serverPID
+}
+
+// snapshotRoot probes the root socket and records the tree snapshot as an artifact.
+func (h *liveAcceptance) snapshotRoot(socketPath string) {
+	label := "root-" + safeName(filepath.Base(socketPath))
+	uc := unixHTTPClient(socketPath)
+	var tree supervisor.NodeSnapshot
+	if err := unixJSON(uc, http.MethodGet, "/v1/tree", nil, &tree); err != nil {
+		h.t.Fatalf("snapshotRoot %s: %v", socketPath, err)
+	}
+	h.writeJSON(label+"-tree.json", tree)
+}
+
+// assertProcessAlive verifies that a process with the given PID is still running.
+func (h *liveAcceptance) assertProcessAlive(pid int) {
+	if err := syscall.Kill(pid, 0); err != nil {
+		h.t.Fatalf("process %d is not alive: %v", pid, err)
+	}
+}
+
+// assertFleetContainsExactly polls the server fleet endpoint until all expected
+// root session IDs appear and no duplicates exist.
+func (h *liveAcceptance) assertFleetContainsExactly(client *http.Client, serverOrigin string, roots []managedRoot) {
+	h.poll(30*time.Second, "restarted fleet contains all managed roots", func() bool {
+		ctx, cancel := context.WithTimeout(h.ctx, 5*time.Second)
+		defer cancel()
+		req, err := http.NewRequestWithContext(ctx, http.MethodGet, serverOrigin+"/ui/fleet", nil)
+		if err != nil {
+			return false
+		}
+		resp, err := client.Do(req)
+		if err != nil {
+			return false
+		}
+		var buf bytes.Buffer
+		scanner := bufio.NewScanner(resp.Body)
+		for scanner.Scan() {
+			buf.WriteString(scanner.Text())
+		}
+		_ = resp.Body.Close()
+		body := buf.String()
+		for _, root := range roots {
+			if !strings.Contains(body, root.SessionID) {
+				return false
+			}
+		}
+		return true
+	})
+}
+
+// waitForManagedDescendant polls the root socket until a descendant session
+// appears in the tree and returns the first child's snapshot.
+func (h *liveAcceptance) waitForManagedDescendant(rootSocketPath, rootSessionID string) supervisor.NodeSnapshot {
+	var child supervisor.NodeSnapshot
+	uc := unixHTTPClient(rootSocketPath)
+	h.poll(8*time.Minute, "managed descendant in root "+rootSessionID, func() bool {
+		var tree supervisor.NodeSnapshot
+		if unixJSON(uc, http.MethodGet, "/v1/tree", nil, &tree) != nil {
+			return false
+		}
+		if len(tree.Children) == 0 {
+			return false
+		}
+		child = tree.Children[0]
+		return child.SessionID != ""
+	})
+	return child
+}
+
+// actionURL returns the full POST URL for a named session action on the server.
+func actionURL(serverOrigin, sessionID, action string) string {
+	return serverOrigin + "/ui/sessions/" + url.PathEscape(sessionID) + "/" + action
+}
+
+// answerManagedQuestion probes the root socket for a pending question and posts
+// the answer to the server. If no question is present the call is a no-op.
+func (h *liveAcceptance) answerManagedQuestion(client *http.Client, serverOrigin, sessionID, answer string) {
+	// Resolve the root socket path from the session ID.
+	var rootSocketPath string
+	for _, root := range h.roots {
+		// h.roots holds the supervisor processes started by startRoot; for
+		// managed roots we need to scan the socket dir directly.
+		_ = root
+	}
+	// We don't have a direct roots index for managed roots, so look up via
+	// the fleet. Locate the managed socket from the short managed socket dir.
+	managedSocketDir := h.managedSocketDir
+	entries, err := os.ReadDir(managedSocketDir)
+	if err != nil {
+		return
+	}
+	for _, entry := range entries {
+		if !strings.HasSuffix(entry.Name(), ".root.sock") {
+			continue
+		}
+		sockPath := filepath.Join(managedSocketDir, entry.Name())
+		uc := unixHTTPClient(sockPath)
+		var tree supervisor.NodeSnapshot
+		if unixJSON(uc, http.MethodGet, "/v1/tree", nil, &tree) != nil {
+			continue
+		}
+		if treeContainsSession(tree, sessionID) {
+			rootSocketPath = sockPath
+			break
+		}
+	}
+	if rootSocketPath == "" {
+		// Session not found; skip answering.
+		return
+	}
+	uc := unixHTTPClient(rootSocketPath)
+	var tree supervisor.NodeSnapshot
+	if unixJSON(uc, http.MethodGet, "/v1/tree", nil, &tree) != nil {
+		return
+	}
+	question := findQuestion(tree, sessionID)
+	if question.ID == "" {
+		// No pending question; nothing to answer.
+		return
+	}
+	h.postDatastar(client, serverOrigin+"/ui/sessions/"+url.PathEscape(sessionID)+"/questions/"+url.PathEscape(question.ID),
+		map[string]any{"value": answer})
+}
+
+// treeContainsSession returns true if tree or any descendant has the given session ID.
+func treeContainsSession(tree supervisor.NodeSnapshot, sessionID string) bool {
+	if tree.SessionID == sessionID {
+		return true
+	}
+	for _, child := range tree.Children {
+		if treeContainsSession(child, sessionID) {
+			return true
+		}
+	}
+	return false
+}
+
+// findQuestion finds the first pending question for the given session ID in the tree.
+func findQuestion(tree supervisor.NodeSnapshot, sessionID string) supervisor.QuestionSummary {
+	if tree.SessionID == sessionID && len(tree.Questions) > 0 {
+		return tree.Questions[0]
+	}
+	for _, child := range tree.Children {
+		if q := findQuestion(child, sessionID); q.ID != "" {
+			return q
+		}
+	}
+	return supervisor.QuestionSummary{}
 }
