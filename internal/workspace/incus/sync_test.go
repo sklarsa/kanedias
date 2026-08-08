@@ -153,7 +153,7 @@ func (f *syncFakeClient) Exec(ctx context.Context, _ string, request incusclient
 		return result.stdout, result.stderr, result.err
 	}
 	switch command {
-	case "systemctl is-system-running --wait":
+	case "systemctl is-system-running":
 		return "running\n", "", nil
 	case "incus query /1.0/storage-pools?recursion=1":
 		return `[]`, "", nil
@@ -216,7 +216,7 @@ func TestSyncNewSeedSuccessLifecycle(t *testing.T) {
 		"ensure-profile sandbox",
 		"create-instance",
 		"start-instance",
-		"exec systemctl is-system-running --wait",
+		"exec systemctl is-system-running",
 		"exec update-ca-certificates",
 		"exec getent ahosts images.linuxcontainers.org",
 		"exec incus admin waitready --timeout 60",

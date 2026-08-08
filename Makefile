@@ -24,7 +24,9 @@ test: ## Run the hermetic test suite (no Incus, no network)
 test-live: ## Run live Incus/E2E tests (needs Incus + .env; see .env.example)
 	@if [ ! -f .env ]; then \
 		echo "test-live requires a .env file; copy .env.example and fill it in."; exit 1; fi
-	go test -tags incus ./...
+	# -count=1 disables Go's test result cache: live tests are destructive and
+	# must actually run every time rather than replaying a stale cached pass.
+	go test -count=1 -tags incus ./...
 
 fmt: ## Format all Go files in place
 	gofmt -w .

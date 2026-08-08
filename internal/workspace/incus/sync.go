@@ -228,21 +228,40 @@ func syncWithDependencies(ctx context.Context, cfg config.Config, stdout, stderr
 	return nil
 }
 
+// waitForSystemd polls the maintenance instance until systemd reports running or
+// degraded, or the timeout expires. A freshly started Incus instance does not have
+// its systemd control bus up for a few seconds, during which `systemctl
+// is-system-running --wait` fails fast with "Failed to connect to system scope bus"
+// instead of waiting; polling (like waitForDNS) tolerates that transient boot window.
 func waitForSystemd(ctx context.Context, incus client, name string) error {
 	readyCtx, cancel := context.WithTimeout(ctx, systemdTimeout)
 	defer cancel()
 
-	stdout, stderr, err := incus.Exec(readyCtx, name, incusclient.ExecRequest{
-		Command: []string{"systemctl", "is-system-running", "--wait"},
-	})
-	state := strings.TrimSpace(stdout)
-	if err != nil {
-		return fmt.Errorf("wait for systemd in maintenance instance %q (state %q, stderr %q): %w", name, state, strings.TrimSpace(stderr), err)
+	var lastState, lastStderr string
+	var lastErr error
+	for {
+		if err := readyCtx.Err(); err != nil {
+			return fmt.Errorf("wait for systemd in maintenance instance %q (state %q, stderr %q, last err %v): %w", name, lastState, lastStderr, lastErr, err)
+		}
+		stdout, stderr, err := incus.Exec(readyCtx, name, incusclient.ExecRequest{
+			Command: []string{"systemctl", "is-system-running"},
+		})
+		state := strings.TrimSpace(stdout)
+		if err == nil && (state == "running" || state == "degraded") {
+			return nil
+		}
+		lastState, lastStderr, lastErr = state, stderr, err
+
+		timer := time.NewTimer(time.Second)
+		select {
+		case <-readyCtx.Done():
+			if !timer.Stop() {
+				<-timer.C
+			}
+			return fmt.Errorf("wait for systemd in maintenance instance %q (state %q, stderr %q, last err %v): %w", name, lastState, lastStderr, lastErr, readyCtx.Err())
+		case <-timer.C:
+		}
 	}
-	if state != "running" && state != "degraded" {
-		return fmt.Errorf("wait for systemd in maintenance instance %q: state is %q", name, state)
-	}
-	return nil
 }
 
 func waitForDNS(ctx context.Context, incus client, name string, timeout, pollInterval time.Duration) error {
