@@ -6,14 +6,19 @@ import (
 	"io"
 	"os"
 	"path/filepath"
-	"strings"
+	"regexp"
 
 	"golang.org/x/sys/unix"
 )
 
+// sandboxNamePattern mirrors Incus instance-name rules (and the pattern used
+// for supervisor child names in internal/supervisor/provision): 1-63 chars,
+// alphanumeric with optional internal hyphens, no leading/trailing hyphen.
+var sandboxNamePattern = regexp.MustCompile(`^[A-Za-z0-9](?:[A-Za-z0-9-]{0,61}[A-Za-z0-9])?$`)
+
 func validateName(name string) error {
-	if name == "" || name == "." || name == ".." || strings.Contains(name, "/") {
-		return fmt.Errorf("invalid sandbox name %q", name)
+	if !sandboxNamePattern.MatchString(name) {
+		return fmt.Errorf("invalid sandbox name %q: must be 1-63 alphanumeric chars with optional internal hyphens (no leading/trailing hyphen)", name)
 	}
 	return nil
 }

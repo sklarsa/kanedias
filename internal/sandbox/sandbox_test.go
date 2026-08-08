@@ -476,14 +476,22 @@ func TestLifecycleLockIsNonBlockingAndPrivate(t *testing.T) {
 	}
 }
 
-func TestValidateNameMatchesLegacyLifecycleRules(t *testing.T) {
-	for _, name := range []string{"", ".", "..", "with/slash"} {
-		if err := validateName(name); err == nil {
-			t.Errorf("validateName(%q) succeeded", name)
+func TestValidateNameMatchesIncusNamingConvention(t *testing.T) {
+	valid := []string{"sandbox", "my-sandbox-1", "a", "Sandbox-2", "x1-2y"}
+	for _, name := range valid {
+		if err := validateName(name); err != nil {
+			t.Errorf("validateName(%q) rejected a valid name: %v", name, err)
 		}
 	}
-	if err := validateName("sandbox name"); err != nil {
-		t.Fatalf("legacy-valid name rejected: %v", err)
+	invalid := []string{
+		"", ".", "..", "with/slash", "sandbox name", // space
+		"-sandbox", "sandbox-", "sandbox_name", "sandbox..name", // underscore, double dot
+		"1234567890123456789012345678901234567890123456789012345678901234", // 64 chars
+	}
+	for _, name := range invalid {
+		if err := validateName(name); err == nil {
+			t.Errorf("validateName(%q) accepted an invalid name", name)
+		}
 	}
 }
 
