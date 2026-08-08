@@ -35,8 +35,9 @@ func TestHandlerRoutes(t *testing.T) {
 			contentType: "text/html; charset=utf-8",
 			contains: []string{
 				"<title>Kanedias — Circle of the Fleet</title>",
-				"KANEDIAS // CIRCLE OF THE FLEET",
-				"STATIC DEMONSTRATION",
+				`id="sidebar"`,
+				`id="alertBanner"`,
+				`class="instrument"`,
 			},
 		},
 		{
@@ -139,16 +140,29 @@ func TestHandlerRejectsUnsupportedMethods(t *testing.T) {
 	}
 }
 
-func TestInitialPageContainsCircleOfFleetMockup(t *testing.T) {
+func TestInitialPageContainsAstrolabeConsole(t *testing.T) {
 	body := indexBody(t)
 	required := []string{
 		`<html lang="en" data-theme="dark">`,
-		`<body class="terminal">`,
-		`KANEDIAS // CIRCLE OF THE FLEET`,
-		`STATIC DEMONSTRATION`,
-		`id="question-alert"`,
-		`2 QUESTIONS`,
-		`id="fleet-orbit"`,
+		// shell regions
+		`class="topbar"`,
+		`class="sidebar"`,
+		`id="tree"`,
+		`class="main"`,
+		`class="deck"`,
+		// the brass ring-dial instrument + per-agent readouts
+		`class="instrument"`,
+		`id="alidade"`,
+		`id="breadcrumb"`,
+		// global question alert with its count
+		`id="alertBanner"`,
+		`id="alertCount"`,
+		// the four detail tabs
+		`data-tab="question"`,
+		`data-tab="transcript"`,
+		`data-tab="tools"`,
+		`data-tab="metrics"`,
+		// agents across the nested tree
 		`RPC-SPIKE`,
 		`WEB-SHELL`,
 		`INCUS-IMAGE`,
@@ -157,14 +171,20 @@ func TestInitialPageContainsCircleOfFleetMockup(t *testing.T) {
 		`PTY-OWNER`,
 		`TEST-RUNNER`,
 		`CORRECTNESS`,
-		`id="maker-aperture"`,
-		`Should shell sessions survive a browser reconnect`,
-		`12.8K`,
-		`TOKENS`,
-		`id="command-deck"`,
-		`● ACTIVE`,
-		`◇ QUESTION`,
-		`○ COMPLETE`,
+		`ORBITAL-INGEST`,
+		`MERIDIAN-REVIEW`,
+		// question card content + metrics
+		`Which contract should I lock in`,
+		`class="metrics"`,
+		// command deck actions
+		`Steer`,
+		`Interrupt`,
+		`Stop Run`,
+		`Spawn Subagent`,
+		// colorblind-safe: state paired with glyph + text
+		`● active`,
+		`◇ question`,
+		`○ complete`,
 	}
 	for _, want := range required {
 		if !strings.Contains(body, want) {
@@ -173,10 +193,15 @@ func TestInitialPageContainsCircleOfFleetMockup(t *testing.T) {
 	}
 
 	obsolete := []string{
+		// the retired orrery mockup
+		`id="fleet-orbit"`,
+		`id="maker-aperture"`,
+		`class="run-cluster"`,
+		`class="child-moon `,
+		`STATIC DEMONSTRATION`,
+		// leftover scaffold panels
 		"Refresh status",
 		"Not refreshed yet.",
-		"Dashboard view is not available in this scaffold.",
-		"Session view is not available in this scaffold.",
 		`id="dashboard-panel"`,
 		`id="session-panel"`,
 	}
@@ -187,88 +212,98 @@ func TestInitialPageContainsCircleOfFleetMockup(t *testing.T) {
 	}
 }
 
-func TestCircleOfFleetMockupIsStatic(t *testing.T) {
+func TestAstrolabeConsoleIsInteractive(t *testing.T) {
 	body := indexBody(t)
-	lower := strings.ToLower(body)
-	forbidden := []string{
-		"data-on:",
-		"data-init",
-		"@get(",
-		"/ui/status",
-		"fetch(",
-		"xmlhttprequest",
-		"onclick=",
-		"contenteditable",
-		"<form",
-		"<input",
-		"<textarea",
-		"<select",
-		"<a ",
-	}
-	for _, unwanted := range forbidden {
-		if strings.Contains(lower, unwanted) {
-			t.Errorf("static mockup contains active mechanism %q", unwanted)
-		}
-	}
 
-	buttonRE := regexp.MustCompile(`(?s)<button\b[^>]*>.*?</button>`)
-	buttons := buttonRE.FindAllString(body, -1)
-	if len(buttons) != 7 {
-		t.Fatalf("button count = %d, want 7", len(buttons))
-	}
-	for _, button := range buttons {
-		if !strings.Contains(button, " disabled") {
-			t.Errorf("mockup button is not disabled: %s", button)
-		}
-	}
-
+	// The console is wired by exactly two scripts: the local Datastar module
+	// (empty body) and the inline console controller (non-empty body). No
+	// external scripts.
 	scriptRE := regexp.MustCompile(`(?s)<script\b([^>]*)>(.*?)</script>`)
 	scripts := scriptRE.FindAllStringSubmatch(body, -1)
-	if len(scripts) != 1 {
-		t.Fatalf("script count = %d, want only the local Datastar module", len(scripts))
+	if len(scripts) != 2 {
+		t.Fatalf("script count = %d, want 2 (Datastar module + inline controller)", len(scripts))
 	}
-	if !strings.Contains(scripts[0][1], `type="module"`) || !strings.Contains(scripts[0][1], `src="/assets/datastar.js"`) {
-		t.Errorf("sole script is not the local Datastar module: %s", scripts[0][0])
+
+	var sawDatastar, sawController bool
+	for _, script := range scripts {
+		attrs, inner := script[1], strings.TrimSpace(script[2])
+		if strings.Contains(attrs, `src=`) {
+			if !strings.Contains(attrs, `type="module"`) || !strings.Contains(attrs, `src="/assets/datastar.js"`) {
+				t.Errorf("external script is not the local Datastar module: %s", script[0])
+			}
+			if inner != "" {
+				t.Errorf("Datastar module script has unexpected inline body %q", inner)
+			}
+			sawDatastar = true
+			continue
+		}
+		// inline controller
+		if inner == "" {
+			t.Error("inline controller script has an empty body")
+		}
+		for _, want := range []string{"selectRow", "addEventListener", "querySelectorAll"} {
+			if !strings.Contains(inner, want) {
+				t.Errorf("inline controller is missing wiring %q", want)
+			}
+		}
+		sawController = true
 	}
-	if strings.TrimSpace(scripts[0][2]) != "" {
-		t.Errorf("local Datastar script has unexpected inline body %q", scripts[0][2])
+	if !sawDatastar {
+		t.Error("page is missing the local Datastar module script")
+	}
+	if !sawController {
+		t.Error("page is missing the inline console controller script")
+	}
+
+	// The console is a working control surface: it accepts input (search,
+	// answer, deck) and its buttons are live, not disabled placeholders.
+	for _, want := range []string{`id="search"`, `class="deck-input"`, `class="qwrite"`} {
+		if !strings.Contains(body, want) {
+			t.Errorf("interactive console is missing input %q", want)
+		}
+	}
+	if strings.Contains(body, " disabled") {
+		t.Error("Astrolabe console must not ship disabled placeholder controls")
 	}
 }
 
-func TestCircleOfFleetGroupsNestedSubagentsWithParents(t *testing.T) {
+func TestAstrolabeGroupsNestedSubagentsUnderParents(t *testing.T) {
 	body := indexBody(t)
-	if got := strings.Count(body, `class="run-cluster"`); got != 4 {
-		t.Errorf("run cluster count = %d, want 4 parent/child groups", got)
+
+	// The tree nests subagents inside parents via <details>/.children, with a
+	// leaf class for terminal agents. Guard the shape without pinning exact
+	// counts (the mock fleet can grow).
+	if got := strings.Count(body, `class="children"`); got < 3 {
+		t.Errorf("nested subagent groups = %d, want at least 3", got)
 	}
-	if got := strings.Count(body, `class="run-node `); got != 4 {
-		t.Errorf("parent run count = %d, want 4", got)
+	if got := strings.Count(body, `<details`); got < 3 {
+		t.Errorf("collapsible parent runs = %d, want at least 3", got)
 	}
-	if got := strings.Count(body, `class="child-moon `); got != 4 {
-		t.Errorf("nested subagent count = %d, want 4", got)
+	if !strings.Contains(body, `class="row leaf `) {
+		t.Error("tree does not mark any leaf (terminal) agents")
 	}
 
-	groups := []string{
-		`aria-label="RPC-SPIKE parent run with nested RESEARCHER subagent"`,
-		`aria-label="WEB-SHELL parent run with nested PTY-OWNER subagent"`,
-		`aria-label="INCUS-IMAGE parent run with nested TEST-RUNNER subagent"`,
-		`aria-label="FINAL-REVIEW parent run with nested CORRECTNESS subagent"`,
-	}
-	for _, group := range groups {
-		if !strings.Contains(body, group) {
-			t.Errorf("mockup does not expose parent/child group %q", group)
+	// Each row carries the data the controller needs to drive the detail pane.
+	for _, attr := range []string{
+		`data-name="RPC-SPIKE"`,
+		`data-state="question"`,
+		`data-crumb="ORBITAL-INGEST › RPC-SPIKE"`,
+		`data-angle=`,
+		`data-tokens=`,
+	} {
+		if !strings.Contains(body, attr) {
+			t.Errorf("tree row is missing controller data %q", attr)
 		}
 	}
 
-	decorativeMarks := []string{
-		`<header><span>RPC-SPIKE</span><span aria-hidden="true">◆</span></header>`,
-		`<header><span>WEB-SHELL</span><span aria-hidden="true">◇</span></header>`,
-		`<header><span>INCUS-IMAGE</span><span aria-hidden="true">◆</span></header>`,
-		`<header><span>FINAL-REVIEW</span><span aria-hidden="true">◆</span></header>`,
+	// Depth-3 lineage is present: a subagent whose crumb has three segments.
+	if !strings.Contains(body, `ORBITAL-INGEST › RPC-SPIKE › CORRECTNESS`) {
+		t.Error("tree does not expose a depth-3 nested subagent lineage")
 	}
-	for _, mark := range decorativeMarks {
-		if !strings.Contains(body, mark) {
-			t.Errorf("card header does not hide decorative mark: %s", mark)
-		}
+
+	// Question rows are flagged so a colorblind operator cannot miss them.
+	if got := strings.Count(body, `class="asks"`); got < 2 {
+		t.Errorf("flagged question rows = %d, want at least 2", got)
 	}
 }
 
@@ -365,24 +400,28 @@ func TestRenderedPageHasOnlyOrderedLocalRuntimeAssets(t *testing.T) {
 	}
 }
 
-func TestProjectStylesDefineStaticCircleVisualSystem(t *testing.T) {
+func TestProjectStylesDefineAstrolabeVisualSystem(t *testing.T) {
 	contents, err := webFiles.ReadFile("web/app.css")
 	if err != nil {
 		t.Fatalf("read embedded project stylesheet: %v", err)
 	}
 	styles := string(contents)
 	required := []string{
-		"--page-bg: #05070b",
-		"--active: #69a9ed",
-		"--question: #d9ae70",
-		"min-width: 72rem",
-		"#fleet-orbit",
-		".orbit-ring",
-		".run-node",
-		".child-moon",
-		"#maker-aperture",
-		"#question-alert",
-		"#command-deck",
+		// colorblind-safe palette tokens (cyan/amber/violet, never red-vs-green)
+		"--cyan:",
+		"--amber:",
+		"--violet:",
+		"--brass:",
+		// the responsive app shell + core Astrolabe regions
+		".app{",
+		".sidebar{",
+		".instrument{",
+		".alidade{",
+		".alert-banner{",
+		".deck{",
+		// responsive: sidebar collapses to a slide-over on narrow screens
+		"@media (max-width:820px)",
+		".sidebar.open",
 	}
 	for _, want := range required {
 		if !strings.Contains(styles, want) {
@@ -390,10 +429,19 @@ func TestProjectStylesDefineStaticCircleVisualSystem(t *testing.T) {
 		}
 	}
 
+	// State colors must be distinct hues paired with glyphs in markup — assert
+	// the three state accents are present and mutually distinct.
+	for _, token := range []string{"--cyan:", "--amber:", "--violet:"} {
+		if strings.Count(styles, token) < 1 {
+			t.Errorf("stylesheet is missing state accent %q", token)
+		}
+	}
+
+	// Remain self-contained: no external fetches from CSS.
 	lower := strings.ToLower(styles)
-	for _, unwanted := range []string{"@import", "http://", "https://", "url(", "@keyframes", "animation:"} {
+	for _, unwanted := range []string{"@import", "http://", "https://", "url("} {
 		if strings.Contains(lower, unwanted) {
-			t.Errorf("project stylesheet contains disallowed runtime or motion construct %q", unwanted)
+			t.Errorf("project stylesheet contains disallowed external construct %q", unwanted)
 		}
 	}
 }

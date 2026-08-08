@@ -9,194 +9,664 @@
   <link rel="stylesheet" href="/assets/app.css">
   <script type="module" src="/assets/datastar.js"></script>
 </head>
-<body class="terminal">
-  <div class="app-shell container-fluid">
-    <header class="command-header">
-      <div>
-        <p class="kicker">Master Maker’s operator console</p>
-        <h1>KANEDIAS // CIRCLE OF THE FLEET</h1>
-      </div>
-      <div class="session-proof" aria-label="Mock Pi session">
-        <span class="session-label">PI SESSION</span>
-        <strong>019FD8D2</strong>
-        <span class="mock-label">STATIC DEMONSTRATION</span>
-      </div>
-      <div id="question-alert" class="terminal-alert question-count" role="note">
-        <span aria-hidden="true">◇</span>
-        <strong>2 QUESTIONS</strong>
-        <span>await the Maker</span>
-      </div>
-    </header>
+<body>
+<div class="app">
 
-    <main class="fleet-console" aria-label="Static subagent fleet mockup">
-      <section id="fleet-orbit" aria-labelledby="fleet-heading">
-        <div class="section-heading">
-          <div>
-            <p class="kicker">Inner ring: parent runs · Moons: nested subagents</p>
-            <h2 id="fleet-heading">Fleet orrery</h2>
+  <!-- ===================== TOP BAR ===================== -->
+  <header class="topbar">
+    <button class="icon-btn" id="menuBtn" aria-label="Open fleet tree" aria-expanded="false">☰</button>
+    <div class="brandmark" aria-hidden="true"></div>
+    <div class="brand-txt">
+      <span class="t1">Kanedias</span>
+      <span class="t2">Circle of the Fleet</span>
+    </div>
+    <div class="session-pill" title="Pi supervisor session">
+      <span class="dot"></span>
+      <span class="sc">session</span>
+      <b>pi-7f3c·02</b>
+    </div>
+    <div class="topbar-spacer"></div>
+    <button class="alert-banner" id="alertBanner" title="Jump to agents awaiting the Maker">
+      <span class="diamond">◇</span>
+      <span class="count" id="alertCount">2</span>
+      <span class="label-long">Questions await the Maker</span>
+    </button>
+  </header>
+
+  <!-- ===================== SIDEBAR ===================== -->
+  <nav class="sidebar" id="sidebar" aria-label="Agent fleet tree">
+    <div class="side-head">
+      <div class="htitle">
+        <span class="lbl">The Fleet</span>
+        <span class="cnt num">12 runs · 3 deep</span>
+      </div>
+      <div class="search-wrap">
+        <span class="mag">⌕</span>
+        <input id="search" type="search" placeholder="filter agents, tools…" aria-label="Filter agents">
+      </div>
+    </div>
+    <div class="legend" aria-hidden="true">
+      <span class="g-active">● active</span>
+      <span class="g-question">◇ question</span>
+      <span class="g-complete">○ complete</span>
+    </div>
+
+    <div class="tree" id="tree">
+      <!-- ========= WORKFLOW: ORBITAL-INGEST ========= -->
+      <details open class="st-active" data-agent="orbital">
+        <summary>
+          <div class="row st-active"
+               data-id="orbital" data-name="ORBITAL-INGEST" data-type="workflow"
+               data-state="active" data-angle="118" data-pct="41"
+               data-crumb="ORBITAL-INGEST"
+               data-tokens="184.2k" data-tool="READ pipeline.yaml" data-turns="37" data-elapsed="14m03s">
+            <span class="twisty">▸</span>
+            <span class="glyph">●</span>
+            <div class="r-body">
+              <div class="r-line1">
+                <span class="r-name">ORBITAL-INGEST</span>
+                <span class="r-type">workflow</span>
+              </div>
+              <div class="r-status">184.2k tok · READ pipeline.yaml</div>
+            </div>
           </div>
-          <span class="view-label">ALL POSITIONS ARE MOCK DATA</span>
+        </summary>
+        <div class="children">
+
+          <!-- RPC-SPIKE (QUESTION) -->
+          <details open class="st-question" data-agent="rpc">
+            <summary>
+              <div class="row st-question"
+                   data-id="rpc" data-name="RPC-SPIKE" data-type="worker"
+                   data-state="question" data-angle="252" data-pct="68"
+                   data-crumb="ORBITAL-INGEST › RPC-SPIKE"
+                   data-tokens="92.6k" data-tool="paused — awaiting Maker" data-turns="21" data-elapsed="6m40s">
+                <span class="twisty">▸</span>
+                <span class="glyph">◇</span>
+                <div class="r-body">
+                  <div class="r-line1">
+                    <span class="r-name">RPC-SPIKE</span>
+                    <span class="r-type">worker</span>
+                  </div>
+                  <div class="r-status">92.6k tok · paused</div>
+                </div>
+                <span class="asks">asks you</span>
+              </div>
+            </summary>
+            <div class="children">
+              <div class="row leaf st-complete"
+                   data-id="rpc-read" data-name="DOCS-FETCH" data-type="tool-sub"
+                   data-state="complete" data-angle="360" data-pct="100"
+                   data-crumb="ORBITAL-INGEST › RPC-SPIKE › DOCS-FETCH"
+                   data-tokens="18.0k" data-tool="done" data-turns="6" data-elapsed="1m12s">
+                <span class="twisty">·</span>
+                <span class="glyph">○</span>
+                <div class="r-body">
+                  <div class="r-line1">
+                    <span class="r-name">DOCS-FETCH</span>
+                    <span class="r-type">tool-sub</span>
+                  </div>
+                  <div class="r-status">18.0k tok · complete</div>
+                </div>
+              </div>
+              <div class="row leaf st-active"
+                   data-id="rpc-corr" data-name="CORRECTNESS" data-type="worker"
+                   data-state="active" data-angle="84" data-pct="29"
+                   data-crumb="ORBITAL-INGEST › RPC-SPIKE › CORRECTNESS"
+                   data-tokens="11.4k" data-tool="TEST ./internal/rpc" data-turns="4" data-elapsed="0m52s">
+                <span class="twisty">·</span>
+                <span class="glyph">●</span>
+                <div class="r-body">
+                  <div class="r-line1">
+                    <span class="r-name">CORRECTNESS</span>
+                    <span class="r-type">worker</span>
+                  </div>
+                  <div class="r-status">11.4k tok · TEST ./internal/rpc</div>
+                </div>
+              </div>
+            </div>
+          </details>
+
+          <!-- WEB-SHELL (active, parallel) -->
+          <details class="st-active" data-agent="webshell">
+            <summary>
+              <div class="row st-active"
+                   data-id="webshell" data-name="WEB-SHELL" data-type="parallel"
+                   data-state="active" data-angle="150" data-pct="52"
+                   data-crumb="ORBITAL-INGEST › WEB-SHELL"
+                   data-tokens="61.9k" data-tool="EXEC npm run build" data-turns="15" data-elapsed="4m11s">
+                <span class="twisty">▸</span>
+                <span class="glyph">●</span>
+                <div class="r-body">
+                  <div class="r-line1">
+                    <span class="r-name">WEB-SHELL</span>
+                    <span class="r-type">parallel</span>
+                  </div>
+                  <div class="r-status">61.9k tok · EXEC npm run build</div>
+                </div>
+              </div>
+            </summary>
+            <div class="children">
+              <div class="row leaf st-active"
+                   data-id="pty" data-name="PTY-OWNER" data-type="worker"
+                   data-state="active" data-angle="66" data-pct="22"
+                   data-crumb="ORBITAL-INGEST › WEB-SHELL › PTY-OWNER"
+                   data-tokens="7.2k" data-tool="EXEC attach --pty" data-turns="3" data-elapsed="0m38s">
+                <span class="twisty">·</span>
+                <span class="glyph">●</span>
+                <div class="r-body">
+                  <div class="r-line1">
+                    <span class="r-name">PTY-OWNER</span>
+                    <span class="r-type">worker</span>
+                  </div>
+                  <div class="r-status">7.2k tok · EXEC attach --pty</div>
+                </div>
+              </div>
+              <div class="row leaf st-complete"
+                   data-id="incus" data-name="INCUS-IMAGE" data-type="worker"
+                   data-state="complete" data-angle="360" data-pct="100"
+                   data-crumb="ORBITAL-INGEST › WEB-SHELL › INCUS-IMAGE"
+                   data-tokens="29.5k" data-tool="done" data-turns="9" data-elapsed="3m02s">
+                <span class="twisty">·</span>
+                <span class="glyph">○</span>
+                <div class="r-body">
+                  <div class="r-line1">
+                    <span class="r-name">INCUS-IMAGE</span>
+                    <span class="r-type">worker</span>
+                  </div>
+                  <div class="r-status">29.5k tok · complete</div>
+                </div>
+              </div>
+            </div>
+          </details>
+
+          <!-- TEST-RUNNER (active) -->
+          <div class="row leaf st-active"
+               data-id="testrun" data-name="TEST-RUNNER" data-type="worker"
+               data-state="active" data-angle="198" data-pct="63"
+               data-crumb="ORBITAL-INGEST › TEST-RUNNER"
+               data-tokens="44.0k" data-tool="TEST ./internal/image" data-turns="12" data-elapsed="3m47s">
+            <span class="twisty">·</span>
+            <span class="glyph">●</span>
+            <div class="r-body">
+              <div class="r-line1">
+                <span class="r-name">TEST-RUNNER</span>
+                <span class="r-type">worker</span>
+              </div>
+              <div class="r-status">44.0k tok · TEST ./internal/image</div>
+            </div>
+          </div>
+
+        </div>
+      </details>
+
+      <!-- ========= WORKFLOW: MERIDIAN-REVIEW ========= -->
+      <details open class="st-question" data-agent="meridian">
+        <summary>
+          <div class="row st-question"
+               data-id="meridian" data-name="MERIDIAN-REVIEW" data-type="workflow"
+               data-state="active" data-angle="88" data-pct="31"
+               data-crumb="MERIDIAN-REVIEW"
+               data-tokens="120.7k" data-tool="1 child awaits Maker" data-turns="24" data-elapsed="9m18s">
+            <span class="twisty">▸</span>
+            <span class="glyph">●</span>
+            <div class="r-body">
+              <div class="r-line1">
+                <span class="r-name">MERIDIAN-REVIEW</span>
+                <span class="r-type">workflow</span>
+              </div>
+              <div class="r-status">120.7k tok · 1 child paused</div>
+            </div>
+          </div>
+        </summary>
+        <div class="children">
+          <!-- FINAL-REVIEW (QUESTION) -->
+          <div class="row leaf st-question"
+               data-id="finalrev" data-name="FINAL-REVIEW" data-type="worker"
+               data-state="question" data-angle="306" data-pct="85"
+               data-crumb="MERIDIAN-REVIEW › FINAL-REVIEW"
+               data-tokens="55.1k" data-tool="paused — awaiting Maker" data-turns="17" data-elapsed="7m05s">
+            <span class="twisty">·</span>
+            <span class="glyph">◇</span>
+            <div class="r-body">
+              <div class="r-line1">
+                <span class="r-name">FINAL-REVIEW</span>
+                <span class="r-type">worker</span>
+              </div>
+              <div class="r-status">55.1k tok · paused</div>
+            </div>
+            <span class="asks">asks you</span>
+          </div>
+
+          <!-- RESEARCHER -->
+          <details class="st-active" data-agent="researcher">
+            <summary>
+              <div class="row st-active"
+                   data-id="researcher" data-name="RESEARCHER" data-type="worker"
+                   data-state="active" data-angle="132" data-pct="46"
+                   data-crumb="MERIDIAN-REVIEW › RESEARCHER"
+                   data-tokens="38.8k" data-tool="READ docs/rpc.md" data-turns="10" data-elapsed="2m59s">
+                <span class="twisty">▸</span>
+                <span class="glyph">●</span>
+                <div class="r-body">
+                  <div class="r-line1">
+                    <span class="r-name">RESEARCHER</span>
+                    <span class="r-type">worker</span>
+                  </div>
+                  <div class="r-status">38.8k tok · READ docs/rpc.md</div>
+                </div>
+              </div>
+            </summary>
+            <div class="children">
+              <div class="row leaf st-complete"
+                   data-id="res-fetch" data-name="DOCS-FETCH" data-type="tool-sub"
+                   data-state="complete" data-angle="360" data-pct="100"
+                   data-crumb="MERIDIAN-REVIEW › RESEARCHER › DOCS-FETCH"
+                   data-tokens="9.9k" data-tool="done" data-turns="4" data-elapsed="0m44s">
+                <span class="twisty">·</span>
+                <span class="glyph">○</span>
+                <div class="r-body">
+                  <div class="r-line1">
+                    <span class="r-name">DOCS-FETCH</span>
+                    <span class="r-type">tool-sub</span>
+                  </div>
+                  <div class="r-status">9.9k tok · complete</div>
+                </div>
+              </div>
+              <div class="row leaf st-active"
+                   data-id="res-cite" data-name="CITE-CHECK" data-type="worker"
+                   data-state="active" data-angle="54" data-pct="18"
+                   data-crumb="MERIDIAN-REVIEW › RESEARCHER › CITE-CHECK"
+                   data-tokens="3.1k" data-tool="GREP refs/" data-turns="2" data-elapsed="0m21s">
+                <span class="twisty">·</span>
+                <span class="glyph">●</span>
+                <div class="r-body">
+                  <div class="r-line1">
+                    <span class="r-name">CITE-CHECK</span>
+                    <span class="r-type">worker</span>
+                  </div>
+                  <div class="r-status">3.1k tok · GREP refs/</div>
+                </div>
+              </div>
+            </div>
+          </details>
+
+          <!-- DOC-SCRIBE (complete) -->
+          <div class="row leaf st-complete"
+               data-id="scribe" data-name="DOC-SCRIBE" data-type="worker"
+               data-state="complete" data-angle="360" data-pct="100"
+               data-crumb="MERIDIAN-REVIEW › DOC-SCRIBE"
+               data-tokens="26.4k" data-tool="done" data-turns="8" data-elapsed="2m30s">
+            <span class="twisty">·</span>
+            <span class="glyph">○</span>
+            <div class="r-body">
+              <div class="r-line1">
+                <span class="r-name">DOC-SCRIBE</span>
+                <span class="r-type">worker</span>
+              </div>
+              <div class="r-status">26.4k tok · complete</div>
+            </div>
+          </div>
+        </div>
+      </details>
+
+      <!-- ========= WORKER: ALMANAC-SYNC (complete) ========= -->
+      <details class="st-complete" data-agent="almanac">
+        <summary>
+          <div class="row st-complete"
+               data-id="almanac" data-name="ALMANAC-SYNC" data-type="worker"
+               data-state="complete" data-angle="360" data-pct="100"
+               data-crumb="ALMANAC-SYNC"
+               data-tokens="71.3k" data-tool="done" data-turns="19" data-elapsed="6m22s">
+            <span class="twisty">▸</span>
+            <span class="glyph">○</span>
+            <div class="r-body">
+              <div class="r-line1">
+                <span class="r-name">ALMANAC-SYNC</span>
+                <span class="r-type">worker</span>
+              </div>
+              <div class="r-status">71.3k tok · complete</div>
+            </div>
+          </div>
+        </summary>
+        <div class="children">
+          <div class="row leaf st-complete"
+               data-id="alm-diff" data-name="SCHEMA-DIFF" data-type="tool-sub"
+               data-state="complete" data-angle="360" data-pct="100"
+               data-crumb="ALMANAC-SYNC › SCHEMA-DIFF"
+               data-tokens="14.2k" data-tool="done" data-turns="5" data-elapsed="1m50s">
+            <span class="twisty">·</span>
+            <span class="glyph">○</span>
+            <div class="r-body">
+              <div class="r-line1">
+                <span class="r-name">SCHEMA-DIFF</span>
+                <span class="r-type">tool-sub</span>
+              </div>
+              <div class="r-status">14.2k tok · complete</div>
+            </div>
+          </div>
+        </div>
+      </details>
+
+    </div>
+  </nav>
+
+  <!-- ===================== MAIN DETAIL ===================== -->
+  <main class="main" id="main">
+    <div class="detail-inner">
+
+      <!-- Detail header w/ instrument -->
+      <div class="det-head">
+        <div class="instrument" aria-hidden="true">
+          <div class="dial"></div>
+          <div class="ticks"></div>
+          <div class="ticks major"></div>
+          <div class="inner-ring"></div>
+          <div class="inner-ring2"></div>
+          <div class="alidade" id="alidade" style="--angle:252deg;"></div>
+          <div class="hub"></div>
+          <div class="dial-pct num" id="dialPct">68%</div>
+          <div class="dial-cap">position</div>
+        </div>
+        <div class="det-ident">
+          <div class="breadcrumb" id="breadcrumb">
+            <b>ORBITAL-INGEST</b><span class="sep">›</span><b>RPC-SPIKE</b>
+          </div>
+          <h1 id="detName">RPC-SPIKE</h1>
+          <div class="det-badges">
+            <span class="state-badge question" id="detState">◇ question · asks you</span>
+            <span class="type-badge" id="detType">worker</span>
+          </div>
+        </div>
+      </div>
+
+      <!-- Metrics row -->
+      <div class="metrics">
+        <div class="metric"><div class="k">Tokens</div><div class="v num" id="mTokens">92.6k</div><div class="sub">context 41%</div></div>
+        <div class="metric"><div class="k">Tools</div><div class="v num" id="mTools">31</div><div class="sub">2 running</div></div>
+        <div class="metric"><div class="k">Turns</div><div class="v num" id="mTurns">21</div><div class="sub">depth 2</div></div>
+        <div class="metric"><div class="k">Elapsed</div><div class="v num" id="mElapsed">6m40s</div><div class="sub">since spawn</div></div>
+      </div>
+
+      <!-- Tabs -->
+      <div class="tabs" role="tablist">
+        <button class="tab active" data-tab="question" role="tab">◇ Question <span class="tab-flag" id="qFlag">1</span></button>
+        <button class="tab" data-tab="transcript" role="tab">Transcript</button>
+        <button class="tab" data-tab="tools" role="tab">Tools</button>
+        <button class="tab" data-tab="metrics" role="tab">Metrics</button>
+      </div>
+
+      <!-- QUESTION pane -->
+      <section class="tabpane active" data-pane="question">
+        <div class="qcard" id="qcard">
+          <div class="qhead"><span class="diamond">◇</span> The instrument is paused — <span class="sc">rpc-spike</span> asks the Maker</div>
+          <div class="qtext" id="qtext">
+            The public RPC surface exposes <code>StreamImage()</code> but the spec also allows a
+            unary <code>PullImage()</code>. Both compile. Which contract should I lock in before
+            wiring the client, and should I keep the other behind a deprecation flag?
+          </div>
+          <div class="qopts">
+            <button class="qopt"><span class="key">A</span> Lock <b>StreamImage()</b>, drop unary entirely</button>
+            <button class="qopt"><span class="key">B</span> Keep both — unary behind <code>--legacy</code></button>
+            <button class="qopt"><span class="key">C</span> Lock unary <b>PullImage()</b> for now</button>
+          </div>
+          <div class="qwrite">
+            <input type="text" placeholder="…or write a steer for the Maker's answer" aria-label="Write answer">
+            <button>Send</button>
+          </div>
         </div>
 
-        <div class="orrery" aria-label="Four parent runs and four nested subagents">
-          <div class="orbit-ring orbit-inner" aria-hidden="true"></div>
-          <div class="orbit-ring orbit-middle" aria-hidden="true"></div>
-          <div class="orbit-ring orbit-outer" aria-hidden="true"></div>
-
-          <div class="maker-center" aria-label="The Maker at the fleet center">
-            <strong>K∴D</strong>
-            <span>YOU / MAKER</span>
-          </div>
-
-          <div class="run-cluster" role="group" aria-label="RPC-SPIKE parent run with nested RESEARCHER subagent">
-            <article class="run-node run-rpc terminal-card" aria-label="RPC Spike workflow active">
-              <header><span>RPC-SPIKE</span><span aria-hidden="true">◆</span></header>
-              <div>
-                <p>workflow · 3 children</p>
-                <strong>● ACTIVE</strong>
-                <span>READ docs/rpc.md · 01:42</span>
-              </div>
-            </article>
-            <div class="child-moon moon-researcher">
-              <span class="moon-mark" aria-hidden="true">○</span>
-              <span><strong>RESEARCHER</strong><small>COMPLETE</small></span>
-            </div>
-          </div>
-
-          <div class="run-cluster" role="group" aria-label="WEB-SHELL parent run with nested PTY-OWNER subagent">
-            <article class="run-node run-shell terminal-card question-node" aria-label="Web Shell worker paused with a question">
-              <header><span>WEB-SHELL</span><span aria-hidden="true">◇</span></header>
-              <div>
-                <p>worker · 2 children</p>
-                <strong>◇ QUESTION</strong>
-                <span>PAUSED FOR THE MAKER</span>
-              </div>
-            </article>
-            <div class="child-moon moon-pty question-moon">
-              <span class="moon-mark" aria-hidden="true">◇</span>
-              <span><strong>PTY-OWNER</strong><small>QUESTION</small></span>
-            </div>
-          </div>
-
-          <div class="run-cluster" role="group" aria-label="INCUS-IMAGE parent run with nested TEST-RUNNER subagent">
-            <article class="run-node run-incus terminal-card" aria-label="Incus Image worker active">
-              <header><span>INCUS-IMAGE</span><span aria-hidden="true">◆</span></header>
-              <div>
-                <p>worker · 1 child</p>
-                <strong>● ACTIVE</strong>
-                <span>TEST ./internal/image · 00:44</span>
-              </div>
-            </article>
-            <div class="child-moon moon-tests">
-              <span class="moon-mark" aria-hidden="true">●</span>
-              <span><strong>TEST-RUNNER</strong><small>ACTIVE</small></span>
-            </div>
-          </div>
-
-          <div class="run-cluster" role="group" aria-label="FINAL-REVIEW parent run with nested CORRECTNESS subagent">
-            <article class="run-node run-review terminal-card" aria-label="Final Review parallel run partially complete">
-              <header><span>FINAL-REVIEW</span><span aria-hidden="true">◆</span></header>
-              <div>
-                <p>parallel · 3 children</p>
-                <strong>○ COMPLETE 1/3</strong>
-                <span>8.4K TOKENS OBSERVED</span>
-              </div>
-            </article>
-            <div class="child-moon moon-correctness">
-              <span class="moon-mark" aria-hidden="true">●</span>
-              <span><strong>CORRECTNESS</strong><small>ACTIVE</small></span>
-            </div>
+        <div class="block">
+          <div class="block-title">Run lineage</div>
+          <div class="lineage">
+            <div class="ln"><span class="indent"></span><span class="lg active">●</span><span class="lname">ORBITAL-INGEST</span><span class="lmeta">workflow · 184.2k</span></div>
+            <div class="ln here"><span class="indent">└ </span><span class="lg question">◇</span><span class="lname">RPC-SPIKE</span><span class="lmeta">worker · paused</span></div>
+            <div class="ln"><span class="indent">   ├ </span><span class="lg complete">○</span><span class="lname">DOCS-FETCH</span><span class="lmeta">tool-sub · done</span></div>
+            <div class="ln"><span class="indent">   └ </span><span class="lg active">●</span><span class="lname">CORRECTNESS</span><span class="lmeta">worker · 11.4k</span></div>
           </div>
         </div>
-
-        <ul class="fleet-legend" aria-label="Fleet state legend">
-          <li><span aria-hidden="true">●</span> ACTIVE</li>
-          <li><span aria-hidden="true">◇</span> QUESTION</li>
-          <li><span aria-hidden="true">○</span> COMPLETE</li>
-          <li>Shape and text repeat every color-coded state.</li>
-        </ul>
       </section>
 
-      <aside id="maker-aperture" aria-labelledby="aperture-heading">
-        <header class="aperture-header">
-          <div>
-            <p class="kicker">Selected nested child</p>
-            <h2 id="aperture-heading">MAKER’S APERTURE</h2>
+      <!-- TRANSCRIPT pane -->
+      <section class="tabpane" data-pane="transcript">
+        <div class="block">
+          <div class="block-title">Transcript tail</div>
+          <div class="transcript">
+            <div class="t-turn">
+              <span class="t-role agent">agent · rpc-spike</span>
+              <div class="t-body">Read <span class="hl">docs/rpc.md</span>; the service defines two entry points. Comparing message framing before committing to a contract.</div>
+            </div>
+            <div class="t-turn">
+              <span class="t-role tool">tool · READ</span>
+              <div class="t-body">READ <span class="hl">internal/rpc/service.proto</span> → 214 lines · matched <span class="hl">rpc StreamImage / rpc PullImage</span></div>
+            </div>
+            <div class="t-turn">
+              <span class="t-role tool">tool · TEST</span>
+              <div class="t-body">TEST <span class="hl">./internal/rpc</span> → ok  11 passed  0 failed  (0.42s)</div>
+            </div>
+            <div class="t-turn">
+              <span class="t-role agent">agent · rpc-spike</span>
+              <div class="t-body">Both contracts are viable; this is a design decision with downstream cost. Pausing to ask the Maker.<span class="cursor"></span></div>
+            </div>
           </div>
-          <span>NESTED DEPTH 1</span>
-        </header>
+        </div>
+      </section>
 
-        <p class="selection-path">WEB-SHELL <span>›</span> PTY-OWNER</p>
+      <!-- TOOLS pane -->
+      <section class="tabpane" data-pane="tools">
+        <div class="block">
+          <div class="block-title">Tool calls</div>
+          <table class="tools-tbl">
+            <thead><tr><th>#</th><th>Tool</th><th>Target</th><th>Result</th><th>t</th></tr></thead>
+            <tbody>
+              <tr><td class="num">31</td><td class="cmd">READ</td><td>docs/rpc.md</td><td><span class="tag ok">ok</span></td><td class="num">0.1s</td></tr>
+              <tr><td class="num">30</td><td class="cmd">READ</td><td>internal/rpc/service.proto</td><td><span class="tag ok">ok</span></td><td class="num">0.1s</td></tr>
+              <tr><td class="num">29</td><td class="cmd">TEST</td><td>./internal/rpc</td><td><span class="tag ok">ok</span></td><td class="num">0.4s</td></tr>
+              <tr><td class="num">28</td><td class="cmd">GREP</td><td>rpc StreamImage</td><td><span class="tag ok">ok</span></td><td class="num">0.0s</td></tr>
+              <tr><td class="num">27</td><td class="cmd">SPAWN</td><td>CORRECTNESS (subagent)</td><td><span class="tag run">run</span></td><td class="num">—</td></tr>
+              <tr><td class="num">26</td><td class="cmd">EDIT</td><td>internal/rpc/client.go</td><td><span class="tag ok">ok</span></td><td class="num">0.2s</td></tr>
+            </tbody>
+          </table>
+        </div>
+      </section>
 
-        <ul class="aperture-tabs" aria-label="Static detail views">
-          <li aria-current="page">QUESTION</li>
-          <li>TRANSCRIPT</li>
-          <li>TOOLS</li>
-          <li>ARTIFACTS</li>
-        </ul>
+      <!-- METRICS pane -->
+      <section class="tabpane" data-pane="metrics">
+        <div class="block">
+          <div class="block-title">Instrument readings</div>
+          <div class="bar-row"><span class="blabel">Context used</span><span class="bar"><i style="--w:41%"></i></span><span class="bval num">41%</span></div>
+          <div class="bar-row"><span class="blabel">Progress</span><span class="bar"><i style="--w:68%"></i></span><span class="bval num">68%</span></div>
+          <div class="bar-row"><span class="blabel">Tool success</span><span class="bar"><i style="--w:96%"></i></span><span class="bval num">96%</span></div>
+          <div class="bar-row"><span class="blabel">Subagent load</span><span class="bar"><i style="--w:33%"></i></span><span class="bval num">2 / 6</span></div>
+          <div class="bar-row"><span class="blabel">Cache hit</span><span class="bar"><i style="--w:78%"></i></span><span class="bval num">78%</span></div>
+        </div>
+      </section>
 
-        <section class="terminal-alert full-question" aria-labelledby="question-heading">
-          <p class="kicker">The child has left its orbit</p>
-          <h3 id="question-heading">Should shell sessions survive a browser reconnect, or can v1 terminate them when the tab closes?</h3>
-          <div class="answer-preview" aria-label="Disabled answer previews">
-            <button class="btn btn-ghost" type="button" disabled>PRESERVE + REPLAY</button>
-            <button class="btn btn-ghost" type="button" disabled>TAB-BOUND V1</button>
-            <button class="btn btn-ghost" type="button" disabled>WRITE ANSWER…</button>
-          </div>
-        </section>
+    </div>
+  </main>
 
-        <section class="run-tree-panel" aria-labelledby="tree-heading">
-          <h3 id="tree-heading">Run lineage</h3>
-          <ul class="run-tree">
-            <li><span aria-hidden="true">◆</span> WEB-SHELL <small>worker · paused</small></li>
-            <li class="tree-child tree-question"><span aria-hidden="true">◇</span> PTY-OWNER <small>asks you now</small></li>
-            <li class="tree-child"><span aria-hidden="true">├</span> RPC-SCOUT <small>complete · 4.1K tokens</small></li>
-            <li class="tree-grandchild"><span aria-hidden="true">└</span> DOCS-FETCH <small>complete</small></li>
-          </ul>
-        </section>
+  <!-- ===================== COMMAND DECK ===================== -->
+  <footer class="deck">
+    <span class="deck-lbl">alidade ›</span>
+    <input class="deck-input" type="text" placeholder="steer RPC-SPIKE — type a directive for the Maker to relay…" aria-label="Command input">
+    <button class="dbtn steer"><span class="g">→</span> Steer</button>
+    <button class="dbtn interrupt"><span class="g">◇</span> Interrupt</button>
+    <button class="dbtn stop"><span class="g">▣</span> Stop Run</button>
+    <button class="dbtn spawn"><span class="g">＋</span> Spawn Subagent</button>
+  </footer>
 
-        <section class="transcript-panel" aria-labelledby="transcript-heading">
-          <div class="panel-title">
-            <h3 id="transcript-heading">Recent transmission</h3>
-            <span>STATIC TAIL</span>
-          </div>
-          <div class="transcript-line">
-            <time>20:41:11</time>
-            <p><strong>ASSISTANT</strong>The server-owned PTY enables replay after reconnect.</p>
-          </div>
-          <div class="transcript-line tool-line">
-            <time>20:41:15</time>
-            <p><strong>TOOL / READ</strong>docs/rpc.md · 281 lines</p>
-          </div>
-          <div class="transcript-line">
-            <time>20:41:18</time>
-            <p><strong>ASSISTANT</strong>That creates one product decision I should not guess.</p>
-          </div>
-        </section>
+</div>
 
-        <dl class="run-metrics" aria-label="Mock run metrics">
-          <div><dt>TOKENS</dt><dd>12.8K</dd></div>
-          <div><dt>TOOLS</dt><dd>09</dd></div>
-          <div><dt>TURNS</dt><dd>12</dd></div>
-          <div><dt>ELAPSED</dt><dd>06:14</dd></div>
-        </dl>
-      </aside>
-    </main>
+<div class="scrim" id="scrim"></div>
 
-    <footer id="command-deck">
-      <div class="command-copy">
-        <span class="command-mark" aria-hidden="true">CENTER&gt;</span>
-        <span>answer or steer selected child…</span>
-        <span class="static-cursor" aria-hidden="true"></span>
-      </div>
-      <div class="command-controls" aria-label="Disabled future controls">
-        <button class="btn btn-primary" type="button" disabled>STEER</button>
-        <button class="btn btn-ghost question-control" type="button" disabled>INTERRUPT</button>
-        <button class="btn btn-ghost stop-control" type="button" disabled>STOP RUN</button>
-        <button class="btn btn-ghost" type="button" disabled>＋ FORGE ORBIT</button>
-      </div>
-      <span class="deck-state">STATIC MOCKUP</span>
-    </footer>
-  </div>
+<script>
+(function(){
+  "use strict";
+
+  /* -------- Row selection + detail update -------- */
+  var rows = Array.prototype.slice.call(document.querySelectorAll('.row'));
+  var breadcrumb = document.getElementById('breadcrumb');
+  var detName = document.getElementById('detName');
+  var detState = document.getElementById('detState');
+  var detType = document.getElementById('detType');
+  var alidade = document.getElementById('alidade');
+  var dialPct = document.getElementById('dialPct');
+  var qcard = document.getElementById('qcard');
+  var qtext = document.getElementById('qtext');
+  var qFlag = document.getElementById('qFlag');
+  var mTokens = document.getElementById('mTokens');
+  var mTools = document.getElementById('mTools');
+  var mTurns = document.getElementById('mTurns');
+  var mElapsed = document.getElementById('mElapsed');
+  var deckInput = document.querySelector('.deck-input');
+
+  var STATE_LABEL = {
+    active:   '● active',
+    question: '◇ question · asks you',
+    complete: '○ complete'
+  };
+
+  // per-agent question text (only question-state agents shown here)
+  var QUESTIONS = {
+    rpc: "The public RPC surface exposes <code>StreamImage()</code> but the spec also allows a unary <code>PullImage()</code>. Both compile. Which contract should I lock in before wiring the client, and should I keep the other behind a deprecation flag?",
+    finalrev: "Two lint findings remain in <code>internal/image/installer.go</code>: an unchecked <code>Close()</code> and a shadowed <code>err</code>. Ship as-is with a follow-up, or block this review until both are fixed in place?"
+  };
+
+  function selectRow(row){
+    rows.forEach(function(r){ r.classList.remove('sel'); r.removeAttribute('aria-current'); });
+    row.classList.add('sel');
+    row.setAttribute('aria-current','true');
+
+    var name  = row.getAttribute('data-name');
+    var type  = row.getAttribute('data-type');
+    var state = row.getAttribute('data-state');
+    var angle = row.getAttribute('data-angle') || '90';
+    var pct   = row.getAttribute('data-pct') || '0';
+    var crumb = row.getAttribute('data-crumb') || name;
+
+    detName.textContent = name;
+    detType.textContent = type;
+
+    // state badge + colour class
+    detState.textContent = STATE_LABEL[state] || state;
+    detState.className = 'state-badge ' + state;
+
+    // instrument
+    alidade.style.setProperty('--angle', angle + 'deg');
+    dialPct.textContent = pct + '%';
+
+    // breadcrumb
+    var parts = crumb.split('›').map(function(s){ return s.trim(); });
+    breadcrumb.innerHTML = parts.map(function(p, i){
+      return (i ? '<span class="sep">›</span>' : '') + '<b>' + p + '</b>';
+    }).join('');
+
+    // metrics
+    mTokens.textContent  = row.getAttribute('data-tokens') || '—';
+    mTurns.textContent   = row.getAttribute('data-turns') || '—';
+    mElapsed.textContent = row.getAttribute('data-elapsed') || '—';
+    mTools.textContent   = String((parseInt(row.getAttribute('data-turns'),10)||0) + 10);
+
+    // deck placeholder reflects target
+    deckInput.setAttribute('placeholder', 'steer ' + name + ' — type a directive for the Maker to relay…');
+
+    // question card visibility + content
+    var id = row.getAttribute('data-id');
+    if(state === 'question' && QUESTIONS[id]){
+      qcard.style.display = '';
+      qtext.innerHTML = QUESTIONS[id];
+      qFlag.style.display = '';
+      qFlag.textContent = '1';
+    } else {
+      qcard.style.display = 'none';
+      qFlag.style.display = 'none';
+    }
+  }
+
+  rows.forEach(function(row){
+    row.setAttribute('tabindex','0');
+    row.setAttribute('role','button');
+    row.addEventListener('click', function(){
+      // Let the twisty expand/collapse without stealing selection oddly:
+      selectRow(row);
+      // if this row is inside a summary and user clicked the twisty, toggle handled by <details>
+      closeSheetIfMobile();
+    });
+    row.addEventListener('keydown', function(e){
+      if(e.key === 'Enter' || e.key === ' '){ e.preventDefault(); selectRow(row); }
+    });
+  });
+
+  /* -------- Tabs -------- */
+  var tabs = Array.prototype.slice.call(document.querySelectorAll('.tab'));
+  var panes = Array.prototype.slice.call(document.querySelectorAll('.tabpane'));
+  tabs.forEach(function(tab){
+    tab.addEventListener('click', function(){
+      tabs.forEach(function(t){ t.classList.remove('active'); });
+      panes.forEach(function(p){ p.classList.remove('active'); });
+      tab.classList.add('active');
+      var name = tab.getAttribute('data-tab');
+      var pane = document.querySelector('.tabpane[data-pane="'+name+'"]');
+      if(pane) pane.classList.add('active');
+    });
+  });
+
+  /* -------- Search / filter -------- */
+  var search = document.getElementById('search');
+  search.addEventListener('input', function(){
+    var q = search.value.trim().toLowerCase();
+    rows.forEach(function(row){
+      var hay = (row.getAttribute('data-name') + ' ' +
+                 row.getAttribute('data-type') + ' ' +
+                 (row.getAttribute('data-tool')||'')).toLowerCase();
+      var match = !q || hay.indexOf(q) !== -1;
+      // hide/show the row's nearest container (summary row -> its details; leaf -> itself)
+      var container = row.closest('details') && row.parentElement.tagName === 'SUMMARY'
+        ? row.closest('details') : row;
+      if(container === row){
+        row.style.display = match ? '' : 'none';
+      } else {
+        // for a summary row, keep visible if it or any descendant matches
+        var anyChild = Array.prototype.some.call(container.querySelectorAll('.row'), function(cr){
+          var h = (cr.getAttribute('data-name')+' '+cr.getAttribute('data-type')+' '+(cr.getAttribute('data-tool')||'')).toLowerCase();
+          return !q || h.indexOf(q) !== -1;
+        });
+        container.style.display = anyChild ? '' : 'none';
+        if(q && anyChild) container.setAttribute('open','');
+      }
+    });
+  });
+
+  /* -------- Mobile slide-over -------- */
+  var sidebar = document.getElementById('sidebar');
+  var menuBtn = document.getElementById('menuBtn');
+  var scrim = document.getElementById('scrim');
+  function openSheet(){ sidebar.classList.add('open'); scrim.classList.add('show'); menuBtn.setAttribute('aria-expanded','true'); }
+  function closeSheet(){ sidebar.classList.remove('open'); scrim.classList.remove('show'); menuBtn.setAttribute('aria-expanded','false'); }
+  function closeSheetIfMobile(){ if(window.matchMedia('(max-width:820px)').matches) closeSheet(); }
+  menuBtn.addEventListener('click', function(){
+    if(sidebar.classList.contains('open')) closeSheet(); else openSheet();
+  });
+  scrim.addEventListener('click', closeSheet);
+
+  /* -------- Alert banner jumps to first question -------- */
+  document.getElementById('alertBanner').addEventListener('click', function(){
+    var firstQ = rows.filter(function(r){ return r.getAttribute('data-state') === 'question'; })[0];
+    if(firstQ){
+      // ensure ancestors open
+      var d = firstQ.closest('details');
+      while(d){ d.setAttribute('open',''); d = d.parentElement.closest('details'); }
+      openSheetIfNeeded();
+      selectRow(firstQ);
+      firstQ.scrollIntoView({block:'center', behavior:'smooth'});
+    }
+  });
+  function openSheetIfNeeded(){ if(window.matchMedia('(max-width:820px)').matches) openSheet(); }
+
+  /* -------- Init: select the paused RPC-SPIKE row -------- */
+  var initial = document.querySelector('.row[data-id="rpc"]');
+  if(initial) selectRow(initial);
+})();
+</script>
 </body>
 </html>
