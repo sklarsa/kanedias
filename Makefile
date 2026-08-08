@@ -1,4 +1,6 @@
 BINARY := bin/kanedias
+# Config the CLI/server/proxy commands load. Override with CONFIG=/path/to/config.toml.
+CONFIG ?= config.toml
 
 .DEFAULT_GOAL := help
 
@@ -9,7 +11,7 @@ include .env
 export
 endif
 
-.PHONY: help build test test-live lint fmt
+.PHONY: help build test test-live lint fmt run server proxy
 
 help: ## Show this help
 	@grep -hE '^[a-zA-Z_-]+:.*?## .*$$' $(MAKEFILE_LIST) | \
@@ -35,3 +37,16 @@ lint: ## Check formatting (gofmt) and run golangci-lint
 	@files=$$(gofmt -l .); if [ -n "$$files" ]; then \
 		echo "The following files need gofmt:"; echo "$$files"; exit 1; fi
 	golangci-lint run ./...
+
+run: build ## Run the egress proxy + web server (server on 127.0.0.1:8080); Ctrl-C stops both
+	@echo "Starting egress proxy (10.76.111.1:3128) in the background..."
+	$(BINARY) --config $(CONFIG) proxy run & \
+	proxy_pid=$$!; \
+	trap 'echo "stopping proxy..."; kill $$proxy_pid 2>/dev/null || true' EXIT INT TERM; \
+	$(BINARY) --config $(CONFIG) server --listen 127.0.0.1:8080
+
+server: build ## Run the web server on 127.0.0.1:8080 (sessions also need the proxy; see `proxy` or `run`)
+	$(BINARY) --config $(CONFIG) server --listen 127.0.0.1:8080
+
+proxy: build ## Run the egress credential proxy (needed for sandboxed sessions to reach the network/model)
+	$(BINARY) --config $(CONFIG) proxy run
