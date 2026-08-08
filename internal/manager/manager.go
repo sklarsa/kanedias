@@ -4,9 +4,17 @@ import (
 	"context"
 	"encoding/json"
 	"errors"
+	"fmt"
+	"log/slog"
+	"net"
+	"os"
+	"os/user"
+	"path/filepath"
+	"strings"
 	"sync"
 
 	"github.com/sklarsa/kanedias/internal/supervisor"
+	"github.com/sklarsa/kanedias/internal/supervisorapi"
 )
 
 // errNotImplemented marks interface-locked stubs replaced by the manager
@@ -14,32 +22,229 @@ import (
 var errNotImplemented = errors.New("manager: not implemented")
 
 // Manager is the root-only control plane between the recursive supervisor
-// API and the web server. This skeleton locks the public interface; the
-// manager lane replaces the stubbed behavior.
+// API and the web server.
 type Manager struct {
-	mu     sync.Mutex
-	opts   Options
-	closed bool
+	mu              sync.Mutex
+	opts            Options
+	roots           map[string]*rootHandle // keyed by socket path
+	routes          map[string]string      // sessionID -> rootID
+	discoveryIssues []DiscoveryIssue
+	factory         clientFactory
+	closed          bool
 }
 
-// New normalizes and validates options. The skeleton accepts any options;
-// the manager lane adds path, identity, and binary validation.
+// New normalizes and validates options, resolves defaults, and creates the
+// required directories.
 func New(opts Options) (*Manager, error) {
 	if opts.EventLimits.MaxEvents <= 0 && opts.EventLimits.MaxBytes <= 0 {
 		return nil, errors.New("manager: event limits require at least one positive bound")
 	}
-	return &Manager{opts: opts}, nil
+	if opts.Logger == nil {
+		return nil, errors.New("manager: logger is required")
+	}
+
+	// Resolve RootSocketDir default.
+	if opts.RootSocketDir == "" {
+		if xdg := os.Getenv("XDG_RUNTIME_DIR"); xdg != "" {
+			opts.RootSocketDir = filepath.Join(xdg, "kanedias", "roots")
+		} else {
+			opts.RootSocketDir = fmt.Sprintf("/tmp/kanedias-%d/roots", os.Geteuid())
+		}
+	}
+	// Resolve SessionLogDir default.
+	if opts.SessionLogDir == "" {
+		if xdg := os.Getenv("XDG_STATE_HOME"); xdg != "" {
+			opts.SessionLogDir = filepath.Join(xdg, "kanedias", "sessions")
+		} else {
+			home, err := userHomeDir()
+			if err != nil {
+				return nil, fmt.Errorf("manager: resolve session log dir: %w", err)
+			}
+			opts.SessionLogDir = filepath.Join(home, ".local", "state", "kanedias", "sessions")
+		}
+	}
+
+	// Clean paths.
+	opts.RootSocketDir = filepath.Clean(opts.RootSocketDir)
+	opts.SessionLogDir = filepath.Clean(opts.SessionLogDir)
+
+	if !filepath.IsAbs(opts.RootSocketDir) {
+		return nil, fmt.Errorf("manager: root socket dir %q must be absolute", opts.RootSocketDir)
+	}
+	if !filepath.IsAbs(opts.SessionLogDir) {
+		return nil, fmt.Errorf("manager: session log dir %q must be absolute", opts.SessionLogDir)
+	}
+
+	// Validate or create the final socket directory.
+	if err := ensurePrivateDir(opts.RootSocketDir); err != nil {
+		return nil, fmt.Errorf("manager: root socket dir: %w", err)
+	}
+	if err := ensurePrivateDir(opts.SessionLogDir); err != nil {
+		return nil, fmt.Errorf("manager: session log dir: %w", err)
+	}
+
+	// Validate unix path length for a plausible socket file inside RootSocketDir.
+	testPath := filepath.Join(opts.RootSocketDir, strings.Repeat("a", 32)+".root.sock")
+	if err := validateUnixPathLength(testPath); err != nil {
+		return nil, fmt.Errorf("manager: root socket dir path too long: %w", err)
+	}
+
+	// Validate ConfigPath.
+	if opts.ConfigPath != "" {
+		clean := filepath.Clean(opts.ConfigPath)
+		if !filepath.IsAbs(clean) {
+			return nil, fmt.Errorf("manager: config path %q must be absolute", opts.ConfigPath)
+		}
+		opts.ConfigPath = clean
+	}
+
+	// Validate SessionBinary (required for spawning, but optional at construction time).
+	if opts.SessionBinary != "" {
+		resolved, err := resolveExecutable(opts.SessionBinary)
+		if err != nil {
+			return nil, fmt.Errorf("manager: session binary: %w", err)
+		}
+		opts.SessionBinary = resolved
+	}
+
+	// Apply default intervals.
+	if opts.DiscoveryInterval == 0 {
+		opts.DiscoveryInterval = defaultDiscoveryInterval
+	}
+	if opts.SnapshotInterval == 0 {
+		opts.SnapshotInterval = defaultSnapshotInterval
+	}
+	if opts.SpawnTimeout == 0 {
+		opts.SpawnTimeout = defaultSpawnTimeout
+	}
+	if opts.DiscoveryInterval < 0 || opts.SnapshotInterval < 0 || opts.SpawnTimeout < 0 {
+		return nil, errors.New("manager: intervals must be positive")
+	}
+
+	m := &Manager{
+		opts:    opts,
+		roots:   make(map[string]*rootHandle),
+		routes:  make(map[string]string),
+		factory: defaultClientFactory,
+	}
+	return m, nil
 }
 
-// Start performs one discovery pass and launches monitor loops.
-func (m *Manager) Start(context.Context) error { return nil }
+func defaultClientFactory(socketPath string) (rootClient, error) {
+	return supervisorapi.NewClient(socketPath)
+}
+
+// ensurePrivateDir creates the directory if absent, then validates it.
+func ensurePrivateDir(path string) error {
+	if err := os.MkdirAll(path, 0o700); err != nil {
+		return err
+	}
+	return validatePrivateDir(path)
+}
+
+// validateUnixPathLength checks that the path fits within the platform's
+// UNIX_PATH_MAX (108 bytes on Linux).
+func validateUnixPathLength(path string) error {
+	addr := &net.UnixAddr{Name: path, Net: "unix"}
+	if len(addr.Name) > 107 {
+		return fmt.Errorf("unix path %q exceeds maximum length (107 bytes)", path)
+	}
+	return nil
+}
+
+// resolveExecutable returns a clean absolute path to a regular executable.
+// The target of a symlink may itself be a regular file.
+func resolveExecutable(path string) (string, error) {
+	clean := filepath.Clean(path)
+	if !filepath.IsAbs(clean) {
+		return "", fmt.Errorf("%q is not an absolute path", path)
+	}
+	info, err := os.Stat(clean) // follows symlinks
+	if err != nil {
+		return "", err
+	}
+	if !info.Mode().IsRegular() {
+		return "", fmt.Errorf("%q is not a regular file", clean)
+	}
+	if info.Mode()&0o111 == 0 {
+		return "", fmt.Errorf("%q is not executable", clean)
+	}
+	return clean, nil
+}
+
+func userHomeDir() (string, error) {
+	if home := os.Getenv("HOME"); home != "" {
+		return home, nil
+	}
+	u, err := user.Current()
+	if err != nil {
+		return "", err
+	}
+	return u.HomeDir, nil
+}
+
+// Start performs one discovery pass and launches periodic discovery.
+func (m *Manager) Start(ctx context.Context) error {
+	m.discoverOnce(ctx)
+	return nil
+}
 
 // Fleet returns the current fleet projection.
-func (m *Manager) Fleet() FleetSnapshot { return FleetSnapshot{} }
+func (m *Manager) Fleet() FleetSnapshot {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	roots := make([]RootState, 0, len(m.roots))
+	for _, handle := range m.roots {
+		roots = append(roots, RootState{
+			RootSessionID: handle.rootID,
+			Tree:          handle.tree,
+			Revision:      1,
+		})
+	}
+	issues := append([]DiscoveryIssue(nil), m.discoveryIssues...)
+	return FleetSnapshot{Roots: roots, Issues: issues, Revision: 1}
+}
 
 // Session returns the projection for one session in an admitted root tree.
 func (m *Manager) Session(sessionID string) (SessionState, error) {
-	return SessionState{}, errNotImplemented
+	m.mu.Lock()
+	rootID, ok := m.routes[sessionID]
+	if !ok {
+		m.mu.Unlock()
+		return SessionState{}, errNotImplemented
+	}
+	var handle *rootHandle
+	for _, h := range m.roots {
+		if h.rootID == rootID {
+			handle = h
+			break
+		}
+	}
+	m.mu.Unlock()
+	if handle == nil {
+		return SessionState{}, errNotImplemented
+	}
+	node, found := findNode(handle.tree, sessionID)
+	if !found {
+		return SessionState{}, errNotImplemented
+	}
+	return SessionState{
+		RootSessionID: rootID,
+		Node:          node,
+		Revision:      1,
+	}, nil
+}
+
+func findNode(snapshot supervisor.NodeSnapshot, sessionID string) (supervisor.NodeSnapshot, bool) {
+	if snapshot.SessionID == sessionID {
+		return snapshot, true
+	}
+	for _, child := range snapshot.Children {
+		if found, ok := findNode(child, sessionID); ok {
+			return found, true
+		}
+	}
+	return supervisor.NodeSnapshot{}, false
 }
 
 // SubscribeFleet registers a bounded fleet change subscriber.
@@ -92,8 +297,15 @@ func (m *Manager) Quiesce(context.Context) error { return nil }
 // clients without stopping admitted roots.
 func (m *Manager) Close(context.Context) error {
 	m.mu.Lock()
+	defer m.mu.Unlock()
+	if m.closed {
+		return nil
+	}
 	m.closed = true
-	m.mu.Unlock()
+	for socketPath, handle := range m.roots {
+		_ = handle.client.Close()
+		delete(m.roots, socketPath)
+	}
 	return nil
 }
 
@@ -102,3 +314,13 @@ var (
 	_ = supervisor.NewEventBroker
 	_ clientFactory
 )
+
+// Default interval constants.
+const (
+	defaultDiscoveryInterval = 5e9   // 5s
+	defaultSnapshotInterval  = 10e9  // 10s
+	defaultSpawnTimeout      = 120e9 // 2m
+)
+
+// ensure slog is referenced
+var _ *slog.Logger

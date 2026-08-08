@@ -38,7 +38,10 @@ type DescendantClient struct {
 	unaryTimeout time.Duration
 }
 
-func NewDescendantClient(socketPath string) (supervisor.DescendantClient, error) {
+// NewClient constructs a concrete *DescendantClient for the manager's private
+// rootClient seam. Callers that only need supervisor.DescendantClient should
+// use NewDescendantClient.
+func NewClient(socketPath string) (*DescendantClient, error) {
 	if socketPath == "" {
 		return nil, contract.NewError(contract.ErrorChildUnavailable, "child socket path is empty")
 	}
@@ -49,6 +52,10 @@ func NewDescendantClient(socketPath string) (supervisor.DescendantClient, error)
 		},
 	}
 	return &DescendantClient{socketPath: socketPath, client: &http.Client{Transport: transport}, transport: transport, unaryTimeout: defaultUnaryTimeout}, nil
+}
+
+func NewDescendantClient(socketPath string) (supervisor.DescendantClient, error) {
+	return NewClient(socketPath)
 }
 
 func (client *DescendantClient) request(ctx context.Context, method, path string, body json.RawMessage) (*http.Response, error) {
@@ -91,8 +98,7 @@ func readDescendantJSON(response *http.Response, target any) error {
 		}
 		return contract.NewError(contract.ErrorChildUnavailable, fmt.Sprintf("child returned HTTP %d", response.StatusCode))
 	}
-	decoder := json.NewDecoder(bytes.NewReader(body))
-	if err := decoder.Decode(target); err != nil {
+	if err := json.Unmarshal(body, target); err != nil {
 		return contract.NewError(contract.ErrorChildUnavailable, "decode child response: "+err.Error())
 	}
 	return nil
