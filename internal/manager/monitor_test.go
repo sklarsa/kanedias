@@ -196,7 +196,7 @@ func TestStoppingTransitionNotifiesFleet(t *testing.T) {
 	fleetSub := m.SubscribeFleet()
 	defer fleetSub.Close()
 
-	if !m.monitorRoot(handle) {
+	if m.monitorRoot(handle) != monitorStarted {
 		t.Fatal("monitorRoot refused to start")
 	}
 	t.Cleanup(func() {
@@ -234,7 +234,7 @@ func TestStoppingTransitionNotifiesFleet(t *testing.T) {
 // ---- ManagerStart / ManagerClose tests ----
 
 func TestManagerStartAndClose(t *testing.T) {
-	// Use short dirs: the path-length probe now uses a 64-char token placeholder.
+	// Use short dirs: the path-length probe uses a 32-char token placeholder.
 	dir, logDir := shortTempDirs(t)
 	m, err := New(Options{
 		RootSocketDir:     dir,
@@ -365,7 +365,7 @@ func TestMonitorRootRefusesAfterClose(t *testing.T) {
 		rootID:     "afterclose",
 		client:     &fakeClient{snapshot: rootTree("afterclose")},
 	}
-	if m.monitorRoot(handle) {
+	if m.monitorRoot(handle) != monitorRefusedClosing {
 		t.Fatal("monitorRoot must refuse to start loops after Close")
 	}
 	if handle.monitoring {

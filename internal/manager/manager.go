@@ -42,6 +42,10 @@ type Manager struct {
 	sessionFanout   *changeFanout
 	fleetRevision   uint64
 	sessionRevision uint64
+	// afterCommitSpawnHook, if non-nil, is invoked inside commitSpawn between
+	// commitTree and monitorRoot. Test-only seam for the MGR-D interleaving; nil
+	// in production.
+	afterCommitSpawnHook func(committed *rootHandle)
 }
 
 // New normalizes and validates options, resolves defaults, and creates the
@@ -95,8 +99,10 @@ func New(opts Options) (*Manager, error) {
 	}
 
 	// Validate unix path length for a plausible socket file inside RootSocketDir.
-	// The real spawn token is 64 hex chars (32 random bytes), so probe with 64.
-	testPath := filepath.Join(opts.RootSocketDir, strings.Repeat("a", 64)+".root.sock")
+	// The real spawn token is 32 hex chars (16 random bytes = 128 bits of
+	// entropy), so the probe uses the same length to accurately reflect the real
+	// filename. Keep this in sync with generateToken / spawnTokenHexLen.
+	testPath := filepath.Join(opts.RootSocketDir, strings.Repeat("a", spawnTokenHexLen)+".root.sock")
 	if err := validateUnixPathLength(testPath); err != nil {
 		return nil, fmt.Errorf("manager: root socket dir path too long: %w", err)
 	}
@@ -365,6 +371,16 @@ func (m *Manager) Close(ctx context.Context) error {
 	case <-done:
 		return m.closeClients()
 	case <-ctx.Done():
+		// MGR-E (accepted tradeoff): if the caller's ctx expires before the
+		// monitor loops drain, the Wait goroutine above and the roots' clients are
+		// left open. We intentionally do NOT close the clients here: a loop that is
+		// wedged in an in-flight call still holds a client reference, so closing it
+		// from under the loop would be a use-after-close (the very class of bug
+		// MGR-A fixes). closeClients remains idempotent, so a subsequent Close with
+		// a longer deadline (after the loops finally exit) cleans up correctly.
+		// In practice per-root cancellation (MGR-B) plus context-aware client
+		// calls make an indefinitely-wedged loop unreachable, so this window is a
+		// deadline-exceeded edge, not a steady-state leak.
 		return ctx.Err()
 	}
 }
@@ -382,6 +398,9 @@ func (m *Manager) closeClients() error {
 		_ = handle.client.Close()
 		delete(m.roots, socketPath)
 	}
+	// MGR-F: clear routes too so post-Close state is consistent (no ghost routes
+	// pointing at now-removed roots).
+	m.routes = make(map[string]string)
 	return nil
 }
 

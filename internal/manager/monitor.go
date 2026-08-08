@@ -1,6 +1,8 @@
 package manager
 
 import (
+	"context"
+	"errors"
 	"math/rand"
 	"time"
 
@@ -16,41 +18,75 @@ const (
 // monitorRoot launches independent snapshot and event loops for handle exactly
 // once, serialized against Close so the WaitGroup Add happens-before Wait.
 //
-// It returns false without launching any loops if the manager is already closed
-// (in which case the handle is left for the caller to clean up), or if the
-// handle is already being monitored (guarding against duplicate loops when a
-// root's tree is re-committed on a later discovery cycle).
-func (m *Manager) monitorRoot(handle *rootHandle) bool {
+// It returns a tri-state monitorResult:
+//   - monitorRefusedClosing if the manager is already closing (no loops started;
+//     the caller must clean up the orphaned handle);
+//   - monitorAlreadyLive if the handle is already being monitored (e.g. a
+//     concurrent discovery started it) — the handle is live and MUST be left
+//     alone by the caller;
+//   - monitorStarted if this call launched the loops.
+//
+// The whole decision is made under a single m.mu hold so a concurrent caller
+// racing to monitor the same handle sees a coherent state and exactly one of
+// them wins the start.
+func (m *Manager) monitorRoot(handle *rootHandle) monitorResult {
 	m.mu.Lock()
+	defer m.mu.Unlock()
+	return m.monitorRootLocked(handle)
+}
+
+// monitorRootLocked is monitorRoot's body; it must be called with m.mu held so
+// that the "commit + start monitoring" decision can be folded under a single
+// lock hold (spawn.go/discovery.go call it right after commitTree while still
+// holding, or via monitorRoot which re-takes, the lock).
+func (m *Manager) monitorRootLocked(handle *rootHandle) monitorResult {
 	if m.closed || m.closeCtx.Err() != nil {
-		m.mu.Unlock()
-		return false
+		return monitorRefusedClosing
 	}
 	if handle.monitoring {
-		m.mu.Unlock()
-		return false
+		return monitorAlreadyLive
 	}
 	handle.monitoring = true
+	// Give the handle its own cancellation scope, a child of closeCtx so the
+	// manager-wide Close still cancels it, but also cancellable individually on
+	// removal or client-replace.
+	if handle.ctx == nil {
+		handle.ctx, handle.cancel = context.WithCancel(m.closeCtx)
+	}
 	// Add under m.mu so this Add happens-before Close's Wait (which acquires
-	// m.mu via closeClients only after the WaitGroup drains).
+	// m.mu via closeClients only after the WaitGroup drains). loopsWG mirrors
+	// monitorWG but is scoped to this handle so a client-replace can wait for
+	// exactly these two loops (MGR-A).
 	m.monitorWG.Add(2)
-	m.mu.Unlock()
+	handle.loopsWG.Add(2)
 
-	go func() { defer m.monitorWG.Done(); m.snapshotLoop(handle) }()
-	go func() { defer m.monitorWG.Done(); m.eventLoop(handle) }()
-	return true
+	go func() { defer m.monitorWG.Done(); defer handle.loopsWG.Done(); m.snapshotLoop(handle) }()
+	go func() { defer m.monitorWG.Done(); defer handle.loopsWG.Done(); m.eventLoop(handle) }()
+	return monitorStarted
 }
 
 // snapshotLoop periodically fetches the root snapshot and updates the tree.
+//
+// It selects on the handle's own context so a single-root removal or a
+// client-replace cancels just this loop (see rootHandle's concurrency
+// invariant). The client pointer and context are snapshotted under m.mu at the
+// top of each iteration so a concurrent commitTree replacing handle.client
+// races neither the read nor a use-after-close: if the handle was cancelled we
+// bail before making the call.
 func (m *Manager) snapshotLoop(handle *rootHandle) {
 	ticker := time.NewTicker(m.opts.SnapshotInterval)
 	defer ticker.Stop()
 	for {
+		hctx := m.handleCtx(handle)
 		select {
-		case <-m.closeCtx.Done():
+		case <-hctx.Done():
 			return
 		case <-ticker.C:
-			snapshot, err := handle.client.Snapshot(m.closeCtx)
+			client, ctx, ok := m.currentClient(handle)
+			if !ok {
+				return // handle cancelled (removed/replaced); stop the loop.
+			}
+			snapshot, err := client.Snapshot(ctx)
 			if err != nil {
 				m.markStale(handle, true)
 				continue
@@ -65,7 +101,15 @@ func (m *Manager) snapshotLoop(handle *rootHandle) {
 				m.bumpFleetRevision()
 				continue
 			}
+			// snapshotLoop always re-commits its OWN handle. If the handle was
+			// cancelled (removed/displaced) while this snapshot was in flight,
+			// commitTree returns errHandleCancelled — exit quietly instead of
+			// marking a root that no longer exists stale (and instead of letting a
+			// stale iteration displace whatever replaced us).
 			if _, err := m.commitTree(handle, normalized, candidate); err != nil {
+				if errors.Is(err, errHandleCancelled) {
+					return
+				}
 				m.markStale(handle, true)
 				continue
 			}
@@ -77,16 +121,23 @@ func (m *Manager) snapshotLoop(handle *rootHandle) {
 
 // eventLoop subscribes to the root event stream and feeds events into the
 // root's mirror. It reconnects with exponential backoff and jitter on failure.
+//
+// Like snapshotLoop it selects on the handle's own context and snapshots the
+// client pointer under m.mu, so a removed/replaced root's loop exits promptly
+// instead of spinning forever against a closed client (MGR-B).
 func (m *Manager) eventLoop(handle *rootHandle) {
 	backoff := backoffMin
 	for {
-		if m.closeCtx.Err() != nil {
-			return
+		client, ctx, ok := m.currentClient(handle)
+		if !ok {
+			return // handle cancelled (removed/replaced); stop the loop.
 		}
-		sub, err := handle.client.Subscribe(m.closeCtx)
+		sub, err := client.Subscribe(ctx)
 		if err != nil {
 			m.setStreamConnected(handle, false)
-			m.sleep(backoff)
+			if !m.sleep(ctx, backoff) {
+				return
+			}
 			backoff = nextBackoff(backoff)
 			continue
 		}
@@ -101,11 +152,44 @@ func (m *Manager) eventLoop(handle *rootHandle) {
 	}
 }
 
+// currentClient snapshots the handle's client pointer and monitor context under
+// m.mu. It returns ok=false if the handle's loops have been cancelled (removed
+// or client-replaced), signalling the loop to exit. Reading handle.client only
+// here — under the lock — is what makes the concurrent commitTree replace safe
+// (MGR-A: no data race, no use-after-close, because a replaced client is closed
+// only after the loop has been cancelled and observed the cancellation).
+func (m *Manager) currentClient(handle *rootHandle) (rootClient, context.Context, bool) {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	ctx := handle.ctx
+	if ctx == nil {
+		ctx = m.closeCtx
+	}
+	if ctx.Err() != nil {
+		return nil, nil, false
+	}
+	return handle.client, ctx, true
+}
+
+// handleCtx returns the handle's monitor context (or closeCtx as a fallback),
+// under m.mu.
+func (m *Manager) handleCtx(handle *rootHandle) context.Context {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	if handle.ctx != nil {
+		return handle.ctx
+	}
+	return m.closeCtx
+}
+
 // consumeSubscription drains replay then live events from sub into the mirror.
 // Returns true if at least one event was accepted (to reset backoff).
 func (m *Manager) consumeSubscription(handle *rootHandle, sub supervisor.Subscription) bool {
 	defer sub.Close()
 	accepted := false
+	// The live-event select below waits on the handle's own context so a
+	// per-root removal/replace exits promptly, not just a manager-wide Close.
+	hctx := m.handleCtx(handle)
 
 	// Drain replay first.
 	m.mu.Lock()
@@ -136,7 +220,7 @@ func (m *Manager) consumeSubscription(handle *rootHandle, sub supervisor.Subscri
 			}
 			m.mu.Unlock()
 			m.bumpSessionRevision(handle.rootID)
-		case <-m.closeCtx.Done():
+		case <-hctx.Done():
 			return accepted
 		}
 	}
@@ -191,13 +275,17 @@ func (m *Manager) bumpSessionRevision(rootID string) {
 	_ = rootID // future: per-session fanout
 }
 
-// sleep waits for duration or until closeCtx is cancelled.
-func (m *Manager) sleep(d time.Duration) {
+// sleep waits for duration or until ctx is cancelled. It returns true if the
+// full duration elapsed and false if ctx was cancelled first, so callers can
+// abort their loop promptly on removal/replace/close.
+func (m *Manager) sleep(ctx context.Context, d time.Duration) bool {
 	timer := time.NewTimer(d)
 	defer timer.Stop()
 	select {
 	case <-timer.C:
-	case <-m.closeCtx.Done():
+		return true
+	case <-ctx.Done():
+		return false
 	}
 }
 

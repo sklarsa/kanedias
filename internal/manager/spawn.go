@@ -286,20 +286,41 @@ func (m *Manager) commitSpawn(pending *pendingRoot, snapshot supervisor.NodeSnap
 		actionable: true,
 		client:     pending.client,
 	}
-	committed, err := m.commitTree(handle, normalized, candidate)
+	res, err := m.commitTree(handle, normalized, candidate)
 	if err != nil {
 		return "", fmt.Errorf("spawn admission route conflict: %w", err)
 	}
-	// Transfer client ownership — pending.client is now owned by the handle
-	// (unless commitTree reused an existing handle and closed our client).
+	// Transfer client ownership — pending.client is now owned by the committed
+	// handle (unless commitTree reused an existing handle and closed our client).
 	pending.client = nil
+	// If a replaced-inode handle was displaced, drain its loops and close its old
+	// client outside the lock (MGR-A).
+	m.drainAndCloseDisplaced(res.displaced)
 
-	// Start monitoring the newly admitted root. If the manager is closing, the
-	// loops are not started; remove the orphaned handle so its client is closed
-	// and the spawn fails cleanly rather than being silently unmonitored.
-	if !m.monitorRoot(committed) && committed == handle {
-		m.removeRootBySocketPath(handle.socketPath, handle)
+	// Test seam (MGR-D): lets a test deterministically inject a concurrent
+	// discovery that reuses+starts monitoring res.handle in the window between
+	// our commitTree and our monitorRoot. nil in production.
+	if m.afterCommitSpawnHook != nil {
+		m.afterCommitSpawnHook(res.handle)
+	}
+
+	// Start monitoring the newly admitted root.
+	//
+	// MGR-D: monitorRoot returns a tri-state. It is NOT an error for the handle
+	// to already be live — a concurrent discovery may have reused this exact
+	// socket and started its loops between our commitTree and this call. In that
+	// case the root is admitted and monitored; we must NOT remove it or return a
+	// bogus "closing" error. We only tear down when the manager is genuinely
+	// closing (monitorRefusedClosing) AND the committed handle is our own fresh
+	// handle (never a reused live one).
+	switch m.monitorRoot(res.handle) {
+	case monitorRefusedClosing:
+		if res.handle == handle {
+			m.removeRootBySocketPath(handle.socketPath, handle)
+		}
 		return "", errors.New("manager: closing, cannot admit spawned root")
+	case monitorStarted, monitorAlreadyLive:
+		// Admitted and live either way.
 	}
 	m.bumpFleetRevision()
 	return snapshot.SessionID, nil
@@ -376,8 +397,18 @@ func (m *Manager) cleanupFailedSpawnWithTimeouts(pending *pendingRoot, t cleanup
 	_ = errors.Join(pending.process.WaitErr(), pending.safeUnlinkOwnedSocket())
 }
 
+// spawnTokenBytes is the number of random bytes in a spawn launch token. 16
+// bytes = 128 bits of entropy, ample for an unguessable launch token, and its
+// hex rendering (spawnTokenHexLen chars) leaves far more of the 107-byte unix
+// socket path budget for the directory than the previous 32-byte/64-hex token.
+const spawnTokenBytes = 16
+
+// spawnTokenHexLen is the length of a spawn token rendered as lowercase hex.
+// New()'s path-length probe uses this so the probe reflects the real filename.
+const spawnTokenHexLen = spawnTokenBytes * 2 // hex.EncodedLen(spawnTokenBytes)
+
 func generateToken() (string, error) {
-	var buf [32]byte
+	var buf [spawnTokenBytes]byte
 	if _, err := rand.Read(buf[:]); err != nil {
 		return "", err
 	}
