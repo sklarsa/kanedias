@@ -40,7 +40,7 @@ func (m *Manager) monitorRoot(handle *rootHandle) monitorResult {
 // lock hold (spawn.go/discovery.go call it right after commitTree while still
 // holding, or via monitorRoot which re-takes, the lock).
 func (m *Manager) monitorRootLocked(handle *rootHandle) monitorResult {
-	if m.closed || m.closeCtx.Err() != nil {
+	if m.closed || m.quiesced || m.closeCtx.Err() != nil {
 		return monitorRefusedClosing
 	}
 	if handle.monitoring {
@@ -81,12 +81,18 @@ func (m *Manager) snapshotLoop(handle *rootHandle) {
 		select {
 		case <-hctx.Done():
 			return
+		case <-m.snapshotCtx.Done():
+			return
 		case <-ticker.C:
-			client, ctx, ok := m.currentClient(handle)
+			client, ctx, cancel, ok := m.snapshotClient(handle)
 			if !ok {
-				return // handle cancelled (removed/replaced); stop the loop.
+				return // handle cancelled/replaced or manager quiesced.
 			}
 			snapshot, err := client.Snapshot(ctx)
+			cancel()
+			if m.snapshotCtx.Err() != nil {
+				return
+			}
 			if err != nil {
 				m.markStale(handle, true)
 				continue
@@ -96,9 +102,18 @@ func (m *Manager) snapshotLoop(handle *rootHandle) {
 				m.markStale(handle, true)
 				continue
 			}
-			if retainable(snapshot) && !admissible(snapshot) {
+			if retainable(snapshot) {
 				m.updateRetainedTree(handle, normalized, false)
+				m.markStale(handle, false)
 				m.bumpFleetRevision()
+				m.bumpSessionRevision()
+				continue
+			}
+			if !admissible(snapshot) {
+				// Never make an admitted root actionable from a lifecycle/binding
+				// snapshot that would fail initial admission. Retain the last good
+				// tree, disable writes through stale, and retry later.
+				m.markStale(handle, true)
 				continue
 			}
 			// snapshotLoop always re-commits its OWN handle. If the handle was
@@ -106,8 +121,8 @@ func (m *Manager) snapshotLoop(handle *rootHandle) {
 			// commitTree returns errHandleCancelled — exit quietly instead of
 			// marking a root that no longer exists stale (and instead of letting a
 			// stale iteration displace whatever replaced us).
-			if _, err := m.commitTree(handle, normalized, candidate); err != nil {
-				if errors.Is(err, errHandleCancelled) {
+			if _, err := m.commitTreeWithActionability(handle, normalized, candidate, true); err != nil {
+				if errors.Is(err, errHandleCancelled) || errors.Is(err, errManagerQuiesced) {
 					return
 				}
 				m.markStale(handle, true)
@@ -115,6 +130,7 @@ func (m *Manager) snapshotLoop(handle *rootHandle) {
 			}
 			m.markStale(handle, false)
 			m.bumpFleetRevision()
+			m.bumpSessionRevision()
 		}
 	}
 }
@@ -143,12 +159,21 @@ func (m *Manager) eventLoop(handle *rootHandle) {
 		}
 		m.setStreamConnected(handle, true)
 		accepted := m.consumeSubscription(handle, sub)
+		m.setStreamConnected(handle, false)
+
+		// A successfully established stream can still close immediately. Apply a
+		// bounded delay on every reconnect path so repeated EOFs cannot form a hot
+		// accept/close loop.
+		delay := backoff
 		if accepted {
 			backoff = backoffMin
+			delay = backoffMin
 		} else {
 			backoff = nextBackoff(backoff)
 		}
-		m.setStreamConnected(handle, false)
+		if !m.sleep(ctx, delay) {
+			return
+		}
 	}
 }
 
@@ -169,6 +194,22 @@ func (m *Manager) currentClient(handle *rootHandle) (rootClient, context.Context
 		return nil, nil, false
 	}
 	return handle.client, ctx, true
+}
+
+// snapshotClient returns a client with a call context canceled by either the
+// per-handle lifetime or Quiesce. Event subscriptions intentionally continue to
+// use only the handle lifetime until Close.
+func (m *Manager) snapshotClient(handle *rootHandle) (rootClient, context.Context, context.CancelFunc, bool) {
+	client, handleCtx, ok := m.currentClient(handle)
+	if !ok || m.snapshotCtx.Err() != nil {
+		return nil, nil, nil, false
+	}
+	ctx, cancel := context.WithCancel(handleCtx)
+	stop := context.AfterFunc(m.snapshotCtx, cancel)
+	return client, ctx, func() {
+		stop()
+		cancel()
+	}, true
 }
 
 // handleCtx returns the handle's monitor context (or closeCtx as a fallback),
@@ -204,7 +245,7 @@ func (m *Manager) consumeSubscription(handle *rootHandle, sub supervisor.Subscri
 	// Notify session subscribers once after the replay drain so a reconnect
 	// refreshes the activity tail without waiting for the next live event.
 	if replayAccepted {
-		m.bumpSessionRevision(handle.rootID)
+		m.bumpSessionRevision()
 	}
 
 	// Then live events.
@@ -219,7 +260,7 @@ func (m *Manager) consumeSubscription(handle *rootHandle, sub supervisor.Subscri
 				accepted = true
 			}
 			m.mu.Unlock()
-			m.bumpSessionRevision(handle.rootID)
+			m.bumpSessionRevision()
 		case <-hctx.Done():
 			return accepted
 		}
@@ -229,27 +270,37 @@ func (m *Manager) consumeSubscription(handle *rootHandle, sub supervisor.Subscri
 // markStale sets or clears the stale flag for a root handle and notifies.
 func (m *Manager) markStale(handle *rootHandle, stale bool) {
 	m.mu.Lock()
-	if h, ok := m.roots[handle.socketPath]; ok {
+	changed := false
+	if h, ok := m.roots[handle.socketPath]; ok && h == handle && h.stale != stale {
 		h.stale = stale
+		changed = true
 	}
 	m.mu.Unlock()
-	m.bumpFleetRevision()
+	if changed {
+		m.bumpFleetRevision()
+		m.bumpSessionRevision()
+	}
 }
 
 // setStreamConnected updates the StreamConnected field for a root.
 func (m *Manager) setStreamConnected(handle *rootHandle, connected bool) {
 	m.mu.Lock()
-	if h, ok := m.roots[handle.socketPath]; ok {
+	changed := false
+	if h, ok := m.roots[handle.socketPath]; ok && h == handle && h.streamConnected != connected {
 		h.streamConnected = connected
+		changed = true
 	}
 	m.mu.Unlock()
+	if changed {
+		m.bumpFleetRevision()
+	}
 }
 
 // updateRetainedTree replaces the tree for a stopping/failed root without
 // updating routes (since routes have been removed).
 func (m *Manager) updateRetainedTree(handle *rootHandle, tree supervisor.NodeSnapshot, actionable bool) {
 	m.mu.Lock()
-	if h, ok := m.roots[handle.socketPath]; ok {
+	if h, ok := m.roots[handle.socketPath]; ok && h == handle {
 		h.tree = tree
 		h.actionable = actionable
 	}
@@ -265,14 +316,15 @@ func (m *Manager) bumpFleetRevision() {
 	m.fleetFanout.Publish(rev)
 }
 
-// bumpSessionRevision notifies session subscribers for all sessions in rootID.
-func (m *Manager) bumpSessionRevision(rootID string) {
+// bumpSessionRevision notifies the global v1 session fanout. Per-root fanout is
+// a scalability follow-up; callers must not read mutable handle fields merely to
+// publish this global revision.
+func (m *Manager) bumpSessionRevision() {
 	m.mu.Lock()
 	m.sessionRevision++
 	rev := m.sessionRevision
 	m.mu.Unlock()
 	m.sessionFanout.Publish(rev)
-	_ = rootID // future: per-session fanout
 }
 
 // sleep waits for duration or until ctx is cancelled. It returns true if the

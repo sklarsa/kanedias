@@ -6,8 +6,10 @@ import (
 	"net"
 	"os"
 	"path/filepath"
+	"strings"
 	"syscall"
 	"testing"
+	"time"
 
 	"github.com/sklarsa/kanedias/internal/supervisor"
 	"github.com/sklarsa/kanedias/internal/supervisor/contract"
@@ -185,6 +187,25 @@ func TestValidateRootTreeRejectsWrongRootID(t *testing.T) {
 	}
 }
 
+func TestValidateRootTreeRejectsRootParentAndContext(t *testing.T) {
+	tests := []struct {
+		name string
+		edit func(*supervisor.NodeSnapshot)
+	}{
+		{name: "parent", edit: func(tree *supervisor.NodeSnapshot) { tree.ParentSessionID = "parent" }},
+		{name: "context", edit: func(tree *supervisor.NodeSnapshot) { tree.Context = contract.ContextFresh }},
+	}
+	for _, tc := range tests {
+		t.Run(tc.name, func(t *testing.T) {
+			tree := rootTree("root")
+			tc.edit(&tree)
+			if _, _, err := validateRootTree(tree); err == nil {
+				t.Fatalf("accepted root with invalid %s", tc.name)
+			}
+		})
+	}
+}
+
 func TestValidateRootTreeRejectsRootKindBelowTop(t *testing.T) {
 	child := childTree("child", "root")
 	child.Kind = contract.ChildKindRoot
@@ -217,6 +238,24 @@ func TestValidateRootTreeRejectsWrongParent(t *testing.T) {
 	tree := rootTree("root", child)
 	if _, _, err := validateRootTree(tree); err == nil {
 		t.Fatal("accepted wrong parent ID")
+	}
+}
+
+func TestValidateRootTreeRejectsUnsafeSessionIDs(t *testing.T) {
+	for _, id := range []string{".", "..", "../sessions/victim", "with/slash", `with\backslash`, "percent%2Fescape", "query?value", "fragment#value", "white space", "snowman-☃", "", strings.Repeat("a", 129)} {
+		t.Run(id, func(t *testing.T) {
+			tree := rootTree("root", childTree(id, "root"))
+			if _, _, err := validateRootTree(tree); err == nil {
+				t.Fatalf("accepted unsafe session ID %q", id)
+			}
+		})
+	}
+}
+
+func TestValidateRootTreeAcceptsSafeSessionIDCharacters(t *testing.T) {
+	tree := rootTree("root", childTree("child_1.example:fork-2", "root"), childTree(strings.Repeat("a", 128), "root"))
+	if _, _, err := validateRootTree(tree); err != nil {
+		t.Fatalf("rejected safe session ID: %v", err)
 	}
 }
 
@@ -433,6 +472,101 @@ func TestDiscoverOnceRemovesRootWhenSocketDisappears(t *testing.T) {
 	}
 }
 
+func TestDiscoverOnceFailedReplacementProbeRetiresOldRoot(t *testing.T) {
+	dir := t.TempDir()
+	if err := os.Chmod(dir, 0o700); err != nil {
+		t.Fatal(err)
+	}
+	socketPath := makeRootSocket(t, dir, "replaced.root.sock")
+	identity, err := inspectRootSocket(socketPath, os.Lstat, os.Geteuid())
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	m := fakeManager(func(string) (rootClient, error) { return nil, errors.New("replacement unavailable") })
+	m.opts.RootSocketDir = dir
+	oldClient := &fakeClient{}
+	handle := &rootHandle{
+		socketPath: socketPath, rootID: "old-root", identity: identity,
+		tree: rootTree("old-root"), actionable: true, client: oldClient,
+	}
+	handle.ctx, handle.cancel = context.WithCancel(m.closeCtx)
+	m.roots[socketPath] = handle
+	m.routes["old-root"] = "old-root"
+
+	if err := os.Remove(socketPath); err != nil {
+		t.Fatal(err)
+	}
+	makeRootSocket(t, dir, "replaced.root.sock")
+	m.discoverOnce(context.Background())
+
+	if _, ok := m.roots[socketPath]; ok {
+		t.Fatal("failed replacement probe retained the old root handle")
+	}
+	if _, ok := m.routes["old-root"]; ok {
+		t.Fatal("failed replacement probe retained the old route")
+	}
+	if handle.ctx.Err() == nil {
+		t.Fatal("old monitor context was not cancelled after socket replacement")
+	}
+	if !oldClient.closed {
+		t.Fatal("old client was not closed after socket replacement")
+	}
+	if len(m.discoveryIssues) != 1 || m.discoveryIssues[0].Code != "connect_failed" {
+		t.Fatalf("discovery issues = %+v, want connect_failed", m.discoveryIssues)
+	}
+}
+
+func TestDiscoverOnceAdmitsSuccessfulSocketReplacement(t *testing.T) {
+	dir := t.TempDir()
+	if err := os.Chmod(dir, 0o700); err != nil {
+		t.Fatal(err)
+	}
+	socketPath := makeRootSocket(t, dir, "replace-success.root.sock")
+	identity, err := inspectRootSocket(socketPath, os.Lstat, os.Geteuid())
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	oldClient := &fakeClient{}
+	newClient := &fakeClient{snapshot: rootTree("new-root")}
+	m := fakeManager(func(string) (rootClient, error) { return newClient, nil })
+	m.opts.RootSocketDir = dir
+	oldHandle := &rootHandle{
+		socketPath: socketPath, rootID: "old-root", identity: identity,
+		tree: rootTree("old-root"), actionable: true, client: oldClient,
+	}
+	m.roots[socketPath] = oldHandle
+	m.routes["old-root"] = "old-root"
+
+	if err := os.Remove(socketPath); err != nil {
+		t.Fatal(err)
+	}
+	makeRootSocket(t, dir, "replace-success.root.sock")
+	m.discoverOnce(context.Background())
+	t.Cleanup(func() {
+		ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+		defer cancel()
+		_ = m.Close(ctx)
+	})
+
+	if got := m.roots[socketPath]; got == nil || got.rootID != "new-root" {
+		t.Fatalf("replacement root = %+v, want new-root", got)
+	}
+	if _, ok := m.routes["old-root"]; ok {
+		t.Fatal("successful replacement retained old route")
+	}
+	if m.routes["new-root"] != "new-root" {
+		t.Fatalf("new route = %q, want new-root", m.routes["new-root"])
+	}
+	if !oldClient.closed {
+		t.Fatal("successful replacement did not close old client")
+	}
+	if len(m.discoveryIssues) != 0 {
+		t.Fatalf("successful replacement issues = %+v", m.discoveryIssues)
+	}
+}
+
 func TestDiscoverOnceMalformedTreeExposesIssue(t *testing.T) {
 	dir := t.TempDir()
 	if err := os.Chmod(dir, 0o700); err != nil {
@@ -456,6 +590,26 @@ func TestDiscoverOnceMalformedTreeExposesIssue(t *testing.T) {
 	}
 	if len(m.discoveryIssues) == 0 {
 		t.Fatal("no discovery issue for malformed tree")
+	}
+}
+
+func TestDiscoveryIssuesDoNotExposeAbsoluteSocketPaths(t *testing.T) {
+	dir := t.TempDir()
+	if err := os.Chmod(dir, 0o700); err != nil {
+		t.Fatal(err)
+	}
+	candidate := filepath.Join(dir, "invalid.root.sock")
+	if err := os.WriteFile(candidate, []byte("not a socket"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	m := fakeManager(nil)
+	m.opts.RootSocketDir = dir
+	m.discoverOnce(context.Background())
+	if len(m.discoveryIssues) != 1 {
+		t.Fatalf("issues = %#v", m.discoveryIssues)
+	}
+	if strings.Contains(m.discoveryIssues[0].Message, dir) || strings.Contains(m.discoveryIssues[0].Message, candidate) {
+		t.Fatalf("public discovery issue exposed absolute path: %#v", m.discoveryIssues[0])
 	}
 }
 
@@ -491,6 +645,36 @@ func TestCommitTreeRouteConflictReturnsError(t *testing.T) {
 	candidate := map[string]string{"shared": "root-b"}
 	if _, err := m.commitTree(handle, supervisor.NodeSnapshot{}, candidate); err == nil {
 		t.Fatal("expected route conflict error")
+	}
+}
+
+func TestCommitTreeRejectsAdmissionAfterQuiesce(t *testing.T) {
+	m := fakeManager(nil)
+	if err := m.Quiesce(context.Background()); err != nil {
+		t.Fatal(err)
+	}
+	handle := &rootHandle{socketPath: "/tmp/late.root.sock", rootID: "late", actionable: true}
+	if _, err := m.commitTree(handle, rootTree("late"), map[string]string{"late": "late"}); !errors.Is(err, errManagerQuiesced) {
+		t.Fatalf("commitTree error = %v, want errManagerQuiesced", err)
+	}
+	if len(m.roots) != 0 || len(m.routes) != 0 {
+		t.Fatalf("quiesced commit mutated manager: roots=%d routes=%d", len(m.roots), len(m.routes))
+	}
+}
+
+func TestCommitTreeRejectsDuplicateRootIDOnAnotherSocket(t *testing.T) {
+	m := fakeManager(nil)
+	tree := rootTree("duplicate")
+	first := &rootHandle{socketPath: "/tmp/first.root.sock", rootID: "duplicate", identity: socketIdentity{dev: 1, ino: 1}}
+	if _, err := m.commitTree(first, tree, map[string]string{"duplicate": "duplicate"}); err != nil {
+		t.Fatalf("commit first root: %v", err)
+	}
+	second := &rootHandle{socketPath: "/tmp/second.root.sock", rootID: "duplicate", identity: socketIdentity{dev: 1, ino: 2}}
+	if _, err := m.commitTree(second, tree, map[string]string{"duplicate": "duplicate"}); err == nil {
+		t.Fatal("accepted duplicate root ID on another socket")
+	}
+	if len(m.roots) != 1 || m.roots[first.socketPath] != first {
+		t.Fatalf("duplicate commit mutated roots: %#v", m.roots)
 	}
 }
 

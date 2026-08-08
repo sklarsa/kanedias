@@ -345,7 +345,8 @@ func TestCleanupNeverUnlinksReplacedSocket(t *testing.T) {
 		t.Fatal(err)
 	}
 
-	// Remove and recreate with a different inode.
+	// Remove and recreate. The filesystem may immediately reuse the inode, so
+	// generation identity must include more than device+inode.
 	if err := os.Remove(origPath); err != nil {
 		t.Fatal(err)
 	}

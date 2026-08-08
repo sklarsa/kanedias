@@ -279,7 +279,7 @@ details[open] > summary .twisty{ transform:rotate(90deg); }
 .glyph{ width:14px; flex:0 0 14px; text-align:center; font-size:12px; line-height:1; }
 .st-active .glyph{ color:var(--cyan); text-shadow:0 0 6px var(--cyan-glow); }
 .st-question .glyph{ color:var(--amber); }
-.st-complete .glyph{ color:var(--violet); }
+.st-completed .glyph{ color:var(--violet); }
 
 .r-body{ flex:1 1 auto; min-width:0; }
 .r-line1{ display:flex; align-items:center; gap:6px; }
@@ -440,7 +440,7 @@ details[open] > summary .twisty{ transform:rotate(90deg); }
 .state-badge.question{ color:var(--amber); border-color:var(--amber);
   background:var(--amber-glow); box-shadow:0 0 16px var(--amber-glow);
   animation:pulseAmber 2.4s ease-in-out infinite; }
-.state-badge.complete{ color:var(--violet); border-color:var(--violet);
+.state-badge.completed{ color:var(--violet); border-color:var(--violet);
   background:rgba(154,127,224,.12); }
 .type-badge{
   font-size:9.5px; letter-spacing:.14em; text-transform:uppercase; color:var(--ink-dim);
@@ -570,7 +570,7 @@ details[open] > summary .twisty{ transform:rotate(90deg); }
 .lineage .ln .lg{ font-size:11px; }
 .lineage .lg.active{ color:var(--cyan); }
 .lineage .lg.question{ color:var(--amber); }
-.lineage .lg.complete{ color:var(--violet); }
+.lineage .lg.completed{ color:var(--violet); }
 .lineage .ln .lname{ color:var(--ink); }
 .lineage .ln .lmeta{ color:var(--ink-faint); margin-left:auto; font-size:10px; }
 

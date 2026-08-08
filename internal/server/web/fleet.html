@@ -43,7 +43,7 @@
     >
       <span class="twisty">▸</span>
       {{if eq .Lifecycle "question"}}<span class="glyph">◇</span>
-      {{else if eq .Lifecycle "complete"}}<span class="glyph">○</span>
+      {{else if eq .Lifecycle "completed"}}<span class="glyph">○</span>
       {{else}}<span class="glyph">●</span>{{end}}
       <div class="r-body">
         <div class="r-line1">
@@ -78,7 +78,7 @@
          data-on:click="$selectedSessionId = el.dataset.sessionId; @get('/ui/session', {payload:{selectedSessionId:el.dataset.sessionId}, requestCancellation:'auto'})"
     >
       <span class="twisty">▸</span>
-      {{if .Questions}}<span class="glyph">◇</span>{{else if eq .Lifecycle "complete"}}<span class="glyph">○</span>{{else}}<span class="glyph">●</span>{{end}}
+      {{if .Questions}}<span class="glyph">◇</span>{{else if eq .Lifecycle "completed"}}<span class="glyph">○</span>{{else}}<span class="glyph">●</span>{{end}}
       <div class="r-body">
         <div class="r-line1">
           <span class="r-name">{{.WorkerType}}</span>
@@ -102,7 +102,7 @@
      data-on:click="$selectedSessionId = el.dataset.sessionId; @get('/ui/session', {payload:{selectedSessionId:el.dataset.sessionId}, requestCancellation:'auto'})"
 >
   <span class="twisty">·</span>
-  {{if .Questions}}<span class="glyph">◇</span>{{else if eq .Lifecycle "complete"}}<span class="glyph">○</span>{{else}}<span class="glyph">●</span>{{end}}
+  {{if .Questions}}<span class="glyph">◇</span>{{else if eq .Lifecycle "completed"}}<span class="glyph">○</span>{{else}}<span class="glyph">●</span>{{end}}
   <div class="r-body">
     <div class="r-line1">
       <span class="r-name">{{.WorkerType}}</span>

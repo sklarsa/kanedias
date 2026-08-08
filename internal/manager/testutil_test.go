@@ -129,19 +129,22 @@ func (fc *fakeClient) Close() error {
 // fakeManager builds a Manager with injected factories for testing.
 func fakeManager(factory clientFactory) *Manager {
 	ctx, cancel := context.WithCancel(context.Background())
+	snapshotCtx, snapshotCancel := context.WithCancel(ctx)
 	return &Manager{
 		opts: Options{
 			EventLimits:      supervisor.EventBrokerOptions{MaxEvents: 100},
 			Logger:           discardLogger(),
 			SnapshotInterval: time.Hour, // long: monitoring loops must not fire during unit tests
 		},
-		roots:         make(map[string]*rootHandle),
-		routes:        make(map[string]string),
-		factory:       factory,
-		closeCtx:      ctx,
-		closeCancel:   cancel,
-		fleetFanout:   newChangeFanout(4),
-		sessionFanout: newChangeFanout(4),
+		roots:          make(map[string]*rootHandle),
+		routes:         make(map[string]string),
+		factory:        factory,
+		closeCtx:       ctx,
+		closeCancel:    cancel,
+		snapshotCtx:    snapshotCtx,
+		snapshotCancel: snapshotCancel,
+		fleetFanout:    newChangeFanout(4),
+		sessionFanout:  newChangeFanout(4),
 	}
 }
 
