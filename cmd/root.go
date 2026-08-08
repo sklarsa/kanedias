@@ -33,7 +33,7 @@ type services struct {
 	runSupervisor      func(context.Context, config.Config, SessionOptions, io.Writer) error
 	syncRepos          func(context.Context, config.Config, io.Writer, io.Writer) error
 	syncIncusWorkspace func(context.Context, config.Config, io.Writer, io.Writer) error
-	runServer          func(context.Context, server.Options) error
+	runServer          func(context.Context, config.Config, server.Options) error
 	runSessionChild    process.ChildRunner
 }
 
@@ -97,7 +97,7 @@ func newRootCommand(service services, options proxy.Options) *cobra.Command {
 		newProfileCommand(service, getConfigPath),
 		newProxyCommand(service, getConfigPath, options),
 		newSandboxCommand(service, getConfigPath),
-		newServerCommand(service),
+		newServerCommand(service, getConfigPath),
 		newSessionChildCommand(service.runSessionChild),
 		newSessionCommand(service, getConfigPath),
 		newWorkspaceCommand(service, getConfigPath),

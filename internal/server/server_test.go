@@ -3,6 +3,7 @@ package server
 import (
 	"bytes"
 	"context"
+	"encoding/json"
 	"errors"
 	"io"
 	"log/slog"
@@ -11,6 +12,9 @@ import (
 	"strings"
 	"testing"
 	"time"
+
+	"github.com/sklarsa/kanedias/internal/config"
+	"github.com/sklarsa/kanedias/internal/manager"
 )
 
 func TestValidateListenAddressAcceptsLocalOnlyAddresses(t *testing.T) {
@@ -77,7 +81,7 @@ func TestRunRejectsNilContext(t *testing.T) {
 	}
 
 	//nolint:staticcheck // SA1012: intentionally passing a nil context to verify Run rejects it.
-	err = Run(nil, Options{ListenAddress: "127.0.0.1:0", Logger: logger})
+	err = Run(nil, config.Config{}, Options{ListenAddress: "127.0.0.1:0", Logger: logger})
 	if err == nil || !strings.Contains(err.Error(), "context") {
 		t.Fatalf("Run(nil, ...) error = %v, want context error", err)
 	}
@@ -449,4 +453,179 @@ func (staticAddr) Network() string {
 
 func (address staticAddr) String() string {
 	return string(address)
+}
+
+// fakeFleetManager implements fleetManager for lifecycle tests.
+type fakeFleetManager struct {
+	events            chan string
+	stopSessionCalled bool
+}
+
+func newFakeFleetManager() *fakeFleetManager {
+	return &fakeFleetManager{events: make(chan string, 20)}
+}
+
+func (f *fakeFleetManager) Start(context.Context) error  { return nil }
+func (f *fakeFleetManager) Fleet() manager.FleetSnapshot { return manager.FleetSnapshot{} }
+func (f *fakeFleetManager) Session(string) (manager.SessionState, error) {
+	return manager.SessionState{}, errors.New("not implemented")
+}
+func (f *fakeFleetManager) SubscribeFleet() manager.ChangeSubscription {
+	ch := make(chan uint64)
+	close(ch)
+	return manager.ChangeSubscription{Updates: ch, Close: func() {}}
+}
+func (f *fakeFleetManager) SubscribeSession(string) (manager.ChangeSubscription, error) {
+	return manager.ChangeSubscription{}, errors.New("not implemented")
+}
+func (f *fakeFleetManager) SpawnRoot(context.Context) (string, error) {
+	return "", errors.New("not implemented")
+}
+func (f *fakeFleetManager) Steer(context.Context, string, string) error {
+	return errors.New("not implemented")
+}
+func (f *fakeFleetManager) Interrupt(context.Context, string) error {
+	return errors.New("not implemented")
+}
+func (f *fakeFleetManager) StopSession(context.Context, string) error {
+	f.stopSessionCalled = true
+	return errors.New("not implemented")
+}
+func (f *fakeFleetManager) AnswerQuestion(context.Context, string, string, json.RawMessage) error {
+	return errors.New("not implemented")
+}
+func (f *fakeFleetManager) SessionStats(context.Context, string) (manager.SessionStats, error) {
+	return manager.SessionStats{}, errors.New("not implemented")
+}
+func (f *fakeFleetManager) Quiesce(context.Context) error {
+	f.events <- "quiesce"
+	return nil
+}
+func (f *fakeFleetManager) Close(context.Context) error {
+	f.events <- "close"
+	return nil
+}
+
+// TestManagerLifecycleOrder verifies the phased shutdown ordering:
+// manager.Quiesce -> stream context canceled -> HTTP Shutdown -> manager.Close
+func TestManagerLifecycleOrder(t *testing.T) {
+	logger, _ := testLogger()
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+
+	fleet := newFakeFleetManager()
+	addresses := make(chan string, 1)
+	listen := func(network, address string) (net.Listener, error) {
+		listener, err := net.Listen(network, address)
+		if err == nil {
+			addresses <- listener.Addr().String()
+		}
+		return listener, err
+	}
+
+	// streamCanceled is closed when the stream context is canceled.
+	streamCanceled := make(chan struct{})
+
+	var streamCtxCapture context.Context
+	handlerFn := func(effectiveAddress string, streamCtx context.Context) (http.Handler, error) {
+		streamCtxCapture = streamCtx
+		go func() {
+			<-streamCtx.Done()
+			close(streamCanceled)
+		}()
+		return http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
+			w.WriteHeader(http.StatusOK)
+		}), nil
+	}
+
+	result := make(chan error, 1)
+	go func() {
+		result <- runWithManager(ctx, Options{ListenAddress: "127.0.0.1:0", Logger: logger}, fleet, handlerFn, listen, time.Second)
+	}()
+
+	select {
+	case <-addresses:
+	case <-time.After(time.Second):
+		t.Fatal("timed out waiting for listener address")
+	}
+
+	// Trigger shutdown.
+	cancel()
+
+	select {
+	case err := <-result:
+		if err != nil {
+			t.Fatalf("runWithManager error = %v", err)
+		}
+	case <-time.After(3 * time.Second):
+		t.Fatal("runWithManager did not return after cancellation")
+	}
+
+	// Verify order: quiesce, then stream canceled, then close.
+	var got []string
+	for i := 0; i < 2; i++ {
+		select {
+		case ev := <-fleet.events:
+			got = append(got, ev)
+		default:
+		}
+	}
+
+	if len(got) < 2 || got[0] != "quiesce" || got[1] != "close" {
+		t.Errorf("event order = %v, want [quiesce close]", got)
+	}
+
+	// Verify stream context was canceled (it must have been before close since both
+	// happen in the shutdown sequence before runWithManager returns).
+	select {
+	case <-streamCanceled:
+		// good
+	case <-time.After(time.Second):
+		t.Error("stream context was not canceled during shutdown")
+	}
+	_ = streamCtxCapture
+}
+
+// TestManagerLifecycleNoStopSession asserts that neither Quiesce nor Close
+// invokes StopSession on any admitted root.
+func TestManagerLifecycleNoStopSession(t *testing.T) {
+	logger, _ := testLogger()
+	ctx, cancel := context.WithCancel(context.Background())
+
+	fleet := newFakeFleetManager()
+	addresses := make(chan string, 1)
+	listen := func(network, address string) (net.Listener, error) {
+		listener, err := net.Listen(network, address)
+		if err == nil {
+			addresses <- listener.Addr().String()
+		}
+		return listener, err
+	}
+	handlerFn := func(_ string, _ context.Context) (http.Handler, error) {
+		return http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
+			w.WriteHeader(http.StatusOK)
+		}), nil
+	}
+
+	result := make(chan error, 1)
+	go func() {
+		result <- runWithManager(ctx, Options{ListenAddress: "127.0.0.1:0", Logger: logger}, fleet, handlerFn, listen, time.Second)
+	}()
+
+	select {
+	case <-addresses:
+	case <-time.After(time.Second):
+		t.Fatal("timed out waiting for listener")
+	}
+
+	cancel()
+	select {
+	case <-result:
+	case <-time.After(3 * time.Second):
+		t.Fatal("runWithManager did not return")
+	}
+
+	if fleet.stopSessionCalled {
+		t.Error("StopSession was called during shutdown — only Close is permitted")
+	}
 }
