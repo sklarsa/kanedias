@@ -127,6 +127,10 @@ type liveAcceptance struct {
 	roots   []*acceptanceProcess
 	streams []*sseCapture
 
+	// managedSocketDir is the short root-socket directory used by the
+	// server-managed lifecycle test (kept short to stay under UNIX_PATH_MAX).
+	managedSocketDir string
+
 	mu       sync.Mutex
 	sessions map[string]struct{}
 	async    sync.WaitGroup
@@ -1535,6 +1539,27 @@ type managedRoot struct {
 	PID        int
 }
 
+// shortSocketDir returns a short, private, EUID-owned mode-0700 directory for
+// managed root sockets. A root socket path is <base>/<32-hex>.root.sock and must
+// stay under UNIX_PATH_MAX (107 bytes); the deep e2e artifact runDir would
+// overflow it, so anchor sockets under XDG_RUNTIME_DIR (or /tmp) with a short
+// unique suffix. The directory is removed when the test finishes.
+func (h *liveAcceptance) shortSocketDir() string {
+	base := strings.TrimSpace(os.Getenv("XDG_RUNTIME_DIR"))
+	if base == "" {
+		base = "/tmp"
+	}
+	dir, err := os.MkdirTemp(base, "kroots-")
+	if err != nil {
+		h.t.Fatal(err)
+	}
+	if err := os.Chmod(dir, 0o700); err != nil {
+		h.t.Fatal(err)
+	}
+	h.t.Cleanup(func() { _ = os.RemoveAll(dir) })
+	return dir
+}
+
 // runServerManaged exercises the full server-managed supervisor lifecycle:
 // spawn, buffering, server restart, rediscovery, Pi control, descendant
 // stop, root stop, and exact Incus cleanup.
@@ -1542,9 +1567,13 @@ func (h *liveAcceptance) runServerManaged() {
 	h.buildReviewedCheckout()
 
 	// Create a run-local managed config that overlays server and supervisor.events
-	// directories onto the authorized config so that sockets and logs land in the
-	// isolated runDir (no collisions with a concurrently running proxy or session).
-	rootSocketDir := filepath.Join(h.runDir, "managed-sockets")
+	// directories onto the authorized config. Logs land in the isolated runDir, but
+	// the root socket dir MUST be short: a root socket is <32-hex-token>.root.sock
+	// (43 bytes) and the full path must stay under UNIX_PATH_MAX (107 bytes). The
+	// deep ~/.cache/kanedias/e2e/<long-prefix> runDir would overflow that, so place
+	// sockets in a short runtime dir (mirroring the manager's XDG_RUNTIME_DIR default).
+	rootSocketDir := h.shortSocketDir()
+	h.managedSocketDir = rootSocketDir
 	sessionLogDir := filepath.Join(h.runDir, "managed-logs")
 	for _, dir := range []string{rootSocketDir, sessionLogDir} {
 		if err := os.MkdirAll(dir, 0o700); err != nil {
@@ -1951,8 +1980,8 @@ func (h *liveAcceptance) answerManagedQuestion(client *http.Client, serverOrigin
 		_ = root
 	}
 	// We don't have a direct roots index for managed roots, so look up via
-	// the fleet. Locate the managed socket from the runDir managed-sockets dir.
-	managedSocketDir := filepath.Join(h.runDir, "managed-sockets")
+	// the fleet. Locate the managed socket from the short managed socket dir.
+	managedSocketDir := h.managedSocketDir
 	entries, err := os.ReadDir(managedSocketDir)
 	if err != nil {
 		return
