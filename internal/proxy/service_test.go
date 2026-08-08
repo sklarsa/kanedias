@@ -3,6 +3,7 @@ package proxy
 import (
 	"context"
 	"io"
+	"net"
 	"os"
 	"path/filepath"
 	"testing"
@@ -99,4 +100,46 @@ func TestRunContextTreatsCancellationAsCleanShutdown(t *testing.T) {
 	if err != nil {
 		t.Fatalf("RunContext() error = %v, want clean shutdown", err)
 	}
+}
+
+func TestRunContextShutsDownSiblingOnServerError(t *testing.T) {
+	dir := t.TempDir()
+
+	// Reserve then free a proxy port so RunContext can bind it.
+	proxyL, err := net.Listen("tcp", "127.0.0.1:0")
+	if err != nil {
+		t.Fatal(err)
+	}
+	proxyAddr := proxyL.Addr().String()
+	if err := proxyL.Close(); err != nil {
+		t.Fatal(err)
+	}
+
+	// Occupy a metrics port so the metrics server fails to bind.
+	metricsL, err := net.Listen("tcp", "127.0.0.1:0")
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer metricsL.Close()
+
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+
+	err = RunContext(ctx, Options{
+		ListenAddress:        proxyAddr,
+		MetricsListenAddress: metricsL.Addr().String(),
+		CACertPath:           filepath.Join(dir, "ca.crt"),
+		CAKeyPath:            filepath.Join(dir, "ca.key"),
+	})
+	if err == nil {
+		t.Fatal("RunContext() = nil, want error when metrics listener fails to bind")
+	}
+
+	// The failing path must shut down the sibling proxy listener so its port is
+	// released; otherwise RunContext returns while the listener is still bound.
+	freed, derr := net.Listen("tcp", proxyAddr)
+	if derr != nil {
+		t.Fatalf("proxy port %s not released after metrics server failure: %v", proxyAddr, derr)
+	}
+	_ = freed.Close()
 }
