@@ -59,8 +59,22 @@ func (adapter childRootProvisionAdapter) Destroy(ctx context.Context, resources 
 	return adapter.provisioner.Destroy(ctx, resources)
 }
 
-func runSupervisor(ctx context.Context, cfg config.Config, options SessionOptions, output io.Writer) error {
+type eventBrokerFactory func(supervisor.EventBrokerOptions) (*supervisor.EventBroker, error)
+
+func runSupervisor(ctx context.Context, cfg config.Config, opts SessionOptions, out io.Writer) error {
+	return runSupervisorWithBrokerFactory(ctx, cfg, opts, out, supervisor.NewEventBrokerWithOptions)
+}
+
+func runSupervisorWithBrokerFactory(ctx context.Context, cfg config.Config, options SessionOptions, output io.Writer, factory eventBrokerFactory) error {
 	if err := cfg.ValidateSupervisor(); err != nil {
+		return err
+	}
+	limits, err := cfg.Supervisor.Events.Limits()
+	if err != nil {
+		return err
+	}
+	broker, err := factory(supervisor.EventBrokerOptions{MaxEvents: limits.MaxEvents, MaxBytes: limits.MaxBytes})
+	if err != nil {
 		return err
 	}
 	if options.ConfigPath == "" || !filepath.IsAbs(options.ConfigPath) || filepath.Clean(options.ConfigPath) != options.ConfigPath {
@@ -114,7 +128,7 @@ func runSupervisor(ctx context.Context, cfg config.Config, options SessionOption
 		CloseListener:        closeListener,
 		HandoffVerifier:      handoffVerifier,
 		RunAttribution:       os.Getenv("KANEDIAS_E2E_RUN_ID"),
-	}, supervisor.NewEventBroker())
+	}, broker)
 	if err != nil {
 		return err
 	}
@@ -149,7 +163,11 @@ func runSupervisor(ctx context.Context, cfg config.Config, options SessionOption
 	}
 }
 
-func productionChildRunner(ctx context.Context, bootstrap process.Bootstrap, reporter *process.Reporter) (resultErr error) {
+func productionChildRunner(ctx context.Context, bootstrap process.Bootstrap, reporter *process.Reporter) error {
+	return productionChildRunnerWithBrokerFactory(ctx, bootstrap, reporter, supervisor.NewEventBrokerWithOptions)
+}
+
+func productionChildRunnerWithBrokerFactory(ctx context.Context, bootstrap process.Bootstrap, reporter *process.Reporter, factory eventBrokerFactory) (resultErr error) {
 	configPath := os.Getenv("KANEDIAS_CONFIG")
 	if configPath == "" || !filepath.IsAbs(configPath) || filepath.Clean(configPath) != configPath {
 		return contract.NewError(contract.ErrorInvalidRequest, "KANEDIAS_CONFIG must name an absolute clean path")
@@ -159,6 +177,14 @@ func productionChildRunner(ctx context.Context, bootstrap process.Bootstrap, rep
 		return err
 	}
 	if err := cfg.ValidateSupervisor(); err != nil {
+		return err
+	}
+	limits, err := cfg.Supervisor.Events.Limits()
+	if err != nil {
+		return err
+	}
+	broker, err := factory(supervisor.EventBrokerOptions{MaxEvents: limits.MaxEvents, MaxBytes: limits.MaxBytes})
+	if err != nil {
 		return err
 	}
 	resolvedWorker, err := cfg.ResolveWorker(bootstrap.Request.WorkerType)
@@ -239,7 +265,7 @@ func productionChildRunner(ctx context.Context, bootstrap process.Bootstrap, rep
 				RunAttribution: bootstrap.RunAttribution,
 			})
 		},
-	}, supervisor.NewEventBroker())
+	}, broker)
 	if err != nil {
 		return err
 	}

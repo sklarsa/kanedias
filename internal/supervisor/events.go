@@ -4,14 +4,17 @@ import (
 	"encoding/json"
 	"fmt"
 	"sync"
+
+	"github.com/sklarsa/kanedias/internal/config"
 )
 
 const (
-	DefaultEventRingCapacity         = 4_096
+	// DefaultEventRingCapacity and DefaultEventRingByteCapacity alias the
+	// config-owned constants so the two default paths cannot drift.
+	DefaultEventRingCapacity     = config.DefaultSupervisorEventMaxEvents
+	DefaultEventRingByteCapacity = config.DefaultSupervisorEventMaxBytes
+
 	DefaultSubscriberMailboxCapacity = 128
-	// The record cap remains useful for normal small events; this conservative
-	// aggregate cap prevents a ring of maximum-size Pi records consuming GiBs.
-	DefaultEventRingByteCapacity = 16 << 20
 )
 
 type EventEnvelope struct {
@@ -67,22 +70,20 @@ type EventBrokerOptions struct {
 	MaxBytes  int
 }
 
-// NewEventBrokerWithOptions constructs a broker with configured limits.
-// Zero-valued fields fall back to the defaults until the eviction loop
-// supports independent limits (config lane completes that change).
+// NewEventBrokerWithOptions constructs a broker with configured, independent
+// limits. A zero field disables that limit; a negative field is rejected. At
+// least one limit must be positive.
 func NewEventBrokerWithOptions(options EventBrokerOptions) (*EventBroker, error) {
-	if options.MaxEvents <= 0 && options.MaxBytes <= 0 {
+	if options.MaxEvents < 0 {
+		return nil, fmt.Errorf("MaxEvents must be >= 0")
+	}
+	if options.MaxBytes < 0 {
+		return nil, fmt.Errorf("MaxBytes must be >= 0")
+	}
+	if options.MaxEvents == 0 && options.MaxBytes == 0 {
 		return nil, fmt.Errorf("at least one of MaxEvents or MaxBytes must be positive")
 	}
-	maxEvents := options.MaxEvents
-	if maxEvents <= 0 {
-		maxEvents = DefaultEventRingCapacity
-	}
-	maxBytes := options.MaxBytes
-	if maxBytes <= 0 {
-		maxBytes = DefaultEventRingByteCapacity
-	}
-	return newEventBrokerWithByteCapacity(maxEvents, DefaultSubscriberMailboxCapacity, maxBytes), nil
+	return newEventBrokerWithByteCapacity(options.MaxEvents, DefaultSubscriberMailboxCapacity, options.MaxBytes), nil
 }
 
 func newEventBroker(ringCapacity, mailboxCapacity int) *EventBroker {
@@ -214,10 +215,11 @@ func (broker *EventBroker) Close() {
 func (broker *EventBroker) retainLocked(event EventEnvelope) EventEnvelope {
 	broker.nextSeq++
 	event.Seq = broker.nextSeq
-	if broker.ringCap > 0 && broker.byteCap > 0 {
+	if broker.ringCap > 0 || broker.byteCap > 0 {
 		broker.ring = append(broker.ring, event)
 		broker.ringBytes += retainedEventBytes(event)
-		for len(broker.ring) > broker.ringCap || broker.ringBytes > broker.byteCap {
+		for (broker.ringCap > 0 && len(broker.ring) > broker.ringCap) ||
+			(broker.byteCap > 0 && broker.ringBytes > broker.byteCap) {
 			broker.ringBytes -= retainedEventBytes(broker.ring[0])
 			broker.ring[0] = EventEnvelope{}
 			broker.ring = broker.ring[1:]
