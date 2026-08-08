@@ -117,17 +117,25 @@ func RunContext(ctx context.Context, options Options) error {
 		logger.Info("Prometheus metrics listening", "address", options.MetricsListenAddress, "path", "/metrics")
 	}
 
-	select {
-	case err = <-serverErrors:
-		logger.Error("proxy stopped", "error", err)
-		return err
-	case <-ctx.Done():
+	// shutdownBoth gracefully stops the proxy and metrics servers so that
+	// RunContext never returns while a sibling listener is still bound and its
+	// goroutine is still accepting.
+	shutdownBoth := func() error {
 		shutdownCtx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
 		defer cancel()
-		shutdownErr := proxyServer.Shutdown(shutdownCtx)
+		var shutdownErr error
+		shutdownErr = errors.Join(shutdownErr, proxyServer.Shutdown(shutdownCtx))
 		if metricsServer != nil {
 			shutdownErr = errors.Join(shutdownErr, metricsServer.Shutdown(shutdownCtx))
 		}
 		return shutdownErr
+	}
+
+	select {
+	case err = <-serverErrors:
+		logger.Error("proxy stopped", "error", err)
+		return errors.Join(err, shutdownBoth())
+	case <-ctx.Done():
+		return shutdownBoth()
 	}
 }
