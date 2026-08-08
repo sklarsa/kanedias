@@ -12,10 +12,13 @@ import (
 
 // rootHandle is the manager's in-memory record for one admitted root socket.
 type rootHandle struct {
-	socketPath string
-	rootID     string
-	identity   socketIdentity
-	tree       supervisor.NodeSnapshot
+	socketPath      string
+	rootID          string
+	identity        socketIdentity
+	tree            supervisor.NodeSnapshot
+	mirror          *eventMirror
+	stale           bool
+	streamConnected bool
 	// actionable is false for stopping/failed/stopped/completed snapshots.
 	actionable bool
 	client     rootClient
@@ -216,6 +219,9 @@ func (m *Manager) commitTree(handle *rootHandle, tree supervisor.NodeSnapshot, c
 		m.routes[sessionID] = rootID
 	}
 	handle.tree = tree
+	if handle.mirror == nil {
+		handle.mirror = newEventMirror(m.opts.EventLimits)
+	}
 	m.roots[handle.socketPath] = handle
 	return nil
 }

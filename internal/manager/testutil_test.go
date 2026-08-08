@@ -94,17 +94,22 @@ func (fc *fakeClient) Close() error {
 
 // fakeManager builds a Manager with injected factories for testing.
 func fakeManager(factory clientFactory) *Manager {
+	ctx, cancel := context.WithCancel(context.Background())
 	return &Manager{
 		opts: Options{
 			EventLimits: supervisor.EventBrokerOptions{MaxEvents: 100},
 			Logger:      discardLogger(),
 		},
-		roots:   make(map[string]*rootHandle),
-		routes:  make(map[string]string),
-		factory: factory,
+		roots:         make(map[string]*rootHandle),
+		routes:        make(map[string]string),
+		factory:       factory,
+		closeCtx:      ctx,
+		closeCancel:   cancel,
+		fleetFanout:   newChangeFanout(4),
+		sessionFanout: newChangeFanout(4),
 	}
 }
 
 func discardLogger() *slog.Logger {
-	return slog.New(slog.NewTextHandler(nil, &slog.HandlerOptions{Level: slog.LevelError + 100}))
+	return slog.New(slog.DiscardHandler)
 }

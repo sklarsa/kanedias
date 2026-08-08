@@ -12,6 +12,7 @@ import (
 	"path/filepath"
 	"strings"
 	"sync"
+	"time"
 
 	"github.com/sklarsa/kanedias/internal/supervisor"
 	"github.com/sklarsa/kanedias/internal/supervisorapi"
@@ -31,6 +32,15 @@ type Manager struct {
 	discoveryIssues []DiscoveryIssue
 	factory         clientFactory
 	closed          bool
+	quiesced        bool
+	// monitoring infrastructure
+	closeCtx        context.Context
+	closeCancel     context.CancelFunc
+	monitorWG       sync.WaitGroup
+	fleetFanout     *changeFanout
+	sessionFanout   *changeFanout
+	fleetRevision   uint64
+	sessionRevision uint64
 }
 
 // New normalizes and validates options, resolves defaults, and creates the
@@ -121,11 +131,16 @@ func New(opts Options) (*Manager, error) {
 		return nil, errors.New("manager: intervals must be positive")
 	}
 
+	ctx, cancel := context.WithCancel(context.Background())
 	m := &Manager{
-		opts:    opts,
-		roots:   make(map[string]*rootHandle),
-		routes:  make(map[string]string),
-		factory: defaultClientFactory,
+		opts:          opts,
+		roots:         make(map[string]*rootHandle),
+		routes:        make(map[string]string),
+		factory:       defaultClientFactory,
+		closeCtx:      ctx,
+		closeCancel:   cancel,
+		fleetFanout:   newChangeFanout(supervisor.DefaultSubscriberMailboxCapacity),
+		sessionFanout: newChangeFanout(supervisor.DefaultSubscriberMailboxCapacity),
 	}
 	return m, nil
 }
@@ -183,10 +198,41 @@ func userHomeDir() (string, error) {
 	return u.HomeDir, nil
 }
 
-// Start performs one discovery pass and launches periodic discovery.
+// Start performs one discovery pass and launches periodic discovery and
+// monitoring goroutines for all admitted roots.
 func (m *Manager) Start(ctx context.Context) error {
 	m.discoverOnce(ctx)
+	m.mu.Lock()
+	handles := make([]*rootHandle, 0, len(m.roots))
+	for _, h := range m.roots {
+		handles = append(handles, h)
+	}
+	m.mu.Unlock()
+	for _, h := range handles {
+		m.monitorRoot(h)
+	}
+	go m.discoveryLoop()
 	return nil
+}
+
+// discoveryLoop runs periodic discovery until the manager is closed.
+func (m *Manager) discoveryLoop() {
+	ticker := time.NewTicker(m.opts.DiscoveryInterval)
+	defer ticker.Stop()
+	for {
+		select {
+		case <-m.closeCtx.Done():
+			return
+		case <-ticker.C:
+			m.mu.Lock()
+			q := m.quiesced
+			m.mu.Unlock()
+			if q {
+				return
+			}
+			m.discoverOnce(m.closeCtx)
+		}
+	}
 }
 
 // Fleet returns the current fleet projection.
@@ -195,14 +241,24 @@ func (m *Manager) Fleet() FleetSnapshot {
 	defer m.mu.Unlock()
 	roots := make([]RootState, 0, len(m.roots))
 	for _, handle := range m.roots {
+		var gap *ReplayGap
+		incomplete := false
+		if handle.mirror != nil {
+			gap = handle.mirror.Gap()
+			incomplete = gap != nil
+		}
 		roots = append(roots, RootState{
-			RootSessionID: handle.rootID,
-			Tree:          handle.tree,
-			Revision:      1,
+			RootSessionID:   handle.rootID,
+			Tree:            handle.tree,
+			Stale:           handle.stale,
+			StreamConnected: handle.streamConnected,
+			Incomplete:      incomplete,
+			Gap:             gap,
+			Revision:        m.fleetRevision,
 		})
 	}
 	issues := append([]DiscoveryIssue(nil), m.discoveryIssues...)
-	return FleetSnapshot{Roots: roots, Issues: issues, Revision: 1}
+	return FleetSnapshot{Roots: roots, Issues: issues, Revision: m.fleetRevision}
 }
 
 // Session returns the projection for one session in an admitted root tree.
@@ -220,19 +276,35 @@ func (m *Manager) Session(sessionID string) (SessionState, error) {
 			break
 		}
 	}
-	m.mu.Unlock()
 	if handle == nil {
+		m.mu.Unlock()
 		return SessionState{}, errNotImplemented
 	}
 	node, found := findNode(handle.tree, sessionID)
 	if !found {
+		m.mu.Unlock()
 		return SessionState{}, errNotImplemented
 	}
-	return SessionState{
-		RootSessionID: rootID,
-		Node:          node,
-		Revision:      1,
-	}, nil
+	var events []supervisor.EventEnvelope
+	var gap *ReplayGap
+	incomplete := false
+	if handle.mirror != nil {
+		events = handle.mirror.EventsFor(sessionID)
+		gap = handle.mirror.Gap()
+		incomplete = gap != nil
+	}
+	state := SessionState{
+		RootSessionID:   rootID,
+		Node:            node,
+		RootStale:       handle.stale,
+		StreamConnected: handle.streamConnected,
+		Incomplete:      incomplete,
+		Gap:             gap,
+		RecentActivity:  projectActivity(events, sessionID),
+		Revision:        m.sessionRevision,
+	}
+	m.mu.Unlock()
+	return state, nil
 }
 
 func findNode(snapshot supervisor.NodeSnapshot, sessionID string) (supervisor.NodeSnapshot, bool) {
@@ -249,14 +321,18 @@ func findNode(snapshot supervisor.NodeSnapshot, sessionID string) (supervisor.No
 
 // SubscribeFleet registers a bounded fleet change subscriber.
 func (m *Manager) SubscribeFleet() ChangeSubscription {
-	updates := make(chan uint64)
-	close(updates)
-	return ChangeSubscription{Updates: updates, Close: func() {}}
+	return m.fleetFanout.Subscribe()
 }
 
 // SubscribeSession registers a bounded subscriber for one session.
 func (m *Manager) SubscribeSession(sessionID string) (ChangeSubscription, error) {
-	return ChangeSubscription{}, errNotImplemented
+	m.mu.Lock()
+	_, ok := m.routes[sessionID]
+	m.mu.Unlock()
+	if !ok {
+		return ChangeSubscription{}, errNotImplemented
+	}
+	return m.sessionFanout.Subscribe(), nil
 }
 
 // SpawnRoot launches a detached root supervisor and admits it.
@@ -291,17 +367,37 @@ func (m *Manager) SessionStats(ctx context.Context, sessionID string) (SessionSt
 
 // Quiesce rejects new writes and stops discovery/polling while event drains
 // continue until Close.
-func (m *Manager) Quiesce(context.Context) error { return nil }
+func (m *Manager) Quiesce(context.Context) error {
+	m.mu.Lock()
+	m.quiesced = true
+	m.mu.Unlock()
+	return nil
+}
 
-// Close cancels subscriptions, waits for manager goroutines, and closes
-// clients without stopping admitted roots.
-func (m *Manager) Close(context.Context) error {
+// Close cancels subscriptions, waits for manager monitor goroutines, and
+// closes clients without stopping admitted roots.
+func (m *Manager) Close(ctx context.Context) error {
+	_ = m.Quiesce(ctx)
+	m.closeCancel()
+	done := make(chan struct{})
+	go func() { m.monitorWG.Wait(); close(done) }()
+	select {
+	case <-done:
+		return m.closeClients()
+	case <-ctx.Done():
+		return ctx.Err()
+	}
+}
+
+func (m *Manager) closeClients() error {
 	m.mu.Lock()
 	defer m.mu.Unlock()
 	if m.closed {
 		return nil
 	}
 	m.closed = true
+	m.fleetFanout.Close()
+	m.sessionFanout.Close()
 	for socketPath, handle := range m.roots {
 		_ = handle.client.Close()
 		delete(m.roots, socketPath)
