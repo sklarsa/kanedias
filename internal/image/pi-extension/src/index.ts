@@ -5,9 +5,11 @@ import type { ForkSourceSnapshot } from "./fork.ts";
 import { verifyHandoff } from "./git-handoff.ts";
 import { delegateSessionSchema, handoffSchema } from "./schemas.ts";
 import { SupervisorClient } from "./supervisor-client.ts";
-import type { CreateChildRequest, DelegateSessionInput, HandoffInput } from "./types.ts";
+import type { CreateChildRequest, DelegateSessionInput, HandoffInput, WorkerSummary } from "./types.ts";
 
 const MAX_TOOL_TEXT = 64 * 1024;
+const WORKERS_RETRY_ATTEMPTS = 40;
+const WORKERS_RETRY_DELAY_MS = 300;
 
 interface ExtensionOptions {
   env?: Record<string, string | undefined>;
@@ -48,7 +50,25 @@ export default async function kanediasExtension(pi: ExtensionAPI, options: Exten
     });
   }
 
-  const configuredWorkers = await client.workers();
+  // Fetch the configured worker catalog. Retry for a while (the supervisor
+  // socket can take a moment to start serving) and NEVER throw: a rejection here
+  // aborts the whole extension load and loses every registration (including the
+  // E2E controlled-question handler above). If it ultimately fails the extension
+  // still loads and delegate_session degrades to an empty catalog.
+  let configuredWorkers: WorkerSummary[] = [];
+  try {
+    for (let attempt = 0; attempt < WORKERS_RETRY_ATTEMPTS; attempt++) {
+      try {
+        configuredWorkers = await client.workers();
+        break;
+      } catch (err) {
+        if (attempt === WORKERS_RETRY_ATTEMPTS - 1) throw err;
+        await new Promise((resolve) => setTimeout(resolve, WORKERS_RETRY_DELAY_MS));
+      }
+    }
+  } catch {
+    // Ignore: keep the extension loaded even if the supervisor is unavailable.
+  }
   const workerDescription = configuredWorkers
     .map((worker) => `${worker.workerType}: ${worker.description}`)
     .join("; ");
