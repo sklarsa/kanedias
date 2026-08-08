@@ -380,8 +380,12 @@ func TestPiControlsRejectNonActionableRoot(t *testing.T) {
 	if err := m.Interrupt(context.Background(), "root"); err == nil {
 		t.Fatal("Interrupt accepted non-actionable root")
 	}
-	if err := m.StopSession(context.Background(), "root"); err == nil {
-		t.Fatal("StopSession accepted non-actionable root")
+	// Stop on a non-actionable root evicts it from the fleet immediately.
+	if err := m.StopSession(context.Background(), "root"); err != nil {
+		t.Fatalf("StopSession on non-actionable root should evict it: %v", err)
+	}
+	if len(m.roots) != 0 || len(m.routes) != 0 {
+		t.Fatalf("StopSession on non-actionable root did not evict it (roots=%d routes=%d)", len(m.roots), len(m.routes))
 	}
 	_, err := m.SessionStats(context.Background(), "root")
 	if err == nil {
@@ -400,8 +404,13 @@ func TestPiControlsRejectStaleRoot(t *testing.T) {
 	if err := m.Interrupt(context.Background(), "root"); err == nil {
 		t.Fatal("Interrupt accepted stale root")
 	}
-	if err := m.StopSession(context.Background(), "root"); err == nil {
-		t.Fatal("StopSession accepted stale root")
+	// Stop on a stale root evicts it from the fleet immediately instead of
+	// waiting for the next discovery pass.
+	if err := m.StopSession(context.Background(), "root"); err != nil {
+		t.Fatalf("StopSession on stale root should evict it: %v", err)
+	}
+	if len(m.roots) != 0 || len(m.routes) != 0 {
+		t.Fatalf("StopSession on stale root did not evict it (roots=%d routes=%d)", len(m.roots), len(m.routes))
 	}
 	if err := m.AnswerQuestion(context.Background(), "root", "q-1", json.RawMessage(`{"confirmed":true}`)); err == nil {
 		t.Fatal("AnswerQuestion accepted stale root")
