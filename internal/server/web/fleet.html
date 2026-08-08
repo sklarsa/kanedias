@@ -1,0 +1,116 @@
+{{define "fleet.html"}}
+<div id="fleet-panel">
+  <nav class="sidebar" id="sidebar" aria-label="Agent fleet tree">
+    <div class="side-head">
+      <div class="htitle">
+        <span class="lbl">The Fleet</span>
+        <span class="cnt num">{{len .Roots}} roots</span>
+      </div>
+      <div class="search-wrap">
+        <span class="mag">⌕</span>
+        <input id="search" type="search" placeholder="filter agents, tools…" aria-label="Filter agents">
+      </div>
+    </div>
+    <div class="legend" aria-hidden="true">
+      <span class="g-active">● active</span>
+      <span class="g-question">◇ question</span>
+      <span class="g-complete">○ complete</span>
+    </div>
+
+    <div class="tree" id="tree">
+      {{range .Roots}}
+        {{template "root-row.html" .}}
+      {{end}}
+      {{if .Issues}}
+        <div class="discovery-issues">
+          {{range .Issues}}
+            <div class="issue" data-code="{{.Code}}">{{.Message}}</div>
+          {{end}}
+        </div>
+      {{end}}
+    </div>
+  </nav>
+</div>
+{{end}}
+
+{{define "root-row.html"}}
+<details open class="st-{{.Lifecycle}}" data-root="{{.RootSessionID}}">
+  <summary>
+    <div class="row st-{{.Lifecycle}}"
+         data-session-id="{{.RootSessionID}}"
+         data-lifecycle="{{.Lifecycle}}"
+         data-on:click="$selectedSessionId = el.dataset.sessionId; @get('/ui/session', {payload:{selectedSessionId:el.dataset.sessionId}, requestCancellation:'auto'})"
+    >
+      <span class="twisty">▸</span>
+      {{if eq .Lifecycle "question"}}<span class="glyph">◇</span>
+      {{else if eq .Lifecycle "complete"}}<span class="glyph">○</span>
+      {{else}}<span class="glyph">●</span>{{end}}
+      <div class="r-body">
+        <div class="r-line1">
+          <span class="r-name">{{.RootSessionID}}</span>
+          <span class="r-type">root</span>
+        </div>
+        <div class="r-status">
+          {{if .Stale}}stale{{else if not .StreamConnected}}disconnected{{else}}{{.Lifecycle}}{{end}}
+          {{if .GapText}}<span class="gap-warning">⚠ {{.GapText}}</span>{{end}}
+        </div>
+      </div>
+      {{if .Incomplete}}<span class="incomplete-warning">incomplete replay</span>{{end}}
+    </div>
+  </summary>
+  {{if .Children}}
+    <div class="children">
+      {{range .Children}}
+        {{template "node-row.html" .}}
+      {{end}}
+    </div>
+  {{end}}
+</details>
+{{end}}
+
+{{define "node-row.html"}}
+{{if .HasChildren}}
+<details class="st-{{.Lifecycle}}" data-node="{{.SessionID}}">
+  <summary>
+    <div class="row st-{{.Lifecycle}}"
+         data-session-id="{{.SessionID}}"
+         data-lifecycle="{{.Lifecycle}}"
+         data-on:click="$selectedSessionId = el.dataset.sessionId; @get('/ui/session', {payload:{selectedSessionId:el.dataset.sessionId}, requestCancellation:'auto'})"
+    >
+      <span class="twisty">▸</span>
+      {{if .Questions}}<span class="glyph">◇</span>{{else if eq .Lifecycle "complete"}}<span class="glyph">○</span>{{else}}<span class="glyph">●</span>{{end}}
+      <div class="r-body">
+        <div class="r-line1">
+          <span class="r-name">{{.WorkerType}}</span>
+          <span class="r-type">worker</span>
+        </div>
+        <div class="r-status">{{.Lifecycle}}</div>
+      </div>
+      {{if .Questions}}<span class="asks">asks you</span>{{end}}
+    </div>
+  </summary>
+  <div class="children">
+    {{range .Children}}
+      {{template "node-row.html" .}}
+    {{end}}
+  </div>
+</details>
+{{else}}
+<div class="row leaf st-{{.Lifecycle}}"
+     data-session-id="{{.SessionID}}"
+     data-lifecycle="{{.Lifecycle}}"
+     data-on:click="$selectedSessionId = el.dataset.sessionId; @get('/ui/session', {payload:{selectedSessionId:el.dataset.sessionId}, requestCancellation:'auto'})"
+>
+  <span class="twisty">·</span>
+  {{if .Questions}}<span class="glyph">◇</span>{{else if eq .Lifecycle "complete"}}<span class="glyph">○</span>{{else}}<span class="glyph">●</span>{{end}}
+  <div class="r-body">
+    <div class="r-line1">
+      <span class="r-name">{{.WorkerType}}</span>
+      <span class="r-type">worker</span>
+    </div>
+    <div class="r-status">{{.Lifecycle}}</div>
+  </div>
+  {{if .Questions}}<span class="asks">asks you</span>{{end}}
+</div>
+{{end}}
+{{end}}

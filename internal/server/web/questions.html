@@ -1,0 +1,42 @@
+{{define "questions.html"}}
+<div id="question-panel">
+  {{range .Questions}}
+  <div class="qcard" data-question-id="{{.ID}}">
+    <div class="qhead"><span class="diamond">◇</span> {{if .Title}}{{.Title}}{{else}}Question{{end}}</div>
+    {{if .Message}}
+    <div class="qtext">{{.Message}}</div>
+    {{end}}
+    {{if .Options}}
+    <div class="qopts">
+      {{range $i, $opt := .Options}}
+      <button class="qopt"
+        data-on:click="@post('/ui/sessions/'+$selectedSessionId+'/questions/{{$.ID}}', {payload:{value:{{$opt | js}}}})">
+        <span class="key">{{$i}}</span> {{$opt}}
+      </button>
+      {{end}}
+    </div>
+    {{end}}
+    {{if eq .Method "confirm"}}
+    <div class="qconfirm">
+      <button class="qopt confirm"
+        data-on:click="@post('/ui/sessions/'+$selectedSessionId+'/questions/{{.ID}}', {payload:{confirmed:true}})">
+        Confirm
+      </button>
+      <button class="qopt deny"
+        data-on:click="@post('/ui/sessions/'+$selectedSessionId+'/questions/{{.ID}}', {payload:{confirmed:false}})">
+        Deny
+      </button>
+    </div>
+    {{end}}
+    <div class="qwrite">
+      <input type="text" placeholder="{{if .Placeholder}}{{.Placeholder}}{{else}}Write an answer…{{end}}" aria-label="Write answer" id="qinput-{{.ID}}">
+      <button data-on:click="@post('/ui/sessions/'+$selectedSessionId+'/questions/{{.ID}}', {payload:{value:document.getElementById('qinput-{{.ID}}').value}})">Send</button>
+      <button class="cancel"
+        data-on:click="@post('/ui/sessions/'+$selectedSessionId+'/questions/{{.ID}}', {payload:{cancelled:true}})">Cancel</button>
+    </div>
+  </div>
+  {{else}}
+  <div id="question-panel"></div>
+  {{end}}
+</div>
+{{end}}
