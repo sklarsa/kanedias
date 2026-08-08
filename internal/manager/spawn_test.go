@@ -126,9 +126,9 @@ func init() {
 		sid, _ := unix.Getsid(0)
 		pid := os.Getpid()
 		if sid == pid {
-			os.Stdout.WriteString("sid_ok\n")
+			_, _ = os.Stdout.WriteString("sid_ok\n")
 		} else {
-			os.Stdout.WriteString("sid_fail\n")
+			_, _ = os.Stdout.WriteString("sid_fail\n")
 		}
 		os.Exit(0)
 	}
@@ -162,8 +162,8 @@ func TestRootSpawnerRealExecSetsSid(t *testing.T) {
 	}
 	starter := osProcessStarter{}
 	process, err := starter.Start(spec)
-	logFile.Close()
-	devNull.Close()
+	_ = logFile.Close()
+	_ = devNull.Close()
 	if err != nil {
 		t.Fatal(err)
 	}

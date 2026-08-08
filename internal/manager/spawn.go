@@ -6,7 +6,6 @@ import (
 	"encoding/hex"
 	"errors"
 	"fmt"
-	"net"
 	"os"
 	"os/exec"
 	"path/filepath"
@@ -347,13 +346,4 @@ func generateToken() (string, error) {
 		return "", err
 	}
 	return hex.EncodeToString(buf[:]), nil
-}
-
-// validateUnixPathLengthForSocket checks a real socket path.
-func validateUnixPathLengthForSocket(path string) error {
-	addr := &net.UnixAddr{Name: path, Net: "unix"}
-	if len(addr.Name) > 107 {
-		return fmt.Errorf("unix socket path %q exceeds maximum length", path)
-	}
-	return nil
 }

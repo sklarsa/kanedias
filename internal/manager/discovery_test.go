@@ -47,7 +47,7 @@ func TestInspectRootSocketRejectsWrongMode(t *testing.T) {
 		t.Fatal(err)
 	}
 	listener.SetUnlinkOnClose(false)
-	listener.Close()
+	_ = listener.Close()
 	// Socket is created with mode 0755 by default — that is already wrong.
 	// Set it to 0o644 to make the intent explicit.
 	if err := os.Chmod(path, 0o644); err != nil {
@@ -67,7 +67,7 @@ func TestInspectRootSocketRejectsForeignUID(t *testing.T) {
 		t.Fatal(err)
 	}
 	listener.SetUnlinkOnClose(false)
-	listener.Close()
+	_ = listener.Close()
 	if err := os.Chmod(path, 0o600); err != nil {
 		t.Fatal(err)
 	}
@@ -94,7 +94,7 @@ func TestInspectRootSocketAcceptsValidSocket(t *testing.T) {
 		t.Fatal(err)
 	}
 	listener.SetUnlinkOnClose(false)
-	listener.Close()
+	_ = listener.Close()
 	if err := os.Chmod(path, 0o600); err != nil {
 		t.Fatal(err)
 	}
@@ -251,7 +251,7 @@ func makeRootSocket(t *testing.T, dir string, name string) string {
 		t.Fatalf("create root socket %q: %v", path, err)
 	}
 	listener.SetUnlinkOnClose(false)
-	listener.Close()
+	_ = listener.Close()
 	if err := os.Chmod(path, 0o600); err != nil {
 		t.Fatalf("chmod root socket %q: %v", path, err)
 	}

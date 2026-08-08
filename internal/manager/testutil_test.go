@@ -126,7 +126,7 @@ func shortTempDirs(t *testing.T) (rootDir, logDir string) {
 	if err != nil {
 		t.Fatalf("shortTempDirs MkdirTemp: %v", err)
 	}
-	t.Cleanup(func() { os.RemoveAll(base) })
+	t.Cleanup(func() { _ = os.RemoveAll(base) })
 	rootDir = filepath.Join(base, "r")
 	logDir = filepath.Join(base, "l")
 	for _, d := range []string{rootDir, logDir} {

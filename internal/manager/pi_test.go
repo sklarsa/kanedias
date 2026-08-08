@@ -3,7 +3,6 @@ package manager
 import (
 	"context"
 	"encoding/json"
-	"fmt"
 	"testing"
 
 	"github.com/sklarsa/kanedias/internal/supervisor"
@@ -204,7 +203,9 @@ func TestInterruptSendsAbort(t *testing.T) {
 		t.Fatalf("expected 1 call, got %d", len(client.callLog))
 	}
 	var abortPayload map[string]any
-	json.Unmarshal(client.callLog[0].payload, &abortPayload)
+	if err := json.Unmarshal(client.callLog[0].payload, &abortPayload); err != nil {
+		t.Fatal(err)
+	}
 	if abortPayload["type"] != "abort" {
 		t.Fatalf("type = %v, want abort", abortPayload["type"])
 	}
@@ -420,7 +421,7 @@ func TestSteerSuccessFalseReturnsError(t *testing.T) {
 		case 0:
 			return json.RawMessage(`{"type":"response","command":"get_state","success":true,"data":{"isStreaming":true}}`), nil
 		default:
-			return json.RawMessage(fmt.Sprintf(`{"type":"response","command":"steer","success":false,"error":"race"}`)), nil
+			return json.RawMessage(`{"type":"response","command":"steer","success":false,"error":"race"}`), nil
 		}
 	}
 	m := piManagerWithSession("root", client, tree)

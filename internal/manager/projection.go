@@ -6,27 +6,12 @@ import (
 	"github.com/sklarsa/kanedias/internal/supervisor"
 )
 
-// allowlistedPiEvents is the set of Pi event types that receive specific
-// structured projections. Unknown types produce a generic ActivityItem.
-var allowlistedPiEvents = map[string]struct{}{
-	"message_update":        {},
-	"message_end":           {},
-	"tool_execution_start":  {},
-	"tool_execution_update": {},
-	"tool_execution_end":    {},
-	"queue_update":          {},
-	"agent_start":           {},
-	"agent_settled":         {},
-	"extension_error":       {},
-}
-
 // activityProjector accumulates a sequence of events into a list of
 // ActivityItems, tracking tool state by toolCallId.
 type activityProjector struct {
 	items    []ActivityItem
 	tools    map[string]int // toolCallId -> index into items
 	textSeq  uint64
-	textBuf  string
 	textOpen bool
 }
 

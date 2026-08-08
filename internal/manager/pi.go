@@ -22,7 +22,7 @@ type piResponse[T any] struct {
 func decodePiResponse[T any](raw json.RawMessage, expectedCommand string) (T, error) {
 	var zero T
 	if !json.Valid(raw) {
-		return zero, fmt.Errorf("Pi response is not valid JSON")
+		return zero, fmt.Errorf("pi response is not valid JSON")
 	}
 	// Reject trailing data: json.Unmarshal uses the whole body.
 	var resp piResponse[T]
@@ -30,17 +30,17 @@ func decodePiResponse[T any](raw json.RawMessage, expectedCommand string) (T, er
 		return zero, fmt.Errorf("decode Pi response: %w", err)
 	}
 	if resp.Type == "" {
-		return zero, fmt.Errorf("Pi response missing type field")
+		return zero, fmt.Errorf("pi response missing type field")
 	}
 	if resp.Command != "" && expectedCommand != "" && resp.Command != expectedCommand {
-		return zero, fmt.Errorf("Pi response command %q does not match expected %q", resp.Command, expectedCommand)
+		return zero, fmt.Errorf("pi response command %q does not match expected %q", resp.Command, expectedCommand)
 	}
 	if !resp.Success {
 		msg := resp.Error
 		if msg == "" {
-			msg = "Pi returned success:false"
+			msg = "pi returned success:false"
 		}
-		return zero, fmt.Errorf("Pi command failed: %s", msg)
+		return zero, fmt.Errorf("pi command failed: %s", msg)
 	}
 	return resp.Data, nil
 }
@@ -234,7 +234,7 @@ func (m *Manager) SessionStats(ctx context.Context, sessionID string) (SessionSt
 		return SessionStats{}, err
 	}
 	if data.SessionID != "" && node.PiSessionID != "" && data.SessionID != node.PiSessionID {
-		return SessionStats{}, fmt.Errorf("Pi stats identity mismatch: got %q, expected %q", data.SessionID, node.PiSessionID)
+		return SessionStats{}, fmt.Errorf("pi stats identity mismatch: got %q, expected %q", data.SessionID, node.PiSessionID)
 	}
 	return projectStats(data), nil
 }
