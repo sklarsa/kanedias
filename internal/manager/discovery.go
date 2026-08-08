@@ -234,6 +234,25 @@ func (m *Manager) commitTree(handle *rootHandle, tree supervisor.NodeSnapshot, c
 	m.mu.Lock()
 	defer m.mu.Unlock()
 
+	// Determine the rootID that currently owns this socket path (if any). Routes
+	// belonging to that existing root are NOT conflicts — they will be removed by
+	// removeRoutesLocked before the new routes are installed.
+	var reuseRootID string
+	if existing, ok := m.roots[handle.socketPath]; ok && existing != handle {
+		reuseRootID = existing.rootID
+	}
+
+	// Conflict check FIRST, before any mutation. A conflict is a candidate
+	// sessionID already routed to a different rootID — excluding the reused root's
+	// own prior routes, which removeRoutesLocked will clear momentarily.
+	for sessionID, rootID := range candidate {
+		if owned, ok := m.routes[sessionID]; ok && owned != rootID && owned != reuseRootID {
+			return nil, fmt.Errorf("route conflict for session %q (owned by %q, new root %q)", sessionID, owned, rootID)
+		}
+	}
+
+	// Conflict check passed — now it is safe to mutate.
+
 	// Reuse a live handle for the same socket path if one already exists and it
 	// is a different instance than the caller's (Q1 orphan guard). Reusing the
 	// existing instance keeps its already-running monitor goroutines valid (they
@@ -260,11 +279,6 @@ func (m *Manager) commitTree(handle *rootHandle, tree supervisor.NodeSnapshot, c
 		target = existing
 	}
 
-	for sessionID, rootID := range candidate {
-		if existing, ok := m.routes[sessionID]; ok && existing != rootID {
-			return nil, fmt.Errorf("route conflict for session %q (owned by %q, new root %q)", sessionID, existing, rootID)
-		}
-	}
 	// Remove old routes for this root if the root already existed.
 	m.removeRoutesLocked(target.rootID)
 	for sessionID, rootID := range candidate {

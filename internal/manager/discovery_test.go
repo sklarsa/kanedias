@@ -493,3 +493,74 @@ func TestCommitTreeRouteConflictReturnsError(t *testing.T) {
 		t.Fatal("expected route conflict error")
 	}
 }
+
+// TestCommitTreeConflictIsAtomic verifies that commitTree does not mutate a
+// live, monitored handle when a route conflict is detected. Before the fix,
+// commitTree swapped the client and reassigned fields BEFORE the conflict
+// check, leaving the existing handle pointing at a closed client on error.
+func TestCommitTreeConflictIsAtomic(t *testing.T) {
+	m := fakeManager(nil)
+
+	// Set up a live monitored handle for socket "a.root.sock" owning route "owns".
+	existingClient := &fakeClient{}
+	existingHandle := &rootHandle{
+		socketPath: "/tmp/a.root.sock",
+		rootID:     "root-a",
+		identity:   socketIdentity{dev: 1, ino: 1},
+		actionable: true,
+		client:     existingClient,
+	}
+	m.roots["/tmp/a.root.sock"] = existingHandle
+	m.routes["root-a"] = "root-a"
+	m.routes["owns"] = "root-a"
+
+	// Pre-seed "shared" -> "root-b" so the incoming commit will conflict.
+	m.routes["shared"] = "root-b"
+
+	// Caller's fresh client (different identity — simulates replaced inode).
+	freshClient := &fakeClient{}
+	incomingHandle := &rootHandle{
+		socketPath: "/tmp/a.root.sock",
+		rootID:     "root-a-new",
+		identity:   socketIdentity{dev: 1, ino: 2}, // different inode
+		actionable: true,
+		client:     freshClient,
+	}
+	// Candidate claims "shared" which is already owned by "root-b" — conflict.
+	candidate := map[string]string{"root-a-new": "root-a-new", "shared": "root-a-new"}
+
+	_, err := m.commitTree(incomingHandle, supervisor.NodeSnapshot{}, candidate)
+	if err == nil {
+		t.Fatal("expected route conflict error, got nil")
+	}
+
+	// The existing handle's client must NOT have been closed.
+	if existingClient.closed {
+		t.Error("commitTree closed the existing handle's client on conflict — not atomic")
+	}
+
+	// The existing handle's fields must be unchanged.
+	if existingHandle.rootID != "root-a" {
+		t.Errorf("existingHandle.rootID mutated to %q, want root-a", existingHandle.rootID)
+	}
+	if existingHandle.identity != (socketIdentity{dev: 1, ino: 1}) {
+		t.Errorf("existingHandle.identity mutated: %+v", existingHandle.identity)
+	}
+	if existingHandle.client != existingClient {
+		t.Error("existingHandle.client was replaced on conflict — not atomic")
+	}
+
+	// Routes must be unchanged.
+	if m.routes["owns"] != "root-a" {
+		t.Errorf("route 'owns' changed to %q, want root-a", m.routes["owns"])
+	}
+	if m.routes["shared"] != "root-b" {
+		t.Errorf("route 'shared' changed to %q, want root-b", m.routes["shared"])
+	}
+
+	// The caller's fresh client must NOT have been closed by commitTree (the
+	// caller, probeRoot, will close it on error — no double-close).
+	if freshClient.closed {
+		t.Error("commitTree closed the caller's fresh client on conflict — caller would double-close")
+	}
+}
