@@ -110,6 +110,35 @@ func TestHandlerPrintsAdvertisedURLs(t *testing.T) {
 	}
 }
 
+func TestHandlerTrustedNetworkModeBypassesBrowserSecurity(t *testing.T) {
+	logger := slog.New(slog.NewTextHandler(io.Discard, nil))
+	handler, err := newHandlerWithOptions(
+		logger, "steven-desktop:8080", io.Discard, nil, context.Background(), false,
+	)
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	get := httptest.NewRequest(http.MethodGet, "/", nil)
+	get.Host = "other-private-host:8080"
+	getResult := httptest.NewRecorder()
+	handler.ServeHTTP(getResult, get)
+	if getResult.Code != http.StatusOK {
+		t.Fatalf("trusted-network GET status = %d, want 200", getResult.Code)
+	}
+
+	post := httptest.NewRequest(http.MethodPost, "/ui/sessions", strings.NewReader("not json"))
+	post.Host = "other-private-host:8080"
+	post.Header.Set("Origin", "http://different-private-host:8080")
+	post.Header.Set("Sec-Fetch-Site", "cross-site")
+	post.Header.Set("Content-Type", "text/plain")
+	postResult := httptest.NewRecorder()
+	handler.ServeHTTP(postResult, post)
+	if postResult.Code != http.StatusNotFound {
+		t.Fatalf("trusted-network POST status = %d, want downstream 404", postResult.Code)
+	}
+}
+
 // indexBody returns the body of an authenticated GET /.
 func indexBody(t *testing.T) string {
 	t.Helper()

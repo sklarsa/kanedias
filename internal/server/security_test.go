@@ -356,6 +356,62 @@ func TestNewStoreRejectsCookiesFromPreviousStore(t *testing.T) {
 	}
 }
 
+func TestRequestBoundaryWildcardUsesActualRequestHost(t *testing.T) {
+	boundary := newRequestBoundary("0.0.0.0:8080")
+	handler := boundary.requireWriteBoundary(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
+		w.WriteHeader(http.StatusOK)
+	}))
+	tests := []struct {
+		name   string
+		host   string
+		origin string
+		want   int
+	}{
+		{"matching private hostname", "steven-desktop:8080", "http://steven-desktop:8080", http.StatusOK},
+		{"different origin", "steven-desktop:8080", "http://other-host:8080", http.StatusForbidden},
+		{"wrong port", "steven-desktop:9090", "http://steven-desktop:9090", http.StatusForbidden},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			req := httptest.NewRequest(http.MethodPost, "/ui/sessions", nil)
+			req.Host = tt.host
+			req.Header.Set("Origin", tt.origin)
+			req.Header.Set("Sec-Fetch-Site", "same-origin")
+			req.Header.Set("Content-Type", "application/json")
+			w := httptest.NewRecorder()
+			handler.ServeHTTP(w, req)
+			if w.Code != tt.want {
+				t.Errorf("status = %d, want %d", w.Code, tt.want)
+			}
+		})
+	}
+}
+
+func TestRequestBoundaryConfiguredHostnameIsCanonical(t *testing.T) {
+	boundary := newRequestBoundary("steven-desktop:8080")
+	handler := boundary.requireWriteBoundary(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
+		w.WriteHeader(http.StatusOK)
+	}))
+	for _, tt := range []struct {
+		host string
+		want int
+	}{
+		{"steven-desktop:8080", http.StatusOK},
+		{"192.168.1.10:8080", http.StatusForbidden},
+	} {
+		req := httptest.NewRequest(http.MethodPost, "/ui/sessions", nil)
+		req.Host = tt.host
+		req.Header.Set("Origin", "http://"+tt.host)
+		req.Header.Set("Sec-Fetch-Site", "same-origin")
+		req.Header.Set("Content-Type", "application/json")
+		w := httptest.NewRecorder()
+		handler.ServeHTTP(w, req)
+		if w.Code != tt.want {
+			t.Errorf("host %q status = %d, want %d", tt.host, w.Code, tt.want)
+		}
+	}
+}
+
 func TestRequestBoundaryRejectsWrongHost(t *testing.T) {
 	boundary := newRequestBoundary("127.0.0.1:43127")
 	handler := boundary.requireWriteBoundary(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {

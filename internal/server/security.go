@@ -184,10 +184,9 @@ func isLoopbackHost(host string) bool {
 	return strings.EqualFold(host, "localhost")
 }
 
-// boundaryHostMatches reports whether the request Host is acceptable: it must
-// share the port with the expected effective address and name a loopback host.
-// This lets operators reach the console via localhost, 127.0.0.1, or ::1
-// interchangeably without admitting an external Host.
+// boundaryHostMatches reports whether the request Host is acceptable. Specific
+// addresses must match exactly, with loopback aliases allowed. An unspecified
+// listener accepts any non-empty request Host on its configured port.
 func boundaryHostMatches(host, expected string) bool {
 	if host == expected {
 		return true
@@ -197,23 +196,23 @@ func boundaryHostMatches(host, expected string) bool {
 		return false
 	}
 	h, port, err := net.SplitHostPort(host)
-	if err != nil || port != expectedPort {
+	if err != nil || h == "" || port != expectedPort {
 		return false
+	}
+	if ip := net.ParseIP(expectedHost); ip != nil && ip.IsUnspecified() {
+		return true
 	}
 	return isLoopbackHost(h) && isLoopbackHost(expectedHost)
 }
 
-// boundaryOriginMatches reports whether the Origin header's host is an
-// acceptable loopback alias of the server's effective address.
-func boundaryOriginMatches(origin, expected string) bool {
+// boundaryOriginMatches reports whether Origin names the request's actual Host
+// and that authority is allowed by the advertised listener boundary.
+func boundaryOriginMatches(origin, requestHost, expected string) bool {
 	u, err := url.Parse(origin)
-	if err != nil {
+	if err != nil || (u.Scheme != "http" && u.Scheme != "https") {
 		return false
 	}
-	if u.Scheme != "http" && u.Scheme != "https" {
-		return false
-	}
-	return boundaryHostMatches(u.Host, expected)
+	return strings.EqualFold(u.Host, requestHost) && boundaryHostMatches(u.Host, expected)
 }
 
 // requireWriteBoundary is a middleware that enforces same-origin write constraints.
@@ -225,7 +224,7 @@ func (b requestBoundary) requireWriteBoundary(next http.Handler) http.Handler {
 			return
 		}
 		origin := r.Header.Get("Origin")
-		if origin != "" && !boundaryOriginMatches(origin, b.Host) {
+		if origin != "" && !boundaryOriginMatches(origin, r.Host, b.Host) {
 			http.Error(w, "Forbidden", http.StatusForbidden)
 			return
 		}
