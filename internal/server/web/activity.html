@@ -6,18 +6,19 @@
     <div class="transcript">
       {{range .Items}}
       {{if .IsTool}}
-      <details class="tool-card {{.ToolCardClass}}" data-tool-card{{if .IsRunning}} open{{end}}>
+      <details class="tool-card {{.ToolCardClass}}" data-tool-card>
         <summary class="tool-summary" tabindex="0">
           <span class="tool-chevron" aria-hidden="true">▸</span>
           <span class="tool-summary-label">{{.Label}}</span>
           {{if .ToolSummary}}<span class="tool-summary-text">{{.ToolSummary}}</span>{{end}}
           <span class="tool-status {{.ToolCardClass}}">{{.StatusLabel}}</span>
+          {{if .ToolTruncated}}<span class="tool-trunc-label">truncated</span>{{end}}
         </summary>
         <div class="tool-detail">
           {{if .ToolArgs}}
           <section class="tool-section">
             <div class="tool-section-head">
-              <span class="tool-section-title">Arguments</span>
+              <span class="tool-section-title">Arguments{{if .ToolArgsTruncated}} <span class="tool-trunc-label">truncated</span>{{end}}</span>
               <button type="button" class="copy-btn" data-copy-tool>copy</button>
             </div>
             <pre class="tool-code-wrap"><code class="tool-code hljs" data-tool-code data-language="json">{{.ToolArgs}}</code></pre>
@@ -26,7 +27,7 @@
           {{if .ToolOutput}}
           <section class="tool-section">
             <div class="tool-section-head">
-              <span class="tool-section-title">Result{{if .ToolTruncated}} <span class="tool-trunc-label">truncated</span>{{end}}</span>
+              <span class="tool-section-title">Result{{if .ToolOutputTruncated}} <span class="tool-trunc-label">truncated</span>{{end}}</span>
               <button type="button" class="copy-btn" data-copy-tool>copy</button>
             </div>
             <pre class="tool-code-wrap"><code class="tool-code hljs" data-tool-code data-language="{{.ToolLanguage}}">{{.ToolOutput}}</code></pre>

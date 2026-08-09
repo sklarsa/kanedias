@@ -117,9 +117,13 @@ type activityItemView struct {
 	ToolOutput    string
 	ToolLanguage  string
 	ToolTruncated bool
-	// Precomputed presentation helpers for the tool card.
+	// Per-field truncation markers so the explicit badge stays on the field that
+	// was actually cut while ToolTruncated drives the neutral summary indicator.
+	ToolArgsTruncated   bool
+	ToolOutputTruncated bool
+	// Precomputed presentation helpers for the tool card. Running state is kept
+	// only in ToolCardClass/StatusLabel; cards are never emitted open.
 	ToolCardClass string
-	IsRunning     bool
 	StatusLabel   string
 }
 
@@ -334,8 +338,9 @@ func newActivityView(state manager.SessionState) activityView {
 			view.ToolOutput = a.ToolOutput
 			view.ToolLanguage = a.ToolLanguage
 			view.ToolTruncated = a.ToolTruncated
+			view.ToolArgsTruncated = a.ToolArgsTruncated
+			view.ToolOutputTruncated = a.ToolOutputTruncated
 			view.ToolCardClass = toolCardClass(a.Status, a.IsError)
-			view.IsRunning = a.Status == "running"
 			view.StatusLabel = toolStatusLabel(a.Status, a.IsError)
 		}
 		items = append(items, view)

@@ -71,12 +71,18 @@ type ActivityItem struct {
 	// here from the supervisor's raw payload via pure bolding/formatting
 	// helpers (boundedDisplay, formatToolJSON, formatToolResult, summarizeTool,
 	// toolLanguage) and never carry template.HTML or raw event data.
-	IsTool        bool
-	ToolSummary   string
-	ToolArgs      string
-	ToolOutput    string
-	ToolLanguage  string
+	IsTool       bool
+	ToolSummary  string
+	ToolArgs     string
+	ToolOutput   string
+	ToolLanguage string
+	// ToolTruncated is the aggregate flag across arguments, partial and final
+	// output; the card summary surfaces a neutral "truncated" indicator from it.
 	ToolTruncated bool
+	// ToolArgsTruncated / ToolOutputTruncated mark which specific field was
+	// actually cut, so the explicit marker stays on the affected field.
+	ToolArgsTruncated   bool
+	ToolOutputTruncated bool
 }
 
 // SessionState is the public projection of one session within a root tree.

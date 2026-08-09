@@ -246,10 +246,14 @@ type toolContentBlock struct {
 }
 
 // formatToolResult projects a tool result/partialResult into a bounded display
-// string. Text content blocks are joined in order and image blocks are
-// summarized as "[image: <mime>]"; when no supported content block is present
-// the indented result JSON is used instead. All output is bounded at
-// maxToolDisplayBytes.
+// string, redacting any media/binary data. Text content blocks are joined in
+// order; image blocks are summarized as "[image: <mime>]" (or "[image]" when
+// no MIME is present); any other non-text block is reduced to a safe "[binary …]"
+// placeholder. When a content array is present with media but no projected
+// text, a neutral placeholder is returned so the original JSON (which can embed
+// base64) never falls through to the JSON projector. Only a result with no
+// content array at all falls back to the indented JSON. All output is bounded
+// at maxToolDisplayBytes.
 func formatToolResult(raw json.RawMessage) (string, bool) {
 	if len(raw) == 0 {
 		return "", false
@@ -257,25 +261,51 @@ func formatToolResult(raw json.RawMessage) (string, bool) {
 	var payload struct {
 		Content []toolContentBlock `json:"content"`
 	}
-	if err := json.Unmarshal(raw, &payload); err == nil {
+	if err := json.Unmarshal(raw, &payload); err == nil && payload.Content != nil {
 		var sb strings.Builder
+		mediaSeen := false
 		for _, block := range payload.Content {
-			switch {
-			case block.Type == "text" && block.Text != "":
-				sb.WriteString(block.Text)
-			case block.Type != "text" && block.MimeType != "":
-				sb.WriteString("[image: " + block.MimeType + "]")
+			switch block.Type {
+			case "text":
+				if block.Text != "" {
+					sb.WriteString(block.Text)
+				}
+			case "image":
+				mediaSeen = true
+				if block.MimeType != "" {
+					sb.WriteString("[image: " + block.MimeType + "]")
+				} else {
+					sb.WriteString("[image]")
+				}
+			default:
+				// Any other non-text block is treated as unsupported binary/media.
+				mediaSeen = true
+				if block.MimeType != "" {
+					sb.WriteString("[binary: " + block.MimeType + "]")
+				} else {
+					sb.WriteString("[binary data]")
+				}
 			}
 		}
 		if sb.Len() > 0 {
 			return boundedDisplay(sb.String())
 		}
+		if mediaSeen {
+			// Media present but no projected text: never fall back to the raw
+			// JSON, which could expose base64 data.
+			return "[binary data]", false
+		}
 	}
 	return formatToolJSON(raw)
 }
 
+// maxToolSummaryRunes caps any single completed tool summary and event-derived
+// tool name/label at a concise fixed run count, so an untrusted supervisor can
+// never push an unbounded display string across the manager→view boundary.
+const maxToolSummaryRunes = 160
+
 // capRunes truncates s to at most n display characters (runes), preserving
-// valid UTF-8. It is used to bound the bash summary line.
+// valid UTF-8. It is used to bound tool summaries, names and labels.
 func capRunes(s string, n int) string {
 	if n <= 0 {
 		return ""
@@ -311,6 +341,7 @@ func summarizeTool(toolName string, args json.RawMessage) string {
 		}
 		return ""
 	}
+	var s string
 	switch toolName {
 	case "bash":
 		cmd := firstString("command")
@@ -326,15 +357,17 @@ func summarizeTool(toolName string, args json.RawMessage) string {
 			cmd = cmd[:i]
 		}
 		if cmd == "" {
-			return toolName
+			s = toolName
+		} else {
+			s = "$ " + cmd
 		}
-		return capRunes("$ "+cmd, 160)
 	case "read", "write", "edit", "ls":
 		p := firstString("path", "file_path")
 		if p == "" {
-			return toolName
+			s = toolName
+		} else {
+			s = toolName + " " + p
 		}
-		return toolName + " " + p
 	case "grep", "find":
 		pat := firstString("pattern")
 		p := firstString("path", "file_path")
@@ -342,12 +375,16 @@ func summarizeTool(toolName string, args json.RawMessage) string {
 			p = "."
 		}
 		if pat == "" {
-			return toolName + " in " + p
+			s = toolName + " in " + p
+		} else {
+			s = toolName + " " + pat + " in " + p
 		}
-		return toolName + " " + pat + " in " + p
 	default:
-		return toolName
+		s = toolName
 	}
+	// Every completed summary — including hostile path/pattern/custom names — is
+	// capped to a concise fixed run bound before crossing the manager boundary.
+	return capRunes(s, maxToolSummaryRunes)
 }
 
 // toolLanguageByExt maps common source-path extensions to the Highlight.js
@@ -392,18 +429,22 @@ func (p *activityProjector) applyToolStart(event supervisor.EventEnvelope) {
 		return
 	}
 	argsDisplay, argsTrunc := formatToolJSON(payload.Args)
+	// The event-derived tool name feeds both Label and ToolName; cap it so a
+	// hostile supervisor cannot push an unbounded string to the view.
+	name := capRunes(payload.ToolName, maxToolSummaryRunes)
 	item := ActivityItem{
-		Seq:           event.Seq,
-		Kind:          "tool_execution_start",
-		Label:         "Tool: " + payload.ToolName,
-		ToolCallID:    payload.ToolCallID,
-		ToolName:      payload.ToolName,
-		Status:        "running",
-		IsTool:        true,
-		ToolSummary:   summarizeTool(payload.ToolName, payload.Args),
-		ToolArgs:      argsDisplay,
-		ToolLanguage:  toolLanguage(payload.ToolName, payload.Args),
-		ToolTruncated: argsTrunc,
+		Seq:               event.Seq,
+		Kind:              "tool_execution_start",
+		Label:             "Tool: " + name,
+		ToolCallID:        payload.ToolCallID,
+		ToolName:          name,
+		Status:            "running",
+		IsTool:            true,
+		ToolSummary:       summarizeTool(payload.ToolName, payload.Args),
+		ToolArgs:          argsDisplay,
+		ToolLanguage:      toolLanguage(payload.ToolName, payload.Args),
+		ToolTruncated:     argsTrunc,
+		ToolArgsTruncated: argsTrunc,
 	}
 	p.tools[payload.ToolCallID] = len(p.items)
 	p.items = append(p.items, item)
@@ -418,6 +459,7 @@ func (p *activityProjector) applyToolUpdate(event supervisor.EventEnvelope) {
 		out, trunc := formatToolResult(payload.PartialResult)
 		p.items[idx].Status = "running"
 		p.items[idx].ToolOutput = out
+		p.items[idx].ToolOutputTruncated = trunc
 		p.items[idx].ToolTruncated = p.items[idx].ToolTruncated || trunc
 	}
 }
@@ -432,6 +474,7 @@ func (p *activityProjector) applyToolEnd(event supervisor.EventEnvelope) {
 		p.items[idx].Status = "done"
 		p.items[idx].IsError = payload.IsError
 		p.items[idx].ToolOutput = out
+		p.items[idx].ToolOutputTruncated = trunc
 		p.items[idx].ToolTruncated = p.items[idx].ToolTruncated || trunc
 	}
 }

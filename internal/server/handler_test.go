@@ -1315,6 +1315,25 @@ func TestHandlerRejectsNilLogger(t *testing.T) {
 	}
 }
 
+// detailsTagOpen reports whether the first <details ...> opening tag carries an
+// open attribute. It parses the attribute strictly (delimiter-separated on both
+// sides) so a status class like "tool-done" or "tool-running" can never cause a
+// false positive.
+func detailsTagOpen(html string) bool {
+	tag := "<details "
+	start := strings.Index(html, tag)
+	if start == -1 {
+		return false
+	}
+	rel := strings.Index(html[start:], ">")
+	if rel == -1 {
+		return false
+	}
+	open := html[start : start+rel]
+	re := regexp.MustCompile(`(^|\s)open(?:[=\s>]|$)`)
+	return re.MatchString(open)
+}
+
 func TestToolCardTemplateEscapesAndCollapses(t *testing.T) {
 	templates, err := parseTemplates(webFiles)
 	if err != nil {
@@ -1326,6 +1345,7 @@ func TestToolCardTemplateEscapesAndCollapses(t *testing.T) {
 			Kind: "tool_execution_start", Label: "Tool: read",
 			IsTool: true, ToolSummary: "read a.txt", ToolArgs: payload,
 			ToolOutput: payload, ToolLanguage: "go", ToolTruncated: false,
+			ToolCardClass: "tool-done", StatusLabel: "done",
 		},
 	}}
 	html, err := renderTemplate(templates, templateActivity, view)
@@ -1341,8 +1361,93 @@ func TestToolCardTemplateEscapesAndCollapses(t *testing.T) {
 	if !strings.Contains(html, `&lt;script&gt;alert`) {
 		t.Fatalf("missing escaped source: %s", html)
 	}
-	if strings.Contains(html, `<details class="tool-card" open`) {
+	if detailsTagOpen(html) {
 		t.Fatalf("tool defaulted open: %s", html)
+	}
+}
+
+func TestToolCardRunningNeverOpens(t *testing.T) {
+	templates, err := parseTemplates(webFiles)
+	if err != nil {
+		t.Fatal(err)
+	}
+	// A real running card keeps the running state only as class/status and must
+	// render collapsed (no open attribute).
+	view := activityView{Items: []activityItemView{
+		{
+			Kind: "tool_execution_start", Label: "Tool: bash", IsTool: true,
+			ToolSummary: "$ echo hi", ToolArgs: "{}", ToolOutput: "hi\n",
+			ToolCardClass: "tool-running", StatusLabel: "running",
+		},
+	}}
+	html, err := renderTemplate(templates, templateActivity, view)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !strings.Contains(html, `class="tool-card tool-running"`) {
+		t.Fatalf("missing running status class: %s", html)
+	}
+	if detailsTagOpen(html) {
+		t.Fatalf("running tool card defaulted open: %s", html)
+	}
+}
+
+func TestToolCardAggregateTruncatedShowsNeutralSummaryBadge(t *testing.T) {
+	templates, err := parseTemplates(webFiles)
+	if err != nil {
+		t.Fatal(err)
+	}
+	// Args-only truncation must still surface a neutral "truncated" indicator in
+	// the collapsed summary, while the result section must NOT be falsely marked.
+	view := activityView{Items: []activityItemView{
+		{
+			Kind: "tool_execution_start", Label: "Tool: bash", IsTool: true,
+			ToolSummary: "$ echo hi", ToolArgs: "{\"a\": 1}",
+			ToolOutput: "hi\n", ToolTruncated: true, ToolArgsTruncated: true,
+			ToolOutputTruncated: false, ToolCardClass: "tool-done", StatusLabel: "done",
+		},
+	}}
+	html, err := renderTemplate(templates, templateActivity, view)
+	if err != nil {
+		t.Fatal(err)
+	}
+	sumStart := strings.Index(html, "<summary")
+	sumEnd := strings.Index(html, "</summary>")
+	if sumStart == -1 || sumEnd == -1 || sumEnd < sumStart {
+		t.Fatalf("no summary block in html: %s", html)
+	}
+	if !strings.Contains(html[sumStart:sumEnd], "truncated") {
+		t.Fatalf("missing neutral truncated summary badge: %s", html)
+	}
+	if !strings.Contains(html, `Arguments <span class="tool-trunc-label">truncated</span>`) {
+		t.Fatalf("missing args truncation marker: %s", html)
+	}
+	if strings.Contains(html, `Result <span class="tool-trunc-label">truncated</span>`) {
+		t.Fatalf("result falsely marked truncated: %s", html)
+	}
+}
+
+func TestToolCardErrorView(t *testing.T) {
+	templates, err := parseTemplates(webFiles)
+	if err != nil {
+		t.Fatal(err)
+	}
+	view := activityView{Items: []activityItemView{
+		{
+			Kind: "tool_execution_end", Label: "Tool: bash", IsTool: true,
+			ToolSummary: "$ false", IsError: true,
+			ToolCardClass: "tool-error", StatusLabel: "error",
+		},
+	}}
+	html, err := renderTemplate(templates, templateActivity, view)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !strings.Contains(html, `class="tool-card tool-error"`) {
+		t.Fatalf("missing error card class: %s", html)
+	}
+	if !strings.Contains(html, `class="tool-status tool-error">error</span>`) {
+		t.Fatalf("missing error status: %s", html)
 	}
 }
 
