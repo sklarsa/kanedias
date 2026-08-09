@@ -50,6 +50,18 @@ func TestInstallerActivatesOnlyKanediasDelegationExtensionAndSkills(t *testing.T
 	}
 }
 
+func TestInstallerEnablesOpenAIFastByDefault(t *testing.T) {
+	script := string(installer)
+	for _, required := range []string{
+		`{"enabled":true}`,
+		`$managed_home/.pi/agent/extensions/openai-fast.json`,
+	} {
+		if !strings.Contains(script, required) {
+			t.Errorf("installer missing OpenAI Fast default %q", required)
+		}
+	}
+}
+
 func TestPiEnvironmentBridgeWritesAllowlistedEnvironment(t *testing.T) {
 	dir := t.TempDir()
 	bridgePath := filepath.Join(dir, "kanedias-pi-env")
