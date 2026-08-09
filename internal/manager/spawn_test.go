@@ -285,10 +285,9 @@ func TestSpawnRootWithRequestTransfersResolvedPolicyOnlyThroughFD3(t *testing.T)
 		t.Fatalf("ExtraFiles = %d, want 1", len(spec.ExtraFiles))
 	}
 	argv := strings.Join(spec.Args, "\x00")
-	environment := strings.Join(spec.Env, "\x00")
 	for _, value := range []string{wantPolicy.Root.Provider, wantPolicy.Root.Model, `"provider"`, `"workers"`} {
-		if strings.Contains(argv, value) || strings.Contains(environment, value) {
-			t.Fatalf("private policy value %q leaked into argv or environment", value)
+		if strings.Contains(argv, value) {
+			t.Fatalf("private policy value %q leaked into argv", value)
 		}
 	}
 	if !reflect.DeepEqual(spec.Env, os.Environ()) {
