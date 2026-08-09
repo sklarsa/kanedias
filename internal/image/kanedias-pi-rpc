@@ -5,7 +5,9 @@ export NVM_DIR=/home/kanedias/.nvm
 # shellcheck source=/dev/null
 source "$NVM_DIR/nvm.sh"
 
-kind=${KANEDIAS_SESSION_KIND:-root}
+: "${KANEDIAS_SESSION_ID:?KANEDIAS_SESSION_ID is required}"
+: "${KANEDIAS_SESSION_KIND:?KANEDIAS_SESSION_KIND is required}"
+kind=$KANEDIAS_SESSION_KIND
 session_file=${KANEDIAS_PI_SESSION_FILE:-}
 args=(--mode rpc)
 

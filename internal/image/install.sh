@@ -25,13 +25,14 @@ pi_theme_file="$assets_dir/cobalt-ember.json"
 tmux_config_file="$assets_dir/tmux.conf"
 pi_rpc_socket_file="$assets_dir/kanedias-pi.socket"
 pi_rpc_service_file="$assets_dir/kanedias-pi@.service"
+pi_environment_bridge_file="$assets_dir/kanedias-pi-env"
 pi_rpc_launcher_file="$assets_dir/kanedias-pi-rpc"
 pi_extension_dir="$assets_dir/pi-extension"
 
 for required_file in \
     "$authorized_hosts_file" "$pi_settings_file" "$pi_auth_file" "$pi_models_file" \
     "$pi_theme_file" "$tmux_config_file" "$pi_rpc_socket_file" "$pi_rpc_service_file" \
-    "$pi_rpc_launcher_file"; do
+    "$pi_environment_bridge_file" "$pi_rpc_launcher_file"; do
     if [[ ! -f $required_file ]]; then
         echo "missing install input: $required_file" >&2
         exit 1
@@ -518,6 +519,7 @@ install_pi_extension() {
     install -d -m 0755 /usr/lib/tmpfiles.d
     cat > /usr/lib/tmpfiles.d/kanedias.conf <<EOF
 d /run/kanedias 0700 kanedias kanedias -
+d /run/kanedias-pi 0700 root root -
 EOF
     systemd-tmpfiles --create /usr/lib/tmpfiles.d/kanedias.conf
 
@@ -534,8 +536,8 @@ EOF
 
 install_pi_rpc_service() {
     install -d -m 0755 /usr/local/libexec
-    install -m 0755 "$assets_dir/kanedias-pi-rpc" \
-        /usr/local/libexec/kanedias-pi-rpc
+    install -m 0755 "$pi_environment_bridge_file" /usr/local/libexec/kanedias-pi-env
+    install -m 0755 "$pi_rpc_launcher_file" /usr/local/libexec/kanedias-pi-rpc
     install -m 0644 "$assets_dir/kanedias-pi.socket" \
         /etc/systemd/system/kanedias-pi.socket
     install -m 0644 "$assets_dir/kanedias-pi@.service" \

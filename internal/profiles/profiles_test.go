@@ -16,11 +16,13 @@ func TestRenderSandboxUsesConfiguredIPv4(t *testing.T) {
 	if err := Render(&output, "sandbox", cfg); err != nil {
 		t.Fatal(err)
 	}
-	for _, key := range []string{
-		"environment.HTTP_PROXY", "environment.HTTPS_PROXY",
-		"environment.http_proxy", "environment.https_proxy",
+	for _, want := range []string{
+		`environment.GH_TOKEN: "container-dummy"`,
+		`environment.HTTP_PROXY: "http://10.76.111.1:3128"`,
+		`environment.HTTPS_PROXY: "http://10.76.111.1:3128"`,
+		`environment.http_proxy: "http://10.76.111.1:3128"`,
+		`environment.https_proxy: "http://10.76.111.1:3128"`,
 	} {
-		want := key + ": \"http://10.76.111.1:3128\""
 		if !strings.Contains(output.String(), want) {
 			t.Errorf("rendered sandbox missing %q", want)
 		}

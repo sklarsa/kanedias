@@ -50,6 +50,208 @@ func TestInstallerActivatesOnlyKanediasDelegationExtensionAndSkills(t *testing.T
 	}
 }
 
+func TestPiEnvironmentBridgeWritesAllowlistedEnvironment(t *testing.T) {
+	dir := t.TempDir()
+	bridgePath := filepath.Join(dir, "kanedias-pi-env")
+	if err := os.WriteFile(bridgePath, piEnvironmentBridge, 0o700); err != nil {
+		t.Fatal(err)
+	}
+	sourcePath := filepath.Join(dir, "pid1-environ")
+	destination := filepath.Join(dir, "pi.env")
+	entries := []string{
+		"FORBIDDEN_SENTINEL=must-not-escape",
+		"KANEDIAS_E2E_RUN_ID=e2e-run",
+		"KANEDIAS_SUPERVISOR_SOCKET=/run/kanedias/supervisor.sock",
+		"KANEDIAS_PI_SESSION_FILE=",
+		"KANEDIAS_PI_THINKING=xhigh",
+		"KANEDIAS_PI_MODEL=model",
+		"KANEDIAS_PI_PROVIDER=provider",
+		`KANEDIAS_WORKER_TYPE=writer "quoted"\path`,
+		"KANEDIAS_SESSION_KIND=write",
+		"KANEDIAS_SESSION_ID=session-123",
+		"SSL_CERT_FILE=/etc/ssl/certs/ca-certificates.crt",
+		"NODE_EXTRA_CA_CERTS=/usr/local/share/ca-certificates/kanedias-proxy.crt",
+		"no_proxy=localhost,127.0.0.1,::1",
+		"NO_PROXY=localhost,127.0.0.1,::1",
+		"GH_TOKEN=container-dummy",
+		"https_proxy=http://proxy.example:3128",
+		"http_proxy=http://proxy.example:3128",
+		"HTTPS_PROXY=http://proxy.example:3128",
+		"HTTP_PROXY=http://proxy.example:3128",
+	}
+	if err := os.WriteFile(sourcePath, append([]byte(strings.Join(entries, "\x00")), 0), 0o600); err != nil {
+		t.Fatal(err)
+	}
+
+	if output, err := exec.Command(bridgePath, sourcePath, destination).CombinedOutput(); err != nil {
+		t.Fatalf("bridge failed: %v\n%s", err, output)
+	}
+	got, err := os.ReadFile(destination)
+	if err != nil {
+		t.Fatal(err)
+	}
+	want := strings.Join([]string{
+		`HTTP_PROXY="http://proxy.example:3128"`,
+		`HTTPS_PROXY="http://proxy.example:3128"`,
+		`http_proxy="http://proxy.example:3128"`,
+		`https_proxy="http://proxy.example:3128"`,
+		`GH_TOKEN="container-dummy"`,
+		`NO_PROXY="localhost,127.0.0.1,::1"`,
+		`no_proxy="localhost,127.0.0.1,::1"`,
+		`NODE_EXTRA_CA_CERTS="/usr/local/share/ca-certificates/kanedias-proxy.crt"`,
+		`SSL_CERT_FILE="/etc/ssl/certs/ca-certificates.crt"`,
+		`KANEDIAS_SESSION_ID="session-123"`,
+		`KANEDIAS_SESSION_KIND="write"`,
+		`KANEDIAS_WORKER_TYPE="writer \"quoted\"\\path"`,
+		`KANEDIAS_PI_PROVIDER="provider"`,
+		`KANEDIAS_PI_MODEL="model"`,
+		`KANEDIAS_PI_THINKING="xhigh"`,
+		`KANEDIAS_PI_SESSION_FILE=""`,
+		`KANEDIAS_SUPERVISOR_SOCKET="/run/kanedias/supervisor.sock"`,
+		`KANEDIAS_E2E_RUN_ID="e2e-run"`,
+	}, "\n") + "\n"
+	if string(got) != want {
+		t.Fatalf("environment file = %q, want %q", got, want)
+	}
+	info, err := os.Stat(destination)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if gotMode := info.Mode().Perm(); gotMode != 0o600 {
+		t.Errorf("environment file mode = %#o, want 0600", gotMode)
+	}
+}
+
+func TestPiEnvironmentBridgePrivilegedInvocationIgnoresStaleEnvironment(t *testing.T) {
+	const privilegedInvocation = "ExecStartPre=+/usr/bin/env -i /usr/bin/bash --noprofile --norc /usr/local/libexec/kanedias-pi-env"
+	if service := string(piRPCService); !strings.Contains(service, privilegedInvocation) {
+		t.Fatalf("service does not sanitize the privileged bridge environment with fixed executables:\n%s", service)
+	}
+
+	dir := t.TempDir()
+	bridgePath := filepath.Join(dir, "kanedias-pi-env")
+	if err := os.WriteFile(bridgePath, piEnvironmentBridge, 0o700); err != nil {
+		t.Fatal(err)
+	}
+	marker := filepath.Join(dir, "attacker-code-ran")
+	bashEnv := filepath.Join(dir, "bash-env")
+	if err := os.WriteFile(bashEnv, []byte("printf pwned > "+marker+"\n"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	attackerBin := filepath.Join(dir, "attacker-bin")
+	if err := os.Mkdir(attackerBin, 0o700); err != nil {
+		t.Fatal(err)
+	}
+	fakeBash := filepath.Join(attackerBin, "bash")
+	if err := os.WriteFile(fakeBash, []byte("#!/bin/sh\nprintf pwned > "+marker+"\n"), 0o700); err != nil {
+		t.Fatal(err)
+	}
+	sourcePath := filepath.Join(dir, "pid1-environ")
+	destination := filepath.Join(dir, "pi.env")
+	entries := []string{
+		"KANEDIAS_SESSION_ID=session-123",
+		"KANEDIAS_SESSION_KIND=root",
+		"KANEDIAS_SUPERVISOR_SOCKET=/run/kanedias/supervisor.sock",
+		"HTTP_PROXY=http://proxy.example:3128",
+		"HTTPS_PROXY=http://proxy.example:3128",
+		"GH_TOKEN=container-dummy",
+		"SSL_CERT_FILE=/etc/ssl/certs/ca-certificates.crt",
+		"NODE_EXTRA_CA_CERTS=/usr/local/share/ca-certificates/kanedias-proxy.crt",
+	}
+	if err := os.WriteFile(sourcePath, append([]byte(strings.Join(entries, "\x00")), 0), 0o600); err != nil {
+		t.Fatal(err)
+	}
+
+	command := exec.Command("/usr/bin/env", "-i", "/usr/bin/bash", "--noprofile", "--norc", bridgePath, sourcePath, destination)
+	command.Env = []string{"PATH=" + attackerBin, "BASH_ENV=" + bashEnv}
+	if output, err := command.CombinedOutput(); err != nil {
+		t.Fatalf("sanitized privileged invocation failed: %v\n%s", err, output)
+	}
+	if _, err := os.Stat(marker); !errors.Is(err, os.ErrNotExist) {
+		t.Fatalf("attacker code marker stat error = %v, want not exist", err)
+	}
+}
+
+func TestPiEnvironmentBridgeProductionRuntimeIsRootControlled(t *testing.T) {
+	service := string(piRPCService)
+	if !strings.Contains(service, "EnvironmentFile=-/run/kanedias-pi/pi.env") {
+		t.Fatalf("service environment file is not in the protected runtime directory:\n%s", service)
+	}
+	if !strings.Contains(string(installer), "d /run/kanedias-pi 0700 root root -") {
+		t.Fatal("installer does not create the Pi environment runtime directory as root-only")
+	}
+
+	bridge := string(piEnvironmentBridge)
+	for _, want := range []string{
+		`destination=${2:-/run/kanedias-pi/pi.env}`,
+		`temporary=$(/usr/bin/mktemp -- "$destination_dir/.pi.env.XXXXXX")`,
+		`exec {output_fd}> "$temporary"`,
+		`/usr/bin/mv -fT -- "$temporary" "$destination"`,
+	} {
+		if !strings.Contains(bridge, want) {
+			t.Errorf("environment bridge missing protected staging behavior %q", want)
+		}
+	}
+	for _, forbidden := range []string{
+		`destination=${2:-/run/kanedias/pi.env}`,
+		`chmod 0600 "$temporary"`,
+		`>> "$temporary"`,
+	} {
+		if strings.Contains(bridge, forbidden) {
+			t.Errorf("environment bridge retains unsafe staging behavior %q", forbidden)
+		}
+	}
+}
+
+func TestPiEnvironmentBridgeRejectsInvalidInputWithoutReplacingDestination(t *testing.T) {
+	required := []string{
+		"KANEDIAS_SESSION_ID=session-123",
+		"KANEDIAS_SESSION_KIND=root",
+		"KANEDIAS_SUPERVISOR_SOCKET=/run/kanedias/supervisor.sock",
+		"HTTP_PROXY=http://proxy.example:3128",
+		"HTTPS_PROXY=http://proxy.example:3128",
+		"GH_TOKEN=container-dummy",
+		"SSL_CERT_FILE=/etc/ssl/certs/ca-certificates.crt",
+		"NODE_EXTRA_CA_CERTS=/usr/local/share/ca-certificates/kanedias-proxy.crt",
+	}
+	tests := []struct {
+		name    string
+		entries []string
+	}{
+		{name: "missing required value", entries: required[1:]},
+		{name: "newline in value", entries: append(append([]string(nil), required...), "KANEDIAS_WORKER_TYPE=bad\nvalue")},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			dir := t.TempDir()
+			bridgePath := filepath.Join(dir, "kanedias-pi-env")
+			if err := os.WriteFile(bridgePath, piEnvironmentBridge, 0o700); err != nil {
+				t.Fatal(err)
+			}
+			sourcePath := filepath.Join(dir, "pid1-environ")
+			destination := filepath.Join(dir, "pi.env")
+			if err := os.WriteFile(sourcePath, append([]byte(strings.Join(tt.entries, "\x00")), 0), 0o600); err != nil {
+				t.Fatal(err)
+			}
+			const original = "existing-destination\n"
+			if err := os.WriteFile(destination, []byte(original), 0o600); err != nil {
+				t.Fatal(err)
+			}
+
+			if output, err := exec.Command(bridgePath, sourcePath, destination).CombinedOutput(); err == nil {
+				t.Fatalf("bridge succeeded, want failure; output: %s", output)
+			}
+			got, err := os.ReadFile(destination)
+			if err != nil {
+				t.Fatal(err)
+			}
+			if string(got) != original {
+				t.Fatalf("destination = %q, want unchanged %q", got, original)
+			}
+		})
+	}
+}
+
 func TestPiRPCLauncherBuildsFreshAndForkArgumentsWithoutEval(t *testing.T) {
 	dir := t.TempDir()
 	launcher := strings.Replace(string(piRPCLauncher), `source "$NVM_DIR/nvm.sh"`, ":", 1)
@@ -66,9 +268,9 @@ func TestPiRPCLauncherBuildsFreshAndForkArgumentsWithoutEval(t *testing.T) {
 		env  []string
 		want []string
 	}{
-		{name: "root fresh", env: []string{"KANEDIAS_SESSION_KIND=root"}, want: []string{"--mode", "rpc", "-e", "/opt/kanedias/pi-extension/src/index.ts"}},
-		{name: "child fresh", env: []string{"KANEDIAS_SESSION_KIND=read", "KANEDIAS_PI_PROVIDER=provider", "KANEDIAS_PI_MODEL=model", "KANEDIAS_PI_THINKING=high"}, want: []string{"--mode", "rpc", "-e", "/opt/kanedias/pi-extension/src/index.ts", "--provider", "provider", "--model", "model", "--thinking", "high"}},
-		{name: "child fork", env: []string{"KANEDIAS_SESSION_KIND=read", "KANEDIAS_PI_SESSION_FILE=/sessions/branch.jsonl", "KANEDIAS_PI_PROVIDER=provider", "KANEDIAS_PI_MODEL=model", "KANEDIAS_PI_THINKING=xhigh"}, want: []string{"--mode", "rpc", "--session", "/sessions/branch.jsonl", "-e", "/opt/kanedias/pi-extension/src/index.ts", "--provider", "provider", "--model", "model", "--thinking", "xhigh"}},
+		{name: "root fresh", env: []string{"KANEDIAS_SESSION_ID=root-1", "KANEDIAS_SESSION_KIND=root"}, want: []string{"--mode", "rpc", "-e", "/opt/kanedias/pi-extension/src/index.ts"}},
+		{name: "child fresh", env: []string{"KANEDIAS_SESSION_ID=child-1", "KANEDIAS_SESSION_KIND=read", "KANEDIAS_PI_PROVIDER=provider", "KANEDIAS_PI_MODEL=model", "KANEDIAS_PI_THINKING=high"}, want: []string{"--mode", "rpc", "-e", "/opt/kanedias/pi-extension/src/index.ts", "--provider", "provider", "--model", "model", "--thinking", "high"}},
+		{name: "child fork", env: []string{"KANEDIAS_SESSION_ID=child-2", "KANEDIAS_SESSION_KIND=read", "KANEDIAS_PI_SESSION_FILE=/sessions/branch.jsonl", "KANEDIAS_PI_PROVIDER=provider", "KANEDIAS_PI_MODEL=model", "KANEDIAS_PI_THINKING=xhigh"}, want: []string{"--mode", "rpc", "--session", "/sessions/branch.jsonl", "-e", "/opt/kanedias/pi-extension/src/index.ts", "--provider", "provider", "--model", "model", "--thinking", "xhigh"}},
 	}
 	for _, tt := range tests {
 		t.Run(tt.name, func(t *testing.T) {
@@ -83,6 +285,32 @@ func TestPiRPCLauncherBuildsFreshAndForkArgumentsWithoutEval(t *testing.T) {
 				t.Fatalf("args = %#v, want %#v", got, tt.want)
 			}
 		})
+	}
+}
+
+func TestPiRPCLauncherRequiresSessionIDBeforeInvokingPi(t *testing.T) {
+	dir := t.TempDir()
+	launcher := strings.Replace(string(piRPCLauncher), `source "$NVM_DIR/nvm.sh"`, ":", 1)
+	launcherPath := filepath.Join(dir, "launcher")
+	if err := os.WriteFile(launcherPath, []byte(launcher), 0o700); err != nil {
+		t.Fatal(err)
+	}
+	marker := filepath.Join(dir, "pi-invoked")
+	piPath := filepath.Join(dir, "pi")
+	if err := os.WriteFile(piPath, []byte("#!/bin/sh\ntouch \"$PI_INVOKED_MARKER\"\n"), 0o700); err != nil {
+		t.Fatal(err)
+	}
+	command := exec.Command(launcherPath)
+	command.Env = []string{
+		"PATH=" + dir + ":/usr/bin:/bin",
+		"KANEDIAS_SESSION_KIND=root",
+		"PI_INVOKED_MARKER=" + marker,
+	}
+	if output, err := command.CombinedOutput(); err == nil {
+		t.Fatalf("launcher succeeded without a session ID; output: %s", output)
+	}
+	if _, err := os.Stat(marker); !errors.Is(err, os.ErrNotExist) {
+		t.Fatalf("Pi invocation marker stat error = %v, want not exist", err)
 	}
 }
 
@@ -115,6 +343,7 @@ func TestCreateRunsImageWorkflowInOrder(t *testing.T) {
 		"push /root/assets/tmux.conf",
 		"push /root/assets/kanedias-pi.socket",
 		"push /root/assets/kanedias-pi@.service",
+		"push /root/assets/kanedias-pi-env",
 		"push /root/assets/kanedias-pi-rpc",
 		"exec install -d /root/assets/pi-extension/skills/delegate-session /root/assets/pi-extension/skills/writer-handoff /root/assets/pi-extension/src",
 		"push /root/assets/pi-extension/package-lock.json",
@@ -174,6 +403,9 @@ func TestCreateRunsImageWorkflowInOrder(t *testing.T) {
 	service := string(client.files["/root/assets/kanedias-pi@.service"].content)
 	for _, want := range []string{
 		"User=kanedias",
+		"Group=kanedias",
+		"EnvironmentFile=-/run/kanedias-pi/pi.env",
+		"ExecStartPre=+/usr/bin/env -i /usr/bin/bash --noprofile --norc /usr/local/libexec/kanedias-pi-env",
 		"WorkingDirectory=/workspace",
 		"StandardInput=socket",
 		"StandardOutput=inherit",
@@ -190,12 +422,24 @@ func TestCreateRunsImageWorkflowInOrder(t *testing.T) {
 	if auth.mode != 0o600 {
 		t.Errorf("pi auth mode = %#o, want 0600", auth.mode)
 	}
+	bridge := client.files["/root/assets/kanedias-pi-env"]
+	if bridge.mode != 0o700 {
+		t.Errorf("environment bridge mode = %#o, want 0700", bridge.mode)
+	}
 	launcher := client.files["/root/assets/kanedias-pi-rpc"]
 	if !strings.Contains(string(launcher.content), `exec pi "${args[@]}"`) || !strings.Contains(string(launcher.content), "/opt/kanedias/pi-extension/src/index.ts") {
 		t.Fatalf("launcher = %q", launcher.content)
 	}
 	if launcher.mode != 0o700 {
 		t.Errorf("launcher mode = %#o, want 0700", launcher.mode)
+	}
+	for _, want := range []string{
+		`"$pi_environment_bridge_file" /usr/local/libexec/kanedias-pi-env`,
+		`"$pi_rpc_launcher_file" /usr/local/libexec/kanedias-pi-rpc`,
+	} {
+		if !strings.Contains(string(installer), want) {
+			t.Errorf("installer missing Pi RPC install behavior %q", want)
+		}
 	}
 	for _, path := range []string{
 		"/root/assets/kanedias-pi.socket",
