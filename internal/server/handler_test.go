@@ -478,6 +478,23 @@ func TestActivityMarksOnlyConversationTextAsMarkdown(t *testing.T) {
 	if strings.Contains(html, `<h1>`) || strings.Contains(html, `<script`) {
 		t.Fatalf("server trusted transcript markup:\n%s", html)
 	}
+
+	// Complete must flow through newActivityView from manager fixtures unchanged,
+	// keyed on the stable sequence.
+	state := manager.SessionState{RecentActivity: []manager.ActivityItem{
+		{Seq: 21, Kind: "message_update", Label: "Message", Text: "streaming"},
+		{Seq: 22, Kind: "message_update", Label: "Message", Text: "done", Complete: true},
+	}}
+	view = newActivityView(state)
+	if len(view.Items) != 2 {
+		t.Fatalf("items = %d, want 2", len(view.Items))
+	}
+	if view.Items[0].Seq != 21 || view.Items[0].Complete {
+		t.Errorf("item 0: seq=%d complete=%v, want seq=21 complete=false", view.Items[0].Seq, view.Items[0].Complete)
+	}
+	if view.Items[1].Seq != 22 || !view.Items[1].Complete {
+		t.Errorf("item 1: seq=%d complete=%v, want seq=22 complete=true", view.Items[1].Seq, view.Items[1].Complete)
+	}
 }
 
 func TestTemplatesDefineStableRoots(t *testing.T) {
@@ -1362,6 +1379,54 @@ func detailsTagOpen(html string) bool {
 	return re.MatchString(open)
 }
 
+func TestActivityTemplatePreservesStableInteractiveState(t *testing.T) {
+	templates, err := parseTemplates(webFiles)
+	if err != nil {
+		t.Fatal(err)
+	}
+	view := activityView{Items: []activityItemView{
+		{Seq: 11, Kind: "message_update", Label: "Message", Text: "completed message", IsMarkdown: true, Complete: true},
+		{Seq: 12, Kind: "message_update", Label: "Message", Text: "streaming message", IsMarkdown: true},
+		{Seq: 13, Kind: "tool_execution_start", Label: "Tool: bash", IsTool: true,
+			ToolArgs: "RUNNING_ARGS", ToolOutput: "RUNNING_RESULT", ToolCardClass: "tool-running", StatusLabel: "running"},
+		{Seq: 14, Kind: "tool_execution_start", Label: "Tool: bash", IsTool: true, Complete: true,
+			ToolArgs: "DONE_ARGS", ToolOutput: "DONE_RESULT", ToolCardClass: "tool-done", StatusLabel: "done"},
+	}}
+	html, err := renderTemplate(templates, templateActivity, view)
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	for _, id := range []string{"11", "12", "13", "14"} {
+		if !strings.Contains(html, `id="activity-item-`+id+`"`) {
+			t.Errorf("missing stable activity ID %s:\n%s", id, html)
+		}
+	}
+	if got := strings.Count(html, `data-preserve-attr="open"`); got != 2 {
+		t.Errorf("preserved tool open attributes = %d, want 2\n%s", got, html)
+	}
+	if !strings.Contains(html, `<div class="t-body" data-markdown data-ignore-morph>completed message</div>`) {
+		t.Errorf("completed message is morphable:\n%s", html)
+	}
+	if !strings.Contains(html, `<div class="t-body" data-markdown>streaming message</div>`) {
+		t.Errorf("streaming message was frozen:\n%s", html)
+	}
+	for _, args := range []string{"RUNNING_ARGS", "DONE_ARGS"} {
+		if !strings.Contains(html, `data-language="json" data-ignore-morph>`+args+`</code>`) {
+			t.Errorf("tool arguments %q are morphable:\n%s", args, html)
+		}
+	}
+	if !strings.Contains(html, `data-language="">RUNNING_RESULT</code>`) {
+		t.Errorf("running tool result was frozen:\n%s", html)
+	}
+	if !strings.Contains(html, `data-language="" data-ignore-morph>DONE_RESULT</code>`) {
+		t.Errorf("completed tool result is morphable:\n%s", html)
+	}
+	if detailsTagOpen(html) {
+		t.Fatalf("tool defaulted open: %s", html)
+	}
+}
+
 func TestToolCardTemplateEscapesAndCollapses(t *testing.T) {
 	templates, err := parseTemplates(webFiles)
 	if err != nil {
@@ -1380,7 +1445,7 @@ func TestToolCardTemplateEscapesAndCollapses(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	if !strings.Contains(html, `<details class="tool-card`) {
+	if !strings.Contains(html, `class="tool-card tool-done"`) {
 		t.Fatal("tool card details missing\n" + html)
 	}
 	if strings.Contains(html, `<script>alert`) {
