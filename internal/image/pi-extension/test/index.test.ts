@@ -94,6 +94,57 @@ test("unknown workers fail before child provisioning", async (t) => {
   assert.equal(childCalls, 0);
 });
 
+test("semantic delegate validation rejects blank tasks before child provisioning", async (t) => {
+  let childCalls = 0;
+  const fixture = await server((req, res) => {
+    res.setHeader("content-type", "application/json");
+    if (req.url === "/v1/workers") {
+      res.end(JSON.stringify([{ workerType: "reviewer", description: "Reviews", profile: { provider: "provider", model: "model" } }]));
+      return;
+    }
+    childCalls++;
+    res.end(JSON.stringify({ kind: "read", workerType: "reviewer", sessionId: "child", output: "unexpected" }));
+  });
+  t.after(fixture.close);
+  const tools: Tool[] = [];
+  await extension({ registerCommand() {}, registerTool: (tool: Tool) => tools.push(tool) } as any, {
+    env: { KANEDIAS_SESSION_ID: "parent", KANEDIAS_SUPERVISOR_SOCKET: fixture.socket },
+  });
+
+  await assert.rejects(
+    tools[0]!.execute("call", { workerType: "reviewer", kind: "read", context: "fresh", task: "  " }, undefined, undefined, { sessionManager: {} }),
+    /invalid delegate_session arguments/,
+  );
+  assert.equal(childCalls, 0);
+});
+
+test("semantic handoff validation rejects blank fields before Git verification", async (t) => {
+  const fixture = await server((_req, res) => {
+    res.setHeader("content-type", "application/json");
+    res.end("[]");
+  });
+  t.after(fixture.close);
+  let execCalls = 0;
+  const tools: Tool[] = [];
+  await extension({
+    registerCommand() {},
+    registerTool: (tool: Tool) => tools.push(tool),
+    exec: async () => { execCalls++; return { stdout: "", stderr: "", code: 1, killed: false }; },
+  } as any, {
+    env: { KANEDIAS_SESSION_ID: "writer", KANEDIAS_SESSION_KIND: "write", KANEDIAS_SUPERVISOR_SOCKET: fixture.socket },
+  });
+
+  await assert.rejects(
+    tools[1]!.execute("call", {
+      repositories: [{ path: "/workspace/repo", repository: "owner/repo", baseCommit: "abc", branch: "feature", headCommit: "def" }],
+      summary: "  ",
+      verification: ["npm test"],
+    }, undefined, undefined, { shutdown() {} }),
+    /invalid handoff arguments/,
+  );
+  assert.equal(execCalls, 0);
+});
+
 test("handoff verifies refs, strips checkout paths, shuts down only after acceptance, and terminates", async (t) => {
   const workspace = await mkdtemp(path.join(os.tmpdir(), "kanedias-index-handoff-"));
   const checkout = path.join(workspace, "owner", "repo");

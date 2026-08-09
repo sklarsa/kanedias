@@ -1,9 +1,8 @@
 import type { ExtensionAPI, ExtensionContext } from "@earendil-works/pi-coding-agent";
-import { Value } from "typebox/value";
 import { prepareFork, validateForkSource } from "./fork.ts";
 import type { ForkSourceSnapshot } from "./fork.ts";
 import { verifyHandoff } from "./git-handoff.ts";
-import { delegateSessionSchema, handoffSchema } from "./schemas.ts";
+import { delegateSessionSchema, handoffSchema, isDelegateSessionInput, isHandoffInput } from "./schemas.ts";
 import { SupervisorClient } from "./supervisor-client.ts";
 import type { CreateChildRequest, DelegateSessionInput, HandoffInput, WorkerSummary } from "./types.ts";
 
@@ -40,7 +39,7 @@ export default async function kanediasExtension(pi: ExtensionAPI, options: Exten
   // fragile dependency on pi's headless-RPC session_start emission timing.
   pi.registerCommand("present_e2e_question", {
     description: "Present the E2E controlled question and await the operator answer.",
-    handler: (args, ctx) => {
+    handler: async (args, ctx) => {
       const title = (args.trim() || `Kanedias E2E controlled question ${env.KANEDIAS_E2E_RUN_ID ?? ""}`).trim();
       const configuredTimeout = Number(env.KANEDIAS_E2E_QUESTION_TIMEOUT_MS ?? "60000");
       const timeout = Number.isFinite(configuredTimeout) && configuredTimeout > 0 && configuredTimeout <= 60_000 ? configuredTimeout : 60_000;
@@ -86,7 +85,7 @@ export default async function kanediasExtension(pi: ExtensionAPI, options: Exten
     promptGuidelines: ["Use delegate_session only when the task is independent enough to justify a separate supervised session."],
     parameters: delegateSessionSchema,
     async execute(_toolCallId, params, signal, _onUpdate, ctx) {
-      if (!Value.Check(delegateSessionSchema, params)) throw new Error("invalid delegate_session arguments");
+      if (!isDelegateSessionInput(params)) throw new Error("invalid delegate_session arguments");
       const input = params as DelegateSessionInput;
       let forkSource: ForkSourceSnapshot | undefined;
       if (input.context === "fork") {
@@ -132,7 +131,7 @@ export default async function kanediasExtension(pi: ExtensionAPI, options: Exten
     executionMode: "sequential",
     async execute(_toolCallId, params, signal, _onUpdate, ctx: ExtensionContext) {
       if (env.KANEDIAS_SESSION_KIND !== "write") throw new Error("handoff is available only in a supervised write session");
-      if (!Value.Check(handoffSchema, params)) throw new Error("invalid handoff arguments");
+      if (!isHandoffInput(params)) throw new Error("invalid handoff arguments");
       const input = params as HandoffInput;
       const durable = await verifyHandoff(pi, input, {
         ...(signal ? { signal } : {}),

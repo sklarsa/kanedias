@@ -1,27 +1,49 @@
+import { StringEnum } from "@earendil-works/pi-ai";
 import { Type } from "typebox";
+import { Value } from "typebox/value";
+import type { DelegateSessionInput, HandoffInput } from "./types.ts";
 
-const nonBlank = Type.String({ minLength: 1, pattern: ".*\\S.*" });
+const nonEmpty = Type.String({ minLength: 1 });
 
 export const delegateSessionSchema = Type.Object({
-  workerType: nonBlank,
-  kind: Type.Union([Type.Literal("read"), Type.Literal("write")]),
-  context: Type.Union([Type.Literal("fresh"), Type.Literal("fork")]),
-  task: nonBlank,
+  workerType: nonEmpty,
+  kind: StringEnum(["read", "write"] as const),
+  context: StringEnum(["fresh", "fork"] as const),
+  task: nonEmpty,
 }, { additionalProperties: false });
 
+export function isDelegateSessionInput(input: unknown): input is DelegateSessionInput {
+  if (!Value.Check(delegateSessionSchema, input)) return false;
+  const candidate = input as DelegateSessionInput;
+  return candidate.workerType.trim() !== "" && candidate.task.trim() !== "";
+}
+
 const repositoryHandoffInputSchema = Type.Object({
-  path: nonBlank,
-  repository: nonBlank,
-  baseCommit: nonBlank,
-  branch: nonBlank,
-  headCommit: nonBlank,
+  path: nonEmpty,
+  repository: nonEmpty,
+  baseCommit: nonEmpty,
+  branch: nonEmpty,
+  headCommit: nonEmpty,
 }, { additionalProperties: false });
 
 export const handoffSchema = Type.Object({
   repositories: Type.Array(repositoryHandoffInputSchema, { minItems: 1 }),
-  summary: nonBlank,
-  verification: Type.Array(nonBlank),
+  summary: nonEmpty,
+  verification: Type.Array(nonEmpty),
 }, { additionalProperties: false });
+
+export function isHandoffInput(input: unknown): input is HandoffInput {
+  if (!Value.Check(handoffSchema, input)) return false;
+  const candidate = input as HandoffInput;
+  return candidate.summary.trim() !== ""
+    && candidate.verification.every((entry) => entry.trim() !== "")
+    && candidate.repositories.every((repository) =>
+      repository.path.trim() !== ""
+      && repository.repository.trim() !== ""
+      && repository.baseCommit.trim() !== ""
+      && repository.branch.trim() !== ""
+      && repository.headCommit.trim() !== "");
+}
 
 const repositoryHandoffSchema = Type.Object({
   repository: Type.String(),
