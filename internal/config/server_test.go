@@ -65,6 +65,8 @@ source = "images:"
 image = "debian/13"
 
 [server]
+hostname = "steven-desktop"
+require_session = true
 discovery_interval = "5s"
 snapshot_interval = "1s"
 spawn_timeout = "2m"
@@ -90,6 +92,12 @@ spawn_timeout = "2m"
 	if resolved.SpawnTimeout != 2*time.Minute {
 		t.Errorf("SpawnTimeout = %v, want 2m", resolved.SpawnTimeout)
 	}
+	if resolved.Hostname != "steven-desktop" {
+		t.Errorf("Hostname = %q, want steven-desktop", resolved.Hostname)
+	}
+	if !resolved.RequireSession {
+		t.Error("RequireSession = false, want explicit true preserved")
+	}
 }
 
 func TestServerConfigResolveDefaultDurations(t *testing.T) {
@@ -106,6 +114,55 @@ func TestServerConfigResolveDefaultDurations(t *testing.T) {
 	}
 	if resolved.SpawnTimeout != DefaultServerSpawnTimeout {
 		t.Errorf("SpawnTimeout = %v, want %v", resolved.SpawnTimeout, DefaultServerSpawnTimeout)
+	}
+	if resolved.RequireSession {
+		t.Error("RequireSession = true, want false when omitted")
+	}
+	if resolved.Hostname != "" {
+		t.Errorf("Hostname = %q, want empty fallback", resolved.Hostname)
+	}
+}
+
+func TestServerConfigResolveDefaultsToTrustedNetworkMode(t *testing.T) {
+	resolved, err := (ServerConfig{}).Resolve()
+	if err != nil {
+		t.Fatal(err)
+	}
+	if resolved.RequireSession {
+		t.Fatal("RequireSession = true, want false when omitted")
+	}
+	if resolved.Hostname != "" {
+		t.Fatalf("Hostname = %q, want empty fallback", resolved.Hostname)
+	}
+}
+
+func TestServerConfigResolveAdvertisedHostname(t *testing.T) {
+	requireSession := true
+	resolved, err := (ServerConfig{
+		Hostname: "steven-desktop", RequireSession: &requireSession,
+	}).Resolve()
+	if err != nil {
+		t.Fatal(err)
+	}
+	if resolved.Hostname != "steven-desktop" {
+		t.Fatalf("Hostname = %q, want steven-desktop", resolved.Hostname)
+	}
+	if !resolved.RequireSession {
+		t.Fatal("RequireSession = false, want explicit true preserved")
+	}
+}
+
+func TestServerConfigResolveRejectsInvalidHostname(t *testing.T) {
+	for _, hostname := range []string{
+		"http://steven-desktop", "steven-desktop:8080", "steven/desktop",
+		"two words", "-steven", "steven-", "steven..desktop",
+	} {
+		t.Run(hostname, func(t *testing.T) {
+			_, err := (ServerConfig{Hostname: hostname}).Resolve()
+			if err == nil || !strings.Contains(err.Error(), "server hostname") {
+				t.Fatalf("Resolve() error = %v, want server hostname error", err)
+			}
+		})
 	}
 }
 

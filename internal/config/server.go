@@ -2,6 +2,7 @@ package config
 
 import (
 	"fmt"
+	"strings"
 	"time"
 )
 
@@ -30,6 +31,7 @@ func (d *Duration) UnmarshalText(text []byte) error {
 // ServerConfig holds raw TOML server settings. Pointer durations distinguish
 // omission from an explicit zero; managers resolve empty paths to defaults.
 type ServerConfig struct {
+	Hostname          string    `toml:"hostname"`
 	RootSocketDir     string    `toml:"root_socket_dir"`
 	SessionLogDir     string    `toml:"session_log_dir"`
 	DiscoveryInterval *Duration `toml:"discovery_interval"`
@@ -86,6 +88,7 @@ func (c SupervisorEventsConfig) Limits() (EventLimits, error) {
 // ResolvedServerConfig contains fully-merged server settings. Path and binary
 // fields stay empty until manager path resolution.
 type ResolvedServerConfig struct {
+	Hostname          string
 	RootSocketDir     string
 	SessionLogDir     string
 	DiscoveryInterval time.Duration
@@ -95,13 +98,38 @@ type ResolvedServerConfig struct {
 	RequireSession    bool
 }
 
-// Resolve applies duration defaults and rejects zero or negative intervals.
+func validateServerHostname(hostname string) error {
+	if hostname == "" {
+		return nil
+	}
+	if len(hostname) > 253 || strings.ContainsAny(hostname, ":/\\?#[]@ \t\r\n") {
+		return fmt.Errorf("server hostname %q must be a plain DNS hostname", hostname)
+	}
+	for _, label := range strings.Split(hostname, ".") {
+		if len(label) == 0 || len(label) > 63 || label[0] == '-' || label[len(label)-1] == '-' {
+			return fmt.Errorf("server hostname %q contains an invalid DNS label", hostname)
+		}
+		for _, char := range label {
+			if (char < 'a' || char > 'z') && (char < 'A' || char > 'Z') &&
+				(char < '0' || char > '9') && char != '-' {
+				return fmt.Errorf("server hostname %q contains an invalid DNS label", hostname)
+			}
+		}
+	}
+	return nil
+}
+
+// Resolve applies duration defaults and rejects invalid hostnames and zero or negative intervals.
 func (c ServerConfig) Resolve() (ResolvedServerConfig, error) {
-	requireSession := true
+	if err := validateServerHostname(c.Hostname); err != nil {
+		return ResolvedServerConfig{}, err
+	}
+	requireSession := false
 	if c.RequireSession != nil {
 		requireSession = *c.RequireSession
 	}
 	resolved := ResolvedServerConfig{
+		Hostname:          c.Hostname,
 		RootSocketDir:     c.RootSocketDir,
 		SessionLogDir:     c.SessionLogDir,
 		SessionBinary:     c.SessionBinary,
