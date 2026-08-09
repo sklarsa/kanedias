@@ -41,20 +41,13 @@ type BaseImage struct {
 }
 
 type Workspace struct {
-	Pool   string         `toml:"pool"`
-	Volume string         `toml:"volume"`
-	Repos  []string       `toml:"repos"`
-	Incus  IncusWorkspace `toml:"incus"`
-}
-
-type IncusWorkspace struct {
+	Pool   string   `toml:"pool"`
 	Volume string   `toml:"volume"`
-	Images []string `toml:"images"`
+	Repos  []string `toml:"repos"`
 }
 
 const (
-	DefaultWorkspaceVolume      = "kanedias-workspace-seed"
-	DefaultIncusWorkspaceVolume = "kanedias-incus-seed"
+	DefaultWorkspaceVolume = "kanedias-workspace-seed"
 )
 
 type Network struct {
@@ -79,9 +72,6 @@ func Load(path string) (Config, error) {
 	cfg.Dir = filepath.Dir(absPath)
 	if cfg.Workspace.Volume == "" {
 		cfg.Workspace.Volume = DefaultWorkspaceVolume
-	}
-	if cfg.Workspace.Incus.Volume == "" {
-		cfg.Workspace.Incus.Volume = DefaultIncusWorkspaceVolume
 	}
 	if _, err := cfg.Network.IPv4Prefix(); err != nil {
 		return Config{}, err
@@ -151,17 +141,6 @@ func (cfg Config) ValidateLifecycle() error {
 	}
 	if cfg.BaseImage.Image == "" {
 		return fmt.Errorf("base_image.image is required")
-	}
-	workspaceSeed := cfg.Workspace.Volume
-	if workspaceSeed == "" {
-		workspaceSeed = DefaultWorkspaceVolume
-	}
-	incusSeed := cfg.Workspace.Incus.Volume
-	if incusSeed == "" {
-		incusSeed = DefaultIncusWorkspaceVolume
-	}
-	if workspaceSeed == incusSeed {
-		return fmt.Errorf("workspace.volume and workspace.incus.volume must be different")
 	}
 	return nil
 }

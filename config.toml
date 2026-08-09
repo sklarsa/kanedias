@@ -38,12 +38,6 @@ repos = [
     "sklarsa/kanedias"
 ]
 
-[workspace.incus]
-volume = "kanedias-incus-seed"
-images = [
-    "images:debian/13",
-]
-
 [workers.researcher]
 description = "Research external sources and return evidence without modifying files."
 provider = "openai-codex"
