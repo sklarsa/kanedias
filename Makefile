@@ -46,7 +46,7 @@ run: build ## Run the egress proxy (only if not already up) + web server on 127.
 		$(BINARY) --config $(CONFIG) proxy run & \
 		proxy_pid=$$!; \
 		trap 'echo "stopping proxy..."; kill $$proxy_pid 2>/dev/null || true' EXIT INT TERM; \
-	fi
+	fi; \
 	$(BINARY) --config $(CONFIG) server --listen 127.0.0.1:8080
 
 server: build ## Run the web server on 127.0.0.1:8080 (sessions also need the proxy; see `proxy` or `run`)
