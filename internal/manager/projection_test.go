@@ -66,6 +66,98 @@ func TestProjectActivitySurfacesOnlyContentInTurn(t *testing.T) {
 	}
 }
 
+func TestProjectActivityMarksAssistantCompleteWithoutChangingIdentity(t *testing.T) {
+	projector := newActivityProjector()
+	projector.Apply(piEvent(7, "s", "message_update", map[string]any{
+		"assistantMessageEvent": map[string]any{"type": "text_delta", "delta": "hello"},
+	}))
+
+	streaming := projector.Items()
+	if len(streaming) != 1 || streaming[0].Seq != 7 || streaming[0].Complete {
+		t.Fatalf("streaming item = %#v", streaming)
+	}
+
+	projector.Apply(piEvent(8, "s", "message_end", map[string]any{
+		"message": map[string]any{
+			"role": "assistant", "stopReason": "stop",
+			"content": []any{map[string]any{"type": "text", "text": "hello"}},
+		},
+	}))
+	completed := projector.Items()
+	if len(completed) != 1 || completed[0].Seq != 7 || !completed[0].Complete {
+		t.Fatalf("completed item = %#v", completed)
+	}
+}
+
+func TestProjectActivityUnmatchedMessageEndKeepsAssistantOpen(t *testing.T) {
+	tests := []struct {
+		name     string
+		endEvent supervisor.EventEnvelope
+		wantUser bool
+	}{
+		{
+			name: "invalid JSON",
+			endEvent: supervisor.EventEnvelope{
+				Seq: 2, SessionID: "s", SourceSeq: 2, Kind: "pi",
+				Payload: json.RawMessage(`{"type":"message_end",`),
+			},
+		},
+		{name: "missing message", endEvent: piEvent(2, "s", "message_end", nil)},
+		{name: "null message", endEvent: piEvent(2, "s", "message_end", map[string]any{"message": nil})},
+		{
+			name: "user message",
+			endEvent: piEvent(2, "s", "message_end", map[string]any{
+				"message": map[string]any{
+					"role":    "user",
+					"content": []any{map[string]any{"type": "text", "text": "prompt"}},
+				},
+			}),
+			wantUser: true,
+		},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			projector := newActivityProjector()
+			projector.Apply(piEvent(1, "s", "message_update", map[string]any{
+				"assistantMessageEvent": map[string]any{"type": "text_delta", "delta": "hello"},
+			}))
+			projector.Apply(tt.endEvent)
+
+			items := projector.Items()
+			assertOpenAssistantItem(t, items, "hello")
+			var hasUser bool
+			for _, item := range items {
+				hasUser = hasUser || item.Kind == "user_message"
+			}
+			if hasUser != tt.wantUser {
+				t.Fatalf("user message projected = %v, want %v: %#v", hasUser, tt.wantUser, items)
+			}
+
+			projector.Apply(piEvent(3, "s", "message_update", map[string]any{
+				"assistantMessageEvent": map[string]any{"type": "text_delta", "delta": " world"},
+			}))
+			assertOpenAssistantItem(t, projector.Items(), "hello world")
+		})
+	}
+}
+
+func assertOpenAssistantItem(t *testing.T, items []ActivityItem, wantText string) {
+	t.Helper()
+	var assistantItems []ActivityItem
+	for _, item := range items {
+		if item.Kind == "message_update" {
+			assistantItems = append(assistantItems, item)
+		}
+	}
+	if len(assistantItems) != 1 {
+		t.Fatalf("assistant items = %#v, want one item", assistantItems)
+	}
+	if assistantItems[0].Seq != 1 || assistantItems[0].Text != wantText || assistantItems[0].Complete {
+		t.Fatalf("open assistant item = %#v, want seq 1 text %q and incomplete", assistantItems[0], wantText)
+	}
+}
+
 func TestProjectActivityShowsPromptAndCoalescesRepeatedProviderError(t *testing.T) {
 	errorMessage := map[string]any{
 		"message": map[string]any{
@@ -94,6 +186,9 @@ func TestProjectActivityShowsPromptAndCoalescesRepeatedProviderError(t *testing.
 	if !items[1].IsError || items[1].Label != "Model error" || items[1].Text != "Stream ended without finish_reason" {
 		t.Fatalf("error item = %#v", items[1])
 	}
+	if !items[0].Complete || !items[1].Complete {
+		t.Fatalf("one-shot user/error items should be complete: %#v", items)
+	}
 }
 
 func TestProjectActivityUnknownEventBecomesGeneric(t *testing.T) {
@@ -113,6 +208,9 @@ func TestProjectActivityUnknownEventBecomesGeneric(t *testing.T) {
 	// Must not contain raw payload text.
 	if items[0].Text != "" {
 		t.Fatalf("text should be empty for unknown event, got %q", items[0].Text)
+	}
+	if !items[0].Complete {
+		t.Fatal("one-shot generic item should be complete")
 	}
 }
 
@@ -137,6 +235,9 @@ func TestProjectActivityToolLifecycle(t *testing.T) {
 	}
 	if items[0].Status != "done" {
 		t.Fatalf("status = %q, want done", items[0].Status)
+	}
+	if !items[0].Complete {
+		t.Fatal("completed tool should be immutable")
 	}
 }
 
@@ -166,6 +267,9 @@ func TestProjectActivityExtensionError(t *testing.T) {
 	}
 	if !items[0].IsError {
 		t.Fatal("extension_error should be IsError=true")
+	}
+	if !items[0].Complete {
+		t.Fatal("one-shot extension_error item should be complete")
 	}
 }
 

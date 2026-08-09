@@ -6,7 +6,7 @@
     <div class="transcript">
       {{range .Items}}
       {{if .IsTool}}
-      <details class="tool-card {{.ToolCardClass}}" data-tool-card>
+      <details id="activity-item-{{.Seq}}" class="tool-card {{.ToolCardClass}}" data-tool-card data-preserve-attr="open">
         <summary class="tool-summary" tabindex="0">
           <span class="tool-chevron" aria-hidden="true">▸</span>
           <span class="tool-summary-label">{{.Label}}</span>
@@ -21,7 +21,7 @@
               <span class="tool-section-title">Arguments{{if .ToolArgsTruncated}} <span class="tool-trunc-label">truncated</span>{{end}}</span>
               <button type="button" class="copy-btn" data-copy-tool>copy</button>
             </div>
-            <pre class="tool-code-wrap"><code class="tool-code hljs" data-tool-code data-language="json">{{.ToolArgs}}</code></pre>
+            <pre class="tool-code-wrap"><code class="tool-code hljs" data-tool-code data-language="json" data-ignore-morph>{{.ToolArgs}}</code></pre>
           </section>
           {{end}}
           {{if .ToolOutput}}
@@ -30,15 +30,15 @@
               <span class="tool-section-title">Result{{if .ToolOutputTruncated}} <span class="tool-trunc-label">truncated</span>{{end}}</span>
               <button type="button" class="copy-btn" data-copy-tool>copy</button>
             </div>
-            <pre class="tool-code-wrap"><code class="tool-code hljs" data-tool-code data-language="{{.ToolLanguage}}">{{.ToolOutput}}</code></pre>
+            <pre class="tool-code-wrap"><code class="tool-code hljs" data-tool-code data-language="{{.ToolLanguage}}"{{if .Complete}} data-ignore-morph{{end}}>{{.ToolOutput}}</code></pre>
           </section>
           {{end}}
         </div>
       </details>
       {{else}}
-      <div class="t-turn {{if .IsError}}t-error{{end}}">
+      <div id="activity-item-{{.Seq}}" class="t-turn {{if .IsError}}t-error{{end}}">
         <span class="t-role {{.Kind}}">{{.Label}}</span>
-        {{if .Text}}<div class="t-body"{{if .IsMarkdown}} data-markdown{{end}}>{{.Text}}</div>{{end}}
+        {{if .Text}}<div class="t-body"{{if .IsMarkdown}} data-markdown{{end}}{{if .Complete}} data-ignore-morph{{end}}>{{.Text}}</div>{{end}}
       </div>
       {{end}}
       {{end}}

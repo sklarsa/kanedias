@@ -121,6 +121,9 @@ type activityItemView struct {
 	ToolName   string
 	IsError    bool
 	IsMarkdown bool
+	// Complete allows the template to leave finalized browser-rendered content
+	// untouched while the surrounding activity panel continues to morph.
+	Complete bool
 	// Tool projection fields (bounded at 64 KiB by the manager).
 	IsTool        bool
 	ToolSummary   string
@@ -359,6 +362,7 @@ func newActivityView(state manager.SessionState) activityView {
 			ToolName:   a.ToolName,
 			IsError:    a.IsError,
 			IsMarkdown: activityUsesMarkdown(a.Kind),
+			Complete:   a.Complete,
 		}
 		if a.IsTool {
 			view.IsTool = true

@@ -96,12 +96,14 @@ func (p *activityProjector) applyPiType(event supervisor.EventEnvelope, piType s
 		_ = json.Unmarshal(event.Payload, &payload)
 		p.items = append(p.items, ActivityItem{
 			Seq: event.Seq, Kind: "extension_error", Label: "Extension error",
-			Text: payload.Message, IsError: true,
+			Text: payload.Message, IsError: true, Complete: true,
 		})
 	default:
-		// Unknown Pi event: generic item without raw payload.
+		// Unknown Pi event: generic item without raw payload. It is a one-shot
+		// projection with no later mutation, so it is marked complete.
 		p.items = append(p.items, ActivityItem{
 			Seq: event.Seq, Kind: "event", Label: "Pi event: " + piType,
+			Complete: true,
 		})
 	}
 }
@@ -136,8 +138,25 @@ func (p *activityProjector) applyMessageUpdate(event supervisor.EventEnvelope) {
 	}
 }
 
+// completeOpenText marks the currently open assistant text item complete and
+// then clears its tracking state. It is a no-op when no assistant text item is
+// open, so a malformed message_end can never freeze prior streaming content.
+func (p *activityProjector) completeOpenText() {
+	if !p.textOpen {
+		return
+	}
+	for i := len(p.items) - 1; i >= 0; i-- {
+		if p.items[i].Kind == "message_update" && p.items[i].Seq == p.textSeq {
+			p.items[i].Complete = true
+			break
+		}
+	}
+	p.textOpen = false
+	p.textSeq = 0
+}
+
 type messageEndPayload struct {
-	Message struct {
+	Message *struct {
 		Role         string `json:"role"`
 		StopReason   string `json:"stopReason"`
 		ErrorMessage string `json:"errorMessage"`
@@ -149,11 +168,8 @@ type messageEndPayload struct {
 }
 
 func (p *activityProjector) applyMessageEnd(event supervisor.EventEnvelope) {
-	p.textOpen = false
-	p.textSeq = 0
-
 	var payload messageEndPayload
-	if err := json.Unmarshal(event.Payload, &payload); err != nil {
+	if err := json.Unmarshal(event.Payload, &payload); err != nil || payload.Message == nil {
 		return
 	}
 	if payload.Message.Role == "user" {
@@ -165,12 +181,17 @@ func (p *activityProjector) applyMessageEnd(event supervisor.EventEnvelope) {
 		}
 		if text != "" {
 			p.items = append(p.items, ActivityItem{
-				Seq: event.Seq, Kind: "user_message", Label: "You", Text: text,
+				Seq: event.Seq, Kind: "user_message", Label: "You", Text: text, Complete: true,
 			})
 		}
 		return
 	}
-	if payload.Message.Role != "assistant" || payload.Message.StopReason != "error" || payload.Message.ErrorMessage == "" {
+	if payload.Message.Role != "assistant" {
+		return
+	}
+	// Only a validated assistant message_end may freeze the open assistant text.
+	p.completeOpenText()
+	if payload.Message.StopReason != "error" || payload.Message.ErrorMessage == "" {
 		return
 	}
 	if len(p.items) > 0 {
@@ -181,7 +202,7 @@ func (p *activityProjector) applyMessageEnd(event supervisor.EventEnvelope) {
 	}
 	p.items = append(p.items, ActivityItem{
 		Seq: event.Seq, Kind: "model_error", Label: "Model error",
-		Text: payload.Message.ErrorMessage, IsError: true,
+		Text: payload.Message.ErrorMessage, IsError: true, Complete: true,
 	})
 }
 
@@ -476,6 +497,7 @@ func (p *activityProjector) applyToolEnd(event supervisor.EventEnvelope) {
 		p.items[idx].ToolOutput = out
 		p.items[idx].ToolOutputTruncated = trunc
 		p.items[idx].ToolTruncated = p.items[idx].ToolTruncated || trunc
+		p.items[idx].Complete = true
 	}
 }
 

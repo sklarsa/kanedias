@@ -83,6 +83,9 @@ type ActivityItem struct {
 	// actually cut, so the explicit marker stays on the affected field.
 	ToolArgsTruncated   bool
 	ToolOutputTruncated bool
+	// Complete reports that later events cannot change this item's displayed
+	// source content. The server uses it only to protect browser-rendered DOM.
+	Complete bool
 }
 
 // SessionState is the public projection of one session within a root tree.
