@@ -1405,6 +1405,12 @@ func TestProjectStylesDefineAstrolabeVisualSystem(t *testing.T) {
 		// and 44px mobile targets without reusing the sidebar scrim.
 		"#new-session-modal::backdrop",
 		"#new-session-modal details{",
+		"#new-session-modal form{",
+		"overflow-y:auto",
+		"#new-session-modal .modal-actions{",
+		"position:sticky",
+		"bottom:0",
+		"flex:0 0 auto",
 		"#new-session-modal[aria-busy=\"true\"]",
 		"#new-session-modal select:focus-visible",
 		"min-height:44px",
@@ -1412,6 +1418,14 @@ func TestProjectStylesDefineAstrolabeVisualSystem(t *testing.T) {
 	for _, want := range required {
 		if !strings.Contains(styles, want) {
 			t.Errorf("project stylesheet does not contain %q", want)
+		}
+	}
+	for description, pattern := range map[string]string{
+		"full modal form scrolls within its cap": `(?s)#new-session-modal form\{[^}]*overflow-y:auto`,
+		"modal actions stay reachable":           `(?s)#new-session-modal \.modal-actions\{[^}]*position:sticky[^}]*bottom:0[^}]*flex:0 0 auto`,
+	} {
+		if !regexp.MustCompile(pattern).MatchString(styles) {
+			t.Errorf("project stylesheet does not prove %s", description)
 		}
 	}
 

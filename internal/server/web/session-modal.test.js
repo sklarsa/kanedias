@@ -48,25 +48,30 @@ class FakeTarget {
 }
 
 class FakeOption extends FakeTarget {
-  constructor(value, levels, defaultThinking) {
+  constructor(value, levels, defaultThinking, defaultSelected = false) {
     super();
     this.value = value;
     this.textContent = value;
+    this.defaultSelected = defaultSelected;
     if (levels !== undefined) this.setAttribute("data-thinking-levels", levels);
     if (defaultThinking !== undefined) this.setAttribute("data-default-thinking", defaultThinking);
   }
 }
 
 class FakeSelect extends FakeTarget {
-  constructor(options, selectedValue, defaultValue) {
+  constructor(options) {
     super();
     this.options = options;
-    this.defaultValue = defaultValue;
-    this._value = selectedValue;
+    const configured = options.find((item) => item.defaultSelected);
+    this._value = configured ? configured.value : options.length ? options[0].value : "";
   }
   get selectedIndex() { return this.options.findIndex((option) => option.value === this._value); }
   get value() { return this._value; }
   set value(value) { this._value = String(value); }
+  reset() {
+    const configured = this.options.find((item) => item.defaultSelected);
+    this._value = configured ? configured.value : this.options.length ? this.options[0].value : "";
+  }
   replaceChildren(...options) {
     this.options = options;
     if (!options.some((option) => option.value === this._value)) this._value = options.length ? options[0].value : "";
@@ -83,8 +88,8 @@ class FakeDialog extends FakeTarget {
   close() { this.open = false; this.dispatch("close"); }
 }
 
-function option(value, levels, defaultThinking) {
-  return new FakeOption(value, levels, defaultThinking);
+function option(value, levels, defaultThinking, defaultSelected) {
+  return new FakeOption(value, levels, defaultThinking, defaultSelected);
 }
 
 function fixture() {
@@ -101,7 +106,7 @@ function fixture() {
   form.reset = function () {
     this.resetCalls++;
     for (const select of [rootModel, rootThinking, workerModelA, workerThinkingA, workerModelB, workerThinkingB]) {
-      select.value = select.defaultValue;
+      select.reset();
     }
   };
   const close = new FakeTarget();
@@ -114,27 +119,27 @@ function fixture() {
   details.open = true;
 
   const rootModel = new FakeSelect([
-    option("deep", "high,xhigh", "high"),
+    option("deep", "high,xhigh", "high", true),
     option("fast", "off,medium", "off")
-  ], "fast", "deep");
+  ]);
   rootModel.focusCalls = 0;
   rootModel.focus = function () { this.focusCalls++; };
-  const rootThinking = new FakeSelect([option("off"), option("medium")], "medium", "xhigh");
+  const rootThinking = new FakeSelect([option("high"), option("xhigh", undefined, undefined, true)]);
 
   const workerModelA = new FakeSelect([
-    option("deep", "high,xhigh", "high"),
+    option("deep", "high,xhigh", "high", true),
     option("fast", "off,medium", "off")
-  ], "fast", "deep");
-  const workerThinkingA = new FakeSelect([option("off"), option("medium")], "off", "high");
+  ]);
+  const workerThinkingA = new FakeSelect([option("high", undefined, undefined, true), option("xhigh")]);
   const workerA = new FakeTarget();
   workerA.setAttribute("data-worker-type", "oracle");
   workerA.querySelector = (selector) => selector === "[data-worker-model]" ? workerModelA : workerThinkingA;
 
   const workerModelB = new FakeSelect([
     option("deep", "high,xhigh", "high"),
-    option("solo", "off", "off")
-  ], "deep", "solo");
-  const workerThinkingB = new FakeSelect([option("high"), option("xhigh")], "xhigh", "off");
+    option("solo", "off", "off", true)
+  ]);
+  const workerThinkingB = new FakeSelect([option("off", undefined, undefined, true)]);
   const workerB = new FakeTarget();
   workerB.setAttribute("data-worker-type", "worker");
   workerB.querySelector = (selector) => selector === "[data-worker-model]" ? workerModelB : workerThinkingB;
@@ -181,13 +186,26 @@ async function settle() {
   await new Promise((resolve) => setImmediate(resolve));
 }
 
+function deferred() {
+  let resolve;
+  let reject;
+  const promise = new Promise((res, rej) => { resolve = res; reject = rej; });
+  return { promise, resolve, reject };
+}
+
 test("open resets configured defaults, rebuilds thinking, and focuses the root model", () => {
   const f = fixture();
+  // Native selects keep the server's selected attribute as defaultSelected even
+  // when their current selectedIndex/value changes before binding.
+  f.rootModel.value = "fast";
+  f.rootThinking.value = "high";
   const controller = modalUI.bind(f.document, async () => response(201, { sessionId: "new" }));
   f.trigger.dispatch("click");
   assert.equal(f.form.resetCalls, 1);
   assert.equal(f.dialog.open, true);
   assert.equal(f.rootModel.value, "deep");
+  assert.equal(f.rootModel.selectedIndex, 0);
+  assert.equal(f.rootModel.options[0].defaultSelected, true);
   assert.deepEqual(f.rootThinking.options.map((item) => item.value), ["high", "xhigh"]);
   assert.equal(f.rootThinking.value, "xhigh");
   assert.equal(f.rootModel.focusCalls, 1);
@@ -219,6 +237,15 @@ test("one-level model displays but disables its thinking selector", () => {
 
 test("buildRequest returns the root and every worker exactly once", () => {
   const f = fixture();
+  f.rootModel.value = "fast";
+  f.rootThinking.replaceChildren(option("off"), option("medium"));
+  f.rootThinking.value = "medium";
+  f.workerModelA.value = "fast";
+  f.workerThinkingA.replaceChildren(option("off"), option("medium"));
+  f.workerThinkingA.value = "off";
+  f.workerModelB.value = "deep";
+  f.workerThinkingB.replaceChildren(option("high"), option("xhigh"));
+  f.workerThinkingB.value = "xhigh";
   const got = modalUI.buildRequest(f.dialog);
   assert.deepEqual(got, {
     root: { modelType: "fast", thinkingLevel: "medium" },
@@ -302,6 +329,48 @@ test("synchronous fetch failure restores controls and keeps the modal open", asy
   assert.equal(f.status.textContent, "The session could not be launched. Please try again.");
 });
 
+test("HTTP 200 with a valid-looking body is not launch success", async () => {
+  const f = fixture();
+  modalUI.bind(f.document, async () => response(200, { sessionId: "not-created" }));
+  f.trigger.dispatch("click");
+  f.form.dispatch("submit");
+  await settle();
+  assert.equal(f.dialog.open, true);
+  assert.equal(f.status.textContent, "The session could not be launched. Please try again.");
+  assert.equal(f.dialog.getAttribute("aria-busy"), null);
+});
+
+test("streaming response without Content-Length is canceled at the byte bound", async () => {
+  const f = fixture();
+  const chunks = [new Uint8Array(40000), new Uint8Array(40000)];
+  let reads = 0;
+  let cancels = 0;
+  const reply = {
+    status: 201,
+    headers: { get() { return null; } },
+    body: {
+      getReader() {
+        return {
+          async read() {
+            const value = chunks[reads++];
+            return value ? { done: false, value } : { done: true };
+          },
+          cancel() { cancels++; }
+        };
+      }
+    },
+    text() { throw new Error("streaming response must not use text()"); }
+  };
+  modalUI.bind(f.document, async () => reply);
+  f.trigger.dispatch("click");
+  f.form.dispatch("submit");
+  await settle();
+  assert.equal(reads, 2);
+  assert.equal(cancels, 1);
+  assert.equal(f.dialog.open, true);
+  assert.equal(f.status.textContent, "The session could not be launched. Please try again.");
+});
+
 test("201 closes and resets the modal", async () => {
   const f = fixture();
   modalUI.bind(f.document, async () => response(201, { sessionId: "created" }));
@@ -338,7 +407,8 @@ test("Cancel, close, backdrop, and native cancel close without fetch", () => {
 test("Escape is capture-consumed while open before terminal interrupt but unchanged outside", () => {
   const f = fixture();
   let interrupts = 0;
-  modalUI.bind(f.document, async () => response(201, {}));
+  let fetchCalls = 0;
+  modalUI.bind(f.document, async () => { fetchCalls++; return response(201, {}); });
   f.document.addEventListener("keydown", (event) => {
     if (event.key === "Escape") interrupts++;
   });
@@ -349,21 +419,96 @@ test("Escape is capture-consumed while open before terminal interrupt but unchan
   assert.equal(guarded.immediatePropagationStopped, true);
   assert.equal(f.dialog.open, false);
   assert.equal(interrupts, 0);
+  assert.equal(fetchCalls, 0);
 
   const outside = f.document.dispatch("keydown", { key: "Escape" });
   assert.equal(outside.defaultPrevented, false);
   assert.equal(interrupts, 1);
 });
 
-test("bind is idempotent and destroy removes listeners", () => {
+test("stale resolved and rejected fetches cannot mutate after close, reopen, or destroy", async () => {
+  for (const completion of ["resolve", "reject"]) {
+    for (const action of ["close", "reopen", "destroy"]) {
+      const f = fixture();
+      const pending = deferred();
+      const controller = modalUI.bind(f.document, () => pending.promise);
+      f.trigger.dispatch("click");
+      f.form.dispatch("submit");
+      assert.equal(f.dialog.getAttribute("aria-busy"), "true");
+
+      if (action === "close") controller.close();
+      if (action === "reopen") { controller.close(); controller.open(); }
+      if (action === "destroy") controller.destroy();
+      f.status.textContent = completion + "-after-" + action;
+      const snapshot = {
+        open: f.dialog.open,
+        busy: f.dialog.getAttribute("aria-busy"),
+        launchDisabled: f.launch.disabled,
+        status: f.status.textContent
+      };
+
+      if (completion === "resolve") pending.resolve(response(201, { sessionId: "stale" }));
+      else pending.reject(new Error("stale failure"));
+      await settle();
+      assert.deepEqual({
+        open: f.dialog.open,
+        busy: f.dialog.getAttribute("aria-busy"),
+        launchDisabled: f.launch.disabled,
+        status: f.status.textContent
+      }, snapshot, completion + " completion mutated state after " + action);
+    }
+  }
+});
+
+test("bind is idempotent and destroy removes every registered interaction listener", () => {
   const f = fixture();
-  const first = modalUI.bind(f.document, async () => response(201, {}));
-  const second = modalUI.bind(f.document, async () => response(201, {}));
+  let fetchCalls = 0;
+  const first = modalUI.bind(f.document, async () => { fetchCalls++; return response(201, {}); });
+  const second = modalUI.bind(f.document, async () => { fetchCalls++; return response(201, {}); });
   assert.equal(first, second);
   f.trigger.dispatch("click");
   assert.equal(f.form.resetCalls, 1);
   second.destroy();
   f.dialog.close();
+
+  const resetCalls = f.form.resetCalls;
   f.trigger.dispatch("click");
-  assert.equal(f.dialog.open, false);
+  assert.equal(f.dialog.open, false, "trigger listener remained");
+
+  const submit = f.form.dispatch("submit");
+  assert.equal(submit.defaultPrevented, false, "submit listener remained");
+  assert.equal(fetchCalls, 0);
+
+  f.rootModel.value = "fast";
+  f.workerModelA.value = "fast";
+  f.workerModelB.value = "deep";
+  const thinkingBefore = [f.rootThinking, f.workerThinkingA, f.workerThinkingB]
+    .map((select) => select.options.map((item) => item.value));
+  f.rootModel.dispatch("change");
+  f.workerModelA.dispatch("change");
+  f.workerModelB.dispatch("change");
+  assert.deepEqual(
+    [f.rootThinking, f.workerThinkingA, f.workerThinkingB]
+      .map((select) => select.options.map((item) => item.value)),
+    thinkingBefore,
+    "a model listener remained"
+  );
+
+  for (const dispatch of [
+    () => f.cancel.dispatch("click"),
+    () => f.close.dispatch("click"),
+    () => f.dialog.dispatch("click", { target: f.dialog }),
+    () => f.dialog.dispatch("cancel")
+  ]) {
+    f.dialog.open = true;
+    const event = dispatch();
+    assert.equal(f.dialog.open, true, "cancel/close listener remained");
+    assert.equal(event.defaultPrevented, false);
+  }
+
+  f.dialog.open = true;
+  const escape = f.document.dispatch("keydown", { key: "Escape" });
+  assert.equal(escape.defaultPrevented, false, "document Escape listener remained");
+  assert.equal(f.dialog.open, true);
+  assert.equal(f.form.resetCalls, resetCalls);
 });

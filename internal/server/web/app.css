@@ -720,6 +720,11 @@ details[open] > summary .twisty{ transform:rotate(90deg); }
   gap:14px;
   max-height:min(88vh, 760px);
   padding:20px;
+  overflow-y:auto;
+  overscroll-behavior:contain;
+}
+#new-session-modal form > *{
+  flex:0 0 auto;
 }
 #new-session-modal .modal-header{
   display:flex;
@@ -788,6 +793,7 @@ details[open] > summary .twisty{ transform:rotate(90deg); }
 }
 #new-session-modal details{
   min-height:0;
+  max-height:min(42vh, 360px);
   overflow:auto;
   padding:0 4px 2px 0;
 }
@@ -822,11 +828,16 @@ details[open] > summary .twisty{ transform:rotate(90deg); }
   background:var(--amber-glow);
 }
 #new-session-modal .modal-actions{
+  position:sticky;
+  bottom:0;
+  z-index:2;
   display:flex;
+  flex:0 0 auto;
   justify-content:flex-end;
   gap:10px;
-  padding-top:12px;
+  padding:12px 0 2px;
   border-top:1px solid var(--brass-line);
+  background:var(--bg-panel);
 }
 #new-session-modal .modal-actions button{
   min-width:104px;

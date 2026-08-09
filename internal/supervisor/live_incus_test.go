@@ -10,9 +10,11 @@ import (
 	"errors"
 	"fmt"
 	"io"
+	"mime"
 	"net"
 	"net/http"
 	"net/http/cookiejar"
+	"net/http/httptest"
 	"net/url"
 	"os"
 	"os/exec"
@@ -49,6 +51,83 @@ const (
 	metadataVolume  = "user.kanedias.workspace_volume"
 	metadataRun     = "user.kanedias.e2e_run"
 )
+
+func TestPostNewSessionJSONContract(t *testing.T) {
+	requestBody := manager.SessionLaunchRequest{
+		Root: manager.ModelSelection{ModelType: "root-model", ThinkingLevel: "high"},
+		Workers: []manager.WorkerModelSelection{
+			{WorkerType: "worker", ModelType: "worker-model", ThinkingLevel: "medium"},
+		},
+	}
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if r.Method != http.MethodPost {
+			t.Errorf("method = %s, want POST", r.Method)
+		}
+		origin := "http://" + r.Host
+		if got := r.Header.Get("Origin"); got != origin {
+			t.Errorf("Origin = %q, want %q", got, origin)
+		}
+		if got := r.Header.Get("Sec-Fetch-Site"); got != "same-origin" {
+			t.Errorf("Sec-Fetch-Site = %q, want same-origin", got)
+		}
+		if got := r.Header.Get("Content-Type"); got != "application/json" {
+			t.Errorf("Content-Type = %q, want application/json", got)
+		}
+		var got manager.SessionLaunchRequest
+		decoder := json.NewDecoder(r.Body)
+		decoder.DisallowUnknownFields()
+		if err := decoder.Decode(&got); err != nil {
+			t.Errorf("decode request: %v", err)
+		}
+		if !reflect.DeepEqual(got, requestBody) {
+			t.Errorf("request = %#v, want %#v", got, requestBody)
+		}
+		w.Header().Set("Content-Type", "application/json")
+		w.WriteHeader(http.StatusCreated)
+		_, _ = io.WriteString(w, `{"sessionId":"created-session"}`)
+	}))
+	defer server.Close()
+
+	sessionID, err := postNewSession(server.Client(), server.URL+"/ui/sessions", requestBody)
+	if err != nil {
+		t.Fatalf("postNewSession: %v", err)
+	}
+	if sessionID != "created-session" {
+		t.Fatalf("session ID = %q, want created-session", sessionID)
+	}
+}
+
+func TestPostNewSessionJSONRejectsInvalidResponses(t *testing.T) {
+	tests := []struct {
+		name        string
+		status      int
+		contentType string
+		body        string
+		wantError   string
+	}{
+		{name: "requires exact created", status: http.StatusOK, contentType: "application/json", body: `{"sessionId":"created"}`, wantError: "status=200"},
+		{name: "requires JSON content type", status: http.StatusCreated, contentType: "text/plain", body: `{"sessionId":"created"}`, wantError: "Content-Type"},
+		{name: "requires body", status: http.StatusCreated, contentType: "application/json", body: ``, wantError: "decode"},
+		{name: "requires nonempty session ID", status: http.StatusCreated, contentType: "application/json", body: `{"sessionId":"  "}`, wantError: "sessionId"},
+		{name: "rejects unknown field", status: http.StatusCreated, contentType: "application/json", body: `{"sessionId":"created","extra":true}`, wantError: "decode"},
+		{name: "rejects trailing JSON", status: http.StatusCreated, contentType: "application/json", body: `{"sessionId":"created"}{}`, wantError: "trailing"},
+		{name: "bounds response", status: http.StatusCreated, contentType: "application/json", body: `{"sessionId":"` + strings.Repeat("x", 70<<10) + `"}`, wantError: "too large"},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
+				w.Header().Set("Content-Type", tt.contentType)
+				w.WriteHeader(tt.status)
+				_, _ = io.WriteString(w, tt.body)
+			}))
+			defer server.Close()
+			_, err := postNewSession(server.Client(), server.URL+"/ui/sessions", map[string]any{"root": map[string]any{}})
+			if err == nil || !strings.Contains(err.Error(), tt.wantError) {
+				t.Fatalf("error = %v, want containing %q", err, tt.wantError)
+			}
+		})
+	}
+}
 
 func TestWriteManagedConfigMergesExistingTables(t *testing.T) {
 	dir := t.TempDir()
@@ -1846,7 +1925,9 @@ func (h *liveAcceptance) runServerManaged() {
 
 	// POST New Session twice with the complete configured default launch request.
 	for range 2 {
-		h.postDatastar(client, serverOrigin+"/ui/sessions", defaultLaunchRequest)
+		if _, err := postNewSession(client, serverOrigin+"/ui/sessions", defaultLaunchRequest); err != nil {
+			h.t.Fatalf("POST managed New Session: %v", err)
+		}
 	}
 
 	// Discover both roots by scanning the socket directory.
@@ -2150,6 +2231,68 @@ func (h *liveAcceptance) bootstrapManagedServer(server *acceptanceProcess) (stri
 	_ = server // used by caller to stop the process; no additional action needed.
 
 	return origin, httpClient
+}
+
+const maxNewSessionResponseBytes = 64 << 10
+
+// postNewSession sends the direct JSON New Session contract with the browser's
+// same-origin write-boundary headers. It accepts only the endpoint's exact 201
+// response and strictly decodes a bounded, nonempty session ID.
+func postNewSession(client *http.Client, fullURL string, body any) (string, error) {
+	encoded, err := json.Marshal(body)
+	if err != nil {
+		return "", fmt.Errorf("marshal body: %w", err)
+	}
+	parsed, err := url.Parse(fullURL)
+	if err != nil {
+		return "", fmt.Errorf("parse URL %q: %w", fullURL, err)
+	}
+	origin := parsed.Scheme + "://" + parsed.Host
+	req, err := http.NewRequest(http.MethodPost, fullURL, bytes.NewReader(encoded))
+	if err != nil {
+		return "", fmt.Errorf("new request: %w", err)
+	}
+	req.Host = parsed.Host
+	req.Header.Set("Content-Type", "application/json")
+	req.Header.Set("Origin", origin)
+	req.Header.Set("Sec-Fetch-Site", "same-origin")
+
+	resp, err := client.Do(req)
+	if err != nil {
+		return "", fmt.Errorf("POST: %w", err)
+	}
+	responseBody, readErr := io.ReadAll(io.LimitReader(resp.Body, maxNewSessionResponseBytes+1))
+	_ = resp.Body.Close()
+	if readErr != nil {
+		return "", fmt.Errorf("read response: %w", readErr)
+	}
+	if len(responseBody) > maxNewSessionResponseBytes {
+		return "", errors.New("response body is too large")
+	}
+	if resp.StatusCode != http.StatusCreated {
+		return "", fmt.Errorf("status=%d, want 201", resp.StatusCode)
+	}
+	mediaType, _, err := mime.ParseMediaType(resp.Header.Get("Content-Type"))
+	if err != nil || mediaType != "application/json" {
+		return "", fmt.Errorf("response Content-Type = %q, want application/json", resp.Header.Get("Content-Type"))
+	}
+
+	var result struct {
+		SessionID string `json:"sessionId"`
+	}
+	decoder := json.NewDecoder(bytes.NewReader(responseBody))
+	decoder.DisallowUnknownFields()
+	if err := decoder.Decode(&result); err != nil {
+		return "", fmt.Errorf("decode response: %w", err)
+	}
+	var trailing any
+	if err := decoder.Decode(&trailing); !errors.Is(err, io.EOF) {
+		return "", errors.New("response contains trailing JSON")
+	}
+	if strings.TrimSpace(result.SessionID) == "" {
+		return "", errors.New("response sessionId is empty")
+	}
+	return result.SessionID, nil
 }
 
 // postDatastar sends a write-boundary-compliant POST to a server action URL.
