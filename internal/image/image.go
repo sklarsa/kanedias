@@ -164,38 +164,7 @@ func loadBuildScriptsFromEntries(directory *os.File, entries []os.DirEntry) ([]b
 		if !strings.HasSuffix(name, ".sh") {
 			continue
 		}
-
-		fd, err := unix.Openat(
-			int(directory.Fd()),
-			name,
-			unix.O_RDONLY|unix.O_CLOEXEC|unix.O_NOFOLLOW|unix.O_NONBLOCK|unix.O_NOCTTY,
-			0,
-		)
-		if err != nil {
-			if errors.Is(err, unix.ELOOP) {
-				return nil, fmt.Errorf("image build script %q must be a regular file", name)
-			}
-			return nil, fmt.Errorf("read image build script %q: %w", name, err)
-		}
-		file := os.NewFile(uintptr(fd), name)
-		content, executable, err := func() ([]byte, bool, error) {
-			defer file.Close()
-			info, err := file.Stat()
-			if err != nil {
-				return nil, false, fmt.Errorf("inspect image build script %q: %w", name, err)
-			}
-			if !info.Mode().IsRegular() {
-				return nil, false, fmt.Errorf("image build script %q must be a regular file", name)
-			}
-			if info.Mode().Perm()&0o111 == 0 {
-				return nil, false, nil
-			}
-			content, err := io.ReadAll(file)
-			if err != nil {
-				return nil, false, fmt.Errorf("read image build script %q: %w", name, err)
-			}
-			return content, true, nil
-		}()
+		content, executable, err := loadBuildScriptAt(int(directory.Fd()), name)
 		if err != nil {
 			return nil, err
 		}
@@ -207,6 +176,90 @@ func loadBuildScriptsFromEntries(directory *os.File, entries []os.DirEntry) ([]b
 		return scripts[i].name < scripts[j].name
 	})
 	return scripts, nil
+}
+
+func loadBuildScriptAt(directoryFD int, name string) ([]byte, bool, error) {
+	const maxAttempts = 3
+	for range maxAttempts {
+		metadataFD, metadata, err := inspectBuildScriptAt(directoryFD, name)
+		if err != nil {
+			return nil, false, err
+		}
+		if metadata.Mode&0o111 == 0 {
+			_ = unix.Close(metadataFD)
+			return nil, false, nil
+		}
+		if metadata.Mode&unix.S_IFMT != unix.S_IFREG {
+			_ = unix.Close(metadataFD)
+			return nil, false, fmt.Errorf("image build script %q must be a regular file", name)
+		}
+
+		readFD, openErr := unix.Openat(
+			directoryFD,
+			name,
+			unix.O_RDONLY|unix.O_CLOEXEC|unix.O_NOFOLLOW|unix.O_NONBLOCK|unix.O_NOCTTY,
+			0,
+		)
+		if openErr != nil {
+			currentFD, current, inspectErr := inspectBuildScriptAt(directoryFD, name)
+			if inspectErr == nil {
+				_ = unix.Close(currentFD)
+			}
+			changed := inspectErr == nil && (!sameBuildScriptObject(metadata, current) || metadata.Mode != current.Mode)
+			_ = unix.Close(metadataFD)
+			if changed {
+				continue
+			}
+			return nil, false, fmt.Errorf("read image build script %q: %w", name, openErr)
+		}
+
+		var opened unix.Stat_t
+		if err := unix.Fstat(readFD, &opened); err != nil {
+			_ = unix.Close(readFD)
+			_ = unix.Close(metadataFD)
+			return nil, false, fmt.Errorf("inspect image build script %q: %w", name, err)
+		}
+		if !sameBuildScriptObject(metadata, opened) {
+			_ = unix.Close(readFD)
+			_ = unix.Close(metadataFD)
+			continue
+		}
+		_ = unix.Close(metadataFD)
+		if opened.Mode&0o111 == 0 {
+			_ = unix.Close(readFD)
+			return nil, false, nil
+		}
+		if opened.Mode&unix.S_IFMT != unix.S_IFREG {
+			_ = unix.Close(readFD)
+			return nil, false, fmt.Errorf("image build script %q must be a regular file", name)
+		}
+
+		file := os.NewFile(uintptr(readFD), name)
+		content, err := io.ReadAll(file)
+		_ = file.Close()
+		if err != nil {
+			return nil, false, fmt.Errorf("read image build script %q: %w", name, err)
+		}
+		return content, true, nil
+	}
+	return nil, false, fmt.Errorf("read image build script %q: changed during preflight", name)
+}
+
+func inspectBuildScriptAt(directoryFD int, name string) (int, unix.Stat_t, error) {
+	fd, err := unix.Openat(directoryFD, name, unix.O_PATH|unix.O_CLOEXEC|unix.O_NOFOLLOW, 0)
+	if err != nil {
+		return -1, unix.Stat_t{}, fmt.Errorf("inspect image build script %q: %w", name, err)
+	}
+	var stat unix.Stat_t
+	if err := unix.Fstat(fd, &stat); err != nil {
+		_ = unix.Close(fd)
+		return -1, unix.Stat_t{}, fmt.Errorf("inspect image build script %q: %w", name, err)
+	}
+	return fd, stat, nil
+}
+
+func sameBuildScriptObject(left, right unix.Stat_t) bool {
+	return left.Dev == right.Dev && left.Ino == right.Ino
 }
 
 func createWithClient(ctx context.Context, client imageClient, cfg config.Config, inputs buildInputs, stdout, stderr io.Writer) (err error) {

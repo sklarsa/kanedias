@@ -6,6 +6,7 @@ import (
 	"encoding/json"
 	"errors"
 	"io"
+	"net"
 	"os"
 	"os/exec"
 	"path/filepath"
@@ -17,6 +18,7 @@ import (
 	"github.com/lxc/incus/v7/shared/api"
 	"github.com/sklarsa/kanedias/internal/config"
 	"github.com/sklarsa/kanedias/internal/incusclient"
+	"golang.org/x/sys/unix"
 )
 
 func TestInstallerExcludesNestedIncus(t *testing.T) {
@@ -441,6 +443,53 @@ func TestLoadBuildScriptsRejectsExecutableSymlink(t *testing.T) {
 	_, err := loadBuildScripts(cfg)
 	if err == nil || !strings.Contains(err.Error(), "linked.sh") || !strings.Contains(err.Error(), "regular file") {
 		t.Fatalf("loadBuildScripts() error = %v, want linked.sh regular file error", err)
+	}
+}
+
+func TestLoadBuildScriptsRejectsExecutableSocketAsNonRegular(t *testing.T) {
+	cfg := imageConfigWithBuildScripts(t, nil)
+	const name = "socket.sh"
+	path := filepath.Join(cfg.BuildScriptsPath(), name)
+	listener, err := net.Listen("unix", path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer listener.Close()
+	if err := os.Chmod(path, 0o700); err != nil {
+		t.Fatal(err)
+	}
+
+	_, err = loadBuildScripts(cfg)
+	if err == nil || !strings.Contains(err.Error(), name) || !strings.Contains(err.Error(), "regular file") {
+		t.Fatalf("loadBuildScripts() error = %v, want named regular file error", err)
+	}
+}
+
+func TestLoadBuildScriptsIgnoresNonExecutableEntries(t *testing.T) {
+	cfg := imageConfigWithBuildScripts(t, nil)
+	writeBuildScript(t, cfg.BuildScriptsPath(), "ignored-unreadable.sh", "ignored\n", 0o000)
+	if err := unix.Mkfifo(filepath.Join(cfg.BuildScriptsPath(), "ignored-fifo.sh"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.Mkdir(filepath.Join(cfg.BuildScriptsPath(), "ignored-directory.sh"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	socketPath := filepath.Join(cfg.BuildScriptsPath(), "ignored-socket.sh")
+	listener, err := net.Listen("unix", socketPath)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer listener.Close()
+	if err := os.Chmod(socketPath, 0o600); err != nil {
+		t.Fatal(err)
+	}
+
+	got, err := loadBuildScripts(cfg)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(got) != 0 {
+		t.Fatalf("loadBuildScripts() = %#v, want no scripts", got)
 	}
 }
 
