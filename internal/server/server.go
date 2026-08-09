@@ -75,14 +75,9 @@ func ValidateListenAddress(address string) error {
 		return nil
 	}
 
-	ip := net.ParseIP(host)
-	if ip == nil {
-		return fmt.Errorf("validate listen address %q: host must be localhost or a loopback IP address", address)
+	if net.ParseIP(host) == nil {
+		return fmt.Errorf("validate listen address %q: host must be localhost or an IP address", address)
 	}
-	if !ip.IsLoopback() {
-		return fmt.Errorf("validate listen address %q: IP address is not loopback", address)
-	}
-
 	return nil
 }
 
