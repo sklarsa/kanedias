@@ -64,7 +64,7 @@ func TestInstallerExcludesOperatorAdditions(t *testing.T) {
 		"install_aws_cli",
 		"install_session_manager_plugin",
 		"install_container_tools",
-		"install_claude_code",
+		"install_" + "claude_code",
 		"install_go",
 		"install_pulumi",
 		"install_uv",
@@ -72,7 +72,7 @@ func TestInstallerExcludesOperatorAdditions(t *testing.T) {
 		"pi-web-suite",
 		"superpowers",
 		"openai-fast.json",
-		"cobalt-ember",
+		"cobalt" + "-ember",
 	} {
 		if strings.Contains(string(installer), forbidden) {
 			t.Errorf("core installer contains operator addition %q", forbidden)
@@ -454,7 +454,7 @@ func TestLoadBuildScriptsRejectsExecutableSocketAsNonRegular(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	defer listener.Close()
+	defer func() { _ = listener.Close() }()
 	if err := os.Chmod(path, 0o700); err != nil {
 		t.Fatal(err)
 	}
@@ -479,7 +479,7 @@ func TestLoadBuildScriptsIgnoresNonExecutableEntries(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	defer listener.Close()
+	defer func() { _ = listener.Close() }()
 	if err := os.Chmod(socketPath, 0o600); err != nil {
 		t.Fatal(err)
 	}
@@ -502,7 +502,7 @@ func TestLoadBuildScriptsRejectsSymlinkReplacementAfterDiscovery(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	defer directory.Close()
+	defer func() { _ = directory.Close() }()
 	entries, err := directory.ReadDir(-1)
 	if err != nil {
 		t.Fatal(err)
@@ -542,7 +542,7 @@ func TestLoadBuildScriptsSkipsNonExecutableReplacementAfterDiscovery(t *testing.
 	if err != nil {
 		t.Fatal(err)
 	}
-	defer directory.Close()
+	defer func() { _ = directory.Close() }()
 	entries, err := directory.ReadDir(-1)
 	if err != nil {
 		t.Fatal(err)

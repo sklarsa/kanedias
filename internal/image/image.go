@@ -149,7 +149,7 @@ func loadBuildScripts(cfg config.Config) ([]buildScript, error) {
 	if err != nil {
 		return nil, fmt.Errorf("read image build scripts %q: %w", path, err)
 	}
-	defer directory.Close()
+	defer func() { _ = directory.Close() }()
 	entries, err := directory.ReadDir(-1)
 	if err != nil {
 		return nil, fmt.Errorf("read image build scripts %q: %w", path, err)

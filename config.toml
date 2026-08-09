@@ -11,6 +11,7 @@ require_session = false
 name = "sandbox"
 source = "https://images.linuxcontainers.org"
 image = "debian/13"
+build_scripts_dir = "image-build.d"
 authorized_hosts = [
     "ssh-ed25519 AAAAC3NzaC1lZDI1NTE5AAAAINmUKR1hA7Ry2zntw2qxEiJJvcjLaFptB/Rci+SJzsnA sklarsa@gmail.com"
 ]
