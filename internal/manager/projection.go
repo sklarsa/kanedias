@@ -103,17 +103,10 @@ func (p *activityProjector) applyPiType(event supervisor.EventEnvelope, piType s
 }
 
 type messageUpdatePayload struct {
-	Type    string `json:"type"`
-	Message struct {
-		Type    string `json:"type"`
-		Content []struct {
-			Type  string `json:"type"`
-			Delta struct {
-				Type string `json:"type"`
-				Text string `json:"text"`
-			} `json:"delta"`
-		} `json:"content"`
-	} `json:"message"`
+	AssistantMessageEvent struct {
+		Type  string `json:"type"`
+		Delta string `json:"delta"`
+	} `json:"assistantMessageEvent"`
 }
 
 func (p *activityProjector) applyMessageUpdate(event supervisor.EventEnvelope) {
@@ -121,38 +114,71 @@ func (p *activityProjector) applyMessageUpdate(event supervisor.EventEnvelope) {
 	if err := json.Unmarshal(event.Payload, &payload); err != nil {
 		return
 	}
-	for _, content := range payload.Message.Content {
-		if content.Type == "tool_use" {
-			continue
-		}
-		if content.Delta.Type == "text_delta" && content.Delta.Text != "" {
-			if !p.textOpen {
-				p.textOpen = true
-				p.textSeq = event.Seq
-				p.items = append(p.items, ActivityItem{
-					Seq: event.Seq, Kind: "message_update", Label: "Message",
-				})
-			} else {
-				// Update seq of the current open message.
-				for i := len(p.items) - 1; i >= 0; i-- {
-					if p.items[i].Kind == "message_update" && p.items[i].Seq == p.textSeq {
-						p.items[i].Text += content.Delta.Text
-						break
-					}
-				}
-				return
-			}
-			if len(p.items) > 0 {
-				p.items[len(p.items)-1].Text += content.Delta.Text
-			}
+	if payload.AssistantMessageEvent.Type != "text_delta" || payload.AssistantMessageEvent.Delta == "" {
+		return
+	}
+	if !p.textOpen {
+		p.textOpen = true
+		p.textSeq = event.Seq
+		p.items = append(p.items, ActivityItem{
+			Seq: event.Seq, Kind: "message_update", Label: "Message",
+		})
+	}
+	for i := len(p.items) - 1; i >= 0; i-- {
+		if p.items[i].Kind == "message_update" && p.items[i].Seq == p.textSeq {
+			p.items[i].Text += payload.AssistantMessageEvent.Delta
+			return
 		}
 	}
+}
+
+type messageEndPayload struct {
+	Message struct {
+		Role         string `json:"role"`
+		StopReason   string `json:"stopReason"`
+		ErrorMessage string `json:"errorMessage"`
+		Content      []struct {
+			Type string `json:"type"`
+			Text string `json:"text"`
+		} `json:"content"`
+	} `json:"message"`
 }
 
 func (p *activityProjector) applyMessageEnd(event supervisor.EventEnvelope) {
 	p.textOpen = false
 	p.textSeq = 0
-	_ = event // message_end signals completion; no additional data extracted
+
+	var payload messageEndPayload
+	if err := json.Unmarshal(event.Payload, &payload); err != nil {
+		return
+	}
+	if payload.Message.Role == "user" {
+		var text string
+		for _, content := range payload.Message.Content {
+			if content.Type == "text" {
+				text += content.Text
+			}
+		}
+		if text != "" {
+			p.items = append(p.items, ActivityItem{
+				Seq: event.Seq, Kind: "user_message", Label: "You", Text: text,
+			})
+		}
+		return
+	}
+	if payload.Message.Role != "assistant" || payload.Message.StopReason != "error" || payload.Message.ErrorMessage == "" {
+		return
+	}
+	if len(p.items) > 0 {
+		last := p.items[len(p.items)-1]
+		if last.IsError && last.Text == payload.Message.ErrorMessage {
+			return
+		}
+	}
+	p.items = append(p.items, ActivityItem{
+		Seq: event.Seq, Kind: "model_error", Label: "Model error",
+		Text: payload.Message.ErrorMessage, IsError: true,
+	})
 }
 
 type toolPayload struct {

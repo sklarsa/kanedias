@@ -42,9 +42,14 @@ func TestProjectActivitySurfacesOnlyContentInTurn(t *testing.T) {
 		piEvent(1, "s", "turn_start", nil),
 		piEvent(2, "s", "message_start", nil),
 		piEvent(3, "s", "message_update", map[string]any{
-			"message": map[string]any{"content": []any{
-				map[string]any{"delta": map[string]any{"type": "text_delta", "text": "hello"}},
-			}},
+			"assistantMessageEvent": map[string]any{
+				"type": "text_delta", "contentIndex": 0, "delta": "hello",
+			},
+			"message": map[string]any{
+				"role":       "assistant",
+				"content":    []any{map[string]any{"type": "text", "text": "hello"}},
+				"stopReason": "pending",
+			},
 		}),
 		piEvent(4, "s", "message_end", nil),
 		piEvent(5, "s", "turn_end", nil),
@@ -56,6 +61,36 @@ func TestProjectActivitySurfacesOnlyContentInTurn(t *testing.T) {
 	}
 	if items[0].Kind != "message_update" || items[0].Text != "hello" {
 		t.Fatalf("content item = %#v", items[0])
+	}
+}
+
+func TestProjectActivityShowsPromptAndCoalescesRepeatedProviderError(t *testing.T) {
+	errorMessage := map[string]any{
+		"message": map[string]any{
+			"role": "assistant", "content": []any{}, "stopReason": "error",
+			"errorMessage": "Stream ended without finish_reason",
+		},
+	}
+	events := []supervisor.EventEnvelope{
+		piEvent(1, "s", "message_end", map[string]any{
+			"message": map[string]any{
+				"role":    "user",
+				"content": []any{map[string]any{"type": "text", "text": "Hello"}},
+			},
+		}),
+		piEvent(2, "s", "message_end", errorMessage),
+		piEvent(3, "s", "message_end", errorMessage),
+	}
+
+	items := projectActivity(events, "s")
+	if len(items) != 2 {
+		t.Fatalf("expected prompt and one error, got %d: %#v", len(items), items)
+	}
+	if items[0].Label != "You" || items[0].Text != "Hello" {
+		t.Fatalf("prompt item = %#v", items[0])
+	}
+	if !items[1].IsError || items[1].Label != "Model error" || items[1].Text != "Stream ended without finish_reason" {
+		t.Fatalf("error item = %#v", items[1])
 	}
 }
 
