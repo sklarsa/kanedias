@@ -39,7 +39,8 @@ type fleetManager interface {
 	Session(sessionID string) (manager.SessionState, error)
 	SubscribeFleet() manager.ChangeSubscription
 	SubscribeSession(sessionID string) (manager.ChangeSubscription, error)
-	SpawnRoot(ctx context.Context) (string, error)
+	LaunchOptions() manager.SessionLaunchOptions
+	SpawnRootWithRequest(ctx context.Context, request manager.SessionLaunchRequest) (string, error)
 	Steer(ctx context.Context, sessionID string, message string) error
 	Interrupt(ctx context.Context, sessionID string) error
 	StopSession(ctx context.Context, sessionID string) error

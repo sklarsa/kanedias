@@ -29,6 +29,9 @@
         <div class="metric"><div class="k">State</div><div class="v">
           {{if .RootStale}}stale{{else if not .StreamConnected}}disconnected{{else}}{{.Lifecycle}}{{end}}
         </div></div>
+        <div class="metric"><div class="k">Provider</div><div class="v num">{{if .Provider}}{{.Provider}}{{else}}—{{end}}</div></div>
+        <div class="metric"><div class="k">Model</div><div class="v num">{{if .Model}}{{.Model}}{{else}}—{{end}}</div></div>
+        <div class="metric"><div class="k">Thinking</div><div class="v num">{{if .ThinkingLevel}}{{.ThinkingLevel}}{{else}}—{{end}}</div></div>
         <div class="metric"><div class="k">Context</div><div class="v num" id="detContext">{{.Stats.Context.PercentText}}</div></div>
         <div class="metric"><div class="k">Messages</div><div class="v num">{{if .Stats.HasStats}}{{.Stats.TotalMessages}}{{else}}—{{end}}</div></div>
         <div class="metric"><div class="k">Tool calls</div><div class="v num">{{if .Stats.HasStats}}{{.Stats.ToolCalls}}{{else}}—{{end}}</div></div>

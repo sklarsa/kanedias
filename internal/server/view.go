@@ -3,6 +3,8 @@ package server
 import (
 	"errors"
 	"fmt"
+	"sort"
+	"strings"
 
 	"github.com/sklarsa/kanedias/internal/manager"
 	"github.com/sklarsa/kanedias/internal/supervisor"
@@ -17,6 +19,99 @@ const (
 	templateActivity   = "activity.html"
 	templateDeckStatus = "deck-status.html"
 )
+
+// indexView is the template data for index.html.
+type indexView struct {
+	SessionModal sessionModalView
+}
+
+// sessionModalView is the launch configuration rendered into the closed dialog.
+type sessionModalView struct {
+	Enabled      bool
+	RootModels   []modelOptionView
+	RootThinking []thinkingOptionView
+	Workers      []workerOptionView
+}
+
+// modelOptionView intentionally exposes only allowlisted browser-facing model
+// metadata. Raw provider and model identifiers never enter this projection.
+type modelOptionView struct {
+	ID                   string
+	Label                string
+	ThinkingLevelsCSV    string
+	DefaultThinkingLevel string
+	Selected             bool
+}
+
+type thinkingOptionView struct {
+	Level    string
+	Selected bool
+}
+
+type workerOptionView struct {
+	Index       int
+	Role        string
+	Description string
+	Models      []modelOptionView
+	Thinking    []thinkingOptionView
+}
+
+// newIndexView projects immutable manager launch options into deterministic
+// template rows. Production launch options are validated and nonempty.
+func newIndexView(options manager.SessionLaunchOptions) indexView {
+	models := append([]manager.ModelLaunchOption(nil), options.Models...)
+	sort.Slice(models, func(i, j int) bool { return models[i].ModelType < models[j].ModelType })
+	workers := append([]manager.WorkerLaunchOption(nil), options.Workers...)
+	sort.Slice(workers, func(i, j int) bool { return workers[i].WorkerType < workers[j].WorkerType })
+
+	modal := sessionModalView{
+		Enabled:      true,
+		RootModels:   newModelOptionViews(models, options.Root.ModelType),
+		RootThinking: thinkingOptionsFor(models, options.Root.ModelType, options.Root.ThinkingLevel),
+		Workers:      make([]workerOptionView, 0, len(workers)),
+	}
+	for i, worker := range workers {
+		modal.Workers = append(modal.Workers, workerOptionView{
+			Index:       i,
+			Role:        worker.WorkerType,
+			Description: worker.Description,
+			Models:      newModelOptionViews(models, worker.ModelType),
+			Thinking:    thinkingOptionsFor(models, worker.ModelType, worker.ThinkingLevel),
+		})
+	}
+	return indexView{SessionModal: modal}
+}
+
+func newModelOptionViews(models []manager.ModelLaunchOption, selected string) []modelOptionView {
+	views := make([]modelOptionView, 0, len(models))
+	for _, model := range models {
+		views = append(views, modelOptionView{
+			ID:                   model.ModelType,
+			Label:                model.Label,
+			ThinkingLevelsCSV:    strings.Join(model.ThinkingLevels, ","),
+			DefaultThinkingLevel: model.DefaultThinkingLevel,
+			Selected:             model.ModelType == selected,
+		})
+	}
+	return views
+}
+
+func thinkingOptionsFor(models []manager.ModelLaunchOption, selectedModel, selectedThinking string) []thinkingOptionView {
+	for _, model := range models {
+		if model.ModelType != selectedModel {
+			continue
+		}
+		if selectedThinking == "" {
+			selectedThinking = model.DefaultThinkingLevel
+		}
+		levels := make([]thinkingOptionView, 0, len(model.ThinkingLevels))
+		for _, level := range model.ThinkingLevels {
+			levels = append(levels, thinkingOptionView{Level: level, Selected: level == selectedThinking})
+		}
+		return levels
+	}
+	return nil
+}
 
 // fleetView is the template data for fleet.html.
 type fleetView struct {
@@ -80,6 +175,9 @@ type detailView struct {
 	StreamConnected bool
 	Incomplete      bool
 	GapText         string
+	Provider        string
+	Model           string
+	ThinkingLevel   string
 	Stats           statsView
 	CanSteer        bool
 	CanInterrupt    bool
@@ -300,6 +398,9 @@ func newDetailView(state manager.SessionState, stats statsView) detailView {
 		StreamConnected: state.StreamConnected,
 		Incomplete:      state.Incomplete,
 		GapText:         gapText,
+		Provider:        state.Node.Model.Provider,
+		Model:           state.Node.Model.Model,
+		ThinkingLevel:   state.Node.Model.ThinkingLevel,
 		Stats:           stats,
 		CanSteer:        capabilities.CanSteer,
 		CanInterrupt:    capabilities.CanInterrupt,

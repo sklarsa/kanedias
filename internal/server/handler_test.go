@@ -150,6 +150,21 @@ func indexBody(t *testing.T) string {
 	return response.Body.String()
 }
 
+func launchOptionsFixture() manager.SessionLaunchOptions {
+	return manager.SessionLaunchOptions{
+		Models: []manager.ModelLaunchOption{
+			{ModelType: "fast-model", Label: "Fast & safe", ThinkingLevels: []string{"off", "medium"}, DefaultThinkingLevel: "off"},
+			{ModelType: "deep-model", Label: "Deep model", ThinkingLevels: []string{"high", "xhigh"}, DefaultThinkingLevel: "high"},
+		},
+		Root: manager.ModelSelection{ModelType: "deep-model", ThinkingLevel: "xhigh"},
+		Workers: []manager.WorkerLaunchOption{
+			{WorkerType: "worker", Description: "Implement changes", ModelType: "deep-model", ThinkingLevel: "xhigh"},
+			{WorkerType: "oracle", Description: "Advise <carefully> & independently", ModelType: "deep-model", ThinkingLevel: "high"},
+			{WorkerType: "reviewer", Description: "Review & verify", ModelType: "fast-model", ThinkingLevel: "medium"},
+		},
+	}
+}
+
 func TestHandlerRoutes(t *testing.T) {
 	handler, cookie := mustNewHandlerWithAuth(t, slog.New(slog.NewTextHandler(&bytes.Buffer{}, nil)))
 
@@ -313,8 +328,70 @@ func TestHandlerRejectsUnsupportedMethods(t *testing.T) {
 	}
 }
 
+func TestInitialPageRendersSessionModalFromLaunchOptions(t *testing.T) {
+	fleet := newStreamFakeFleet()
+	fleet.launchOptions = launchOptionsFixture()
+	handler, cookie := mustNewHandlerWithFleetAuth(t, fleet)
+	response := serveAuthenticatedRequest(t, handler, http.MethodGet, "/", cookie)
+	if response.Code != http.StatusOK {
+		t.Fatalf("GET / status = %d, want 200; body = %q", response.Code, response.Body.String())
+	}
+	body := response.Body.String()
+
+	required := []string{
+		`<dialog id="new-session-modal"`, `id="new-session-form"`, `aria-labelledby="new-session-title"`,
+		`id="new-session-title"`, `New session`, `aria-label="Close"`,
+		`id="root-model"`, `id="root-thinking"`, `value="deep-model" selected`, `value="xhigh" selected`,
+		`data-thinking-levels="off,medium"`, `data-default-thinking-level="off"`,
+		`Fast &amp; safe`, `Deep model`, `<summary>Subagent model profiles</summary>`,
+		`id="new-session-cancel"`, `id="new-session-launch"`, `id="new-session-status"`, `aria-live="polite"`,
+	}
+	for _, want := range required {
+		if !strings.Contains(body, want) {
+			t.Errorf("session modal does not contain %q", want)
+		}
+	}
+	if strings.Contains(body, `<dialog id="new-session-modal" open`) {
+		t.Error("session modal must be closed initially")
+	}
+	if deep, fast := strings.Index(body, `>Deep model</option>`), strings.Index(body, `>Fast &amp; safe</option>`); deep < 0 || fast < 0 || deep >= fast {
+		t.Error("model options are not in deterministic model-type order")
+	}
+	lastWorker := -1
+	for _, role := range []string{"oracle", "reviewer", "worker"} {
+		marker := `data-worker-type="` + role + `"`
+		if got := strings.Count(body, marker); got != 1 {
+			t.Errorf("worker %q row count = %d, want 1", role, got)
+		}
+		position := strings.Index(body, marker)
+		if position <= lastWorker {
+			t.Errorf("worker %q is not in deterministic role order", role)
+		}
+		lastWorker = position
+	}
+	for _, want := range []string{`Advise &lt;carefully&gt; &amp; independently`, `Review &amp; verify`} {
+		if !strings.Contains(body, want) {
+			t.Errorf("escaped worker description missing %q", want)
+		}
+	}
+	for _, forbidden := range []string{"openai-codex", "gpt-5.6-sol", "anthropic", "claude-sonnet-4"} {
+		if strings.Contains(body, forbidden) {
+			t.Errorf("session modal leaked raw provider/model %q", forbidden)
+		}
+	}
+	if !strings.Contains(body, `id="new-session-button"`) || !strings.Contains(body, `type="button"`) {
+		t.Error("New Session trigger is not a stable type=button control")
+	}
+	if strings.Contains(body, `@post('/ui/sessions', {payload:{}})`) {
+		t.Error("New Session trigger still posts an empty request")
+	}
+}
+
 func TestInitialPageContainsAstrolabeConsole(t *testing.T) {
 	body := indexBody(t)
+	if !strings.Contains(body, `id="new-session-button" disabled`) {
+		t.Error("nil-fleet index must render a disabled New Session trigger")
+	}
 	required := []string{
 		`<html lang="en" data-theme="dark">`,
 		// shell stable Datastar patch roots
@@ -375,7 +452,11 @@ func TestInitialPageContainsAstrolabeConsole(t *testing.T) {
 }
 
 func TestAstrolabeConsoleIsInteractive(t *testing.T) {
-	body := indexBody(t)
+	fleet := newStreamFakeFleet()
+	fleet.launchOptions = launchOptionsFixture()
+	handler, cookie := mustNewHandlerWithFleetAuth(t, fleet)
+	response := serveAuthenticatedRequest(t, handler, http.MethodGet, "/", cookie)
+	body := response.Body.String()
 
 	// The console is wired by local asset modules (Datastar, Marked, Highlight,
 	// the Markdown renderer, and app.js delegated behavior). No external scripts
@@ -717,6 +798,10 @@ type streamFakeFleet struct {
 	stats          manager.SessionStats
 	statsErr       error
 	statsCalls     int
+	launchOptions  manager.SessionLaunchOptions
+	spawnRequest   manager.SessionLaunchRequest
+	spawnSessionID string
+	spawnErr       error
 }
 
 func newStreamFakeFleet() *streamFakeFleet {
@@ -755,6 +840,16 @@ func (f *streamFakeFleet) SubscribeSession(id string) (manager.ChangeSubscriptio
 		return manager.ChangeSubscription{}, errors.New("not found")
 	}
 	return manager.ChangeSubscription{Updates: ch, Close: func() {}}, nil
+}
+func (f *streamFakeFleet) LaunchOptions() manager.SessionLaunchOptions { return f.launchOptions }
+func (f *streamFakeFleet) SpawnRootWithRequest(_ context.Context, request manager.SessionLaunchRequest) (string, error) {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	f.spawnRequest = request
+	if f.spawnSessionID == "" {
+		f.spawnSessionID = "session-new"
+	}
+	return f.spawnSessionID, f.spawnErr
 }
 func (f *streamFakeFleet) SpawnRoot(context.Context) (string, error)   { return "", nil }
 func (f *streamFakeFleet) Steer(context.Context, string, string) error { return nil }

@@ -72,7 +72,11 @@ func newHandlerWithOptions(logger *slog.Logger, advertisedAddress string, bootst
 
 	serveIndex := func(w http.ResponseWriter, _ *http.Request) {
 		w.Header().Set("Content-Type", "text/html; charset=utf-8")
-		if err := templates.ExecuteTemplate(w, "index.html", nil); err != nil {
+		view := indexView{SessionModal: sessionModalView{}}
+		if fleet != nil {
+			view = newIndexView(fleet.LaunchOptions())
+		}
+		if err := templates.ExecuteTemplate(w, "index.html", view); err != nil {
 			logger.Error("render index", "error", err)
 		}
 	}
@@ -140,7 +144,7 @@ func newHandlerWithOptions(logger *slog.Logger, advertisedAddress string, bootst
 		write.Use(sessionRequired)
 		write.Use(writeRequired)
 		if fleet != nil {
-			write.Post("/ui/sessions", makeNewSessionHandler(fleet, templates, logger))
+			write.Post("/ui/sessions", makeNewSessionHandler(fleet, logger))
 			write.Post("/ui/sessions/{sessionID}/steer", makeSteerHandler(fleet, templates, logger))
 			write.Post("/ui/sessions/{sessionID}/interrupt", makeInterruptHandler(fleet, templates, logger))
 			write.Post("/ui/sessions/{sessionID}/stop", makeStopSessionHandler(fleet, templates, logger))
@@ -376,7 +380,7 @@ func patchSessionTargets(sse *datastar.ServerSentEventGenerator, templates *temp
 }
 
 func parseTemplates(fsys fs.FS) (*template.Template, error) {
-	return template.ParseFS(fsys, "web/index.html", "web/fleet.html", "web/detail.html",
+	return template.ParseFS(fsys, "web/index.html", "web/session-modal.html", "web/fleet.html", "web/detail.html",
 		"web/questions.html", "web/activity.html", "web/deck-status.html")
 }
 

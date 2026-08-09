@@ -540,7 +540,10 @@ func (f *fakeFleetManager) SubscribeFleet() manager.ChangeSubscription {
 func (f *fakeFleetManager) SubscribeSession(string) (manager.ChangeSubscription, error) {
 	return manager.ChangeSubscription{}, errors.New("not implemented")
 }
-func (f *fakeFleetManager) SpawnRoot(context.Context) (string, error) {
+func (f *fakeFleetManager) LaunchOptions() manager.SessionLaunchOptions {
+	return manager.SessionLaunchOptions{}
+}
+func (f *fakeFleetManager) SpawnRootWithRequest(context.Context, manager.SessionLaunchRequest) (string, error) {
 	return "", errors.New("not implemented")
 }
 func (f *fakeFleetManager) Steer(context.Context, string, string) error {
