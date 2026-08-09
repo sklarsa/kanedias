@@ -6,6 +6,7 @@ import (
 	"io"
 	"os"
 	"path/filepath"
+	"strings"
 	"testing"
 
 	"github.com/sklarsa/kanedias/internal/config"
@@ -36,9 +37,13 @@ func TestRunSupervisorSelectsConfiguredEventLimitsBeforeProvisioning(t *testing.
 	maxEvents, maxBytes := 7, 1024
 	cfg := validSupervisorConfig()
 	cfg.Supervisor.Events = config.SupervisorEventsConfig{MaxEvents: &maxEvents, MaxBytes: &maxBytes}
+	policy, err := cfg.DefaultSessionModelPolicy()
+	if err != nil {
+		t.Fatal(err)
+	}
 	sentinel := errors.New("broker sentinel")
-	err := runSupervisorWithBrokerFactory(context.Background(), cfg, SessionOptions{
-		SocketPath: filepath.Join(t.TempDir(), "root.sock"), ConfigPath: "/tmp/config.toml",
+	err = runSupervisorWithBrokerFactory(context.Background(), cfg, SessionOptions{
+		SocketPath: filepath.Join(t.TempDir(), "root.sock"), ConfigPath: "/tmp/config.toml", Policy: policy,
 	}, io.Discard, func(got supervisor.EventBrokerOptions) (*supervisor.EventBroker, error) {
 		if got != (supervisor.EventBrokerOptions{MaxEvents: 7, MaxBytes: 1024}) {
 			t.Fatalf("options = %#v", got)
@@ -52,9 +57,13 @@ func TestRunSupervisorSelectsConfiguredEventLimitsBeforeProvisioning(t *testing.
 
 func TestRunSupervisorDefaultEventLimitsWhenUnconfigured(t *testing.T) {
 	cfg := validSupervisorConfig()
+	policy, err := cfg.DefaultSessionModelPolicy()
+	if err != nil {
+		t.Fatal(err)
+	}
 	sentinel := errors.New("broker sentinel")
-	err := runSupervisorWithBrokerFactory(context.Background(), cfg, SessionOptions{
-		SocketPath: filepath.Join(t.TempDir(), "root.sock"), ConfigPath: "/tmp/config.toml",
+	err = runSupervisorWithBrokerFactory(context.Background(), cfg, SessionOptions{
+		SocketPath: filepath.Join(t.TempDir(), "root.sock"), ConfigPath: "/tmp/config.toml", Policy: policy,
 	}, io.Discard, func(got supervisor.EventBrokerOptions) (*supervisor.EventBroker, error) {
 		want := supervisor.EventBrokerOptions{
 			MaxEvents: config.DefaultSupervisorEventMaxEvents,
@@ -72,8 +81,12 @@ func TestRunSupervisorDefaultEventLimitsWhenUnconfigured(t *testing.T) {
 
 func TestRunSupervisorRejectsInvalidConfig(t *testing.T) {
 	called := false
-	err := runSupervisorWithBrokerFactory(context.Background(), config.Config{}, SessionOptions{
-		SocketPath: filepath.Join(t.TempDir(), "root.sock"), ConfigPath: "/tmp/config.toml",
+	policy, err := validSupervisorConfig().DefaultSessionModelPolicy()
+	if err != nil {
+		t.Fatal(err)
+	}
+	err = runSupervisorWithBrokerFactory(context.Background(), config.Config{}, SessionOptions{
+		SocketPath: filepath.Join(t.TempDir(), "root.sock"), ConfigPath: "/tmp/config.toml", Policy: policy,
 	}, io.Discard, func(supervisor.EventBrokerOptions) (*supervisor.EventBroker, error) {
 		called = true
 		return nil, nil
@@ -83,6 +96,23 @@ func TestRunSupervisorRejectsInvalidConfig(t *testing.T) {
 	}
 	if called {
 		t.Fatal("broker factory called before config validation")
+	}
+}
+
+func TestRunSupervisorRejectsInvalidPolicyBeforeConfigAndBroker(t *testing.T) {
+	called := false
+	err := runSupervisorWithBrokerFactory(context.Background(), config.Config{}, SessionOptions{
+		SocketPath: filepath.Join(t.TempDir(), "root.sock"), ConfigPath: "/tmp/config.toml",
+		Policy: config.SessionModelPolicy{Root: config.ModelProfile{Model: "model", ThinkingLevel: "high"}},
+	}, io.Discard, func(supervisor.EventBrokerOptions) (*supervisor.EventBroker, error) {
+		called = true
+		return nil, nil
+	})
+	if err == nil || !strings.Contains(err.Error(), "provider") {
+		t.Fatalf("policy validation error = %v", err)
+	}
+	if called {
+		t.Fatal("broker factory called before policy validation")
 	}
 }
 

@@ -69,6 +69,11 @@ func runSupervisor(ctx context.Context, cfg config.Config, opts SessionOptions, 
 }
 
 func runSupervisorWithBrokerFactory(ctx context.Context, cfg config.Config, options SessionOptions, output io.Writer, factory eventBrokerFactory) error {
+	policy := options.Policy.Clone()
+	if err := policy.Validate(); err != nil {
+		return fmt.Errorf("validate session model policy: %w", err)
+	}
+	options.Policy = policy
 	if err := cfg.ValidateSupervisor(); err != nil {
 		return err
 	}

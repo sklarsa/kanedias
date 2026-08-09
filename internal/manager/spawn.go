@@ -1,6 +1,7 @@
 package manager
 
 import (
+	"bytes"
 	"context"
 	"crypto/rand"
 	"encoding/hex"
@@ -13,6 +14,7 @@ import (
 	"time"
 
 	"github.com/sklarsa/kanedias/internal/supervisor"
+	"github.com/sklarsa/kanedias/internal/supervisor/process"
 )
 
 // spawnSpec describes a process to be started.
@@ -22,6 +24,7 @@ type spawnSpec struct {
 	Env         []string
 	Stdin       *os.File
 	Output      *os.File
+	ExtraFiles  []*os.File
 	SysProcAttr *syscall.SysProcAttr
 }
 
@@ -74,6 +77,7 @@ func (osProcessStarter) Start(spec spawnSpec) (spawnedProcess, error) {
 	cmd.Stdin = spec.Stdin
 	cmd.Stdout = spec.Output
 	cmd.Stderr = spec.Output
+	cmd.ExtraFiles = spec.ExtraFiles
 	cmd.SysProcAttr = spec.SysProcAttr
 	if err := cmd.Start(); err != nil {
 		return nil, err
@@ -135,15 +139,29 @@ func (pending *pendingRoot) safeUnlinkOwnedSocket() error {
 	return os.Remove(pending.socketPath)
 }
 
-// SpawnRoot launches a detached root supervisor and admits it into the fleet.
+// SpawnRoot launches a root with the configured default model policy.
 func (m *Manager) SpawnRoot(ctx context.Context) (string, error) {
+	return m.SpawnRootWithRequest(ctx, m.launch.DefaultRequest())
+}
+
+// SpawnRootWithRequest validates an allowlisted launch request before creating
+// any spawn artifact, then transfers the resolved policy through inherited fd 3.
+func (m *Manager) SpawnRootWithRequest(ctx context.Context, request SessionLaunchRequest) (string, error) {
+	policy, err := m.launch.Resolve(request)
+	if err != nil {
+		return "", err
+	}
+	var encoded bytes.Buffer
+	if err := process.EncodeRootBootstrap(&encoded, process.RootBootstrap{Policy: policy}); err != nil {
+		return "", fmt.Errorf("manager: encode root bootstrap: %w", err)
+	}
+
 	m.mu.Lock()
 	q := m.quiesced
 	m.mu.Unlock()
 	if q {
 		return "", errors.New("manager: quiesced, cannot spawn")
 	}
-
 	if m.opts.SessionBinary == "" {
 		return "", errors.New("manager: session binary is not configured")
 	}
@@ -151,11 +169,10 @@ func (m *Manager) SpawnRoot(ctx context.Context) (string, error) {
 		return "", errors.New("manager: config path is not configured")
 	}
 
-	token, err := generateToken()
+	token, err := m.newSpawnToken()
 	if err != nil {
 		return "", fmt.Errorf("manager: generate spawn token: %w", err)
 	}
-
 	socketPath := filepath.Join(m.opts.RootSocketDir, token+".root.sock")
 	if err := validateUnixPathLength(socketPath); err != nil {
 		return "", fmt.Errorf("manager: socket path: %w", err)
@@ -166,12 +183,22 @@ func (m *Manager) SpawnRoot(ctx context.Context) (string, error) {
 	if err != nil {
 		return "", fmt.Errorf("manager: create log file: %w", err)
 	}
-
 	devNull, err := os.Open(os.DevNull)
 	if err != nil {
 		_ = logFile.Close()
 		_ = os.Remove(logPath)
 		return "", fmt.Errorf("manager: open /dev/null: %w", err)
+	}
+	bootstrapRead, bootstrapWrite, err := m.newBootstrapPipe()
+	if err != nil {
+		_ = devNull.Close()
+		_ = logFile.Close()
+		_ = os.Remove(logPath)
+		return "", fmt.Errorf("manager: create root bootstrap pipe: %w", err)
+	}
+	closeBootstrap := func() {
+		_ = bootstrapRead.Close()
+		_ = bootstrapWrite.Close()
 	}
 
 	spec := spawnSpec{
@@ -179,32 +206,50 @@ func (m *Manager) SpawnRoot(ctx context.Context) (string, error) {
 		Args: []string{
 			m.opts.SessionBinary,
 			"--config", m.opts.ConfigPath,
-			"session",
-			"--socket", socketPath,
+			"session", "--socket", socketPath, "--bootstrap-fd", fmt.Sprint(process.RootBootstrapFD),
 		},
-		Env:    os.Environ(),
-		Stdin:  devNull,
-		Output: logFile,
+		Env:        os.Environ(),
+		Stdin:      devNull,
+		Output:     logFile,
+		ExtraFiles: []*os.File{bootstrapRead},
 		SysProcAttr: &syscall.SysProcAttr{
 			Setsid: true,
 		},
 	}
 
-	process, err := m.starter.Start(spec)
-	// Close parent file descriptors; child has inherited them.
+	spawned, err := m.starter.Start(spec)
+	_ = bootstrapRead.Close()
 	_ = logFile.Close()
 	_ = devNull.Close()
 	if err != nil {
+		_ = bootstrapWrite.Close()
 		_ = os.Remove(logPath)
 		return "", fmt.Errorf("manager: start root process: %w", err)
 	}
 
-	pending := &pendingRoot{
-		socketPath: socketPath,
-		logPath:    logPath,
-		process:    process,
+	writeDone := make(chan error, 1)
+	go func() {
+		_, writeErr := bootstrapWrite.Write(encoded.Bytes())
+		closeErr := bootstrapWrite.Close()
+		writeDone <- errors.Join(writeErr, closeErr)
+	}()
+	select {
+	case writeErr := <-writeDone:
+		if writeErr != nil {
+			closeBootstrap()
+			_ = spawned.SignalGroup(syscall.SIGKILL)
+			return "", fmt.Errorf("manager: send root bootstrap: %w", writeErr)
+		}
+	case <-ctx.Done():
+		_ = bootstrapWrite.Close()
+		<-writeDone
+		closeBootstrap()
+		_ = spawned.SignalGroup(syscall.SIGKILL)
+		return "", ctx.Err()
 	}
+	closeBootstrap()
 
+	pending := &pendingRoot{socketPath: socketPath, logPath: logPath, process: spawned}
 	rootID, err := m.admitRoot(ctx, pending)
 	if err != nil {
 		go m.cleanupFailedSpawn(pending)

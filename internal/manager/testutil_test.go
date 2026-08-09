@@ -137,16 +137,18 @@ func fakeManager(factory clientFactory) *Manager {
 			Logger:           discardLogger(),
 			SnapshotInterval: time.Hour, // long: monitoring loops must not fire during unit tests
 		},
-		launch:         managerTestLaunch(),
-		roots:          make(map[string]*rootHandle),
-		routes:         make(map[string]string),
-		factory:        factory,
-		closeCtx:       ctx,
-		closeCancel:    cancel,
-		snapshotCtx:    snapshotCtx,
-		snapshotCancel: snapshotCancel,
-		fleetFanout:    newChangeFanout(4),
-		sessionFanout:  newChangeFanout(4),
+		launch:           managerTestLaunch(),
+		roots:            make(map[string]*rootHandle),
+		routes:           make(map[string]string),
+		factory:          factory,
+		newSpawnToken:    generateToken,
+		newBootstrapPipe: os.Pipe,
+		closeCtx:         ctx,
+		closeCancel:      cancel,
+		snapshotCtx:      snapshotCtx,
+		snapshotCancel:   snapshotCancel,
+		fleetFanout:      newChangeFanout(4),
+		sessionFanout:    newChangeFanout(4),
 	}
 }
 

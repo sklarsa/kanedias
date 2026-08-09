@@ -2,16 +2,21 @@ package manager
 
 import (
 	"context"
+	"errors"
+	"fmt"
 	"os"
 	"os/exec"
 	"path/filepath"
+	"reflect"
 	"runtime"
+	"strings"
 	"sync"
 	"syscall"
 	"testing"
 	"time"
 
 	"github.com/sklarsa/kanedias/internal/supervisor"
+	"github.com/sklarsa/kanedias/internal/supervisor/process"
 	"golang.org/x/sys/unix"
 )
 
@@ -51,15 +56,40 @@ func (p *fakeProcess) exit(err error) {
 // ---- fakeStarter ----
 
 type fakeStarter struct {
-	lastSpec spawnSpec
-	process  *fakeProcess
-	err      error
+	lastSpec       spawnSpec
+	process        *fakeProcess
+	err            error
+	starts         int
+	rootBootstraps chan rootBootstrapResult
+}
+
+type rootBootstrapResult struct {
+	bootstrap process.RootBootstrap
+	err       error
 }
 
 func (fs *fakeStarter) Start(spec spawnSpec) (spawnedProcess, error) {
 	fs.lastSpec = spec
+	fs.starts++
 	if fs.err != nil {
 		return nil, fs.err
+	}
+	if fs.rootBootstraps != nil {
+		if len(spec.ExtraFiles) != 1 {
+			fs.rootBootstraps <- rootBootstrapResult{err: fmt.Errorf("ExtraFiles = %d, want 1", len(spec.ExtraFiles))}
+		} else {
+			duplicate, err := unix.Dup(int(spec.ExtraFiles[0].Fd()))
+			if err != nil {
+				fs.rootBootstraps <- rootBootstrapResult{err: err}
+			} else {
+				file := os.NewFile(uintptr(duplicate), "fake-root-bootstrap")
+				go func() {
+					bootstrap, decodeErr := process.DecodeRootBootstrap(file)
+					closeErr := file.Close()
+					fs.rootBootstraps <- rootBootstrapResult{bootstrap: bootstrap, err: errors.Join(decodeErr, closeErr)}
+				}()
+			}
+		}
 	}
 	return fs.process, nil
 }
@@ -114,6 +144,173 @@ func TestRootSpawnerArgvAndSetsid(t *testing.T) {
 	}
 	if spec.SysProcAttr == nil || !spec.SysProcAttr.Setsid {
 		t.Fatalf("SysProcAttr.Setsid must be true, got %+v", spec.SysProcAttr)
+	}
+}
+
+func TestSpawnRootWithRequestValidatesBeforeSideEffects(t *testing.T) {
+	fs := &fakeStarter{process: newFakeProcess(1235)}
+	m := fakeManager(nil)
+	m.starter = fs
+	m.opts.SessionBinary = "/usr/bin/kanedias"
+	m.opts.ConfigPath = "/etc/kanedias/config.toml"
+	rootDir, logDir := shortTempDirs(t)
+	m.opts.RootSocketDir = rootDir
+	m.opts.SessionLogDir = logDir
+
+	tokens, pipes := 0, 0
+	m.newSpawnToken = func() (string, error) {
+		tokens++
+		return "token", nil
+	}
+	m.newBootstrapPipe = func() (*os.File, *os.File, error) {
+		pipes++
+		return os.Pipe()
+	}
+	invalid := m.launch.DefaultRequest()
+	invalid.Root.ModelType = "not-allowlisted"
+	if _, err := m.SpawnRootWithRequest(context.Background(), invalid); err == nil {
+		t.Fatal("invalid request succeeded")
+	}
+	if tokens != 0 || pipes != 0 || fs.starts != 0 {
+		t.Fatalf("side effects after invalid request: tokens=%d pipes=%d starts=%d", tokens, pipes, fs.starts)
+	}
+	entries, err := os.ReadDir(logDir)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(entries) != 0 {
+		t.Fatalf("invalid request created log files: %v", entries)
+	}
+}
+
+func TestSpawnRootWithRequestTransfersResolvedPolicyOnlyThroughFD3(t *testing.T) {
+	fs := &fakeStarter{process: newFakeProcess(1236), rootBootstraps: make(chan rootBootstrapResult, 1)}
+	m := fakeManager(nil)
+	m.starter = fs
+	m.opts.SessionBinary = "/usr/bin/kanedias"
+	m.opts.ConfigPath = "/etc/kanedias/config.toml"
+	rootDir, logDir := shortTempDirs(t)
+	m.opts.RootSocketDir = rootDir
+	m.opts.SessionLogDir = logDir
+	m.opts.SpawnTimeout = time.Second
+	m.newSpawnToken = func() (string, error) { return "fixed-token", nil }
+	var parentRead, parentWrite *os.File
+	m.newBootstrapPipe = func() (*os.File, *os.File, error) {
+		var pipeErr error
+		parentRead, parentWrite, pipeErr = os.Pipe()
+		return parentRead, parentWrite, pipeErr
+	}
+
+	request := m.launch.DefaultRequest()
+	request.Root = ModelSelection{ModelType: "local-qwen", ThinkingLevel: "off"}
+	for index := range request.Workers {
+		request.Workers[index].ModelType = "local-qwen"
+		request.Workers[index].ThinkingLevel = "off"
+	}
+	wantPolicy, err := m.launch.Resolve(request)
+	if err != nil {
+		t.Fatal(err)
+	}
+	go func() {
+		time.Sleep(20 * time.Millisecond)
+		fs.process.exit(nil)
+	}()
+	_, _ = m.SpawnRootWithRequest(context.Background(), request)
+
+	select {
+	case result := <-fs.rootBootstraps:
+		if result.err != nil {
+			t.Fatal(result.err)
+		}
+		if !reflect.DeepEqual(result.bootstrap.Policy, wantPolicy) {
+			t.Fatalf("bootstrap policy = %#v, want %#v", result.bootstrap.Policy, wantPolicy)
+		}
+	case <-time.After(time.Second):
+		t.Fatal("timed out decoding inherited root bootstrap")
+	}
+	assertFileClosed(t, parentRead)
+	assertFileClosed(t, parentWrite)
+
+	spec := fs.lastSpec
+	wantSuffix := []string{"session", "--socket", filepath.Join(rootDir, "fixed-token.root.sock"), "--bootstrap-fd", "3"}
+	if len(spec.Args) < len(wantSuffix) || !reflect.DeepEqual(spec.Args[len(spec.Args)-len(wantSuffix):], wantSuffix) {
+		t.Fatalf("argv = %#v, want suffix %#v", spec.Args, wantSuffix)
+	}
+	if len(spec.ExtraFiles) != 1 {
+		t.Fatalf("ExtraFiles = %d, want 1", len(spec.ExtraFiles))
+	}
+	argv := strings.Join(spec.Args, "\x00")
+	environment := strings.Join(spec.Env, "\x00")
+	for _, value := range []string{wantPolicy.Root.Provider, wantPolicy.Root.Model, `"provider"`, `"workers"`} {
+		if strings.Contains(argv, value) || strings.Contains(environment, value) {
+			t.Fatalf("private policy value %q leaked into argv or environment", value)
+		}
+	}
+	if !reflect.DeepEqual(spec.Env, os.Environ()) {
+		t.Fatal("root spawn modified the inherited environment to carry policy")
+	}
+}
+
+func TestSpawnRootClosesBootstrapPipeOnStartFailure(t *testing.T) {
+	fs := &fakeStarter{err: errors.New("start sentinel")}
+	m := configuredSpawnManager(t, fs)
+	var readEnd, writeEnd *os.File
+	m.newBootstrapPipe = func() (*os.File, *os.File, error) {
+		var err error
+		readEnd, writeEnd, err = os.Pipe()
+		return readEnd, writeEnd, err
+	}
+	if _, err := m.SpawnRoot(context.Background()); err == nil || !strings.Contains(err.Error(), "start sentinel") {
+		t.Fatalf("SpawnRoot error = %v", err)
+	}
+	assertFileClosed(t, readEnd)
+	assertFileClosed(t, writeEnd)
+}
+
+func TestSpawnRootClosesBootstrapPipeOnWriteFailure(t *testing.T) {
+	fs := &fakeStarter{process: newFakeProcess(1237)}
+	m := configuredSpawnManager(t, fs)
+	var readEnd, writeEnd *os.File
+	m.newBootstrapPipe = func() (*os.File, *os.File, error) {
+		var err error
+		readEnd, writeEnd, err = os.Pipe()
+		if err == nil {
+			_ = readEnd.Close()
+		}
+		return readEnd, writeEnd, err
+	}
+	if _, err := m.SpawnRoot(context.Background()); err == nil || !strings.Contains(err.Error(), "bootstrap") {
+		t.Fatalf("SpawnRoot error = %v, want bootstrap write failure", err)
+	}
+	assertFileClosed(t, readEnd)
+	assertFileClosed(t, writeEnd)
+	fs.process.mu.Lock()
+	signals := append([]syscall.Signal(nil), fs.process.signals...)
+	fs.process.mu.Unlock()
+	if len(signals) != 1 || signals[0] != syscall.SIGKILL {
+		t.Fatalf("bootstrap write failure signals = %v, want [SIGKILL]", signals)
+	}
+}
+
+func configuredSpawnManager(t *testing.T, starter processStarter) *Manager {
+	t.Helper()
+	m := fakeManager(nil)
+	m.starter = starter
+	m.opts.SessionBinary = "/usr/bin/kanedias"
+	m.opts.ConfigPath = "/etc/kanedias/config.toml"
+	m.opts.RootSocketDir, m.opts.SessionLogDir = shortTempDirs(t)
+	m.opts.SpawnTimeout = 50 * time.Millisecond
+	m.newSpawnToken = func() (string, error) { return "fixed-token", nil }
+	return m
+}
+
+func assertFileClosed(t *testing.T, file *os.File) {
+	t.Helper()
+	if file == nil {
+		t.Fatal("file was not created")
+	}
+	if _, err := file.Stat(); !errors.Is(err, os.ErrClosed) {
+		t.Fatalf("file %q remains open: Stat error = %v", file.Name(), err)
 	}
 }
 
