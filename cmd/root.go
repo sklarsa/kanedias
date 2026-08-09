@@ -12,29 +12,24 @@ import (
 	"github.com/sklarsa/kanedias/internal/network"
 	"github.com/sklarsa/kanedias/internal/profiles"
 	"github.com/sklarsa/kanedias/internal/proxy"
-	"github.com/sklarsa/kanedias/internal/sandbox"
 	"github.com/sklarsa/kanedias/internal/server"
 	"github.com/sklarsa/kanedias/internal/supervisor/process"
 	"github.com/sklarsa/kanedias/internal/workspace"
-	incusworkspace "github.com/sklarsa/kanedias/internal/workspace/incus"
 	"github.com/spf13/cobra"
 )
 
 type services struct {
-	loadConfig         func(string) (config.Config, error)
-	ensureNetwork      func(context.Context, config.Config) error
-	renderProfile      func(io.Writer, string, config.Config) error
-	runProxy           func(context.Context, proxy.Options) error
-	initCA             func(string, string) error
-	loginOpenAICodex   func(context.Context, string, io.Writer) error
-	createImage        func(context.Context, config.Config, io.Writer, io.Writer) error
-	createSandbox      func(context.Context, config.Config, string, io.Writer, io.Writer) error
-	destroySandbox     func(context.Context, config.Config, string, io.Writer, io.Writer) error
-	runSupervisor      func(context.Context, config.Config, SessionOptions, io.Writer) error
-	syncRepos          func(context.Context, config.Config, io.Writer, io.Writer) error
-	syncIncusWorkspace func(context.Context, config.Config, io.Writer, io.Writer) error
-	runServer          func(context.Context, config.Config, server.Options) error
-	runSessionChild    process.ChildRunner
+	loadConfig       func(string) (config.Config, error)
+	ensureNetwork    func(context.Context, config.Config) error
+	renderProfile    func(io.Writer, string, config.Config) error
+	runProxy         func(context.Context, proxy.Options) error
+	initCA           func(string, string) error
+	loginOpenAICodex func(context.Context, string, io.Writer) error
+	createImage      func(context.Context, config.Config, io.Writer, io.Writer) error
+	runSupervisor    func(context.Context, config.Config, SessionOptions, io.Writer) error
+	syncRepos        func(context.Context, config.Config, io.Writer, io.Writer) error
+	runServer        func(context.Context, config.Config, server.Options) error
+	runSessionChild  process.ChildRunner
 }
 
 // Execute runs the Kanedias command-line interface.
@@ -63,20 +58,17 @@ func execute(ctx context.Context, service services, options proxy.Options) error
 
 func realServices() services {
 	return services{
-		loadConfig:         config.Load,
-		ensureNetwork:      network.Ensure,
-		renderProfile:      profiles.Render,
-		runProxy:           proxy.RunContext,
-		initCA:             proxy.InitCA,
-		loginOpenAICodex:   proxy.LoginOpenAICodex,
-		createImage:        image.Create,
-		createSandbox:      sandbox.Create,
-		destroySandbox:     sandbox.Destroy,
-		runSupervisor:      runSupervisor,
-		syncRepos:          workspace.Sync,
-		syncIncusWorkspace: incusworkspace.Sync,
-		runServer:          server.Run,
-		runSessionChild:    productionChildRunner,
+		loadConfig:       config.Load,
+		ensureNetwork:    network.Ensure,
+		renderProfile:    profiles.Render,
+		runProxy:         proxy.RunContext,
+		initCA:           proxy.InitCA,
+		loginOpenAICodex: proxy.LoginOpenAICodex,
+		createImage:      image.Create,
+		runSupervisor:    runSupervisor,
+		syncRepos:        workspace.Sync,
+		runServer:        server.Run,
+		runSessionChild:  productionChildRunner,
 	}
 }
 
@@ -96,7 +88,6 @@ func newRootCommand(service services, options proxy.Options) *cobra.Command {
 		newImageCommand(service, getConfigPath),
 		newProfileCommand(service, getConfigPath),
 		newProxyCommand(service, getConfigPath, options),
-		newSandboxCommand(service, getConfigPath),
 		newServerCommand(service, getConfigPath),
 		newSessionChildCommand(service.runSessionChild),
 		newSessionCommand(service, getConfigPath),
