@@ -68,7 +68,6 @@ apt-get install -y --no-install-recommends \
     gzip \
     hostname \
     htop \
-    incus-base \
     iproute2 \
     iputils-ping \
     jq \
@@ -112,7 +111,7 @@ configure_managed_user() {
         useradd --create-home --shell /usr/bin/zsh "$managed_user"
     fi
 
-    usermod --append --groups sudo,incus-admin "$managed_user"
+    usermod --append --groups sudo "$managed_user"
 
     install -m 0440 /dev/null "/etc/sudoers.d/$managed_user"
     printf '%s ALL=(ALL:ALL) NOPASSWD: ALL\n' "$managed_user" \
@@ -145,7 +144,7 @@ configure_managed_user() {
 configure_managed_user
 
 if [[ $(id -u "$managed_user") != 1000 || $(id -g "$managed_user") != 1000 ]]; then
-    printf 'managed user %s must have numeric UID/GID 1000 for Incus proxy mappings\n' "$managed_user" >&2
+    printf 'managed user %s must have numeric UID/GID 1000 for container device mappings\n' "$managed_user" >&2
     exit 1
 fi
 
