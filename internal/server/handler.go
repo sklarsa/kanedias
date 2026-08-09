@@ -87,6 +87,10 @@ func newHandlerWithOptions(logger *slog.Logger, effectiveAddress string, bootstr
 	serveCSS := serveEmbeddedAsset(logger, "web/app.css", "text/css; charset=utf-8")
 	serveJavaScript := serveEmbeddedAsset(logger, "web/datastar.js", "text/javascript; charset=utf-8")
 	serveAppJS := serveEmbeddedAsset(logger, "web/app.js", "text/javascript; charset=utf-8")
+	serveMarked := serveEmbeddedAsset(logger, "web/marked.min.js", "text/javascript; charset=utf-8")
+	serveHighlight := serveEmbeddedAsset(logger, "web/highlight.min.js", "text/javascript; charset=utf-8")
+	serveMarkdownRenderer := serveEmbeddedAsset(logger, "web/markdown-renderer.js", "text/javascript; charset=utf-8")
+	serveTerminalUI := serveEmbeddedAsset(logger, "web/terminal-ui.js", "text/javascript; charset=utf-8")
 
 	router := chi.NewRouter()
 	router.Use(requestLogger(logger), recoverPanics(logger))
@@ -99,6 +103,10 @@ func newHandlerWithOptions(logger *slog.Logger, effectiveAddress string, bootstr
 	router.Get("/assets/terminal.css", serveTerminalCSS)
 	router.Get("/assets/app.css", serveCSS)
 	router.Get("/assets/datastar.js", serveJavaScript)
+	router.Get("/assets/marked.min.js", serveMarked)
+	router.Get("/assets/highlight.min.js", serveHighlight)
+	router.Get("/assets/markdown-renderer.js", serveMarkdownRenderer)
+	router.Get("/assets/terminal-ui.js", serveTerminalUI)
 	router.Get("/assets/app.js", serveAppJS)
 
 	var serveFleet, serveSession http.HandlerFunc
@@ -250,6 +258,14 @@ func makeSessionHandler(fleet fleetManager, templates *template.Template, logger
 				}
 				state, err = fleet.Session(sessionID)
 				if err != nil {
+					emptyState := emptySessionState()
+					if err := patchTemplate(sse, templates, templateDetail, "detail-panel", newDetailView(emptyState, statsView{})); err != nil {
+						return
+					}
+					if err := patchTemplate(sse, templates, templateQuestions, "question-panel", newQuestionPanelView(emptyState)); err != nil {
+						return
+					}
+					_ = patchTemplate(sse, templates, templateActivity, "activity-panel", newActivityView(emptyState))
 					return
 				}
 				if err := patchTemplate(sse, templates, templateDetail, "detail-panel", newDetailView(state, statsFetcher.get(state))); err != nil {

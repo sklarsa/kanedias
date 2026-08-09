@@ -173,6 +173,13 @@ func TestHandlerRoutes(t *testing.T) {
 			contentType: "text/javascript; charset=utf-8",
 		},
 		{
+			name:        "terminal decisions",
+			path:        "/assets/terminal-ui.js",
+			method:      http.MethodGet,
+			status:      http.StatusOK,
+			contentType: "text/javascript; charset=utf-8",
+		},
+		{
 			name:   "unknown",
 			path:   "/unknown",
 			method: http.MethodGet,
@@ -261,6 +268,9 @@ func TestInitialPageContainsAstrolabeConsole(t *testing.T) {
 		// shell stable Datastar patch roots
 		`id="fleet-panel"`,
 		`id="detail-panel"`,
+		`data-can-steer="false"`,
+		`data-can-interrupt="false"`,
+		`data-can-stop="false"`,
 		`id="question-panel"`,
 		`id="activity-panel"`,
 		`id="deck-status"`,
@@ -315,17 +325,28 @@ func TestInitialPageContainsAstrolabeConsole(t *testing.T) {
 func TestAstrolabeConsoleIsInteractive(t *testing.T) {
 	body := indexBody(t)
 
-	// The console is wired by the local Datastar module and app.js (delegated
-	// behavior). No external scripts and no inline controller.
+	// The console is wired by local asset modules (Datastar, Marked, Highlight,
+	// the Markdown renderer, and app.js delegated behavior). No external scripts
+	// and no inline controller.
 	scriptRE := regexp.MustCompile(`(?s)<script\b([^>]*)>(.*?)</script>`)
 	scripts := scriptRE.FindAllStringSubmatch(body, -1)
-	if len(scripts) != 2 {
-		t.Fatalf("script count = %d, want 2 (Datastar module + app.js)", len(scripts))
+	wantScripts := 6 // Datastar + 3 Markdown assets + terminal decisions + app.js
+	if len(scripts) != wantScripts {
+		t.Fatalf("script count = %d, want %d (Datastar + 3 Markdown assets + terminal-ui.js + app.js)", len(scripts), wantScripts)
 	}
 
-	var sawDatastar, sawAppJS bool
+	var sawDatastar, sawTerminalUI, sawAppJS bool
+	markdownAssets := []string{
+		`src="/assets/marked.min.js"`,
+		`src="/assets/highlight.min.js"`,
+		`src="/assets/markdown-renderer.js"`,
+	}
+	sawMarkdown := make(map[string]bool)
 	for _, script := range scripts {
 		attrs, inner := script[1], strings.TrimSpace(script[2])
+		if strings.Contains(attrs, `src="http://`) || strings.Contains(attrs, `src="https://`) {
+			t.Errorf("script references a remote origin: %s", script[0])
+		}
 		if strings.Contains(attrs, `src="/assets/datastar.js"`) {
 			if !strings.Contains(attrs, `type="module"`) {
 				t.Errorf("datastar.js script is not a module: %s", script[0])
@@ -335,28 +356,127 @@ func TestAstrolabeConsoleIsInteractive(t *testing.T) {
 			}
 			sawDatastar = true
 		}
+		if strings.Contains(attrs, `src="/assets/terminal-ui.js"`) {
+			if inner != "" {
+				t.Errorf("terminal-ui.js script has unexpected inline body %q", inner)
+			}
+			sawTerminalUI = true
+		}
 		if strings.Contains(attrs, `src="/assets/app.js"`) {
 			if inner != "" {
 				t.Errorf("app.js script has unexpected inline body %q", inner)
 			}
 			sawAppJS = true
 		}
+		for _, asset := range markdownAssets {
+			if strings.Contains(attrs, asset) {
+				sawMarkdown[asset] = true
+			}
+		}
 	}
 	if !sawDatastar {
 		t.Error("page is missing the local Datastar module script")
 	}
+	if !sawTerminalUI {
+		t.Error("page is missing the local terminal-ui.js script")
+	}
 	if !sawAppJS {
 		t.Error("page is missing the app.js script")
 	}
+	for _, asset := range markdownAssets {
+		if !sawMarkdown[asset] {
+			t.Errorf("page is missing local script %s", asset)
+		}
+	}
 
 	// The console is a working control surface with delegated Datastar wiring.
-	for _, want := range []string{`class="deck-input"`, `data-bind="commandMessage"`, `data-on:click=`} {
+	for _, want := range []string{
+		`class="deck-input"`, `data-bind="commandMessage"`, `data-on:click=`,
+		`aria-keyshortcuts="Control+A Control+C Enter"`,
+		`aria-keyshortcuts="Escape"`,
+		`^A home · ^C clear/copy · esc abort · ^O tools`,
+	} {
 		if !strings.Contains(body, want) {
 			t.Errorf("interactive console is missing wiring %q", want)
 		}
 	}
 	if strings.Contains(body, " disabled") {
 		t.Error("Astrolabe console must not ship disabled placeholder controls")
+	}
+	if strings.Contains(strings.ToLower(body), "onkeydown=") || strings.Contains(strings.ToLower(body), "onkeyup=") {
+		t.Error("Astrolabe console must use delegated keyboard handling, not inline key handlers")
+	}
+}
+
+func TestActivityUsesMarkdownClassification(t *testing.T) {
+	cases := []struct {
+		kind string
+		want bool
+	}{
+		{"user_message", true},
+		{"message_update", true},
+		{"model_error", false},
+		{"tool_call", false},
+		{"tool_result", false},
+		{"bash_execution", false},
+		{"", false},
+	}
+	for _, c := range cases {
+		if got := activityUsesMarkdown(c.kind); got != c.want {
+			t.Errorf("activityUsesMarkdown(%q) = %v, want %v", c.kind, got, c.want)
+		}
+	}
+
+	// Exercise newActivityView from manager state rather than manually-set flags.
+	state := manager.SessionState{RecentActivity: []manager.ActivityItem{
+		{Seq: 1, Kind: "user_message", Text: "# hi"},
+		{Seq: 2, Kind: "message_update", Text: "**bold**"},
+		{Seq: 3, Kind: "model_error", Text: "boom", IsError: true},
+		{Seq: 4, Kind: "tool_result", Text: "out"},
+	}}
+	view := newActivityView(state)
+	if len(view.Items) != 4 {
+		t.Fatalf("items = %d, want 4", len(view.Items))
+	}
+	if !view.Items[0].IsMarkdown || !view.Items[1].IsMarkdown {
+		t.Error("user_message/message_update should be classified as Markdown")
+	}
+	if view.Items[2].IsMarkdown || view.Items[3].IsMarkdown {
+		t.Error("model_error/tool_result must not be classified as Markdown")
+	}
+
+	templates, err := parseTemplates(webFiles)
+	if err != nil {
+		t.Fatal(err)
+	}
+	html, err := renderTemplate(templates, templateActivity, view)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if got := strings.Count(html, `data-markdown`); got != 2 {
+		t.Fatalf("markdown markers = %d, want 2\n%s", got, html)
+	}
+}
+
+func TestActivityMarksOnlyConversationTextAsMarkdown(t *testing.T) {
+	templates, err := parseTemplates(webFiles)
+	if err != nil {
+		t.Fatal(err)
+	}
+	view := activityView{Items: []activityItemView{
+		{Kind: "user_message", Label: "You", Text: "# prompt", IsMarkdown: true},
+		{Kind: "message_update", Label: "Message", Text: "```go\npackage p\n```", IsMarkdown: true},
+		{Kind: "model_error", Label: "Model error", Text: "**not markup**", IsError: true},
+	}}
+	html, err := renderTemplate(templates, templateActivity, view)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if got := strings.Count(html, `data-markdown`); got != 2 {
+		t.Fatalf("markdown markers = %d, want 2\n%s", got, html)
+	}
+	if strings.Contains(html, `<h1>`) || strings.Contains(html, `<script`) {
+		t.Fatalf("server trusted transcript markup:\n%s", html)
 	}
 }
 
@@ -997,7 +1117,7 @@ func TestAssetsAreEmbedded(t *testing.T) {
 	})
 
 	// Unauthenticated paths.
-	for _, path := range []string{"/healthz", "/assets/terminal.css", "/assets/app.css", "/assets/datastar.js", "/assets/app.js"} {
+	for _, path := range []string{"/healthz", "/assets/terminal.css", "/assets/app.css", "/assets/datastar.js", "/assets/terminal-ui.js", "/assets/app.js"} {
 		if response := serveRequest(handler, http.MethodGet, path); response.Code != http.StatusOK {
 			t.Errorf("GET %s status = %d, want %d", path, response.Code, http.StatusOK)
 		}
@@ -1051,6 +1171,10 @@ func TestRenderedPageHasOnlyOrderedLocalRuntimeAssets(t *testing.T) {
 		"/assets/terminal.css",
 		"/assets/app.css",
 		"/assets/datastar.js",
+		"/assets/marked.min.js",
+		"/assets/highlight.min.js",
+		"/assets/markdown-renderer.js",
+		"/assets/terminal-ui.js",
 		"/assets/app.js",
 	}
 	if len(matches) != len(want) {
@@ -1216,6 +1340,142 @@ func TestStatusStreamHonorsCanceledRequest(t *testing.T) {
 func TestHandlerRejectsNilLogger(t *testing.T) {
 	if _, err := newHandler(nil); err == nil {
 		t.Fatal("newHandler(nil) succeeded, want error")
+	}
+}
+
+// detailsTagOpen reports whether the first <details ...> opening tag carries an
+// open attribute. It parses the attribute strictly (delimiter-separated on both
+// sides) so a status class like "tool-done" or "tool-running" can never cause a
+// false positive.
+func detailsTagOpen(html string) bool {
+	tag := "<details "
+	start := strings.Index(html, tag)
+	if start == -1 {
+		return false
+	}
+	rel := strings.Index(html[start:], ">")
+	if rel == -1 {
+		return false
+	}
+	open := html[start : start+rel]
+	re := regexp.MustCompile(`(^|\s)open(?:[=\s>]|$)`)
+	return re.MatchString(open)
+}
+
+func TestToolCardTemplateEscapesAndCollapses(t *testing.T) {
+	templates, err := parseTemplates(webFiles)
+	if err != nil {
+		t.Fatal(err)
+	}
+	payload := "</pre><script>alert(1)</script>"
+	view := activityView{Items: []activityItemView{
+		{
+			Kind: "tool_execution_start", Label: "Tool: read",
+			IsTool: true, ToolSummary: "read a.txt", ToolArgs: payload,
+			ToolOutput: payload, ToolLanguage: "go", ToolTruncated: false,
+			ToolCardClass: "tool-done", StatusLabel: "done",
+		},
+	}}
+	html, err := renderTemplate(templates, templateActivity, view)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !strings.Contains(html, `<details class="tool-card`) {
+		t.Fatal("tool card details missing\n" + html)
+	}
+	if strings.Contains(html, `<script>alert`) {
+		t.Fatalf("unescaped tool content: %s", html)
+	}
+	if !strings.Contains(html, `&lt;script&gt;alert`) {
+		t.Fatalf("missing escaped source: %s", html)
+	}
+	if detailsTagOpen(html) {
+		t.Fatalf("tool defaulted open: %s", html)
+	}
+}
+
+func TestToolCardRunningNeverOpens(t *testing.T) {
+	templates, err := parseTemplates(webFiles)
+	if err != nil {
+		t.Fatal(err)
+	}
+	// A real running card keeps the running state only as class/status and must
+	// render collapsed (no open attribute).
+	view := activityView{Items: []activityItemView{
+		{
+			Kind: "tool_execution_start", Label: "Tool: bash", IsTool: true,
+			ToolSummary: "$ echo hi", ToolArgs: "{}", ToolOutput: "hi\n",
+			ToolCardClass: "tool-running", StatusLabel: "running",
+		},
+	}}
+	html, err := renderTemplate(templates, templateActivity, view)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !strings.Contains(html, `class="tool-card tool-running"`) {
+		t.Fatalf("missing running status class: %s", html)
+	}
+	if detailsTagOpen(html) {
+		t.Fatalf("running tool card defaulted open: %s", html)
+	}
+}
+
+func TestToolCardAggregateTruncatedShowsNeutralSummaryBadge(t *testing.T) {
+	templates, err := parseTemplates(webFiles)
+	if err != nil {
+		t.Fatal(err)
+	}
+	// Args-only truncation must still surface a neutral "truncated" indicator in
+	// the collapsed summary, while the result section must NOT be falsely marked.
+	view := activityView{Items: []activityItemView{
+		{
+			Kind: "tool_execution_start", Label: "Tool: bash", IsTool: true,
+			ToolSummary: "$ echo hi", ToolArgs: "{\"a\": 1}",
+			ToolOutput: "hi\n", ToolTruncated: true, ToolArgsTruncated: true,
+			ToolOutputTruncated: false, ToolCardClass: "tool-done", StatusLabel: "done",
+		},
+	}}
+	html, err := renderTemplate(templates, templateActivity, view)
+	if err != nil {
+		t.Fatal(err)
+	}
+	sumStart := strings.Index(html, "<summary")
+	sumEnd := strings.Index(html, "</summary>")
+	if sumStart == -1 || sumEnd == -1 || sumEnd < sumStart {
+		t.Fatalf("no summary block in html: %s", html)
+	}
+	if !strings.Contains(html[sumStart:sumEnd], "truncated") {
+		t.Fatalf("missing neutral truncated summary badge: %s", html)
+	}
+	if !strings.Contains(html, `Arguments <span class="tool-trunc-label">truncated</span>`) {
+		t.Fatalf("missing args truncation marker: %s", html)
+	}
+	if strings.Contains(html, `Result <span class="tool-trunc-label">truncated</span>`) {
+		t.Fatalf("result falsely marked truncated: %s", html)
+	}
+}
+
+func TestToolCardErrorView(t *testing.T) {
+	templates, err := parseTemplates(webFiles)
+	if err != nil {
+		t.Fatal(err)
+	}
+	view := activityView{Items: []activityItemView{
+		{
+			Kind: "tool_execution_end", Label: "Tool: bash", IsTool: true,
+			ToolSummary: "$ false", IsError: true,
+			ToolCardClass: "tool-error", StatusLabel: "error",
+		},
+	}}
+	html, err := renderTemplate(templates, templateActivity, view)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !strings.Contains(html, `class="tool-card tool-error"`) {
+		t.Fatalf("missing error card class: %s", html)
+	}
+	if !strings.Contains(html, `class="tool-status tool-error">error</span>`) {
+		t.Fatalf("missing error status: %s", html)
 	}
 }
 

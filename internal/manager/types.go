@@ -48,6 +48,14 @@ type RootState struct {
 	Revision        uint64
 }
 
+// maxToolDisplayBytes caps any single tool arguments/output display field. It
+// bounds the bytes the manager projects from a supervisor's raw tool payloads
+// so an untrusted/hostile supervisor can never make the manager emit an
+// unbounded string into the transcript. Display truncation appends the marker
+// byte suffix, so the effective text budget is maxToolDisplayBytes across the
+// whole field.
+const maxToolDisplayBytes = 64 << 10
+
 // ActivityItem is one allowlisted projection of recent session activity.
 type ActivityItem struct {
 	Seq        uint64
@@ -58,6 +66,23 @@ type ActivityItem struct {
 	ToolName   string
 	Status     string
 	IsError    bool
+	// IsTool marks bounded tool-execution projections. The tool display fields
+	// below are the manager's sole raw-event trust boundary: they are derived
+	// here from the supervisor's raw payload via pure bolding/formatting
+	// helpers (boundedDisplay, formatToolJSON, formatToolResult, summarizeTool,
+	// toolLanguage) and never carry template.HTML or raw event data.
+	IsTool       bool
+	ToolSummary  string
+	ToolArgs     string
+	ToolOutput   string
+	ToolLanguage string
+	// ToolTruncated is the aggregate flag across arguments, partial and final
+	// output; the card summary surfaces a neutral "truncated" indicator from it.
+	ToolTruncated bool
+	// ToolArgsTruncated / ToolOutputTruncated mark which specific field was
+	// actually cut, so the explicit marker stays on the affected field.
+	ToolArgsTruncated   bool
+	ToolOutputTruncated bool
 }
 
 // SessionState is the public projection of one session within a root tree.

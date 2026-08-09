@@ -22,6 +22,7 @@ build: ## Build the binary into bin/
 
 test: ## Run the hermetic test suite (no Incus, no network)
 	go test ./...
+	node --test internal/server/web/*.test.js
 
 test-live: ## Run live Incus/E2E tests (needs Incus + .env; see .env.example)
 	@if [ ! -f .env ]; then \

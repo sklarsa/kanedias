@@ -23,6 +23,7 @@ import (
 	"net"
 	"net/http"
 	"net/http/cookiejar"
+	"net/http/httptest"
 	"net/url"
 	"os"
 	"path/filepath"
@@ -32,6 +33,7 @@ import (
 	"time"
 
 	"github.com/sklarsa/kanedias/internal/config"
+	"github.com/sklarsa/kanedias/internal/manager"
 	"github.com/sklarsa/kanedias/internal/supervisor"
 	"github.com/sklarsa/kanedias/internal/supervisor/contract"
 	"github.com/sklarsa/kanedias/internal/supervisorapi"
@@ -42,11 +44,12 @@ import (
 // ---------------------------------------------------------------------------
 
 type persistentRootService struct {
-	mu       sync.Mutex
-	tree     supervisor.NodeSnapshot
-	broker   *supervisor.EventBroker
-	commands []json.RawMessage
-	stopped  chan string
+	mu          sync.Mutex
+	tree        supervisor.NodeSnapshot
+	broker      *supervisor.EventBroker
+	commands    []json.RawMessage
+	stopped     chan string
+	snapshotErr error
 }
 
 func newPersistentRootService(rootID string) *persistentRootService {
@@ -78,7 +81,16 @@ func cloneRootSnapshot(s supervisor.NodeSnapshot) supervisor.NodeSnapshot {
 func (svc *persistentRootService) Snapshot(_ context.Context) (supervisor.NodeSnapshot, error) {
 	svc.mu.Lock()
 	defer svc.mu.Unlock()
+	if svc.snapshotErr != nil {
+		return supervisor.NodeSnapshot{}, svc.snapshotErr
+	}
 	return cloneRootSnapshot(svc.tree), nil
+}
+
+func (svc *persistentRootService) setSnapshotError(err error) {
+	svc.mu.Lock()
+	defer svc.mu.Unlock()
+	svc.snapshotErr = err
 }
 
 func (svc *persistentRootService) Workers(_ context.Context) []contract.WorkerSummary {
@@ -441,6 +453,252 @@ func waitForSocketFile(t *testing.T, path string, timeout time.Duration) {
 // ---------------------------------------------------------------------------
 // The main test
 // ---------------------------------------------------------------------------
+
+type selectedRouteFixture struct {
+	manager    *manager.Manager
+	service    *persistentRootService
+	httpServer *httptest.Server
+	cookie     *http.Cookie
+	rootID     string
+	socketPath string
+	rootCancel context.CancelFunc
+	rootDone   chan error
+}
+
+func newSelectedRouteFixture(t *testing.T) *selectedRouteFixture {
+	t.Helper()
+	base, err := os.MkdirTemp("/tmp", "ksel-")
+	if err != nil {
+		t.Fatalf("MkdirTemp: %v", err)
+	}
+	for _, dir := range []string{filepath.Join(base, "r"), filepath.Join(base, "l")} {
+		if err := os.Mkdir(dir, 0o700); err != nil {
+			t.Fatalf("mkdir %s: %v", dir, err)
+		}
+	}
+
+	rootID := "selected-running-root"
+	socketPath := filepath.Join(base, "r", "selected.root.sock")
+	service := newPersistentRootService(rootID)
+	service.tree.Lifecycle = string(supervisor.LifecycleRunning)
+	rootCtx, rootCancel := context.WithCancel(context.Background())
+	rootDone := make(chan error, 1)
+	go func() {
+		rootDone <- supervisorapi.ServeUnix(rootCtx, socketPath, supervisorapi.NewHandler(service))
+	}()
+	waitForSocketFile(t, socketPath, 3*time.Second)
+
+	logger, _ := testLogger()
+	fleet, err := manager.New(manager.Options{
+		RootSocketDir:     filepath.Join(base, "r"),
+		SessionLogDir:     filepath.Join(base, "l"),
+		DiscoveryInterval: 20 * time.Millisecond,
+		SnapshotInterval:  20 * time.Millisecond,
+		EventLimits:       supervisor.EventBrokerOptions{MaxEvents: 100},
+		Logger:            logger,
+	})
+	if err != nil {
+		rootCancel()
+		t.Fatalf("manager.New: %v", err)
+	}
+	if err := fleet.Start(context.Background()); err != nil {
+		rootCancel()
+		t.Fatalf("manager.Start: %v", err)
+	}
+
+	deadline := time.Now().Add(3 * time.Second)
+	for {
+		if _, err := fleet.Session(rootID); err == nil {
+			break
+		}
+		if time.Now().After(deadline) {
+			t.Fatalf("manager did not discover %q", rootID)
+		}
+		time.Sleep(10 * time.Millisecond)
+	}
+
+	handler, cookie := mustNewHandlerWithFleetAuth(t, fleet)
+	httpServer := httptest.NewServer(handler)
+	fixture := &selectedRouteFixture{
+		manager: fleet, service: service, httpServer: httpServer, cookie: cookie,
+		rootID: rootID, socketPath: socketPath, rootCancel: rootCancel, rootDone: rootDone,
+	}
+	t.Cleanup(func() {
+		httpServer.Close()
+		ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+		defer cancel()
+		_ = fleet.Close(ctx)
+		rootCancel()
+		select {
+		case <-rootDone:
+		case <-time.After(5 * time.Second):
+			t.Error("fake root did not stop")
+		}
+		_ = os.RemoveAll(base)
+	})
+	return fixture
+}
+
+type capabilityStreamProbe struct {
+	mu      sync.Mutex
+	body    strings.Builder
+	changed chan struct{}
+	done    chan error
+}
+
+func startCapabilityStreamProbe(t *testing.T, fixture *selectedRouteFixture) *capabilityStreamProbe {
+	t.Helper()
+	ctx, cancel := context.WithCancel(context.Background())
+	signals := url.QueryEscape(fmt.Sprintf(`{"selectedSessionId":%q}`, fixture.rootID))
+	req, err := http.NewRequestWithContext(ctx, http.MethodGet, fixture.httpServer.URL+"/ui/session?datastar="+signals, nil)
+	if err != nil {
+		cancel()
+		t.Fatalf("new session stream request: %v", err)
+	}
+	req.AddCookie(fixture.cookie)
+	resp, err := fixture.httpServer.Client().Do(req)
+	if err != nil {
+		cancel()
+		t.Fatalf("open session stream: %v", err)
+	}
+	if resp.StatusCode != http.StatusOK {
+		cancel()
+		_ = resp.Body.Close()
+		t.Fatalf("session stream status = %d, want 200", resp.StatusCode)
+	}
+	probe := &capabilityStreamProbe{
+		changed: make(chan struct{}, 1),
+		done:    make(chan error, 1),
+	}
+	go func() {
+		buffer := make([]byte, 4096)
+		for {
+			n, readErr := resp.Body.Read(buffer)
+			if n > 0 {
+				probe.mu.Lock()
+				_, _ = probe.body.Write(buffer[:n])
+				probe.mu.Unlock()
+				select {
+				case probe.changed <- struct{}{}:
+				default:
+				}
+			}
+			if readErr != nil {
+				probe.done <- readErr
+				return
+			}
+		}
+	}()
+	t.Cleanup(func() {
+		cancel()
+		_ = resp.Body.Close()
+	})
+	return probe
+}
+
+func (probe *capabilityStreamProbe) snapshot() string {
+	probe.mu.Lock()
+	defer probe.mu.Unlock()
+	return probe.body.String()
+}
+
+func (probe *capabilityStreamProbe) waitForEnd(t *testing.T, timeout time.Duration) {
+	t.Helper()
+	select {
+	case err := <-probe.done:
+		if err != io.EOF {
+			t.Fatalf("session stream ended with %v, want EOF", err)
+		}
+	case <-time.After(timeout):
+		t.Fatal("session stream did not close after selected route invalidation")
+	}
+}
+
+func (probe *capabilityStreamProbe) waitFor(t *testing.T, description string, timeout time.Duration, predicate func(string) bool) string {
+	t.Helper()
+	timer := time.NewTimer(timeout)
+	defer timer.Stop()
+	for {
+		body := probe.snapshot()
+		if predicate(body) {
+			return body
+		}
+		select {
+		case <-probe.changed:
+		case err := <-probe.done:
+			body = probe.snapshot()
+			if predicate(body) {
+				return body
+			}
+			t.Fatalf("session stream ended before %s: %v\n%s", description, err, body)
+		case <-timer.C:
+			t.Fatalf("timed out waiting for %s\n%s", description, body)
+		}
+	}
+}
+
+func hasCapabilities(body string, steer, interrupt, stop bool) bool {
+	return strings.Contains(body, fmt.Sprintf(`data-can-steer="%t"`, steer)) &&
+		strings.Contains(body, fmt.Sprintf(`data-can-interrupt="%t"`, interrupt)) &&
+		strings.Contains(body, fmt.Sprintf(`data-can-stop="%t"`, stop))
+}
+
+func hasFinalEmptySessionPatch(body string) bool {
+	lastDetail := strings.LastIndex(body, `id="detail-panel"`)
+	if lastDetail < 0 {
+		return false
+	}
+	tail := body[lastDetail:]
+	return hasCapabilities(tail, false, false, false) &&
+		!strings.Contains(tail, `data-can-steer="true"`) &&
+		!strings.Contains(tail, `data-can-interrupt="true"`) &&
+		!strings.Contains(tail, `data-can-stop="true"`) &&
+		strings.Contains(tail, `id="question-panel"`) &&
+		strings.Contains(tail, `id="activity-panel"`)
+}
+
+func TestSelectedRunningRouteAbruptRemovalStreamsDisabledCapabilities(t *testing.T) {
+	fixture := newSelectedRouteFixture(t)
+	probe := startCapabilityStreamProbe(t, fixture)
+	probe.waitFor(t, "initial enabled capabilities", 3*time.Second, func(body string) bool {
+		return hasCapabilities(body, true, true, true)
+	})
+
+	fixture.rootCancel()
+	_ = os.Remove(fixture.socketPath)
+	probe.waitFor(t, "empty selected-session patch after abrupt removal", 3*time.Second, hasFinalEmptySessionPatch)
+	probe.waitForEnd(t, time.Second)
+}
+
+func TestSelectedStaleRootStopEvictionStreamsDisabledCapabilities(t *testing.T) {
+	fixture := newSelectedRouteFixture(t)
+	probe := startCapabilityStreamProbe(t, fixture)
+	probe.waitFor(t, "initial enabled capabilities", 3*time.Second, func(body string) bool {
+		return hasCapabilities(body, true, true, true)
+	})
+
+	fixture.service.setSnapshotError(fmt.Errorf("snapshot unavailable"))
+	deadline := time.Now().Add(3 * time.Second)
+	for {
+		snapshot := fixture.manager.Fleet()
+		if len(snapshot.Roots) == 1 && snapshot.Roots[0].Stale {
+			break
+		}
+		if time.Now().After(deadline) {
+			t.Fatal("root did not become stale")
+		}
+		time.Sleep(10 * time.Millisecond)
+	}
+	probe.waitFor(t, "stale capabilities with Stop retained", 3*time.Second, func(body string) bool {
+		return hasCapabilities(body, false, false, true)
+	})
+
+	if err := fixture.manager.StopSession(context.Background(), fixture.rootID); err != nil {
+		t.Fatalf("StopSession stale eviction: %v", err)
+	}
+	probe.waitFor(t, "empty selected-session patch after stale Stop eviction", 3*time.Second, hasFinalEmptySessionPatch)
+	probe.waitForEnd(t, time.Second)
+}
 
 func TestServerRestartRediscoversRunningRoot(t *testing.T) {
 	// Use a short /tmp path for sockets (Linux limit: 107 bytes).

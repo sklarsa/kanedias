@@ -81,6 +81,17 @@ type detailView struct {
 	Incomplete      bool
 	GapText         string
 	Stats           statsView
+	CanSteer        bool
+	CanInterrupt    bool
+	CanStop         bool
+}
+
+// actionCapabilities is the server-authoritative projection of which session
+// actions are valid for the current lifecycle.
+type actionCapabilities struct {
+	CanSteer     bool
+	CanInterrupt bool
+	CanStop      bool
 }
 
 // questionPanelView is the template data for questions.html.
@@ -89,22 +100,57 @@ type questionPanelView struct {
 	Questions []questionSummaryView
 }
 
+// activityItemView is the safe projection of one activity item.
+//
+// IsMarkdown marks only conversation text (assistant updates and user
+// messages) so the browser renders it as safe Markdown. Error/tool text is
+// never flagged and stays plain escaped text. The server never renders the
+// Markdown itself; it only adds the marker that app.js hands to the sandboxed
+// renderer after escaping.
+//
+// Tool items (IsTool) carry the manager's bounded display fields and a few
+// precomputed presentation helpers (card class, running flag, status label).
+// The tool args/output are plain strings that html/template escapes in the
+// <pre><code> blocks; the browser highlights them via
+// KanediasMarkdown.highlight.
+type activityItemView struct {
+	Seq        uint64
+	Kind       string
+	Label      string
+	Text       string
+	ToolName   string
+	IsError    bool
+	IsMarkdown bool
+	// Tool projection fields (bounded at 64 KiB by the manager).
+	IsTool        bool
+	ToolSummary   string
+	ToolArgs      string
+	ToolOutput    string
+	ToolLanguage  string
+	ToolTruncated bool
+	// Per-field truncation markers so the explicit badge stays on the field that
+	// was actually cut while ToolTruncated drives the neutral summary indicator.
+	ToolArgsTruncated   bool
+	ToolOutputTruncated bool
+	// Precomputed presentation helpers for the tool card. Running state is kept
+	// only in ToolCardClass/StatusLabel; cards are never emitted open.
+	ToolCardClass string
+	StatusLabel   string
+}
+
+// activityUsesMarkdown reports whether an activity kind should be rendered as
+// Markdown. Only assistant message updates and user messages qualify; errors
+// and tool activity remain plain escaped text.
+func activityUsesMarkdown(kind string) bool {
+	return kind == "message_update" || kind == "user_message"
+}
+
 // activityView is the template data for activity.html.
 type activityView struct {
 	SessionID  string
 	Items      []activityItemView
 	Incomplete bool
 	GapText    string
-}
-
-// activityItemView is the safe projection of one activity item.
-type activityItemView struct {
-	Seq      uint64
-	Kind     string
-	Label    string
-	Text     string
-	ToolName string
-	IsError  bool
 }
 
 // deckStatusView is the template data for deck-status.html.
@@ -219,6 +265,20 @@ func newQuestionSummaryView(q supervisor.QuestionSummary) questionSummaryView {
 	}
 }
 
+// newActionCapabilities derives action availability from the current session
+// state. Stream connectivity is deliberately not an authorization signal.
+func newActionCapabilities(state manager.SessionState) actionCapabilities {
+	lifecycle := supervisor.LifecycleState(state.Node.Lifecycle)
+	canSteer := !state.RootStale && (lifecycle == supervisor.LifecycleReady ||
+		lifecycle == supervisor.LifecycleRunning || lifecycle == supervisor.LifecycleAwaitingHandoff)
+	return actionCapabilities{
+		CanSteer:     canSteer,
+		CanInterrupt: !state.RootStale && lifecycle == supervisor.LifecycleRunning,
+		CanStop: state.Node.Lifecycle != "" && lifecycle != supervisor.LifecycleStopping &&
+			lifecycle != supervisor.LifecycleStopped,
+	}
+}
+
 // newDetailView converts a SessionState and (optional) stats into the detail
 // template data. A zero statsView (HasStats false) renders metrics as "—".
 func newDetailView(state manager.SessionState, stats statsView) detailView {
@@ -227,6 +287,7 @@ func newDetailView(state manager.SessionState, stats statsView) detailView {
 		gapText = fmt.Sprintf("replay gap: expected seq %d, first available %d",
 			state.Gap.ExpectedSeq, state.Gap.FirstAvailableSeq)
 	}
+	capabilities := newActionCapabilities(state)
 	return detailView{
 		SessionID:       state.Node.SessionID,
 		WorkerType:      state.Node.WorkerType,
@@ -237,6 +298,9 @@ func newDetailView(state manager.SessionState, stats statsView) detailView {
 		Incomplete:      state.Incomplete,
 		GapText:         gapText,
 		Stats:           stats,
+		CanSteer:        capabilities.CanSteer,
+		CanInterrupt:    capabilities.CanInterrupt,
+		CanStop:         capabilities.CanStop,
 	}
 }
 
@@ -252,18 +316,63 @@ func newQuestionPanelView(state manager.SessionState) questionPanelView {
 	}
 }
 
+// toolCardClass maps a manager tool status onto the compact card's border
+// class: pending (recently started), running, done, or error.
+func toolCardClass(status string, isError bool) string {
+	if isError {
+		return "tool-error"
+	}
+	switch status {
+	case "running":
+		return "tool-running"
+	case "done", "":
+		return "tool-done"
+	default:
+		return "tool-pending"
+	}
+}
+
+// toolStatusLabel is the short uppercase status text shown in the card summary.
+func toolStatusLabel(status string, isError bool) string {
+	if isError {
+		return "error"
+	}
+	switch status {
+	case "running":
+		return "running"
+	case "done":
+		return "done"
+	default:
+		return "pending"
+	}
+}
+
 // newActivityView converts a SessionState into the activity panel data.
 func newActivityView(state manager.SessionState) activityView {
 	items := make([]activityItemView, 0, len(state.RecentActivity))
 	for _, a := range state.RecentActivity {
-		items = append(items, activityItemView{
-			Seq:      a.Seq,
-			Kind:     a.Kind,
-			Label:    a.Label,
-			Text:     a.Text,
-			ToolName: a.ToolName,
-			IsError:  a.IsError,
-		})
+		view := activityItemView{
+			Seq:        a.Seq,
+			Kind:       a.Kind,
+			Label:      a.Label,
+			Text:       a.Text,
+			ToolName:   a.ToolName,
+			IsError:    a.IsError,
+			IsMarkdown: activityUsesMarkdown(a.Kind),
+		}
+		if a.IsTool {
+			view.IsTool = true
+			view.ToolSummary = a.ToolSummary
+			view.ToolArgs = a.ToolArgs
+			view.ToolOutput = a.ToolOutput
+			view.ToolLanguage = a.ToolLanguage
+			view.ToolTruncated = a.ToolTruncated
+			view.ToolArgsTruncated = a.ToolArgsTruncated
+			view.ToolOutputTruncated = a.ToolOutputTruncated
+			view.ToolCardClass = toolCardClass(a.Status, a.IsError)
+			view.StatusLabel = toolStatusLabel(a.Status, a.IsError)
+		}
+		items = append(items, view)
 	}
 	gapText := ""
 	if state.Gap != nil {

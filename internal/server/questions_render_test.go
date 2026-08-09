@@ -120,6 +120,74 @@ func TestCompletedLifecycleUsesTerminalRendering(t *testing.T) {
 	}
 }
 
+func TestActionCapabilitiesFollowCurrentSessionState(t *testing.T) {
+	cases := []struct {
+		name, lifecycle        string
+		stale, connected       bool
+		steer, interrupt, stop bool
+	}{
+		{"empty", "", false, true, false, false, false},
+		{"provisioning", string(supervisor.LifecycleProvisioning), false, true, false, false, true},
+		{"starting", string(supervisor.LifecycleStarting), false, true, false, false, true},
+		{"ready", string(supervisor.LifecycleReady), false, true, true, false, true},
+		{"running", string(supervisor.LifecycleRunning), false, true, true, true, true},
+		{"running stream reconnect", string(supervisor.LifecycleRunning), false, false, true, true, true},
+		{"writer handoff", string(supervisor.LifecycleAwaitingHandoff), false, true, true, false, true},
+		{"stale running", string(supervisor.LifecycleRunning), true, false, false, false, true},
+		{"completed", string(supervisor.LifecycleCompleted), false, true, false, false, true},
+		{"failed", string(supervisor.LifecycleFailed), false, true, false, false, true},
+		{"stopping", string(supervisor.LifecycleStopping), false, true, false, false, false},
+		{"stopped", string(supervisor.LifecycleStopped), false, true, false, false, false},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			state := manager.SessionState{RootStale: tc.stale, StreamConnected: tc.connected,
+				Node: supervisor.NodeSnapshot{SessionID: "s", Lifecycle: tc.lifecycle}}
+			got := newActionCapabilities(state)
+			if got.CanSteer != tc.steer || got.CanInterrupt != tc.interrupt || got.CanStop != tc.stop {
+				t.Fatalf("capabilities = %#v", got)
+			}
+		})
+	}
+}
+
+func TestDetailRendersLiteralActionCapabilities(t *testing.T) {
+	templates, err := parseTemplates(webFiles)
+	if err != nil {
+		t.Fatal(err)
+	}
+	cases := []struct {
+		name  string
+		state manager.SessionState
+		want  []string
+	}{
+		{
+			name: "running",
+			state: manager.SessionState{Node: supervisor.NodeSnapshot{
+				SessionID: "running-session", Lifecycle: "running",
+			}},
+			want: []string{`data-can-steer="true"`, `data-can-interrupt="true"`, `data-can-stop="true"`},
+		},
+		{
+			name: "empty",
+			want: []string{`data-can-steer="false"`, `data-can-interrupt="false"`, `data-can-stop="false"`},
+		},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			html, err := renderTemplate(templates, templateDetail, newDetailView(tc.state, statsView{}))
+			if err != nil {
+				t.Fatal(err)
+			}
+			for _, want := range tc.want {
+				if !strings.Contains(html, want) {
+					t.Errorf("detail missing %q:\n%s", want, html)
+				}
+			}
+		})
+	}
+}
+
 // TestQuestionsRenderSelectOptions is the UI-F1 regression. A select-method
 // question WITH options must render one button per option, each carrying the
 // correct (safe) question ID and wired to the question answer route. Before the
