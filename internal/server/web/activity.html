@@ -7,7 +7,7 @@
       {{range .Items}}
       <div class="t-turn {{if .IsError}}t-error{{end}}">
         <span class="t-role {{.Kind}}">{{.Label}}</span>
-        {{if .Text}}<div class="t-body">{{.Text}}</div>{{end}}
+        {{if .Text}}<div class="t-body"{{if .IsMarkdown}} data-markdown{{end}}>{{.Text}}</div>{{end}}
       </div>
       {{end}}
     </div>

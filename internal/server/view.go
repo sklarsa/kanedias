@@ -89,22 +89,36 @@ type questionPanelView struct {
 	Questions []questionSummaryView
 }
 
+// activityItemView is the safe projection of one activity item.
+//
+// IsMarkdown marks only conversation text (assistant updates and user
+// messages) so the browser renders it as safe Markdown. Error/tool text is
+// never flagged and stays plain escaped text. The server never renders the
+// Markdown itself; it only adds the marker that app.js hands to the sandboxed
+// renderer after escaping.
+type activityItemView struct {
+	Seq        uint64
+	Kind       string
+	Label      string
+	Text       string
+	ToolName   string
+	IsError    bool
+	IsMarkdown bool
+}
+
+// activityUsesMarkdown reports whether an activity kind should be rendered as
+// Markdown. Only assistant message updates and user messages qualify; errors
+// and tool activity remain plain escaped text.
+func activityUsesMarkdown(kind string) bool {
+	return kind == "message_update" || kind == "user_message"
+}
+
 // activityView is the template data for activity.html.
 type activityView struct {
 	SessionID  string
 	Items      []activityItemView
 	Incomplete bool
 	GapText    string
-}
-
-// activityItemView is the safe projection of one activity item.
-type activityItemView struct {
-	Seq      uint64
-	Kind     string
-	Label    string
-	Text     string
-	ToolName string
-	IsError  bool
 }
 
 // deckStatusView is the template data for deck-status.html.
@@ -257,12 +271,13 @@ func newActivityView(state manager.SessionState) activityView {
 	items := make([]activityItemView, 0, len(state.RecentActivity))
 	for _, a := range state.RecentActivity {
 		items = append(items, activityItemView{
-			Seq:      a.Seq,
-			Kind:     a.Kind,
-			Label:    a.Label,
-			Text:     a.Text,
-			ToolName: a.ToolName,
-			IsError:  a.IsError,
+			Seq:        a.Seq,
+			Kind:       a.Kind,
+			Label:      a.Label,
+			Text:       a.Text,
+			ToolName:   a.ToolName,
+			IsError:    a.IsError,
+			IsMarkdown: activityUsesMarkdown(a.Kind),
 		})
 	}
 	gapText := ""

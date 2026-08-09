@@ -736,3 +736,160 @@ details[open] > summary .twisty{ transform:rotate(90deg); }
 a:focus-visible, button:focus-visible, input:focus-visible, summary:focus-visible, .row:focus-visible{
   outline:2px solid var(--brass-bright); outline-offset:1px;
 }
+
+/* ============================================================
+   RENDERED MARKDOWN (transcript)
+   Scoped to server-flagged conversation text only. Every rule is
+   anchored to .t-body[data-markdown-rendered] or .code-block so the
+   plain terminal stylesheet can never be re-targeted.
+   ============================================================ */
+.transcript .t-body[data-markdown-rendered]{
+  color:var(--ink);
+  line-height:1.7;
+}
+.transcript .t-body[data-markdown-rendered] > :first-child{ margin-top:0; }
+.transcript .t-body[data-markdown-rendered] > :last-child{ margin-bottom:0; }
+
+/* headings */
+.transcript .t-body[data-markdown-rendered] h1,
+.transcript .t-body[data-markdown-rendered] h2,
+.transcript .t-body[data-markdown-rendered] h3,
+.transcript .t-body[data-markdown-rendered] h4,
+.transcript .t-body[data-markdown-rendered] h5,
+.transcript .t-body[data-markdown-rendered] h6{
+  margin:1em 0 .4em; color:var(--brass-bright); font-family:var(--serif);
+  font-weight:600; line-height:1.25;
+}
+.transcript .t-body[data-markdown-rendered] h1{ font-size:1.5em; }
+.transcript .t-body[data-markdown-rendered] h2{ font-size:1.3em; }
+.transcript .t-body[data-markdown-rendered] h3{ font-size:1.15em; }
+.transcript .t-body[data-markdown-rendered] h4,
+.transcript .t-body[data-markdown-rendered] h5,
+.transcript .t-body[data-markdown-rendered] h6{ font-size:1em; }
+
+/* paragraphs, emphasis, horizontal rule */
+.transcript .t-body[data-markdown-rendered] p{ margin:.5em 0; }
+.transcript .t-body[data-markdown-rendered] strong{ color:var(--ink); font-weight:700; }
+.transcript .t-body[data-markdown-rendered] em{ font-style:italic; }
+.transcript .t-body[data-markdown-rendered] del{ color:var(--ink-faint); text-decoration:line-through; }
+.transcript .t-body[data-markdown-rendered] hr{
+  border:0; border-top:1px solid var(--brass-line-2); margin:1em 0;
+}
+
+/* nested lists + task checkboxes */
+.transcript .t-body[data-markdown-rendered] ul,
+.transcript .t-body[data-markdown-rendered] ol{
+  margin:.5em 0; padding-left:1.6em;
+}
+.transcript .t-body[data-markdown-rendered] li{ margin:.2em 0; }
+.transcript .t-body[data-markdown-rendered] ul ul,
+.transcript .t-body[data-markdown-rendered] ol ul,
+.transcript .t-body[data-markdown-rendered] ul ol,
+.transcript .t-body[data-markdown-rendered] ol ol{ margin:.1em 0; }
+.transcript .t-body[data-markdown-rendered] li.task-list-item{ list-style:none; margin-left:-1.6em; }
+.transcript .t-body[data-markdown-rendered] input[type="checkbox"]{
+  accent-color:var(--cyan); margin-right:.4em; vertical-align:-1px;
+}
+
+/* blockquotes */
+.transcript .t-body[data-markdown-rendered] blockquote{
+  margin:.6em 0; padding:.2em 1em; color:var(--ink-dim);
+  border-left:3px solid var(--brass-line); background:rgba(216,169,74,.05);
+}
+.transcript .t-body[data-markdown-rendered] blockquote > :first-child{ margin-top:0; }
+.transcript .t-body[data-markdown-rendered] blockquote > :last-child{ margin-bottom:0; }
+
+/* links */
+.transcript .t-body[data-markdown-rendered] a{
+  color:var(--cyan); text-decoration:underline;
+  text-underline-offset:2px;
+}
+.transcript .t-body[data-markdown-rendered] a:hover{ color:var(--brass-bright); }
+.transcript .t-body[data-markdown-rendered] a:active{ color:var(--amber); }
+
+/* inline code */
+.transcript .t-body[data-markdown-rendered] code{
+  background:var(--bg-panel-2); border:1px solid var(--brass-line-2);
+  border-radius:2px; padding:.1em .35em; color:var(--brass-bright);
+}
+
+/* horizontal-scroll tables */
+.transcript .t-body[data-markdown-rendered] table{
+  display:block; max-width:100%; overflow-x:auto;
+  border-collapse:collapse; margin:.6em 0; font-size:12px;
+}
+.transcript .t-body[data-markdown-rendered] th,
+.transcript .t-body[data-markdown-rendered] td{
+  border:1px solid var(--brass-line-2); padding:4px 10px;
+  text-align:left; white-space:nowrap;
+}
+.transcript .t-body[data-markdown-rendered] th{
+  background:var(--bg-panel-2); color:var(--ink-dim);
+  font-weight:600;
+}
+.transcript .t-body[data-markdown-rendered] tr:nth-child(even) td{ background:rgba(216,169,74,.03); }
+
+/* fenced code + copy button */
+.transcript .t-body[data-markdown-rendered] .code-block{
+  position:relative; margin:.7em 0;
+  background:var(--bg-sunk); border:1px solid var(--brass-line-2);
+  border-radius:3px;
+}
+.transcript .t-body[data-markdown-rendered] .code-block pre{
+  margin:0; padding:12px 14px; overflow-x:auto;
+  background:transparent; border:0;
+}
+.transcript .t-body[data-markdown-rendered] .code-block code.hljs{
+  display:inline-block; min-width:100%; background:transparent;
+  border:0; padding:0; color:var(--ink);
+}
+.transcript .t-body[data-markdown-rendered] .copy-btn{
+  position:absolute; top:6px; right:6px; z-index:1;
+  font-family:var(--mono); font-size:9px; letter-spacing:.1em;
+  text-transform:uppercase; color:var(--ink-faint);
+  background:var(--bg-panel); border:1px solid var(--brass-line);
+  border-radius:2px; padding:2px 7px; cursor:pointer;
+}
+.transcript .t-body[data-markdown-rendered] .copy-btn:hover{ color:var(--brass-bright); border-color:var(--brass); }
+.transcript .t-body[data-markdown-rendered] .copy-btn:focus-visible{
+  outline:2px solid var(--brass-bright); outline-offset:1px;
+}
+.transcript .t-body[data-markdown-rendered] ::selection{
+  background:rgba(94,198,216,.35); color:var(--ink);
+}
+
+/* override the terminal stylesheet's backtick pseudo-content for rendered code */
+.transcript .t-body[data-markdown-rendered] code::before,
+.transcript .t-body[data-markdown-rendered] code::after{ content:none; }
+
+/* Highlight.js tokens mapped to the Astrolabe palette. */
+.transcript .t-body[data-markdown-rendered] .hljs-comment,
+.transcript .t-body[data-markdown-rendered] .hljs-quote{ color:var(--ink-faint); font-style:italic; }
+.transcript .t-body[data-markdown-rendered] .hljs-keyword,
+.transcript .t-body[data-markdown-rendered] .hljs-selector-tag,
+.transcript .t-body[data-markdown-rendered] .hljs-literal,
+.transcript .t-body[data-markdown-rendered] .hljs-doctag{ color:var(--violet); }
+.transcript .t-body[data-markdown-rendered] .hljs-string,
+.transcript .t-body[data-markdown-rendered] .hljs-regexp,
+.transcript .t-body[data-markdown-rendered] .hljs-addition{ color:var(--amber); }
+.transcript .t-body[data-markdown-rendered] .hljs-number,
+.transcript .t-body[data-markdown-rendered] .hljs-symbol,
+.transcript .t-body[data-markdown-rendered] .hljs-bullet{ color:var(--brass-bright); }
+.transcript .t-body[data-markdown-rendered] .hljs-title,
+.transcript .t-body[data-markdown-rendered] .hljs-section,
+.transcript .t-body[data-markdown-rendered] .hljs-function .hljs-title{ color:var(--cyan); }
+.transcript .t-body[data-markdown-rendered] .hljs-built_in,
+.transcript .t-body[data-markdown-rendered] .hljs-type,
+.transcript .t-body[data-markdown-rendered] .hljs-class .hljs-title{ color:var(--cyan); }
+.transcript .t-body[data-markdown-rendered] .hljs-attr,
+.transcript .t-body[data-markdown-rendered] .hljs-attribute,
+.transcript .t-body[data-markdown-rendered] .hljs-variable{ color:var(--ink); }
+.transcript .t-body[data-markdown-rendered] .hljs-meta,
+.transcript .t-body[data-markdown-rendered] .hljs-name{ color:var(--amber); }
+.transcript .t-body[data-markdown-rendered] .hljs-selector-id,
+.transcript .t-body[data-markdown-rendered] .hljs-selector-class{ color:var(--violet); }
+.transcript .t-body[data-markdown-rendered] .hljs-template-tag,
+.transcript .t-body[data-markdown-rendered] .hljs-deletion{ color:var(--amber); }
+.transcript .t-body[data-markdown-rendered] .hljs-emphasis{ font-style:italic; }
+.transcript .t-body[data-markdown-rendered] .hljs-strong{ font-weight:700; }
+.transcript .t-body[data-markdown-rendered] .hljs-link{ color:var(--cyan); text-decoration:underline; }

@@ -315,17 +315,28 @@ func TestInitialPageContainsAstrolabeConsole(t *testing.T) {
 func TestAstrolabeConsoleIsInteractive(t *testing.T) {
 	body := indexBody(t)
 
-	// The console is wired by the local Datastar module and app.js (delegated
-	// behavior). No external scripts and no inline controller.
+	// The console is wired by local asset modules (Datastar, Marked, Highlight,
+	// the Markdown renderer, and app.js delegated behavior). No external scripts
+	// and no inline controller.
 	scriptRE := regexp.MustCompile(`(?s)<script\b([^>]*)>(.*?)</script>`)
 	scripts := scriptRE.FindAllStringSubmatch(body, -1)
-	if len(scripts) != 2 {
-		t.Fatalf("script count = %d, want 2 (Datastar module + app.js)", len(scripts))
+	wantScripts := 5 // Datastar module + app.js module + 3 local Markdown assets
+	if len(scripts) != wantScripts {
+		t.Fatalf("script count = %d, want %d (Datastar + 3 Markdown assets + app.js)", len(scripts), wantScripts)
 	}
 
 	var sawDatastar, sawAppJS bool
+	markdownAssets := []string{
+		`src="/assets/marked.min.js"`,
+		`src="/assets/highlight.min.js"`,
+		`src="/assets/markdown-renderer.js"`,
+	}
+	sawMarkdown := make(map[string]bool)
 	for _, script := range scripts {
 		attrs, inner := script[1], strings.TrimSpace(script[2])
+		if strings.Contains(attrs, `src="http://`) || strings.Contains(attrs, `src="https://`) {
+			t.Errorf("script references a remote origin: %s", script[0])
+		}
 		if strings.Contains(attrs, `src="/assets/datastar.js"`) {
 			if !strings.Contains(attrs, `type="module"`) {
 				t.Errorf("datastar.js script is not a module: %s", script[0])
@@ -341,12 +352,22 @@ func TestAstrolabeConsoleIsInteractive(t *testing.T) {
 			}
 			sawAppJS = true
 		}
+		for _, asset := range markdownAssets {
+			if strings.Contains(attrs, asset) {
+				sawMarkdown[asset] = true
+			}
+		}
 	}
 	if !sawDatastar {
 		t.Error("page is missing the local Datastar module script")
 	}
 	if !sawAppJS {
 		t.Error("page is missing the app.js script")
+	}
+	for _, asset := range markdownAssets {
+		if !sawMarkdown[asset] {
+			t.Errorf("page is missing local script %s", asset)
+		}
 	}
 
 	// The console is a working control surface with delegated Datastar wiring.
@@ -357,6 +378,28 @@ func TestAstrolabeConsoleIsInteractive(t *testing.T) {
 	}
 	if strings.Contains(body, " disabled") {
 		t.Error("Astrolabe console must not ship disabled placeholder controls")
+	}
+}
+
+func TestActivityMarksOnlyConversationTextAsMarkdown(t *testing.T) {
+	templates, err := parseTemplates(webFiles)
+	if err != nil {
+		t.Fatal(err)
+	}
+	view := activityView{Items: []activityItemView{
+		{Kind: "user_message", Label: "You", Text: "# prompt", IsMarkdown: true},
+		{Kind: "message_update", Label: "Message", Text: "```go\npackage p\n```", IsMarkdown: true},
+		{Kind: "model_error", Label: "Model error", Text: "**not markup**", IsError: true},
+	}}
+	html, err := renderTemplate(templates, templateActivity, view)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if got := strings.Count(html, `data-markdown`); got != 2 {
+		t.Fatalf("markdown markers = %d, want 2\n%s", got, html)
+	}
+	if strings.Contains(html, `<h1>`) || strings.Contains(html, `<script`) {
+		t.Fatalf("server trusted transcript markup:\n%s", html)
 	}
 }
 
@@ -1051,6 +1094,9 @@ func TestRenderedPageHasOnlyOrderedLocalRuntimeAssets(t *testing.T) {
 		"/assets/terminal.css",
 		"/assets/app.css",
 		"/assets/datastar.js",
+		"/assets/marked.min.js",
+		"/assets/highlight.min.js",
+		"/assets/markdown-renderer.js",
 		"/assets/app.js",
 	}
 	if len(matches) != len(want) {

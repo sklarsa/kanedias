@@ -124,9 +124,62 @@
       }
       if (shouldStick) t.scrollTop = t.scrollHeight;
     }
-    new MutationObserver(stick).observe(panel, { childList: true, subtree: true, characterData: true });
-    stick();
+    // After every activity patch, render any newly-flagged Markdown before
+    // measuring for auto-scroll so the rendered height is correct.
+    function refresh() {
+      if (window.KanediasMarkdown && window.KanediasMarkdown.renderPending) {
+        window.KanediasMarkdown.renderPending(panel);
+      }
+      stick();
+    }
+    new MutationObserver(refresh).observe(panel, { childList: true, subtree: true, characterData: true });
+    refresh();
   })();
+
+  /* -------- Copy fenced code from .code-block (delegated) -------- */
+  document.addEventListener("click", function (e) {
+    var btn = e.target.closest("[data-copy-code]");
+    if (!btn) return;
+    e.stopPropagation();
+    var block = btn.closest(".code-block");
+    var code = block ? block.querySelector("code") : null;
+    if (!code || typeof code.textContent !== "string") return;
+    var text = code.textContent;
+    var done = function (ok) {
+      var label = ok ? "copied" : "copy failed";
+      var original = btn.getAttribute("data-copy-label") || "copy";
+      btn.textContent = label;
+      setTimeout(function () { btn.textContent = original; }, 1200);
+    };
+    var finish = function (ok) { done(ok); };
+    if (navigator.clipboard && navigator.clipboard.writeText) {
+      navigator.clipboard.writeText(text).then(
+        function () { finish(true); },
+        function () { fallbackCopy(text, finish); }
+      );
+    } else {
+      fallbackCopy(text, finish);
+    }
+  });
+
+  function fallbackCopy(text, finish) {
+    var ta = document.createElement("textarea");
+    ta.value = text;
+    ta.setAttribute("readonly", "");
+    ta.style.position = "fixed";
+    ta.style.top = "-1000px";
+    ta.style.opacity = "0";
+    document.body.appendChild(ta);
+    ta.select();
+    var ok = false;
+    try {
+      ok = document.execCommand("copy");
+    } catch (e) {
+      ok = false;
+    }
+    document.body.removeChild(ta);
+    finish(ok);
+  }
 
   /* -------- Deck controls reflect the selected session's capability -------- */
   function setDeckState(sessionID, lifecycle) {
