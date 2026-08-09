@@ -126,14 +126,18 @@ func TestActionCapabilitiesFollowCurrentSessionState(t *testing.T) {
 		stale, connected       bool
 		steer, interrupt, stop bool
 	}{
-		{"ready", "ready", false, true, true, false, true},
-		{"running", "running", false, true, true, true, true},
-		{"running stream reconnect", "running", false, false, true, true, true},
-		{"writer handoff", "awaiting_handoff", false, true, true, false, true},
-		{"stale running", "running", true, false, false, false, true},
-		{"completed", "completed", false, true, false, false, true},
-		{"stopping", "stopping", false, true, false, false, false},
-		{"stopped", "stopped", false, true, false, false, false},
+		{"empty", "", false, true, false, false, false},
+		{"provisioning", string(supervisor.LifecycleProvisioning), false, true, false, false, true},
+		{"starting", string(supervisor.LifecycleStarting), false, true, false, false, true},
+		{"ready", string(supervisor.LifecycleReady), false, true, true, false, true},
+		{"running", string(supervisor.LifecycleRunning), false, true, true, true, true},
+		{"running stream reconnect", string(supervisor.LifecycleRunning), false, false, true, true, true},
+		{"writer handoff", string(supervisor.LifecycleAwaitingHandoff), false, true, true, false, true},
+		{"stale running", string(supervisor.LifecycleRunning), true, false, false, false, true},
+		{"completed", string(supervisor.LifecycleCompleted), false, true, false, false, true},
+		{"failed", string(supervisor.LifecycleFailed), false, true, false, false, true},
+		{"stopping", string(supervisor.LifecycleStopping), false, true, false, false, false},
+		{"stopped", string(supervisor.LifecycleStopped), false, true, false, false, false},
 	}
 	for _, tc := range cases {
 		t.Run(tc.name, func(t *testing.T) {
