@@ -29,16 +29,16 @@
 - Test: `internal/image/image_test.go`
 
 **Interfaces:**
-- Consumes: NUL-delimited PID 1 environment at `/proc/1/environ` and the existing `/run/kanedias` runtime directory.
-- Produces: `/run/kanedias/pi.env`, a systemd-compatible allowlisted environment file loaded before `/usr/local/libexec/kanedias-pi-rpc` starts.
+- Consumes: NUL-delimited PID 1 environment at `/proc/1/environ` and the root-owned `/run/kanedias-pi` runtime directory.
+- Produces: `/run/kanedias-pi/pi.env`, a systemd-compatible allowlisted environment file loaded before `/usr/local/libexec/kanedias-pi-rpc` starts.
 
 - [ ] **Step 1: Write failing tests for the environment bridge and image wiring**
 
 Add a test that executes the embedded bridge against a temporary NUL-delimited environment containing all required proxy/session values plus a forbidden sentinel. Assert the output includes correctly quoted allowlisted assignments, excludes the sentinel, and is mode `0600`. Add a missing-required-value case that fails without replacing the destination. Extend the image workflow assertions to require upload/install of `kanedias-pi-env` and these service directives:
 
 ```ini
-EnvironmentFile=-/run/kanedias/pi.env
-ExecStartPre=+/usr/local/libexec/kanedias-pi-env
+EnvironmentFile=-/run/kanedias-pi/pi.env
+ExecStartPre=+/usr/bin/env -i /usr/bin/bash --noprofile --norc /usr/local/libexec/kanedias-pi-env
 ```
 
 Also retain:
@@ -64,7 +64,7 @@ Create `internal/image/kanedias-pi-env` as an image-owned Bash script. It must:
 
 ```bash
 source_path=${1:-/proc/1/environ}
-destination=${2:-/run/kanedias/pi.env}
+destination=${2:-/run/kanedias-pi/pi.env}
 ```
 
 Read NUL-delimited entries, copy only the exact proxy/CA/GitHub/Kanedias allowlist, reject newline-bearing values, double-quote and escape systemd environment-file values, require `KANEDIAS_SESSION_ID`, `KANEDIAS_SESSION_KIND`, `KANEDIAS_SUPERVISOR_SOCKET`, `HTTP_PROXY`, `HTTPS_PROXY`, `GH_TOKEN`, `SSL_CERT_FILE`, and `NODE_EXTRA_CA_CERTS`, then atomically replace the destination at mode `0600`.
