@@ -89,6 +89,75 @@ func TestProjectActivityMarksAssistantCompleteWithoutChangingIdentity(t *testing
 	}
 }
 
+func TestProjectActivityUnmatchedMessageEndKeepsAssistantOpen(t *testing.T) {
+	tests := []struct {
+		name     string
+		endEvent supervisor.EventEnvelope
+		wantUser bool
+	}{
+		{
+			name: "invalid JSON",
+			endEvent: supervisor.EventEnvelope{
+				Seq: 2, SessionID: "s", SourceSeq: 2, Kind: "pi",
+				Payload: json.RawMessage(`{"type":"message_end",`),
+			},
+		},
+		{name: "missing message", endEvent: piEvent(2, "s", "message_end", nil)},
+		{name: "null message", endEvent: piEvent(2, "s", "message_end", map[string]any{"message": nil})},
+		{
+			name: "user message",
+			endEvent: piEvent(2, "s", "message_end", map[string]any{
+				"message": map[string]any{
+					"role":    "user",
+					"content": []any{map[string]any{"type": "text", "text": "prompt"}},
+				},
+			}),
+			wantUser: true,
+		},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			projector := newActivityProjector()
+			projector.Apply(piEvent(1, "s", "message_update", map[string]any{
+				"assistantMessageEvent": map[string]any{"type": "text_delta", "delta": "hello"},
+			}))
+			projector.Apply(tt.endEvent)
+
+			items := projector.Items()
+			assertOpenAssistantItem(t, items, "hello")
+			var hasUser bool
+			for _, item := range items {
+				hasUser = hasUser || item.Kind == "user_message"
+			}
+			if hasUser != tt.wantUser {
+				t.Fatalf("user message projected = %v, want %v: %#v", hasUser, tt.wantUser, items)
+			}
+
+			projector.Apply(piEvent(3, "s", "message_update", map[string]any{
+				"assistantMessageEvent": map[string]any{"type": "text_delta", "delta": " world"},
+			}))
+			assertOpenAssistantItem(t, projector.Items(), "hello world")
+		})
+	}
+}
+
+func assertOpenAssistantItem(t *testing.T, items []ActivityItem, wantText string) {
+	t.Helper()
+	var assistantItems []ActivityItem
+	for _, item := range items {
+		if item.Kind == "message_update" {
+			assistantItems = append(assistantItems, item)
+		}
+	}
+	if len(assistantItems) != 1 {
+		t.Fatalf("assistant items = %#v, want one item", assistantItems)
+	}
+	if assistantItems[0].Seq != 1 || assistantItems[0].Text != wantText || assistantItems[0].Complete {
+		t.Fatalf("open assistant item = %#v, want seq 1 text %q and incomplete", assistantItems[0], wantText)
+	}
+}
+
 func TestProjectActivityShowsPromptAndCoalescesRepeatedProviderError(t *testing.T) {
 	errorMessage := map[string]any{
 		"message": map[string]any{

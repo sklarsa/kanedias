@@ -156,7 +156,7 @@ func (p *activityProjector) completeOpenText() {
 }
 
 type messageEndPayload struct {
-	Message struct {
+	Message *struct {
 		Role         string `json:"role"`
 		StopReason   string `json:"stopReason"`
 		ErrorMessage string `json:"errorMessage"`
@@ -169,12 +169,9 @@ type messageEndPayload struct {
 
 func (p *activityProjector) applyMessageEnd(event supervisor.EventEnvelope) {
 	var payload messageEndPayload
-	if err := json.Unmarshal(event.Payload, &payload); err != nil {
+	if err := json.Unmarshal(event.Payload, &payload); err != nil || payload.Message == nil {
 		return
 	}
-	// Only a successfully parsed message_end may freeze the open assistant
-	// text; a malformed payload must leave streaming content unfrozen.
-	p.completeOpenText()
 	if payload.Message.Role == "user" {
 		var text string
 		for _, content := range payload.Message.Content {
@@ -189,7 +186,12 @@ func (p *activityProjector) applyMessageEnd(event supervisor.EventEnvelope) {
 		}
 		return
 	}
-	if payload.Message.Role != "assistant" || payload.Message.StopReason != "error" || payload.Message.ErrorMessage == "" {
+	if payload.Message.Role != "assistant" {
+		return
+	}
+	// Only a validated assistant message_end may freeze the open assistant text.
+	p.completeOpenText()
+	if payload.Message.StopReason != "error" || payload.Message.ErrorMessage == "" {
 		return
 	}
 	if len(p.items) > 0 {
