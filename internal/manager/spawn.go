@@ -7,6 +7,7 @@ import (
 	"encoding/hex"
 	"errors"
 	"fmt"
+	"io"
 	"os"
 	"os/exec"
 	"path/filepath"
@@ -39,6 +40,15 @@ type spawnedProcess interface {
 // processStarter starts a process from a spawnSpec.
 type processStarter interface {
 	Start(spawnSpec) (spawnedProcess, error)
+}
+
+func writeRootBootstrap(writer io.Writer, encoded []byte) error {
+	_, err := writer.Write(encoded)
+	return err
+}
+
+func waitRootBootstrapWrite(done <-chan struct{}) {
+	<-done
 }
 
 // startedProcess wraps exec.Cmd and caches the Wait result.
@@ -227,14 +237,14 @@ func (m *Manager) SpawnRootWithRequest(ctx context.Context, request SessionLaunc
 		return "", fmt.Errorf("manager: start root process: %w", err)
 	}
 
-	writeDone := make(chan error, 1)
+	writeDone := make(chan struct{})
+	var writeErr error
 	go func() {
-		_, writeErr := bootstrapWrite.Write(encoded.Bytes())
-		closeErr := bootstrapWrite.Close()
-		writeDone <- errors.Join(writeErr, closeErr)
+		defer close(writeDone)
+		writeErr = errors.Join(m.writeRootBootstrap(bootstrapWrite, encoded.Bytes()), bootstrapWrite.Close())
 	}()
 	select {
-	case writeErr := <-writeDone:
+	case <-writeDone:
 		if writeErr != nil {
 			closeBootstrap()
 			_ = spawned.SignalGroup(syscall.SIGKILL)
@@ -242,7 +252,7 @@ func (m *Manager) SpawnRootWithRequest(ctx context.Context, request SessionLaunc
 		}
 	case <-ctx.Done():
 		_ = bootstrapWrite.Close()
-		<-writeDone
+		m.waitRootBootstrapWrite(writeDone)
 		closeBootstrap()
 		_ = spawned.SignalGroup(syscall.SIGKILL)
 		return "", ctx.Err()

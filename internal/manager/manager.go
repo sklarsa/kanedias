@@ -4,6 +4,7 @@ import (
 	"context"
 	"errors"
 	"fmt"
+	"io"
 	"net"
 	"os"
 	"os/user"
@@ -24,18 +25,22 @@ var errNotFound = errors.New("manager: not found")
 // Manager is the root-only control plane between the recursive supervisor
 // API and the web server.
 type Manager struct {
-	mu               sync.Mutex
-	opts             Options
-	roots            map[string]*rootHandle // keyed by socket path
-	routes           map[string]string      // sessionID -> rootID
-	discoveryIssues  []DiscoveryIssue
-	factory          clientFactory
-	starter          processStarter
-	newSpawnToken    func() (string, error)
-	newBootstrapPipe func() (*os.File, *os.File, error)
-	closed           bool // set once Close begins; blocks new monitor loops
-	clientsClosed    bool // set once clients have been closed (idempotency)
-	quiesced         bool
+	mu              sync.Mutex
+	opts            Options
+	roots           map[string]*rootHandle // keyed by socket path
+	routes          map[string]string      // sessionID -> rootID
+	discoveryIssues []DiscoveryIssue
+	factory         clientFactory
+	starter         processStarter
+	// Root-bootstrap write/join seams retain production behavior while making
+	// blocked-write lifecycle ownership deterministic in tests.
+	newSpawnToken          func() (string, error)
+	newBootstrapPipe       func() (*os.File, *os.File, error)
+	writeRootBootstrap     func(io.Writer, []byte) error
+	waitRootBootstrapWrite func(<-chan struct{})
+	closed                 bool // set once Close begins; blocks new monitor loops
+	clientsClosed          bool // set once clients have been closed (idempotency)
+	quiesced               bool
 	// monitoring infrastructure
 	closeCtx        context.Context
 	closeCancel     context.CancelFunc
@@ -158,20 +163,22 @@ func New(opts Options) (*Manager, error) {
 	ctx, cancel := context.WithCancel(context.Background())
 	snapshotCtx, snapshotCancel := context.WithCancel(ctx)
 	m := &Manager{
-		opts:             opts,
-		roots:            make(map[string]*rootHandle),
-		routes:           make(map[string]string),
-		factory:          defaultClientFactory,
-		starter:          osProcessStarter{},
-		newSpawnToken:    generateToken,
-		newBootstrapPipe: os.Pipe,
-		closeCtx:         ctx,
-		closeCancel:      cancel,
-		snapshotCtx:      snapshotCtx,
-		snapshotCancel:   snapshotCancel,
-		fleetFanout:      newChangeFanout(supervisor.DefaultSubscriberMailboxCapacity),
-		sessionFanout:    newChangeFanout(supervisor.DefaultSubscriberMailboxCapacity),
-		launch:           opts.Launch,
+		opts:                   opts,
+		roots:                  make(map[string]*rootHandle),
+		routes:                 make(map[string]string),
+		factory:                defaultClientFactory,
+		starter:                osProcessStarter{},
+		newSpawnToken:          generateToken,
+		newBootstrapPipe:       os.Pipe,
+		writeRootBootstrap:     writeRootBootstrap,
+		waitRootBootstrapWrite: waitRootBootstrapWrite,
+		closeCtx:               ctx,
+		closeCancel:            cancel,
+		snapshotCtx:            snapshotCtx,
+		snapshotCancel:         snapshotCancel,
+		fleetFanout:            newChangeFanout(supervisor.DefaultSubscriberMailboxCapacity),
+		sessionFanout:          newChangeFanout(supervisor.DefaultSubscriberMailboxCapacity),
+		launch:                 opts.Launch,
 	}
 	return m, nil
 }

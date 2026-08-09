@@ -330,6 +330,25 @@ func TestSpawnRootClosesBootstrapPipeOnWriteFailure(t *testing.T) {
 func TestSpawnRootCancellationJoinsBlockedBootstrapWriter(t *testing.T) {
 	starter := &retainingStarter{process: newFakeProcess(1238), started: make(chan error, 1)}
 	m := configuredSpawnManager(t, starter)
+	writerStarted := make(chan struct{})
+	writerUnblocked := make(chan struct{})
+	allowWriterCompletion := make(chan struct{})
+	writerCompleted := make(chan struct{})
+	joinStarted := make(chan struct{})
+	writeRootBootstrap := m.writeRootBootstrap
+	m.writeRootBootstrap = func(writer io.Writer, encoded []byte) error {
+		close(writerStarted)
+		err := writeRootBootstrap(writer, encoded)
+		close(writerUnblocked)
+		<-allowWriterCompletion
+		close(writerCompleted)
+		return err
+	}
+	waitRootBootstrapWrite := m.waitRootBootstrapWrite
+	m.waitRootBootstrapWrite = func(done <-chan struct{}) {
+		close(joinStarted)
+		waitRootBootstrapWrite(done)
+	}
 	cfg := modelConfigFixture()
 	worker := cfg.Workers["worker"]
 	worker.Description = strings.Repeat("x", process.MaxRecordBytes-4096)
@@ -366,6 +385,11 @@ func TestSpawnRootCancellationJoinsBlockedBootstrapWriter(t *testing.T) {
 	if startErr := <-starter.started; startErr != nil {
 		t.Fatal(startErr)
 	}
+	select {
+	case <-writerStarted:
+	case <-time.After(time.Second):
+		t.Fatal("bootstrap writer did not start")
+	}
 	deadline := time.Now().Add(time.Second)
 	for {
 		available, ioctlErr := unix.IoctlGetInt(int(starter.inheritedRead.Fd()), unix.TIOCINQ)
@@ -373,6 +397,9 @@ func TestSpawnRootCancellationJoinsBlockedBootstrapWriter(t *testing.T) {
 			t.Fatal(ioctlErr)
 		}
 		if available > 0 {
+			if available >= encoded.Len() {
+				t.Fatalf("queued bootstrap bytes = %d, encoded length = %d; write may have completed", available, encoded.Len())
+			}
 			break
 		}
 		if time.Now().After(deadline) {
@@ -380,15 +407,46 @@ func TestSpawnRootCancellationJoinsBlockedBootstrapWriter(t *testing.T) {
 		}
 		time.Sleep(time.Millisecond)
 	}
+	select {
+	case spawnErr := <-result:
+		t.Fatalf("SpawnRoot returned before cancellation while bootstrap remained incomplete: %v", spawnErr)
+	default:
+	}
+	select {
+	case <-writerCompleted:
+		t.Fatal("bootstrap writer completed despite unread queued bytes being shorter than the encoded record")
+	default:
+	}
 
 	cancel()
+	select {
+	case <-joinStarted:
+	case <-time.After(time.Second):
+		t.Fatal("SpawnRoot did not enter the bootstrap-writer join after cancellation")
+	}
+	select {
+	case <-writerUnblocked:
+	case <-time.After(time.Second):
+		t.Fatal("closing the parent writer did not unblock the blocked bootstrap write")
+	}
+	select {
+	case spawnErr := <-result:
+		t.Fatalf("SpawnRoot returned without joining the deliberately paused writer: %v", spawnErr)
+	default:
+	}
+	close(allowWriterCompletion)
 	select {
 	case spawnErr := <-result:
 		if !errors.Is(spawnErr, context.Canceled) {
 			t.Fatalf("SpawnRoot error = %v, want %v", spawnErr, context.Canceled)
 		}
 	case <-time.After(time.Second):
-		t.Fatal("SpawnRoot did not promptly join blocked bootstrap writer after cancellation")
+		t.Fatal("SpawnRoot did not promptly join the released bootstrap writer after cancellation")
+	}
+	select {
+	case <-writerCompleted:
+	default:
+		t.Fatal("SpawnRoot returned before the bootstrap writer completed and joined")
 	}
 	assertFileClosed(t, parentRead)
 	assertFileClosed(t, parentWrite)
@@ -399,19 +457,6 @@ func TestSpawnRootCancellationJoinsBlockedBootstrapWriter(t *testing.T) {
 		t.Fatalf("cancellation signals = %v, want [SIGKILL]", signals)
 	}
 
-	drained := make(chan error, 1)
-	go func() {
-		_, readErr := io.ReadAll(starter.inheritedRead)
-		drained <- readErr
-	}()
-	select {
-	case readErr := <-drained:
-		if readErr != nil {
-			t.Fatalf("drain retained read endpoint: %v", readErr)
-		}
-	case <-time.After(time.Second):
-		t.Fatal("retained endpoint did not reach EOF; bootstrap writer was not closed/joined")
-	}
 	if err := starter.inheritedRead.Close(); err != nil {
 		t.Fatal(err)
 	}
