@@ -3,6 +3,7 @@ package image
 import (
 	"bytes"
 	"context"
+	"encoding/json"
 	"errors"
 	"io"
 	"os"
@@ -50,14 +51,91 @@ func TestInstallerActivatesOnlyKanediasDelegationExtensionAndSkills(t *testing.T
 	}
 }
 
-func TestInstallerEnablesOpenAIFastByDefault(t *testing.T) {
-	script := string(installer)
-	for _, required := range []string{
-		`{"enabled":true}`,
-		`$managed_home/.pi/agent/extensions/openai-fast.json`,
+func TestInstallerExcludesOperatorAdditions(t *testing.T) {
+	piExtras, err := os.ReadFile(filepath.Join("..", "..", "image-build.d", "40-pi-extras.sh"))
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	for _, forbidden := range []string{
+		"install_cloud_apt_packages",
+		"install_aws_cli",
+		"install_session_manager_plugin",
+		"install_container_tools",
+		"install_claude_code",
+		"install_go",
+		"install_pulumi",
+		"install_uv",
+		"install_tfenv",
+		"pi-web-suite",
+		"superpowers",
+		"openai-fast.json",
+		"cobalt-ember",
 	} {
-		if !strings.Contains(script, required) {
-			t.Errorf("installer missing OpenAI Fast default %q", required)
+		if strings.Contains(string(installer), forbidden) {
+			t.Errorf("core installer contains operator addition %q", forbidden)
+		}
+	}
+
+	for _, required := range []string{
+		"git:github.com/obra/superpowers",
+		"npm:pi-web-suite",
+		"npm:@diegopetrucci/pi-openai-fast",
+		"openai-fast.json",
+	} {
+		if !strings.Contains(string(piExtras), required) {
+			t.Errorf("Pi extras script missing %q", required)
+		}
+	}
+}
+
+func TestCustomBuildScriptsContainExpectedToolsAndAreExecutable(t *testing.T) {
+	tests := []struct {
+		name    string
+		markers []string
+	}{
+		{name: "10-cloud-tools.sh", markers: []string{"azure-cli", "awscli.amazonaws.com", "session-manager-plugin"}},
+		{name: "20-container-tools.sh", markers: []string{"docker-ce", "derailed/k9s", "kubernetes-sigs/kind"}},
+		{name: "30-dev-toolchains.sh", markers: []string{"clang", "gcc", "go.dev/dl", "get.pulumi.com", "astral.sh/uv", "tfutils/tfenv"}},
+		{name: "40-pi-extras.sh", markers: []string{"git:github.com/obra/superpowers", "npm:pi-web-suite", "npm:@diegopetrucci/pi-openai-fast"}},
+		{name: "50-user-config.sh", markers: []string{".tmux.conf", "set -g mouse on", "set -g extended-keys on"}},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			path := filepath.Join("..", "..", "image-build.d", tt.name)
+			script, err := os.ReadFile(path)
+			if err != nil {
+				t.Fatal(err)
+			}
+			for _, marker := range tt.markers {
+				if !strings.Contains(string(script), marker) {
+					t.Errorf("script missing tool marker %q", marker)
+				}
+			}
+			info, err := os.Stat(path)
+			if err != nil {
+				t.Fatal(err)
+			}
+			if info.Mode().Perm()&0o111 == 0 {
+				t.Errorf("script mode = %#o, want an execute bit", info.Mode().Perm())
+			}
+		})
+	}
+}
+
+func TestCorePiSettingsExcludeOperatorRegistrations(t *testing.T) {
+	contents, err := os.ReadFile(filepath.Join("..", "..", "assets", "pi-settings.json"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	var settings map[string]any
+	if err := json.Unmarshal(contents, &settings); err != nil {
+		t.Fatal(err)
+	}
+	for _, key := range []string{"theme", "packages"} {
+		if _, present := settings[key]; present {
+			t.Errorf("core Pi settings contain operator registration %q", key)
 		}
 	}
 }
