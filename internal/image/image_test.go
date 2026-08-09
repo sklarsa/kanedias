@@ -53,6 +53,30 @@ func TestInstallerActivatesOnlyKanediasDelegationExtensionAndSkills(t *testing.T
 	}
 }
 
+func TestCoreInstallerExcludesMovedToolchainPackages(t *testing.T) {
+	script := string(installer)
+	const command = "apt-get install -y --no-install-recommends \\\n"
+	_, packages, found := strings.Cut(script, command)
+	if !found {
+		t.Fatalf("core installer missing initial apt package command")
+	}
+	packages, _, found = strings.Cut(packages, "\n\n")
+	if !found {
+		t.Fatalf("core installer initial apt package command is not delimited")
+	}
+	installed := make(map[string]bool)
+	for _, field := range strings.Fields(packages) {
+		if field != `\` {
+			installed[field] = true
+		}
+	}
+	for _, forbidden := range []string{"clang", "gcc", "nodejs"} {
+		if installed[forbidden] {
+			t.Errorf("core installer initial apt packages contain moved package %q", forbidden)
+		}
+	}
+}
+
 func TestInstallerExcludesOperatorAdditions(t *testing.T) {
 	piExtras, err := os.ReadFile(filepath.Join("..", "..", "image-build.d", "40-pi-extras.sh"))
 	if err != nil {
@@ -566,6 +590,44 @@ func TestLoadBuildScriptsSkipsNonExecutableReplacementAfterDiscovery(t *testing.
 	}
 }
 
+func TestCreateRejectsFIFOConfiguredAsBuildScriptsDirectoryWithoutHanging(t *testing.T) {
+	cfg := imageConfigWithBuildScripts(t, nil)
+	if err := os.Remove(cfg.BuildScriptsPath()); err != nil {
+		t.Fatal(err)
+	}
+	if err := unix.Mkfifo(cfg.BuildScriptsPath(), 0o700); err != nil {
+		t.Fatal(err)
+	}
+	connected := false
+	result := make(chan error, 1)
+	go func() {
+		result <- create(context.Background(), cfg, io.Discard, io.Discard, func(context.Context) (imageClient, error) {
+			connected = true
+			return &recordingClient{}, nil
+		})
+	}()
+
+	select {
+	case err := <-result:
+		if err == nil || !strings.Contains(err.Error(), "read image build scripts") || !errors.Is(err, unix.ENOTDIR) {
+			t.Fatalf("create() error = %v, want wrapped read image build scripts ENOTDIR error", err)
+		}
+		if connected {
+			t.Fatal("connected to Incus before rejecting FIFO image build scripts path")
+		}
+	case <-time.After(500 * time.Millisecond):
+		fd, err := unix.Open(cfg.BuildScriptsPath(), unix.O_WRONLY|unix.O_NONBLOCK|unix.O_CLOEXEC, 0)
+		if err == nil {
+			_ = unix.Close(fd)
+		}
+		select {
+		case <-result:
+		case <-time.After(2 * time.Second):
+		}
+		t.Fatal("create() hung while opening FIFO image build scripts path")
+	}
+}
+
 func TestCreateReadsBuildScriptsBeforeConnecting(t *testing.T) {
 	tests := []struct {
 		name  string
@@ -577,19 +639,6 @@ func TestCreateReadsBuildScriptsBeforeConnecting(t *testing.T) {
 				if err := os.Remove(cfg.BuildScriptsPath()); err != nil {
 					t.Fatal(err)
 				}
-			},
-		},
-		{
-			name: "unreadable",
-			setup: func(t *testing.T, cfg config.Config) {
-				if err := os.Chmod(cfg.BuildScriptsPath(), 0o000); err != nil {
-					t.Fatal(err)
-				}
-				t.Cleanup(func() {
-					if err := os.Chmod(cfg.BuildScriptsPath(), 0o700); err != nil {
-						t.Errorf("restore build script directory permissions: %v", err)
-					}
-				})
 			},
 		},
 		{
@@ -622,6 +671,35 @@ func TestCreateReadsBuildScriptsBeforeConnecting(t *testing.T) {
 				t.Fatal("connected to Incus before image build scripts were read")
 			}
 		})
+	}
+}
+
+func TestCreateReturnsBuildScriptDirectoryPermissionErrorBeforeConnecting(t *testing.T) {
+	cfg := imageConfigWithBuildScripts(t, nil)
+	connected := false
+	openDirectory := func(path string) (*os.File, error) {
+		if path != cfg.BuildScriptsPath() {
+			t.Fatalf("open directory path = %q, want %q", path, cfg.BuildScriptsPath())
+		}
+		return nil, unix.EACCES
+	}
+
+	err := createWithBuildScriptsDirectoryOpener(
+		context.Background(),
+		cfg,
+		io.Discard,
+		io.Discard,
+		func(context.Context) (imageClient, error) {
+			connected = true
+			return &recordingClient{}, nil
+		},
+		openDirectory,
+	)
+	if err == nil || !strings.Contains(err.Error(), "read image build scripts") || !errors.Is(err, unix.EACCES) {
+		t.Fatalf("create() error = %v, want wrapped read image build scripts permission error", err)
+	}
+	if connected {
+		t.Fatal("connected to Incus before image build script directory permission error")
 	}
 }
 
@@ -709,6 +787,16 @@ func TestCreateRunsImageWorkflowInOrder(t *testing.T) {
 	}
 	if got := string(client.files["/root/assets/authorized_hosts"].content); got != "github.com\ngitlab.com" {
 		t.Errorf("authorized_hosts = %q, want newline-joined hosts", got)
+	}
+	for _, want := range []string{"10-first.sh stdout", "20-second.sh stdout"} {
+		if !strings.Contains(stdout.String(), want) {
+			t.Errorf("stdout = %q, want build script stream %q", stdout.String(), want)
+		}
+	}
+	for _, want := range []string{"10-first.sh stderr", "20-second.sh stderr"} {
+		if !strings.Contains(stderr.String(), want) {
+			t.Errorf("stderr = %q, want build script stream %q", stderr.String(), want)
+		}
 	}
 	for path, want := range map[string]string{
 		"/root/build-scripts/10-first.sh":  "#!/bin/sh\necho first\n",
@@ -800,8 +888,8 @@ func TestCreateRunsImageWorkflowInOrder(t *testing.T) {
 	if got, want := client.publishDescription, "kanedias sandbox from https://images.linuxcontainers.org/debian/13"; got != want {
 		t.Errorf("published description = %q, want %q", got, want)
 	}
-	if stderr.Len() != 0 {
-		t.Errorf("stderr = %q, want empty", stderr.String())
+	if got, want := stderr.String(), "10-first.sh stderr20-second.sh stderr"; got != want {
+		t.Errorf("stderr = %q, want only build script streams %q", got, want)
 	}
 	if got := stdout.String(); !strings.Contains(got, "installer output") {
 		t.Errorf("stdout = %q, want streamed installer output", got)
@@ -847,8 +935,8 @@ func TestCreateStopsAfterNamedBuildScriptFailureAndCleansUp(t *testing.T) {
 	if !errors.Is(err, sentinel) || !strings.Contains(err.Error(), "20-fail.sh") {
 		t.Fatalf("create() error = %v, want named sentinel build script error", err)
 	}
-	if !strings.Contains(stdout.String(), "10-first.sh output") {
-		t.Fatalf("stdout = %q, want first build script output", stdout.String())
+	if !strings.Contains(stdout.String(), "10-first.sh stdout") {
+		t.Fatalf("stdout = %q, want first build script stdout", stdout.String())
 	}
 	for _, forbidden := range []string{"exec /root/build-scripts/30-later.sh", "stop", "publish"} {
 		if containsCall(client.calls, forbidden) {
@@ -1147,18 +1235,28 @@ func (c *recordingClient) Exec(_ context.Context, _ string, request incusclient.
 			return "", "", err
 		}
 	}
-	output := "command output"
+	stdout := "command output"
+	stderr := ""
 	if reflect.DeepEqual(request.Command, []string{"bash", "/root/install.sh"}) {
-		output = "installer output"
+		stdout = "installer output"
 	} else if len(request.Command) > 0 {
-		output = filepath.Base(request.Command[len(request.Command)-1]) + " output"
+		name := filepath.Base(request.Command[len(request.Command)-1])
+		if strings.HasPrefix(request.Command[0], "/root/build-scripts/") {
+			stdout = name + " stdout"
+			stderr = name + " stderr"
+		} else {
+			stdout = name + " output"
+		}
 	}
-	// Mirror the real Incus layer: output is streamed to the caller's writer as
+	// Mirror the real Incus layer: output is streamed to the caller's writers as
 	// it arrives, not only returned after the command completes.
 	if request.Stdout != nil {
-		_, _ = io.WriteString(request.Stdout, output)
+		_, _ = io.WriteString(request.Stdout, stdout)
 	}
-	return output, "", nil
+	if request.Stderr != nil {
+		_, _ = io.WriteString(request.Stderr, stderr)
+	}
+	return stdout, stderr, nil
 }
 
 func (c *recordingClient) StopInstance(ctx context.Context, _ string, force bool) error {

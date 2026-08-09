@@ -69,6 +69,8 @@ type imageClient interface {
 
 type connector func(context.Context) (imageClient, error)
 
+type buildScriptsDirectoryOpener func(string) (*os.File, error)
+
 type buildScript struct {
 	name    string
 	content []byte
@@ -90,11 +92,21 @@ func Create(ctx context.Context, cfg config.Config, stdout, stderr io.Writer) er
 }
 
 func create(ctx context.Context, cfg config.Config, stdout, stderr io.Writer, connect connector) error {
+	return createWithBuildScriptsDirectoryOpener(ctx, cfg, stdout, stderr, connect, openBuildScriptsDirectory)
+}
+
+func createWithBuildScriptsDirectoryOpener(
+	ctx context.Context,
+	cfg config.Config,
+	stdout, stderr io.Writer,
+	connect connector,
+	openDirectory buildScriptsDirectoryOpener,
+) error {
 	if err := cfg.ValidateLifecycle(); err != nil {
 		return err
 	}
 
-	inputs, err := loadBuildInputs(cfg)
+	inputs, err := loadBuildInputs(cfg, openDirectory)
 	if err != nil {
 		return err
 	}
@@ -108,7 +120,7 @@ func create(ctx context.Context, cfg config.Config, stdout, stderr io.Writer, co
 	return createWithClient(ctx, client, cfg, inputs, stdout, stderr)
 }
 
-func loadBuildInputs(cfg config.Config) (buildInputs, error) {
+func loadBuildInputs(cfg config.Config, openDirectory buildScriptsDirectoryOpener) (buildInputs, error) {
 	var inputs buildInputs
 	assets := []struct {
 		name        string
@@ -132,7 +144,7 @@ func loadBuildInputs(cfg config.Config) (buildInputs, error) {
 	}
 	inputs.profile = profile.Bytes()
 
-	scripts, err := loadBuildScripts(cfg)
+	scripts, err := loadBuildScriptsWithDirectoryOpener(cfg, openDirectory)
 	if err != nil {
 		return buildInputs{}, err
 	}
@@ -141,11 +153,15 @@ func loadBuildInputs(cfg config.Config) (buildInputs, error) {
 }
 
 func loadBuildScripts(cfg config.Config) ([]buildScript, error) {
+	return loadBuildScriptsWithDirectoryOpener(cfg, openBuildScriptsDirectory)
+}
+
+func loadBuildScriptsWithDirectoryOpener(cfg config.Config, openDirectory buildScriptsDirectoryOpener) ([]buildScript, error) {
 	path := cfg.BuildScriptsPath()
 	if path == "" {
 		return nil, nil
 	}
-	directory, err := os.Open(path)
+	directory, err := openDirectory(path)
 	if err != nil {
 		return nil, fmt.Errorf("read image build scripts %q: %w", path, err)
 	}
@@ -155,6 +171,18 @@ func loadBuildScripts(cfg config.Config) ([]buildScript, error) {
 		return nil, fmt.Errorf("read image build scripts %q: %w", path, err)
 	}
 	return loadBuildScriptsFromEntries(directory, entries)
+}
+
+func openBuildScriptsDirectory(path string) (*os.File, error) {
+	fd, err := unix.Open(
+		path,
+		unix.O_RDONLY|unix.O_DIRECTORY|unix.O_NONBLOCK|unix.O_CLOEXEC|unix.O_NOCTTY,
+		0,
+	)
+	if err != nil {
+		return nil, err
+	}
+	return os.NewFile(uintptr(fd), path), nil
 }
 
 func loadBuildScriptsFromEntries(directory *os.File, entries []os.DirEntry) ([]buildScript, error) {
