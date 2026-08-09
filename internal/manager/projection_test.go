@@ -2,7 +2,9 @@ package manager
 
 import (
 	"encoding/json"
+	"strings"
 	"testing"
+	"unicode/utf8"
 
 	"github.com/sklarsa/kanedias/internal/supervisor"
 )
@@ -174,5 +176,105 @@ func TestProjectActivityNonPiEventsIgnored(t *testing.T) {
 	items := projectActivity(events, "s")
 	if len(items) != 0 {
 		t.Fatalf("expected 0 items for non-pi event, got %d", len(items))
+	}
+}
+
+func TestProjectActivityRetainsBoundedToolDisplay(t *testing.T) {
+	events := []supervisor.EventEnvelope{
+		piEvent(1, "s", "tool_execution_start", map[string]any{
+			"toolCallId": "tc-1", "toolName": "read",
+			"args": map[string]any{"path": "internal/server/view.go"},
+		}),
+		piEvent(2, "s", "tool_execution_update", map[string]any{
+			"toolCallId": "tc-1", "toolName": "read",
+			"partialResult": map[string]any{"content": []any{
+				map[string]any{"type": "text", "text": "package server"},
+			}},
+		}),
+		piEvent(3, "s", "tool_execution_end", map[string]any{
+			"toolCallId": "tc-1", "toolName": "read", "isError": false,
+			"result": map[string]any{"content": []any{
+				map[string]any{"type": "text", "text": "package server\n"},
+			}},
+		}),
+	}
+	items := projectActivity(events, "s")
+	if len(items) != 1 {
+		t.Fatalf("items = %#v", items)
+	}
+	item := items[0]
+	if !item.IsTool {
+		t.Fatal("tool item should be flagged IsTool")
+	}
+	if item.ToolSummary != "read internal/server/view.go" || item.ToolLanguage != "go" {
+		t.Fatalf("tool display = %#v", item)
+	}
+	if !strings.Contains(item.ToolArgs, `"path": "internal/server/view.go"`) || item.ToolOutput != "package server\n" {
+		t.Fatalf("tool details = %#v", item)
+	}
+	if item.Status != "done" || item.IsError {
+		t.Fatalf("tool state = %#v", item)
+	}
+}
+
+func TestToolDisplayTruncatesUTF8Safely(t *testing.T) {
+	big := strings.Repeat("界", maxToolDisplayBytes)
+	events := []supervisor.EventEnvelope{
+		piEvent(1, "s", "tool_execution_start", map[string]any{
+			"toolCallId": "tc-t", "toolName": "read",
+			"args": map[string]any{"path": "a.txt"},
+		}),
+		piEvent(2, "s", "tool_execution_end", map[string]any{
+			"toolCallId": "tc-t", "toolName": "read", "isError": false,
+			"result": map[string]any{"content": []any{
+				map[string]any{"type": "text", "text": big},
+			}},
+		}),
+	}
+	items := projectActivity(events, "s")
+	if len(items) != 1 {
+		t.Fatalf("items = %#v", items)
+	}
+	item := items[0]
+	if !utf8.ValidString(item.ToolOutput) {
+		t.Fatal("tool output is not valid UTF-8")
+	}
+	if !item.ToolTruncated {
+		t.Fatal("tool output should be flagged truncated")
+	}
+	if len(item.ToolOutput) > maxToolDisplayBytes {
+		t.Fatalf("tool output exceeds %d bytes: %d", maxToolDisplayBytes, len(item.ToolOutput))
+	}
+	if !strings.HasSuffix(item.ToolOutput, "\n… display truncated …") {
+		t.Fatalf("missing truncation marker in output tail: %q", item.ToolOutput[len(item.ToolOutput)-40:])
+	}
+}
+
+func TestProjectActivityToolSummaries(t *testing.T) {
+	cases := []struct {
+		name     string
+		toolName string
+		args     map[string]any
+		want     string
+	}{
+		{"bash", "bash", map[string]any{"command": "echo hi\ncd src"}, "$ echo hi"},
+		{"grep", "grep", map[string]any{"pattern": "TODO", "path": "src"}, "grep TODO in src"},
+		{"write prefers path then file_path", "write", map[string]any{"path": "a.go", "file_path": "b.rs"}, "write a.go"},
+		{"custom fallback", "my_custom_tool", nil, "my_custom_tool"},
+	}
+	for _, c := range cases {
+		t.Run(c.name, func(t *testing.T) {
+			extra := map[string]any{"toolCallId": "tc-x", "toolName": c.toolName}
+			if c.args != nil {
+				extra["args"] = c.args
+			}
+			items := projectActivity([]supervisor.EventEnvelope{piEvent(1, "s", "tool_execution_start", extra)}, "s")
+			if len(items) != 1 {
+				t.Fatalf("items = %#v", items)
+			}
+			if items[0].ToolSummary != c.want {
+				t.Fatalf("summary = %q, want %q", items[0].ToolSummary, c.want)
+			}
+		})
 	}
 }

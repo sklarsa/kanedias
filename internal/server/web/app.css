@@ -893,3 +893,126 @@ a:focus-visible, button:focus-visible, input:focus-visible, summary:focus-visibl
 .transcript .t-body[data-markdown-rendered] .hljs-emphasis{ font-style:italic; }
 .transcript .t-body[data-markdown-rendered] .hljs-strong{ font-weight:700; }
 .transcript .t-body[data-markdown-rendered] .hljs-link{ color:var(--cyan); text-decoration:underline; }
+
+/* ============================================================
+   TOOL CARDS (bounded expandable tool inputs/results)
+   Scoped to .transcript .tool-card so the terminal stylesheet and the
+   plain message body styling can never be re-targeted by tool content.
+   Collapsed cards are compact; expanded output scrolls horizontally and is
+   constrained within the transcript width. Text remains selectable.
+   ============================================================ */
+.transcript .tool-card{
+  margin:0 0 12px;
+  border:1px solid var(--brass-line-2);
+  border-left:3px solid var(--brass-line);
+  border-radius:3px;
+  background:linear-gradient(180deg, var(--bg-panel-2), var(--bg-sunk));
+  user-select:text; -webkit-user-select:text;
+}
+.transcript .tool-card.tool-running{ border-left-color:var(--cyan); }
+.transcript .tool-card.tool-done{ border-left-color:var(--violet); }
+.transcript .tool-card.tool-error{ border-left-color:var(--amber); }
+.transcript .tool-card.tool-pending{ border-left-color:var(--brass); }
+
+.transcript .tool-summary{
+  display:flex; align-items:center; gap:8px;
+  padding:7px 10px; cursor:pointer; list-style:none;
+  color:var(--ink); font-size:12px; line-height:1.4;
+}
+.transcript .tool-summary::-webkit-details-marker{ display:none; }
+.transcript .tool-summary:hover{ background:rgba(216,169,74,.06); }
+.transcript .tool-summary:focus-visible{
+  outline:2px solid var(--brass-bright); outline-offset:1px;
+}
+.transcript .tool-card[open] > .tool-summary{ border-bottom:1px solid var(--brass-line-2); }
+
+.transcript .tool-chevron{
+  flex:0 0 auto; color:var(--brass); font-size:10px;
+  transition:transform .15s ease;
+}
+.transcript .tool-card[open] > .tool-summary .tool-chevron{ transform:rotate(90deg); }
+.transcript .tool-summary-label{
+  flex:0 0 auto; font-family:var(--mono); font-weight:600; color:var(--brass-bright);
+}
+.transcript .tool-summary-text{
+  flex:1 1 auto; min-width:0; overflow:hidden; text-overflow:ellipsis;
+  white-space:nowrap; color:var(--ink-dim); font-family:var(--mono); font-size:11.5px;
+}
+.transcript .tool-status{
+  flex:0 0 auto; font-size:9px; letter-spacing:.12em; text-transform:uppercase;
+  padding:1px 6px; border-radius:2px; border:1px solid;
+}
+.transcript .tool-status.tool-running{ color:var(--cyan); border-color:rgba(94,198,216,.45); }
+.transcript .tool-status.tool-done{ color:var(--violet); border-color:rgba(154,127,224,.45); }
+.transcript .tool-status.tool-error{ color:var(--amber); border-color:var(--amber); }
+.transcript .tool-status.tool-pending{ color:var(--ink-faint); border-color:var(--brass-line); }
+
+.transcript .tool-detail{ padding:8px 10px 10px; }
+.transcript .tool-section{ margin-top:8px; }
+.transcript .tool-section:first-child{ margin-top:0; }
+.transcript .tool-section-head{
+  display:flex; align-items:center; justify-content:space-between; gap:8px;
+  margin-bottom:4px;
+}
+.transcript .tool-section-title{
+  font-size:9.5px; letter-spacing:.14em; text-transform:uppercase;
+  color:var(--ink-faint); font-family:var(--mono);
+}
+.transcript .tool-trunc-label{
+  color:var(--amber); border:1px solid var(--brass-line-2); border-radius:2px;
+  padding:1px 5px; font-size:8.5px; letter-spacing:.1em;
+}
+
+/* code block: constrained width with horizontal scroll, keeps text selectable */
+.transcript .tool-code-wrap{
+  margin:0; max-width:100%; overflow-x:auto;
+  background:var(--bg-sunk); border:1px solid var(--brass-line-2);
+  border-radius:3px; padding:10px 12px;
+}
+.transcript .tool-code-wrap .tool-code{
+  display:inline-block; min-width:100%;
+  font-family:var(--mono); font-size:11.5px; line-height:1.6;
+  color:var(--ink); background:transparent; border:0; padding:0;
+  white-space:pre;
+}
+.transcript .tool-card .copy-btn{
+  font-family:var(--mono); font-size:9px; letter-spacing:.1em;
+  text-transform:uppercase; color:var(--ink-faint);
+  background:var(--bg-panel); border:1px solid var(--brass-line);
+  border-radius:2px; padding:2px 7px; cursor:pointer;
+}
+.transcript .tool-card .copy-btn:hover{ color:var(--brass-bright); border-color:var(--brass); }
+.transcript .tool-card .copy-btn:focus-visible{
+  outline:2px solid var(--brass-bright); outline-offset:1px;
+}
+
+/* Highlight.js tokens inside tool code, mapped to the Astrolabe palette */
+.transcript .tool-code .hljs-comment,
+.transcript .tool-code .hljs-quote{ color:var(--ink-faint); font-style:italic; }
+.transcript .tool-code .hljs-keyword,
+.transcript .tool-code .hljs-selector-tag,
+.transcript .tool-code .hljs-literal,
+.transcript .tool-code .hljs-doctag{ color:var(--violet); }
+.transcript .tool-code .hljs-string,
+.transcript .tool-code .hljs-regexp,
+.transcript .tool-code .hljs-addition{ color:var(--amber); }
+.transcript .tool-code .hljs-number,
+.transcript .tool-code .hljs-symbol,
+.transcript .tool-code .hljs-bullet{ color:var(--brass-bright); }
+.transcript .tool-code .hljs-title,
+.transcript .tool-code .hljs-section{ color:var(--cyan); }
+.transcript .tool-code .hljs-built_in,
+.transcript .tool-code .hljs-type{ color:var(--cyan); }
+.transcript .tool-code .hljs-attr,
+.transcript .tool-code .hljs-attribute,
+.transcript .tool-code .hljs-variable{ color:var(--ink); }
+.transcript .tool-code .hljs-meta,
+.transcript .tool-code .hljs-name{ color:var(--amber); }
+.transcript .tool-code .hljs-selector-id,
+.transcript .tool-code .hljs-selector-class{ color:var(--violet); }
+.transcript .tool-code .hljs-emphasis{ font-style:italic; }
+.transcript .tool-code .hljs-strong{ font-weight:700; }
+.transcript .tool-card ::selection{
+  background:rgba(94,198,216,.35); color:var(--ink);
+}
+

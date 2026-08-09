@@ -112,6 +112,31 @@
     if (!panel) return;
     var shouldStick = true;
     var lastTranscript = null;
+
+    // Highlight any newly-inserted tool args/result <code> blocks via the
+    // sandboxed KanediasMarkdown.highlight, matching Task 1's markdown flow.
+    // Only blocks that are not yet marked [data-highlighted] are processed.
+    function highlightToolCode(root) {
+      if (!window.KanediasMarkdown || typeof window.KanediasMarkdown.highlight !== "function") return;
+      var nodes = root.querySelectorAll("[data-tool-code]:not([data-highlighted])");
+      for (var i = 0; i < nodes.length; i++) {
+        var el = nodes[i];
+        var lang = el.getAttribute && el.getAttribute("data-language") ? el.getAttribute("data-language") : "";
+        var html;
+        try {
+          html = window.KanediasMarkdown.highlight(el.textContent || "", lang);
+        } catch (e) {
+          continue;
+        }
+        try {
+          el.innerHTML = html;
+        } catch (e) {
+          continue;
+        }
+        if (el.setAttribute) el.setAttribute("data-highlighted", "true");
+      }
+    }
+
     function stick() {
       var t = panel.querySelector(".transcript");
       if (!t) return;
@@ -124,27 +149,21 @@
       }
       if (shouldStick) t.scrollTop = t.scrollHeight;
     }
-    // After every activity patch, render any newly-flagged Markdown before
-    // measuring for auto-scroll so the rendered height is correct.
+    // After every activity patch, render any newly-flagged Markdown and
+    // highlight tool blocks before measuring for auto-scroll so the rendered
+    // height is correct.
     function refresh() {
       if (window.KanediasMarkdown && window.KanediasMarkdown.renderPending) {
         window.KanediasMarkdown.renderPending(panel);
       }
+      highlightToolCode(panel);
       stick();
     }
     new MutationObserver(refresh).observe(panel, { childList: true, subtree: true, characterData: true });
     refresh();
   })();
 
-  /* -------- Copy fenced code from .code-block (delegated) -------- */
-  document.addEventListener("click", function (e) {
-    var btn = e.target.closest("[data-copy-code]");
-    if (!btn) return;
-    e.stopPropagation();
-    var block = btn.closest(".code-block");
-    var code = block ? block.querySelector("code") : null;
-    if (!code || typeof code.textContent !== "string") return;
-    var text = code.textContent;
+  function copyText(text, btn) {
     var done = function (ok) {
       var label = ok ? "copied" : "copy failed";
       var original = btn.getAttribute("data-copy-label") || "copy";
@@ -160,6 +179,29 @@
     } else {
       fallbackCopy(text, finish);
     }
+  }
+
+  /* -------- Copy fenced code from .code-block (delegated) -------- */
+  document.addEventListener("click", function (e) {
+    var btn = e.target.closest("[data-copy-code]");
+    if (!btn) return;
+    e.stopPropagation();
+    var block = btn.closest(".code-block");
+    var code = block ? block.querySelector("code") : null;
+    if (!code || typeof code.textContent !== "string") return;
+    copyText(code.textContent, btn);
+  });
+
+  /* -------- Copy a tool card's args/result block (delegated) -------- */
+  document.addEventListener("click", function (e) {
+    var btn = e.target.closest("[data-copy-tool]");
+    if (!btn) return;
+    // Never let a copy click toggle the collapsed <details> tool card.
+    e.stopPropagation();
+    var section = btn.closest(".tool-section");
+    var code = section ? section.querySelector("[data-tool-code]") : null;
+    if (!code || typeof code.textContent !== "string") return;
+    copyText(code.textContent, btn);
   });
 
   function fallbackCopy(text, finish) {

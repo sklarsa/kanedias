@@ -96,6 +96,12 @@ type questionPanelView struct {
 // never flagged and stays plain escaped text. The server never renders the
 // Markdown itself; it only adds the marker that app.js hands to the sandboxed
 // renderer after escaping.
+//
+// Tool items (IsTool) carry the manager's bounded display fields and a few
+// precomputed presentation helpers (card class, running flag, status label).
+// The tool args/output are plain strings that html/template escapes in the
+// <pre><code> blocks; the browser highlights them via
+// KanediasMarkdown.highlight.
 type activityItemView struct {
 	Seq        uint64
 	Kind       string
@@ -104,6 +110,17 @@ type activityItemView struct {
 	ToolName   string
 	IsError    bool
 	IsMarkdown bool
+	// Tool projection fields (bounded at 64 KiB by the manager).
+	IsTool        bool
+	ToolSummary   string
+	ToolArgs      string
+	ToolOutput    string
+	ToolLanguage  string
+	ToolTruncated bool
+	// Precomputed presentation helpers for the tool card.
+	ToolCardClass string
+	IsRunning     bool
+	StatusLabel   string
 }
 
 // activityUsesMarkdown reports whether an activity kind should be rendered as
@@ -266,11 +283,42 @@ func newQuestionPanelView(state manager.SessionState) questionPanelView {
 	}
 }
 
+// toolCardClass maps a manager tool status onto the compact card's border
+// class: pending (recently started), running, done, or error.
+func toolCardClass(status string, isError bool) string {
+	if isError {
+		return "tool-error"
+	}
+	switch status {
+	case "running":
+		return "tool-running"
+	case "done", "":
+		return "tool-done"
+	default:
+		return "tool-pending"
+	}
+}
+
+// toolStatusLabel is the short uppercase status text shown in the card summary.
+func toolStatusLabel(status string, isError bool) string {
+	if isError {
+		return "error"
+	}
+	switch status {
+	case "running":
+		return "running"
+	case "done":
+		return "done"
+	default:
+		return "pending"
+	}
+}
+
 // newActivityView converts a SessionState into the activity panel data.
 func newActivityView(state manager.SessionState) activityView {
 	items := make([]activityItemView, 0, len(state.RecentActivity))
 	for _, a := range state.RecentActivity {
-		items = append(items, activityItemView{
+		view := activityItemView{
 			Seq:        a.Seq,
 			Kind:       a.Kind,
 			Label:      a.Label,
@@ -278,7 +326,19 @@ func newActivityView(state manager.SessionState) activityView {
 			ToolName:   a.ToolName,
 			IsError:    a.IsError,
 			IsMarkdown: activityUsesMarkdown(a.Kind),
-		})
+		}
+		if a.IsTool {
+			view.IsTool = true
+			view.ToolSummary = a.ToolSummary
+			view.ToolArgs = a.ToolArgs
+			view.ToolOutput = a.ToolOutput
+			view.ToolLanguage = a.ToolLanguage
+			view.ToolTruncated = a.ToolTruncated
+			view.ToolCardClass = toolCardClass(a.Status, a.IsError)
+			view.IsRunning = a.Status == "running"
+			view.StatusLabel = toolStatusLabel(a.Status, a.IsError)
+		}
+		items = append(items, view)
 	}
 	gapText := ""
 	if state.Gap != nil {

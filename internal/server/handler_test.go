@@ -1315,6 +1315,37 @@ func TestHandlerRejectsNilLogger(t *testing.T) {
 	}
 }
 
+func TestToolCardTemplateEscapesAndCollapses(t *testing.T) {
+	templates, err := parseTemplates(webFiles)
+	if err != nil {
+		t.Fatal(err)
+	}
+	payload := "</pre><script>alert(1)</script>"
+	view := activityView{Items: []activityItemView{
+		{
+			Kind: "tool_execution_start", Label: "Tool: read",
+			IsTool: true, ToolSummary: "read a.txt", ToolArgs: payload,
+			ToolOutput: payload, ToolLanguage: "go", ToolTruncated: false,
+		},
+	}}
+	html, err := renderTemplate(templates, templateActivity, view)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !strings.Contains(html, `<details class="tool-card`) {
+		t.Fatal("tool card details missing\n" + html)
+	}
+	if strings.Contains(html, `<script>alert`) {
+		t.Fatalf("unescaped tool content: %s", html)
+	}
+	if !strings.Contains(html, `&lt;script&gt;alert`) {
+		t.Fatalf("missing escaped source: %s", html)
+	}
+	if strings.Contains(html, `<details class="tool-card" open`) {
+		t.Fatalf("tool defaulted open: %s", html)
+	}
+}
+
 func TestHandlerParsesTemplatesAtConstruction(t *testing.T) {
 	invalid := fstest.MapFS{
 		"web/index.html": &fstest.MapFile{Data: []byte(`{{if}}`)},

@@ -5,10 +5,41 @@
     <div class="block-title">Recent activity</div>
     <div class="transcript">
       {{range .Items}}
+      {{if .IsTool}}
+      <details class="tool-card {{.ToolCardClass}}" data-tool-card{{if .IsRunning}} open{{end}}>
+        <summary class="tool-summary" tabindex="0">
+          <span class="tool-chevron" aria-hidden="true">▸</span>
+          <span class="tool-summary-label">{{.Label}}</span>
+          {{if .ToolSummary}}<span class="tool-summary-text">{{.ToolSummary}}</span>{{end}}
+          <span class="tool-status {{.ToolCardClass}}">{{.StatusLabel}}</span>
+        </summary>
+        <div class="tool-detail">
+          {{if .ToolArgs}}
+          <section class="tool-section">
+            <div class="tool-section-head">
+              <span class="tool-section-title">Arguments</span>
+              <button type="button" class="copy-btn" data-copy-tool>copy</button>
+            </div>
+            <pre class="tool-code-wrap"><code class="tool-code hljs" data-tool-code data-language="json">{{.ToolArgs}}</code></pre>
+          </section>
+          {{end}}
+          {{if .ToolOutput}}
+          <section class="tool-section">
+            <div class="tool-section-head">
+              <span class="tool-section-title">Result{{if .ToolTruncated}} <span class="tool-trunc-label">truncated</span>{{end}}</span>
+              <button type="button" class="copy-btn" data-copy-tool>copy</button>
+            </div>
+            <pre class="tool-code-wrap"><code class="tool-code hljs" data-tool-code data-language="{{.ToolLanguage}}">{{.ToolOutput}}</code></pre>
+          </section>
+          {{end}}
+        </div>
+      </details>
+      {{else}}
       <div class="t-turn {{if .IsError}}t-error{{end}}">
         <span class="t-role {{.Kind}}">{{.Label}}</span>
         {{if .Text}}<div class="t-body"{{if .IsMarkdown}} data-markdown{{end}}>{{.Text}}</div>{{end}}
       </div>
+      {{end}}
       {{end}}
     </div>
     {{if .Incomplete}}<div class="replay-warning">⚠ Incomplete replay</div>{{end}}
