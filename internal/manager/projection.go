@@ -54,7 +54,26 @@ func (p *activityProjector) Apply(event supervisor.EventEnvelope) {
 	p.applyPiType(event, wrapper.Type)
 }
 
+// ignoredPiTypes are pure lifecycle/flow events that carry no transcript content
+// (agent/turn/message framing, retries, UI requests). They would otherwise show
+// up as noisy "Pi event: …" lines and drown out the real messages and tool calls.
+var ignoredPiTypes = map[string]bool{
+	"agent_start":          true,
+	"agent_settled":        true,
+	"agent_end":            true,
+	"queue_update":         true,
+	"turn_start":           true,
+	"turn_end":             true,
+	"message_start":        true,
+	"auto_retry_start":     true,
+	"auto_retry_end":       true,
+	"extension_ui_request": true,
+}
+
 func (p *activityProjector) applyPiType(event supervisor.EventEnvelope, piType string) {
+	if ignoredPiTypes[piType] {
+		return
+	}
 	switch piType {
 	case "message_update":
 		p.applyMessageUpdate(event)
@@ -66,10 +85,6 @@ func (p *activityProjector) applyPiType(event supervisor.EventEnvelope, piType s
 		p.applyToolUpdate(event)
 	case "tool_execution_end":
 		p.applyToolEnd(event)
-	case "queue_update", "agent_start", "agent_settled":
-		// Pure lifecycle churn (agent started/settled, queue tick); not surfaced
-		// in the transcript so real messages and tool calls are not drowned out.
-		return
 	case "extension_error":
 		var payload struct {
 			Message string `json:"message"`

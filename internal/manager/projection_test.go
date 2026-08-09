@@ -24,10 +24,38 @@ func TestProjectActivityFiltersAgentLifecycleNoise(t *testing.T) {
 		piEvent(1, "s", "agent_start", nil),
 		piEvent(2, "s", "agent_settled", nil),
 		piEvent(3, "s", "queue_update", nil),
+		piEvent(4, "s", "turn_start", nil),
+		piEvent(5, "s", "message_start", nil),
+		piEvent(6, "s", "turn_end", nil),
+		piEvent(7, "s", "agent_end", nil),
+		piEvent(8, "s", "auto_retry_start", nil),
+		piEvent(9, "s", "extension_ui_request", nil),
 	}
 	items := projectActivity(events, "s")
 	if len(items) != 0 {
 		t.Fatalf("agent lifecycle noise should not be surfaced, got %d items: %#v", len(items), items)
+	}
+}
+
+func TestProjectActivitySurfacesOnlyContentInTurn(t *testing.T) {
+	events := []supervisor.EventEnvelope{
+		piEvent(1, "s", "turn_start", nil),
+		piEvent(2, "s", "message_start", nil),
+		piEvent(3, "s", "message_update", map[string]any{
+			"message": map[string]any{"content": []any{
+				map[string]any{"delta": map[string]any{"type": "text_delta", "text": "hello"}},
+			}},
+		}),
+		piEvent(4, "s", "message_end", nil),
+		piEvent(5, "s", "turn_end", nil),
+		piEvent(6, "s", "agent_end", nil),
+	}
+	items := projectActivity(events, "s")
+	if len(items) != 1 {
+		t.Fatalf("expected exactly 1 content item, got %d: %#v", len(items), items)
+	}
+	if items[0].Kind != "message_update" || items[0].Text != "hello" {
+		t.Fatalf("content item = %#v", items[0])
 	}
 }
 

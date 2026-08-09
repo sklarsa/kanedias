@@ -101,7 +101,51 @@
     e.preventDefault();
     var btn = document.getElementById("steerBtn");
     if (btn) btn.click();
+    // Clear the just-sent command so it is not left queued in the box.
+    input.value = "";
+    input.dispatchEvent(new Event("input", { bubbles: true }));
   });
+
+  /* -------- Transcript auto-scrolls to the newest content (TUI-like) -------- */
+  (function () {
+    var panel = document.getElementById("activity-panel");
+    if (!panel) return;
+    var shouldStick = true;
+    var lastTranscript = null;
+    function stick() {
+      var t = panel.querySelector(".transcript");
+      if (!t) return;
+      if (lastTranscript !== t) {
+        lastTranscript = t;
+        shouldStick = true;
+        t.addEventListener("scroll", function () {
+          shouldStick = t.scrollHeight - t.scrollTop - t.clientHeight < 40;
+        });
+      }
+      if (shouldStick) t.scrollTop = t.scrollHeight;
+    }
+    new MutationObserver(stick).observe(panel, { childList: true, subtree: true, characterData: true });
+    stick();
+  })();
+
+  /* -------- Deck controls reflect the selected session's capability -------- */
+  function setDeckState(sessionID, lifecycle) {
+    var canAct = !!sessionID && (lifecycle === "ready" || lifecycle === "running" ||
+      lifecycle === "active" || lifecycle === "question" || lifecycle === "starting");
+    var sel = function (sel) { return document.querySelector(sel); };
+    var steer = sel("#steerBtn");
+    var itr = sel(".dbtn.interrupt");
+    var stop = sel(".dbtn.stop");
+    if (steer) steer.disabled = !canAct;
+    if (stop) stop.disabled = !canAct;
+    if (itr) itr.disabled = !(!!sessionID && lifecycle === "running");
+  }
+  document.addEventListener("click", function (e) {
+    var row = e.target.closest(".row");
+    if (!row) return;
+    setDeckState(row.getAttribute("data-session-id"), row.getAttribute("data-lifecycle"));
+  });
+  setDeckState("", "");
 
   /* -------- Alert banner jumps to first question (delegated) -------- */
   document.addEventListener("click", function (e) {
