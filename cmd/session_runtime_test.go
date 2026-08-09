@@ -6,6 +6,7 @@ import (
 	"io"
 	"os"
 	"path/filepath"
+	"reflect"
 	"strings"
 	"testing"
 
@@ -116,24 +117,51 @@ func TestRunSupervisorRejectsInvalidPolicyBeforeConfigAndBroker(t *testing.T) {
 	}
 }
 
-func TestProductionChildRunnerSelectsConfiguredEventLimitsBeforeProvisioning(t *testing.T) {
+func TestInheritedChildPolicySelectsExactWorkerAndClonesMap(t *testing.T) {
+	bootstrap := process.Bootstrap{
+		Policy: config.SessionModelPolicy{
+			Root: config.ModelProfile{Provider: "root-provider", Model: "root-model", ThinkingLevel: "off"},
+			Workers: map[string]config.WorkerProfile{
+				"worker":   {Description: "work", Provider: "admitted-provider", Model: "admitted-model", ThinkingLevel: "xhigh"},
+				"reviewer": {Description: "review", Provider: "review-provider", Model: "review-model", ThinkingLevel: "medium"},
+			},
+		},
+		Request: contract.CreateChildRequest{WorkerType: "worker"},
+	}
+	policy, worker, err := inheritedChildPolicy(bootstrap)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if want := bootstrap.Policy.Workers["worker"]; worker != want {
+		t.Fatalf("selected worker = %#v, want exact inherited profile %#v", worker, want)
+	}
+	policy.Workers["worker"] = config.WorkerProfile{Description: "mutated", Provider: "mutated", Model: "mutated", ThinkingLevel: "off"}
+	if reflect.DeepEqual(policy, bootstrap.Policy) {
+		t.Fatal("resolved child policy aliases bootstrap policy")
+	}
+	if len(policy.Workers) != 2 || len(bootstrap.Policy.Workers) != 2 {
+		t.Fatalf("worker roles lost: resolved=%#v bootstrap=%#v", policy.Workers, bootstrap.Policy.Workers)
+	}
+}
+
+func TestProductionChildRunnerUsesInheritedPolicyDespiteChangedGlobalDefaults(t *testing.T) {
 	content := `[network]
 ipv4 = "10.76.111.1/24"
 [base_image]
 name = "sandbox"
 source = "images:"
 image = "debian/13"
-[models.gpt-5-6-sol]
-provider = "openai-codex"
-model = "gpt-5.6-sol"
-thinking_levels = ["high"]
-default_thinking_level = "high"
+[models.changed-default]
+provider = "changed-provider"
+model = "changed-model"
+thinking_levels = ["low"]
+default_thinking_level = "low"
 [session]
-model_type = "gpt-5-6-sol"
-thinking_level = "high"
+model_type = "changed-default"
+thinking_level = "low"
 [workers.worker]
-description = "work"
-model_type = "gpt-5-6-sol"
+description = "changed global worker"
+model_type = "changed-default"
 
 [supervisor.events]
 max_events = 7
@@ -147,21 +175,29 @@ max_bytes = 1024
 
 	sentinel := errors.New("broker sentinel")
 	bootstrap := process.Bootstrap{
-		SessionID: "session-test",
-		ParentID:  "session-test",
-		RootID:    "session-test",
+		SessionID: "session-child",
+		ParentID:  "session-parent",
+		RootID:    "session-root",
 		Request: contract.CreateChildRequest{
 			Kind:       contract.ChildKindRead,
 			Context:    contract.ContextFresh,
 			WorkerType: "worker",
 			Task:       "test",
 		},
-		Worker: config.WorkerProfile{
-			Description: "work", Provider: "provider", Model: "model",
+		Policy: config.SessionModelPolicy{
+			Root: config.ModelProfile{Provider: "admitted-root-provider", Model: "admitted-root-model", ThinkingLevel: "off"},
+			Workers: map[string]config.WorkerProfile{
+				"worker":   {Description: "admitted worker", Provider: "admitted-provider", Model: "admitted-model", ThinkingLevel: "xhigh"},
+				"reviewer": {Description: "admitted reviewer", Provider: "review-provider", Model: "review-model", ThinkingLevel: "medium"},
+			},
 		},
-		SocketPath: filepath.Join(t.TempDir(), "child.sock"),
+		SourceInstance: "session-session-parent",
+		SourceVolume:   "workspace-session-parent",
+		SocketPath:     filepath.Join(t.TempDir(), "child.sock"),
 	}
 
+	// The sentinel is reached only after inherited-policy validation and worker
+	// resolution, but before any provider/Incus side effect.
 	err := productionChildRunnerWithBrokerFactory(context.Background(), bootstrap, nil, func(got supervisor.EventBrokerOptions) (*supervisor.EventBroker, error) {
 		if got != (supervisor.EventBrokerOptions{MaxEvents: 7, MaxBytes: 1024}) {
 			t.Fatalf("options = %#v", got)

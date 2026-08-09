@@ -8,6 +8,7 @@ import (
 	"net"
 	"os"
 	"path/filepath"
+	"reflect"
 	"sync"
 	"sync/atomic"
 	"testing"
@@ -187,6 +188,75 @@ func readRequest() contract.CreateChildRequest {
 
 func directChildSnapshot(id string) NodeSnapshot {
 	return NodeSnapshot{SessionID: id, ParentSessionID: "root-1", RootSessionID: "root-1", Kind: contract.ChildKindRead, Context: contract.ContextFresh, WorkerType: "reviewer", Lifecycle: string(LifecycleReady), Questions: []QuestionSummary{}, Children: []NodeSnapshot{}}
+}
+
+func TestCreateChildClonesCompletePolicyAcrossTwoGenerations(t *testing.T) {
+	admitted := testModelPolicy()
+	var childBootstrap process.Bootstrap
+	root := childCreationNode(t, func(_ context.Context, got process.Bootstrap) (ChildProcess, error) {
+		childBootstrap = got
+		return nil, errors.New("capture child bootstrap")
+	}, func(string) (DescendantClient, error) { return nil, errors.New("unexpected client") })
+	root.deps.ModelPolicy = admitted.Clone()
+	root.deps.NewSessionID = func() (string, error) { return "child-1", nil }
+
+	_, _ = root.CreateChild(context.Background(), "root-1", readRequest())
+	if !reflect.DeepEqual(childBootstrap.Policy, admitted) {
+		t.Fatalf("child policy = %#v, want %#v", childBootstrap.Policy, admitted)
+	}
+	if len(childBootstrap.Policy.Workers) != len(admitted.Workers) {
+		t.Fatalf("child worker roles = %#v, want all roles %#v", childBootstrap.Policy.Workers, admitted.Workers)
+	}
+	inherited := childBootstrap.Policy.Clone()
+	mutated := childBootstrap.Policy.Workers["reviewer"]
+	mutated.Model = "mutated-bootstrap-model"
+	childBootstrap.Policy.Workers["reviewer"] = mutated
+	if reflect.DeepEqual(root.deps.ModelPolicy, childBootstrap.Policy) {
+		t.Fatal("child bootstrap policy aliases root node policy")
+	}
+
+	childIdentity, err := NewIdentity(IdentitySpec{
+		SessionID: "child-1", ParentID: "root-1", RootID: "root-1",
+		Kind: contract.ChildKindRead, Context: contract.ContextFresh, Worker: "reviewer",
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	var grandchildBootstrap process.Bootstrap
+	child := &Node{
+		identity: childIdentity, broker: NewEventBroker(), state: LifecycleReady, started: true,
+		resources: &provision.Resources{SessionID: "child-1", Instance: "child-instance", Volume: "child-volume"},
+		children:  newChildRegistry(), startupDone: make(chan struct{}), done: make(chan struct{}),
+		deps: Dependencies{
+			ModelPolicy: inherited.Clone(), SocketPath: "/tmp/child-1.sock",
+			SpawnChild: func(_ context.Context, got process.Bootstrap) (ChildProcess, error) {
+				grandchildBootstrap = got
+				return nil, errors.New("capture grandchild bootstrap")
+			},
+			DescendantClient: func(string) (DescendantClient, error) { return nil, errors.New("unexpected client") },
+			NewSessionID:     func() (string, error) { return "grandchild-1", nil },
+			CloseListener:    func(context.Context) error { return nil },
+		},
+	}
+	close(child.startupDone)
+
+	// Simulate global defaults changing after root admission. Descendant policy
+	// authority must remain the originally inherited policy.
+	changedGlobals := admitted.Clone()
+	changed := changedGlobals.Workers["worker"]
+	changed.Provider, changed.Model, changed.ThinkingLevel = "changed-provider", "changed-model", "xhigh"
+	changedGlobals.Workers["worker"] = changed
+
+	grandchildRequest := readRequest()
+	grandchildRequest.WorkerType = "worker"
+	_, _ = child.CreateChild(context.Background(), "child-1", grandchildRequest)
+	if !reflect.DeepEqual(grandchildBootstrap.Policy, inherited) {
+		t.Fatalf("grandchild policy = %#v, want original inherited policy %#v (changed globals %#v)", grandchildBootstrap.Policy, inherited, changedGlobals)
+	}
+	grandchildBootstrap.Policy.Workers["worker"] = changed
+	if reflect.DeepEqual(child.deps.ModelPolicy, grandchildBootstrap.Policy) {
+		t.Fatal("grandchild bootstrap policy aliases child node policy")
+	}
 }
 
 func TestCreateChildResolvesWorkerBeforeAnyProcessSideEffect(t *testing.T) {

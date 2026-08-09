@@ -33,7 +33,13 @@ func validBootstrap(t *testing.T) Bootstrap {
 		SessionID: "child-1", ParentID: "parent-1", RootID: "root-1",
 		SocketPath:     filepath.Join(t.TempDir(), "child.sock"),
 		SourceInstance: "session-parent-1", SourceVolume: "workspace-parent-1",
-		Worker:  config.WorkerProfile{Description: "Review code", Provider: "openai-codex", Model: "gpt-5", ThinkingLevel: "high"},
+		Policy: config.SessionModelPolicy{
+			Root: config.ModelProfile{Provider: "local-executor", Model: "root-model", ThinkingLevel: "off"},
+			Workers: map[string]config.WorkerProfile{
+				"reviewer": {Description: "Review code", Provider: "openai-codex", Model: "gpt-5", ThinkingLevel: "high"},
+				"worker":   {Description: "Implement code", Provider: "anthropic", Model: "claude-worker", ThinkingLevel: "medium"},
+			},
+		},
 		Request: contract.CreateChildRequest{WorkerType: "reviewer", Kind: contract.ChildKindRead, Context: contract.ContextFresh, Task: "review this change"},
 	}
 }
@@ -64,6 +70,25 @@ func TestSpawnerConfigPathReplacesOnlyKanediasConfig(t *testing.T) {
 	}
 }
 
+func TestSpawnerOwnsIndependentPolicyClone(t *testing.T) {
+	bootstrap := validBootstrap(t)
+	script := filepath.Join(t.TempDir(), "child.sh")
+	if err := os.WriteFile(script, []byte("#!/bin/sh\ncat <&3 >/dev/null\ncat <&4 >/dev/null\n"), 0o700); err != nil {
+		t.Fatal(err)
+	}
+	child, err := (Spawner{Executable: script}).Spawn(context.Background(), bootstrap)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer func() { _ = child.Kill() }()
+	mutated := bootstrap.Policy.Workers["reviewer"]
+	mutated.Model = "mutated-after-spawn"
+	bootstrap.Policy.Workers["reviewer"] = mutated
+	if child.bootstrap.Policy.Workers["reviewer"].Model == mutated.Model {
+		t.Fatal("spawned child state aliases caller policy map")
+	}
+}
+
 func TestBootstrapStrictDecodeAndValidation(t *testing.T) {
 	bootstrap := validBootstrap(t)
 	var encoded bytes.Buffer
@@ -74,8 +99,17 @@ func TestBootstrapStrictDecodeAndValidation(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	if got.SessionID != bootstrap.SessionID || got.Request.Task != bootstrap.Request.Task || got.Worker.Model != bootstrap.Worker.Model {
+	if got.SessionID != bootstrap.SessionID || got.Request.Task != bootstrap.Request.Task || !reflect.DeepEqual(got.Policy, bootstrap.Policy) {
 		t.Fatalf("decoded bootstrap = %#v", got)
+	}
+	if len(got.Policy.Workers) != 2 {
+		t.Fatalf("decoded workers = %#v, want complete policy", got.Policy.Workers)
+	}
+	mutated := got.Policy.Workers["reviewer"]
+	mutated.Model = "mutated-after-decode"
+	got.Policy.Workers["reviewer"] = mutated
+	if bootstrap.Policy.Workers["reviewer"].Model == mutated.Model {
+		t.Fatal("decoded policy aliases encoded policy worker map")
 	}
 
 	data, _ := json.Marshal(bootstrap)
@@ -99,10 +133,19 @@ func TestBootstrapRejectsInvalidInputsBeforeProvisioning(t *testing.T) {
 		{"missing source instance", func(b *Bootstrap) { b.SourceInstance = "" }},
 		{"missing source volume", func(b *Bootstrap) { b.SourceVolume = "" }},
 		{"relative socket", func(b *Bootstrap) { b.SocketPath = "child.sock" }},
-		{"missing worker description", func(b *Bootstrap) { b.Worker.Description = "" }},
-		{"missing worker provider", func(b *Bootstrap) { b.Worker.Provider = "" }},
-		{"missing worker model", func(b *Bootstrap) { b.Worker.Model = "" }},
-		{"invalid thinking level", func(b *Bootstrap) { b.Worker.ThinkingLevel = "huge" }},
+		{"missing policy root provider", func(b *Bootstrap) { b.Policy.Root.Provider = "" }},
+		{"missing workers", func(b *Bootstrap) { b.Policy.Workers = nil }},
+		{"missing worker description", func(b *Bootstrap) {
+			worker := b.Policy.Workers["reviewer"]
+			worker.Description = ""
+			b.Policy.Workers["reviewer"] = worker
+		}},
+		{"invalid thinking level", func(b *Bootstrap) {
+			worker := b.Policy.Workers["reviewer"]
+			worker.ThinkingLevel = "huge"
+			b.Policy.Workers["reviewer"] = worker
+		}},
+		{"requested worker absent from policy", func(b *Bootstrap) { delete(b.Policy.Workers, "reviewer") }},
 		{"invalid fork combination", func(b *Bootstrap) { b.Request.Context = contract.ContextFork }},
 		{"missing task", func(b *Bootstrap) { b.Request.Task = " " }},
 	}

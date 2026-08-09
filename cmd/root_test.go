@@ -225,7 +225,10 @@ func TestHiddenSessionChildMarksProtocolDescriptorsCloseOnExec(t *testing.T) {
 	bootstrap := process.Bootstrap{
 		SessionID: "child-1", ParentID: "parent-1", RootID: "root-1",
 		SocketPath: filepath.Join(t.TempDir(), "child.sock"), SourceInstance: "instance", SourceVolume: "volume",
-		Worker:  config.WorkerProfile{Description: "review", Provider: "provider", Model: "model"},
+		Policy: config.SessionModelPolicy{
+			Root:    config.ModelProfile{Provider: "provider", Model: "root-model", ThinkingLevel: "off"},
+			Workers: map[string]config.WorkerProfile{"reviewer": {Description: "review", Provider: "provider", Model: "model", ThinkingLevel: "off"}},
+		},
 		Request: contract.CreateChildRequest{WorkerType: "reviewer", Kind: contract.ChildKindRead, Context: contract.ContextFresh, Task: "review"},
 	}
 	command := exec.Command(os.Args[0], "-test.run=TestHiddenSessionChildMarksProtocolDescriptorsCloseOnExec", "--")

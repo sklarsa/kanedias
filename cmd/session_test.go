@@ -278,7 +278,10 @@ func TestProductionChildRequiresAbsoluteConfigBeforeProvisioning(t *testing.T) {
 	bootstrap := process.Bootstrap{
 		SessionID: "child", ParentID: "parent", RootID: "root", SocketPath: filepath.Join(t.TempDir(), "child.sock"),
 		SourceInstance: "parent-instance", SourceVolume: "parent-volume",
-		Worker:  config.WorkerProfile{Description: "review", Provider: "provider", Model: "model"},
+		Policy: config.SessionModelPolicy{
+			Root:    config.ModelProfile{Provider: "provider", Model: "root-model", ThinkingLevel: "off"},
+			Workers: map[string]config.WorkerProfile{"reviewer": {Description: "review", Provider: "provider", Model: "model", ThinkingLevel: "off"}},
+		},
 		Request: contract.CreateChildRequest{WorkerType: "reviewer", Kind: contract.ChildKindRead, Context: contract.ContextFresh, Task: "review"},
 	}
 	for _, path := range []string{"", "relative.toml"} {

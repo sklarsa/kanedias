@@ -343,7 +343,7 @@ func (node *Node) CreateChild(ctx context.Context, parent string, request contra
 	bootstrap := process.Bootstrap{
 		SessionID: childID, ParentID: identity.SessionID, RootID: identity.RootID,
 		SocketPath: childSocket, SourceInstance: resources.Instance, SourceVolume: resources.Volume,
-		Worker: worker, Request: request, RunAttribution: node.deps.RunAttribution,
+		Policy: node.deps.ModelPolicy.Clone(), Request: request, RunAttribution: node.deps.RunAttribution,
 	}
 	child, err := node.deps.SpawnChild(spawnCtx, bootstrap)
 	if err != nil {

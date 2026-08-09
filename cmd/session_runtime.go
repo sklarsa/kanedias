@@ -149,6 +149,18 @@ func productionChildRunner(ctx context.Context, bootstrap process.Bootstrap, rep
 	return productionChildRunnerWithBrokerFactory(ctx, bootstrap, reporter, supervisor.NewEventBrokerWithOptions)
 }
 
+func inheritedChildPolicy(bootstrap process.Bootstrap) (config.SessionModelPolicy, config.WorkerProfile, error) {
+	policy := bootstrap.Policy.Clone()
+	if err := policy.Validate(); err != nil {
+		return config.SessionModelPolicy{}, config.WorkerProfile{}, contract.NewError(contract.ErrorInvalidRequest, "inherited session model policy is invalid: "+err.Error())
+	}
+	worker, err := policy.ResolveWorker(bootstrap.Request.WorkerType)
+	if err != nil {
+		return config.SessionModelPolicy{}, config.WorkerProfile{}, contract.NewError(contract.ErrorUnknownWorkerType, err.Error())
+	}
+	return policy, worker, nil
+}
+
 func productionChildRunnerWithBrokerFactory(ctx context.Context, bootstrap process.Bootstrap, reporter *process.Reporter, factory eventBrokerFactory) (resultErr error) {
 	configPath := os.Getenv("KANEDIAS_CONFIG")
 	if configPath == "" || !filepath.IsAbs(configPath) || filepath.Clean(configPath) != configPath {
@@ -161,6 +173,10 @@ func productionChildRunnerWithBrokerFactory(ctx context.Context, bootstrap proce
 	if err := cfg.ValidateSupervisor(); err != nil {
 		return err
 	}
+	policy, resolvedWorker, err := inheritedChildPolicy(bootstrap)
+	if err != nil {
+		return err
+	}
 	limits, err := cfg.Supervisor.Events.Limits()
 	if err != nil {
 		return err
@@ -168,17 +184,6 @@ func productionChildRunnerWithBrokerFactory(ctx context.Context, bootstrap proce
 	broker, err := factory(supervisor.EventBrokerOptions{MaxEvents: limits.MaxEvents, MaxBytes: limits.MaxBytes})
 	if err != nil {
 		return err
-	}
-	policy, err := cfg.DefaultSessionModelPolicy()
-	if err != nil {
-		return err
-	}
-	resolvedWorker, err := policy.ResolveWorker(bootstrap.Request.WorkerType)
-	if err != nil {
-		return contract.NewError(contract.ErrorUnknownWorkerType, err.Error())
-	}
-	if resolvedWorker != bootstrap.Worker {
-		return contract.NewError(contract.ErrorConflict, "child worker profile does not match configured policy")
 	}
 	childProvisioner, err := provision.NewConfiguredChildProvisioner(ctx, cfg)
 	if err != nil {
@@ -200,7 +205,7 @@ func productionChildRunnerWithBrokerFactory(ctx context.Context, bootstrap proce
 	adapter := childRootProvisionAdapter{provisioner: childProvisioner, request: provision.ChildRequest{
 		SessionID: bootstrap.SessionID, ParentID: bootstrap.ParentID, RootID: bootstrap.RootID,
 		SourceInstance: bootstrap.SourceInstance, SourceVolume: bootstrap.SourceVolume,
-		HostSocketPath: bootstrap.SocketPath, Worker: bootstrap.Worker, Contract: bootstrap.Request,
+		HostSocketPath: bootstrap.SocketPath, Worker: resolvedWorker, Contract: bootstrap.Request,
 		RunAttribution: bootstrap.RunAttribution,
 	}}
 

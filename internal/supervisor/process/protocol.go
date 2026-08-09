@@ -31,7 +31,7 @@ type Bootstrap struct {
 	SocketPath     string                      `json:"socketPath"`
 	SourceInstance string                      `json:"sourceInstance"`
 	SourceVolume   string                      `json:"sourceVolume"`
-	Worker         config.WorkerProfile        `json:"worker"`
+	Policy         config.SessionModelPolicy   `json:"policy"`
 	Request        contract.CreateChildRequest `json:"request"`
 	RunAttribution string                      `json:"runAttribution,omitempty"`
 }
@@ -112,31 +112,14 @@ func (bootstrap Bootstrap) Validate() error {
 	if !filepath.IsAbs(bootstrap.SocketPath) || filepath.Clean(bootstrap.SocketPath) != bootstrap.SocketPath {
 		return contract.NewError(contract.ErrorInvalidRequest, "child socket path must be an absolute clean path")
 	}
-	if err := validateWorker(bootstrap.Worker); err != nil {
-		return err
+	if err := bootstrap.Policy.Validate(); err != nil {
+		return contract.NewError(contract.ErrorInvalidRequest, "session model policy is invalid: "+err.Error())
 	}
 	if err := bootstrap.Request.Validate(); err != nil {
 		return err
 	}
-	return nil
-}
-
-func validateWorker(worker config.WorkerProfile) error {
-	for field, value := range map[string]string{
-		"worker description": worker.Description,
-		"worker provider":    worker.Provider,
-		"worker model":       worker.Model,
-	} {
-		if strings.TrimSpace(value) == "" {
-			return contract.NewError(contract.ErrorInvalidRequest, field+" is required")
-		}
-	}
-	if worker.ThinkingLevel != "" {
-		switch worker.ThinkingLevel {
-		case "off", "minimal", "low", "medium", "high", "xhigh", "max":
-		default:
-			return contract.NewError(contract.ErrorInvalidRequest, "worker thinking level is invalid")
-		}
+	if _, err := bootstrap.Policy.ResolveWorker(bootstrap.Request.WorkerType); err != nil {
+		return contract.NewError(contract.ErrorUnknownWorkerType, err.Error())
 	}
 	return nil
 }
