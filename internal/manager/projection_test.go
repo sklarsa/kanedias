@@ -19,17 +19,15 @@ func piEvent(seq uint64, session, piType string, extra map[string]any) superviso
 	}
 }
 
-func TestProjectActivityAgentStartAndSettled(t *testing.T) {
+func TestProjectActivityFiltersAgentLifecycleNoise(t *testing.T) {
 	events := []supervisor.EventEnvelope{
 		piEvent(1, "s", "agent_start", nil),
 		piEvent(2, "s", "agent_settled", nil),
+		piEvent(3, "s", "queue_update", nil),
 	}
 	items := projectActivity(events, "s")
-	if len(items) != 2 {
-		t.Fatalf("items = %d, want 2", len(items))
-	}
-	if items[0].Kind != "agent_start" || items[1].Kind != "agent_settled" {
-		t.Fatalf("item kinds = %q %q", items[0].Kind, items[1].Kind)
+	if len(items) != 0 {
+		t.Fatalf("agent lifecycle noise should not be surfaced, got %d items: %#v", len(items), items)
 	}
 }
 
@@ -79,13 +77,13 @@ func TestProjectActivityToolLifecycle(t *testing.T) {
 
 func TestProjectActivityFiltersOtherSessions(t *testing.T) {
 	events := []supervisor.EventEnvelope{
-		piEvent(1, "s1", "agent_start", nil),
-		piEvent(2, "s2", "agent_start", nil),
-		piEvent(3, "s1", "agent_settled", nil),
+		piEvent(1, "s1", "tool_execution_start", map[string]any{"toolCallId": "a", "toolName": "bash"}),
+		piEvent(2, "s2", "tool_execution_start", map[string]any{"toolCallId": "b", "toolName": "bash"}),
+		piEvent(3, "s1", "tool_execution_end", map[string]any{"toolCallId": "a"}),
 	}
 	items := projectActivity(events, "s1")
-	if len(items) != 2 {
-		t.Fatalf("expected 2 items for s1, got %d", len(items))
+	if len(items) != 1 {
+		t.Fatalf("expected 1 item for s1, got %d", len(items))
 	}
 	items2 := projectActivity(events, "s2")
 	if len(items2) != 1 {

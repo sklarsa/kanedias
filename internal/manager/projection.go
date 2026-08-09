@@ -66,18 +66,10 @@ func (p *activityProjector) applyPiType(event supervisor.EventEnvelope, piType s
 		p.applyToolUpdate(event)
 	case "tool_execution_end":
 		p.applyToolEnd(event)
-	case "queue_update":
-		p.items = append(p.items, ActivityItem{
-			Seq: event.Seq, Kind: "queue_update", Label: "Queue update",
-		})
-	case "agent_start":
-		p.items = append(p.items, ActivityItem{
-			Seq: event.Seq, Kind: "agent_start", Label: "Agent started",
-		})
-	case "agent_settled":
-		p.items = append(p.items, ActivityItem{
-			Seq: event.Seq, Kind: "agent_settled", Label: "Agent settled",
-		})
+	case "queue_update", "agent_start", "agent_settled":
+		// Pure lifecycle churn (agent started/settled, queue tick); not surfaced
+		// in the transcript so real messages and tool calls are not drowned out.
+		return
 	case "extension_error":
 		var payload struct {
 			Message string `json:"message"`
