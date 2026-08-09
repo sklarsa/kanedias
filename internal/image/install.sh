@@ -520,6 +520,7 @@ install_pi_extension() {
     install -d -m 0755 /usr/lib/tmpfiles.d
     cat > /usr/lib/tmpfiles.d/kanedias.conf <<EOF
 d /run/kanedias 0700 kanedias kanedias -
+d /run/kanedias-pi 0700 root root -
 EOF
     systemd-tmpfiles --create /usr/lib/tmpfiles.d/kanedias.conf
 

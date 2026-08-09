@@ -6,9 +6,9 @@ After=network-online.target
 User=kanedias
 Group=kanedias
 Environment=HOME=/home/kanedias
-EnvironmentFile=-/run/kanedias/pi.env
+EnvironmentFile=-/run/kanedias-pi/pi.env
 WorkingDirectory=/workspace
-ExecStartPre=+/usr/local/libexec/kanedias-pi-env
+ExecStartPre=+/usr/bin/env -i /usr/bin/bash --noprofile --norc /usr/local/libexec/kanedias-pi-env
 ExecStart=/usr/local/libexec/kanedias-pi-rpc
 StandardInput=socket
 StandardOutput=inherit

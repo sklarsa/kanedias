@@ -156,6 +156,87 @@ func TestPiEnvironmentBridgeWritesAllowlistedEnvironment(t *testing.T) {
 	}
 }
 
+func TestPiEnvironmentBridgePrivilegedInvocationIgnoresStaleEnvironment(t *testing.T) {
+	const privilegedInvocation = "ExecStartPre=+/usr/bin/env -i /usr/bin/bash --noprofile --norc /usr/local/libexec/kanedias-pi-env"
+	if service := string(piRPCService); !strings.Contains(service, privilegedInvocation) {
+		t.Fatalf("service does not sanitize the privileged bridge environment with fixed executables:\n%s", service)
+	}
+
+	dir := t.TempDir()
+	bridgePath := filepath.Join(dir, "kanedias-pi-env")
+	if err := os.WriteFile(bridgePath, piEnvironmentBridge, 0o700); err != nil {
+		t.Fatal(err)
+	}
+	marker := filepath.Join(dir, "attacker-code-ran")
+	bashEnv := filepath.Join(dir, "bash-env")
+	if err := os.WriteFile(bashEnv, []byte("printf pwned > "+marker+"\n"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	attackerBin := filepath.Join(dir, "attacker-bin")
+	if err := os.Mkdir(attackerBin, 0o700); err != nil {
+		t.Fatal(err)
+	}
+	fakeBash := filepath.Join(attackerBin, "bash")
+	if err := os.WriteFile(fakeBash, []byte("#!/bin/sh\nprintf pwned > "+marker+"\n"), 0o700); err != nil {
+		t.Fatal(err)
+	}
+	sourcePath := filepath.Join(dir, "pid1-environ")
+	destination := filepath.Join(dir, "pi.env")
+	entries := []string{
+		"KANEDIAS_SESSION_ID=session-123",
+		"KANEDIAS_SESSION_KIND=root",
+		"KANEDIAS_SUPERVISOR_SOCKET=/run/kanedias/supervisor.sock",
+		"HTTP_PROXY=http://proxy.example:3128",
+		"HTTPS_PROXY=http://proxy.example:3128",
+		"GH_TOKEN=container-dummy",
+		"SSL_CERT_FILE=/etc/ssl/certs/ca-certificates.crt",
+		"NODE_EXTRA_CA_CERTS=/usr/local/share/ca-certificates/kanedias-proxy.crt",
+	}
+	if err := os.WriteFile(sourcePath, append([]byte(strings.Join(entries, "\x00")), 0), 0o600); err != nil {
+		t.Fatal(err)
+	}
+
+	command := exec.Command("/usr/bin/env", "-i", "/usr/bin/bash", "--noprofile", "--norc", bridgePath, sourcePath, destination)
+	command.Env = []string{"PATH=" + attackerBin, "BASH_ENV=" + bashEnv}
+	if output, err := command.CombinedOutput(); err != nil {
+		t.Fatalf("sanitized privileged invocation failed: %v\n%s", err, output)
+	}
+	if _, err := os.Stat(marker); !errors.Is(err, os.ErrNotExist) {
+		t.Fatalf("attacker code marker stat error = %v, want not exist", err)
+	}
+}
+
+func TestPiEnvironmentBridgeProductionRuntimeIsRootControlled(t *testing.T) {
+	service := string(piRPCService)
+	if !strings.Contains(service, "EnvironmentFile=-/run/kanedias-pi/pi.env") {
+		t.Fatalf("service environment file is not in the protected runtime directory:\n%s", service)
+	}
+	if !strings.Contains(string(installer), "d /run/kanedias-pi 0700 root root -") {
+		t.Fatal("installer does not create the Pi environment runtime directory as root-only")
+	}
+
+	bridge := string(piEnvironmentBridge)
+	for _, want := range []string{
+		`destination=${2:-/run/kanedias-pi/pi.env}`,
+		`temporary=$(/usr/bin/mktemp -- "$destination_dir/.pi.env.XXXXXX")`,
+		`exec {output_fd}> "$temporary"`,
+		`/usr/bin/mv -fT -- "$temporary" "$destination"`,
+	} {
+		if !strings.Contains(bridge, want) {
+			t.Errorf("environment bridge missing protected staging behavior %q", want)
+		}
+	}
+	for _, forbidden := range []string{
+		`destination=${2:-/run/kanedias/pi.env}`,
+		`chmod 0600 "$temporary"`,
+		`>> "$temporary"`,
+	} {
+		if strings.Contains(bridge, forbidden) {
+			t.Errorf("environment bridge retains unsafe staging behavior %q", forbidden)
+		}
+	}
+}
+
 func TestPiEnvironmentBridgeRejectsInvalidInputWithoutReplacingDestination(t *testing.T) {
 	required := []string{
 		"KANEDIAS_SESSION_ID=session-123",
@@ -357,8 +438,8 @@ func TestCreateRunsImageWorkflowInOrder(t *testing.T) {
 	for _, want := range []string{
 		"User=kanedias",
 		"Group=kanedias",
-		"EnvironmentFile=-/run/kanedias/pi.env",
-		"ExecStartPre=+/usr/local/libexec/kanedias-pi-env",
+		"EnvironmentFile=-/run/kanedias-pi/pi.env",
+		"ExecStartPre=+/usr/bin/env -i /usr/bin/bash --noprofile --norc /usr/local/libexec/kanedias-pi-env",
 		"WorkingDirectory=/workspace",
 		"StandardInput=socket",
 		"StandardOutput=inherit",

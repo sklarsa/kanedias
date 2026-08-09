@@ -1,8 +1,8 @@
-#!/usr/bin/env bash
+#!/usr/bin/bash
 set -Eeuo pipefail
 
 source_path=${1:-/proc/1/environ}
-destination=${2:-/run/kanedias/pi.env}
+destination=${2:-/run/kanedias-pi/pi.env}
 
 allowlist=(
     HTTP_PROXY
@@ -66,10 +66,11 @@ for name in "${required[@]}"; do
     fi
 done
 
-destination_dir=$(dirname -- "$destination")
-temporary=$(mktemp "$destination_dir/.pi.env.XXXXXX")
-trap 'rm -f -- "$temporary"' EXIT
-chmod 0600 "$temporary"
+destination_dir=$(/usr/bin/dirname -- "$destination")
+umask 077
+temporary=$(/usr/bin/mktemp -- "$destination_dir/.pi.env.XXXXXX")
+trap '/usr/bin/rm -f -- "$temporary"' EXIT
+exec {output_fd}> "$temporary"
 
 for name in "${allowlist[@]}"; do
     if [[ ${present[$name]:-} != 1 ]]; then
@@ -77,8 +78,9 @@ for name in "${allowlist[@]}"; do
     fi
     value=${values[$name]//\\/\\\\}
     value=${value//\"/\\\"}
-    printf '%s="%s"\n' "$name" "$value" >> "$temporary"
+    printf '%s="%s"\n' "$name" "$value" >&"$output_fd"
 done
 
-mv -f -- "$temporary" "$destination"
+exec {output_fd}>&-
+/usr/bin/mv -fT -- "$temporary" "$destination"
 trap - EXIT
