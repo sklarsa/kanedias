@@ -40,20 +40,35 @@ repos = [
     "sklarsa/kanedias"
 ]
 
-[workers.researcher]
-description = "Research external sources and return evidence without modifying files."
+[models.local-qwen]
+label = "Local Qwen 3.6"
+provider = "local-executor"
+model = "Qwen3.6-27B-GGUF"
+thinking_levels = ["off"]
+default_thinking_level = "off"
+
+[models.gpt-5-6-sol]
+label = "GPT-5.6 Solver"
 provider = "openai-codex"
 model = "gpt-5.6-sol"
+thinking_levels = ["minimal", "low", "medium", "high", "xhigh", "max"]
+default_thinking_level = "high"
+
+[session]
+model_type = "local-qwen"
+thinking_level = "off"
+
+[workers.researcher]
+description = "Research external sources and return evidence without modifying files."
+model_type = "gpt-5-6-sol"
 thinking_level = "high"
 
 [workers.reviewer]
 description = "Review code and designs without modifying files."
-provider = "openai-codex"
-model = "gpt-5.6-sol"
+model_type = "gpt-5-6-sol"
 thinking_level = "xhigh"
 
 [workers.worker]
 description = "Implement changes and hand off pushed Git refs."
-provider = "openai-codex"
-model = "gpt-5.6-sol"
+model_type = "gpt-5-6-sol"
 thinking_level = "high"

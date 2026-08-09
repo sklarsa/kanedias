@@ -1,6 +1,10 @@
 package contract
 
-import "strings"
+import (
+	"strings"
+
+	"github.com/sklarsa/kanedias/internal/config"
+)
 
 type ChildKind string
 
@@ -24,11 +28,10 @@ type ForkSpec struct {
 	LeafEntryID string `json:"leafEntryId"`
 }
 
-type ModelProfile struct {
-	Provider      string `json:"provider"`
-	Model         string `json:"model"`
-	ThinkingLevel string `json:"thinkingLevel,omitempty"`
-}
+// ModelProfile is the canonical credential-free model selection carried by
+// every session. It is an alias for the single config runtime representation so
+// the API never forks the policy shape.
+type ModelProfile = config.ModelProfile
 
 type WorkerSummary struct {
 	WorkerType  string       `json:"workerType"`

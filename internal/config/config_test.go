@@ -235,16 +235,32 @@ func TestLoadWorkers(t *testing.T) {
 	path := writeConfig(t, `[network]
 ipv4 = "10.76.111.1/24"
 
-[workers.reviewer]
-description = "Review code and designs without modifying files."
+[models.local-qwen]
+label = "Local Qwen"
+provider = "local-executor"
+model = "Qwen3.6-27B-GGUF"
+thinking_levels = ["off"]
+default_thinking_level = "off"
+
+[models.gpt-5-6-sol]
+label = "GPT-5.6 Solver"
 provider = "openai-codex"
 model = "gpt-5.6-sol"
+thinking_levels = ["low", "high", "xhigh"]
+default_thinking_level = "high"
+
+[session]
+model_type = "local-qwen"
+thinking_level = "off"
+
+[workers.reviewer]
+description = "Review code and designs without modifying files."
+model_type = "gpt-5-6-sol"
 thinking_level = "xhigh"
 
 [workers.worker]
 description = "Implement changes and hand off pushed Git refs."
-provider = "openai-codex"
-model = "gpt-5.6-sol"
+model_type = "gpt-5-6-sol"
 thinking_level = "high"
 `)
 
@@ -255,10 +271,9 @@ thinking_level = "high"
 	if got, want := cfg.WorkerNames(), []string{"reviewer", "worker"}; !reflect.DeepEqual(got, want) {
 		t.Fatalf("WorkerNames() = %#v, want %#v", got, want)
 	}
-	if got, want := cfg.Workers["reviewer"], (WorkerProfile{
+	if got, want := cfg.Workers["reviewer"], (WorkerDefaults{
 		Description:   "Review code and designs without modifying files.",
-		Provider:      "openai-codex",
-		Model:         "gpt-5.6-sol",
+		ModelType:     "gpt-5-6-sol",
 		ThinkingLevel: "xhigh",
 	}); got != want {
 		t.Fatalf("Workers[reviewer] = %#v, want %#v", got, want)
@@ -266,13 +281,13 @@ thinking_level = "high"
 }
 
 func TestResolveWorker(t *testing.T) {
+	cfg := modelConfigFixture()
 	want := WorkerProfile{
 		Description:   "Implement changes and hand off pushed Git refs.",
 		Provider:      "openai-codex",
 		Model:         "gpt-5.6-sol",
 		ThinkingLevel: "high",
 	}
-	cfg := Config{Workers: map[string]WorkerProfile{"worker": want}}
 
 	got, err := cfg.ResolveWorker("worker")
 	if err != nil {
@@ -287,32 +302,24 @@ func TestResolveWorker(t *testing.T) {
 }
 
 func TestValidateSupervisorWorkers(t *testing.T) {
-	valid := WorkerProfile{
-		Description:   "Review code and designs without modifying files.",
-		Provider:      "openai-codex",
-		Model:         "gpt-5.6-sol",
-		ThinkingLevel: "xhigh",
-	}
-	base := BaseImage{Name: "sandbox", Source: "https://images.linuxcontainers.org", Image: "debian/13"}
 	tests := []struct {
 		name    string
-		workers map[string]WorkerProfile
+		workers map[string]WorkerDefaults
 		wantErr string
 	}{
-		{name: "valid", workers: map[string]WorkerProfile{"reviewer": valid}},
-		{name: "no workers", workers: map[string]WorkerProfile{}, wantErr: "at least one worker is required"},
-		{name: "empty worker name", workers: map[string]WorkerProfile{"": valid}, wantErr: "worker name is required"},
-		{name: "whitespace worker name", workers: map[string]WorkerProfile{"  ": valid}, wantErr: "worker name is required"},
-		{name: "empty description", workers: map[string]WorkerProfile{"reviewer": {Provider: valid.Provider, Model: valid.Model}}, wantErr: "description is required"},
-		{name: "empty provider", workers: map[string]WorkerProfile{"reviewer": {Description: valid.Description, Model: valid.Model}}, wantErr: "provider is required"},
-		{name: "empty model", workers: map[string]WorkerProfile{"reviewer": {Description: valid.Description, Provider: valid.Provider}}, wantErr: "model is required"},
-		{name: "invalid thinking level", workers: map[string]WorkerProfile{"reviewer": {Description: valid.Description, Provider: valid.Provider, Model: valid.Model, ThinkingLevel: "extreme"}}, wantErr: `invalid thinking_level "extreme"`},
-		{name: "optional thinking level", workers: map[string]WorkerProfile{"reviewer": {Description: valid.Description, Provider: valid.Provider, Model: valid.Model}}},
+		{name: "valid", workers: map[string]WorkerDefaults{"reviewer": {Description: "d", ModelType: "gpt-5-6-sol", ThinkingLevel: "xhigh"}}},
+		{name: "no workers", workers: map[string]WorkerDefaults{}, wantErr: "at least one worker is required"},
+		{name: "empty worker name", workers: map[string]WorkerDefaults{"": {Description: "d", ModelType: "gpt-5-6-sol"}}, wantErr: "worker name is required"},
+		{name: "whitespace worker name", workers: map[string]WorkerDefaults{"  ": {Description: "d", ModelType: "gpt-5-6-sol"}}, wantErr: "worker name is required"},
+		{name: "empty description", workers: map[string]WorkerDefaults{"reviewer": {ModelType: "gpt-5-6-sol"}}, wantErr: "description is required"},
+		{name: "unknown model type", workers: map[string]WorkerDefaults{"reviewer": {Description: "d", ModelType: "bogus"}}, wantErr: "unknown model type"},
+		{name: "unsupported thinking level", workers: map[string]WorkerDefaults{"reviewer": {Description: "d", ModelType: "local-qwen", ThinkingLevel: "high"}}, wantErr: "does not support thinking level"},
 	}
 
 	for _, tt := range tests {
 		t.Run(tt.name, func(t *testing.T) {
-			cfg := Config{BaseImage: base, Workers: tt.workers}
+			cfg := modelConfigFixture()
+			cfg.Workers = tt.workers
 			err := cfg.ValidateSupervisor()
 			if tt.wantErr == "" {
 				if err != nil {
@@ -327,13 +334,136 @@ func TestValidateSupervisorWorkers(t *testing.T) {
 	}
 }
 
+func TestValidateSupervisorModelCatalog(t *testing.T) {
+	base := modelConfigFixture()
+	tests := []struct {
+		name    string
+		mutate  func(*Config)
+		wantErr string
+	}{
+		{name: "valid fixture", mutate: func(*Config) {}},
+		{
+			name:    "invalid model slug",
+			mutate:  func(c *Config) { c.Models["Bad_Model"] = base.Models["gpt-5-6-sol"] },
+			wantErr: "invalid name",
+		},
+		{
+			name:    "empty model slug",
+			mutate:  func(c *Config) { c.Models[""] = base.Models["gpt-5-6-sol"] },
+			wantErr: "invalid name",
+		},
+		{
+			name: "duplicate provider/model pair",
+			mutate: func(c *Config) {
+				c.Models["gpt-clone"] = ModelDefinition{
+					Label: "Clone", Provider: "openai-codex", Model: "gpt-5.6-sol",
+					ThinkingLevels: []string{"high"}, DefaultThinkingLevel: "high",
+				}
+			},
+			wantErr: "duplicate provider/model",
+		},
+		{
+			name: "empty provider",
+			mutate: func(c *Config) {
+				c.Models["gpt-5-6-sol"] = ModelDefinition{Model: "gpt-5.6-sol", ThinkingLevels: []string{"high"}, DefaultThinkingLevel: "high"}
+			},
+			wantErr: "provider is required",
+		},
+		{
+			name: "empty model",
+			mutate: func(c *Config) {
+				c.Models["gpt-5-6-sol"] = ModelDefinition{Provider: "openai-codex", ThinkingLevels: []string{"high"}, DefaultThinkingLevel: "high"}
+			},
+			wantErr: "model is required",
+		},
+		{
+			name: "invalid thinking level in model",
+			mutate: func(c *Config) {
+				m := c.Models["gpt-5-6-sol"]
+				m.ThinkingLevels = []string{"high", "extreme"}
+				c.Models["gpt-5-6-sol"] = m
+			},
+			wantErr: "invalid thinking level",
+		},
+		{
+			name: "duplicate thinking level",
+			mutate: func(c *Config) {
+				m := c.Models["gpt-5-6-sol"]
+				m.ThinkingLevels = []string{"high", "high"}
+				c.Models["gpt-5-6-sol"] = m
+			},
+			wantErr: "duplicate thinking level",
+		},
+		{
+			name: "empty thinking levels",
+			mutate: func(c *Config) {
+				m := c.Models["gpt-5-6-sol"]
+				m.ThinkingLevels = nil
+				c.Models["gpt-5-6-sol"] = m
+			},
+			wantErr: "at least one thinking level",
+		},
+		{
+			name: "default thinking not in set",
+			mutate: func(c *Config) {
+				m := c.Models["gpt-5-6-sol"]
+				m.ThinkingLevels = []string{"high", "xhigh"}
+				m.DefaultThinkingLevel = "medium"
+				c.Models["gpt-5-6-sol"] = m
+			},
+			wantErr: "default thinking level",
+		},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			cfg := modelConfigFixture()
+			tt.mutate(&cfg)
+			err := cfg.ValidateSupervisor()
+			if tt.wantErr == "" {
+				if err != nil {
+					t.Fatalf("ValidateSupervisor() error = %v", err)
+				}
+				return
+			}
+			if err == nil || !strings.Contains(err.Error(), tt.wantErr) {
+				t.Fatalf("ValidateSupervisor() error = %v, want containing %q", err, tt.wantErr)
+			}
+		})
+	}
+}
+
+func TestValidateSupervisorResolvesSessionAndWorkerDefaults(t *testing.T) {
+	cfg := modelConfigFixture()
+	if err := cfg.ValidateSupervisor(); err != nil {
+		t.Fatalf("ValidateSupervisor() error = %v", err)
+	}
+
+	session := modelConfigFixture()
+	session.Session = SessionDefaults{ModelType: "bogus", ThinkingLevel: "high"}
+	if err := session.ValidateSupervisor(); err == nil || !strings.Contains(err.Error(), "unknown model type") {
+		t.Fatalf("ValidateSupervisor() error = %v, want unknown model type", err)
+	}
+
+	unsupported := modelConfigFixture()
+	unsupported.Session = SessionDefaults{ModelType: "local-qwen", ThinkingLevel: "high"}
+	if err := unsupported.ValidateSupervisor(); err == nil || !strings.Contains(err.Error(), "does not support thinking level") {
+		t.Fatalf("ValidateSupervisor() error = %v, want unsupported thinking level", err)
+	}
+}
+
 func TestValidateSupervisorValidThinkingLevels(t *testing.T) {
-	base := BaseImage{Name: "sandbox", Source: "https://images.linuxcontainers.org", Image: "debian/13"}
 	for _, level := range []string{"off", "minimal", "low", "medium", "high", "xhigh", "max"} {
 		t.Run(level, func(t *testing.T) {
-			cfg := Config{BaseImage: base, Workers: map[string]WorkerProfile{"worker": {
-				Description: "Does work.", Provider: "provider", Model: "model", ThinkingLevel: level,
-			}}}
+			cfg := modelConfigFixture()
+			cfg.Models = map[string]ModelDefinition{"m": {
+				Provider: "provider", Model: "model",
+				ThinkingLevels: []string{level}, DefaultThinkingLevel: level,
+			}}
+			cfg.Session = SessionDefaults{ModelType: "m", ThinkingLevel: level}
+			cfg.Workers = map[string]WorkerDefaults{"worker": {
+				Description: "Does work.", ModelType: "m", ThinkingLevel: level,
+			}}
 			if err := cfg.ValidateSupervisor(); err != nil {
 				t.Fatalf("ValidateSupervisor() error = %v", err)
 			}
@@ -342,9 +472,8 @@ func TestValidateSupervisorValidThinkingLevels(t *testing.T) {
 }
 
 func TestValidateSupervisorIncludesLifecycleValidation(t *testing.T) {
-	cfg := Config{Workers: map[string]WorkerProfile{"worker": {
-		Description: "Does work.", Provider: "provider", Model: "model",
-	}}}
+	cfg := modelConfigFixture()
+	cfg.BaseImage = BaseImage{}
 	if err := cfg.ValidateSupervisor(); err == nil || err.Error() != "base_image.name is required" {
 		t.Fatalf("ValidateSupervisor() error = %v, want lifecycle validation error", err)
 	}
@@ -374,6 +503,142 @@ func TestLoadDecodeError(t *testing.T) {
 	}
 	if !strings.Contains(err.Error(), "decode config") {
 		t.Fatalf("Load() error = %q, want error identifying config decode", err)
+	}
+}
+
+func modelConfigFixture() Config {
+	return Config{
+		BaseImage: BaseImage{Name: "sandbox", Source: "https://images.linuxcontainers.org", Image: "debian/13"},
+		Models: map[string]ModelDefinition{
+			"local-qwen": {
+				Label: "Local Qwen", Provider: "local-executor", Model: "Qwen3.6-27B-GGUF",
+				ThinkingLevels: []string{"off"}, DefaultThinkingLevel: "off",
+			},
+			"gpt-5-6-sol": {
+				Label: "GPT-5.6 Solver", Provider: "openai-codex", Model: "gpt-5.6-sol",
+				ThinkingLevels:       []string{"minimal", "low", "medium", "high", "xhigh", "max"},
+				DefaultThinkingLevel: "high",
+			},
+		},
+		Session: SessionDefaults{ModelType: "local-qwen", ThinkingLevel: "off"},
+		Workers: map[string]WorkerDefaults{
+			"reviewer": {Description: "Review code and designs without modifying files.", ModelType: "gpt-5-6-sol", ThinkingLevel: "xhigh"},
+			"worker":   {Description: "Implement changes and hand off pushed Git refs.", ModelType: "gpt-5-6-sol", ThinkingLevel: "high"},
+		},
+	}
+}
+
+func TestDefaultSessionModelPolicyResolvesCatalogReferences(t *testing.T) {
+	cfg := modelConfigFixture()
+	policy, err := cfg.DefaultSessionModelPolicy()
+	if err != nil {
+		t.Fatal(err)
+	}
+	if policy.Root != (ModelProfile{Provider: "local-executor", Model: "Qwen3.6-27B-GGUF", ThinkingLevel: "off"}) {
+		t.Fatalf("root = %#v", policy.Root)
+	}
+	reviewer, err := policy.ResolveWorker("reviewer")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if reviewer.Model != "gpt-5.6-sol" || reviewer.ThinkingLevel != "xhigh" {
+		t.Fatalf("reviewer = %#v", reviewer)
+	}
+}
+
+func TestDefaultSessionModelPolicyFallsBackToModelDefaultThinking(t *testing.T) {
+	cfg := modelConfigFixture()
+	cfg.Session = SessionDefaults{ModelType: "gpt-5-6-sol"}
+	policy, err := cfg.DefaultSessionModelPolicy()
+	if err != nil {
+		t.Fatal(err)
+	}
+	if policy.Root != (ModelProfile{Provider: "openai-codex", Model: "gpt-5.6-sol", ThinkingLevel: "high"}) {
+		t.Fatalf("root = %#v", policy.Root)
+	}
+
+	workerCfg := modelConfigFixture()
+	workerCfg.Workers = map[string]WorkerDefaults{"worker": {Description: "Does work.", ModelType: "gpt-5-6-sol"}}
+	policy, err = workerCfg.DefaultSessionModelPolicy()
+	if err != nil {
+		t.Fatal(err)
+	}
+	if got := policy.Workers["worker"]; got.ThinkingLevel != "high" {
+		t.Fatalf("worker thinking = %q, want high default", got.ThinkingLevel)
+	}
+}
+
+func TestSessionModelPolicyCloneDoesNotAliasWorkers(t *testing.T) {
+	original, err := modelConfigFixture().DefaultSessionModelPolicy()
+	if err != nil {
+		t.Fatal(err)
+	}
+	cloned := original.Clone()
+	worker := cloned.Workers["reviewer"]
+	worker.Model = "mutated"
+	cloned.Workers["reviewer"] = worker
+	if original.Workers["reviewer"].Model == "mutated" {
+		t.Fatal("Clone retained the workers map")
+	}
+}
+
+func TestSessionModelPolicyValidate(t *testing.T) {
+	base := func() SessionModelPolicy {
+		policy, err := modelConfigFixture().DefaultSessionModelPolicy()
+		if err != nil {
+			t.Fatal(err)
+		}
+		return policy
+	}
+	tests := []struct {
+		name    string
+		mutate  func(*SessionModelPolicy)
+		wantErr string
+	}{
+		{name: "valid", mutate: func(*SessionModelPolicy) {}},
+		{name: "root missing provider", mutate: func(p *SessionModelPolicy) { p.Root.Provider = "" }, wantErr: "provider"},
+		{name: "root invalid thinking", mutate: func(p *SessionModelPolicy) { p.Root.ThinkingLevel = "extreme" }, wantErr: "thinking level"},
+		{name: "no workers", mutate: func(p *SessionModelPolicy) { p.Workers = map[string]WorkerProfile{} }, wantErr: "at least one worker"},
+		{name: "worker empty description", mutate: func(p *SessionModelPolicy) {
+			w := p.Workers["reviewer"]
+			w.Description = ""
+			p.Workers["reviewer"] = w
+		}, wantErr: "description"},
+		{name: "worker invalid thinking", mutate: func(p *SessionModelPolicy) {
+			w := p.Workers["reviewer"]
+			w.ThinkingLevel = "bogus"
+			p.Workers["reviewer"] = w
+		}, wantErr: "thinking level"},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			policy := base()
+			tt.mutate(&policy)
+			err := policy.Validate()
+			if tt.wantErr == "" {
+				if err != nil {
+					t.Fatalf("Validate() error = %v", err)
+				}
+				return
+			}
+			if err == nil || !strings.Contains(err.Error(), tt.wantErr) {
+				t.Fatalf("Validate() error = %v, want containing %q", err, tt.wantErr)
+			}
+		})
+	}
+}
+
+func TestWorkerNamesDeterministic(t *testing.T) {
+	cfg := modelConfigFixture()
+	if got, want := cfg.WorkerNames(), []string{"reviewer", "worker"}; !reflect.DeepEqual(got, want) {
+		t.Fatalf("Config.WorkerNames() = %#v, want %#v", got, want)
+	}
+	policy, err := cfg.DefaultSessionModelPolicy()
+	if err != nil {
+		t.Fatal(err)
+	}
+	if got, want := policy.WorkerNames(), []string{"reviewer", "worker"}; !reflect.DeepEqual(got, want) {
+		t.Fatalf("SessionModelPolicy.WorkerNames() = %#v, want %#v", got, want)
 	}
 }
 

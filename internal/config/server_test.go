@@ -190,13 +190,10 @@ func TestServerConfigResolveRejectsZeroAndNegativeDurations(t *testing.T) {
 
 func TestValidateSupervisorCallsEventLimits(t *testing.T) {
 	zero := 0
-	cfg := Config{
-		BaseImage: BaseImage{Name: "sandbox", Source: "images:", Image: "debian/13"},
-		Workers:   map[string]WorkerProfile{"worker": {Description: "work", Provider: "p", Model: "m"}},
-		Supervisor: SupervisorConfig{Events: SupervisorEventsConfig{
-			MaxEvents: &zero, MaxBytes: &zero,
-		}},
-	}
+	cfg := modelConfigFixture()
+	cfg.Supervisor = SupervisorConfig{Events: SupervisorEventsConfig{
+		MaxEvents: &zero, MaxBytes: &zero,
+	}}
 	err := cfg.ValidateSupervisor()
 	if err == nil || !strings.Contains(err.Error(), "at least one") {
 		t.Fatalf("ValidateSupervisor() error = %v, want event-limits error", err)
@@ -210,10 +207,14 @@ ipv4 = "10.76.111.1/24"
 name = "sandbox"
 source = "images:"
 image = "debian/13"
+[models.gpt-5-6-sol]
+provider = "openai-codex"
+model = "gpt-5.6-sol"
+thinking_levels = ["high"]
+default_thinking_level = "high"
 [workers.worker]
 description = "work"
-provider = "provider"
-model = "model"
+model_type = "gpt-5-6-sol"
 
 [supervisor.events]
 max_events = 7

@@ -38,7 +38,10 @@ func (catalog configWorkerCatalog) Summaries() []contract.WorkerSummary {
 	names := catalog.config.WorkerNames()
 	result := make([]contract.WorkerSummary, 0, len(names))
 	for _, name := range names {
-		profile := catalog.config.Workers[name]
+		profile, err := catalog.config.ResolveWorker(name)
+		if err != nil {
+			continue
+		}
 		result = append(result, contract.WorkerSummary{
 			WorkerType: name, Description: profile.Description,
 			Profile: contract.ModelProfile{Provider: profile.Provider, Model: profile.Model, ThinkingLevel: profile.ThinkingLevel},

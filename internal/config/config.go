@@ -11,21 +11,16 @@ import (
 	"github.com/pelletier/go-toml/v2"
 )
 
-type WorkerProfile struct {
-	Description   string `toml:"description" json:"description"`
-	Provider      string `toml:"provider" json:"provider"`
-	Model         string `toml:"model" json:"model"`
-	ThinkingLevel string `toml:"thinking_level" json:"thinkingLevel,omitempty"`
-}
-
 type Config struct {
-	Network    Network                  `toml:"network"`
-	BaseImage  BaseImage                `toml:"base_image"`
-	Workspace  Workspace                `toml:"workspace"`
-	Workers    map[string]WorkerProfile `toml:"workers"`
-	Server     ServerConfig             `toml:"server"`
-	Supervisor SupervisorConfig         `toml:"supervisor"`
-	Dir        string                   `toml:"-"`
+	Network    Network                    `toml:"network"`
+	BaseImage  BaseImage                  `toml:"base_image"`
+	Workspace  Workspace                  `toml:"workspace"`
+	Models     map[string]ModelDefinition `toml:"models"`
+	Session    SessionDefaults            `toml:"session"`
+	Workers    map[string]WorkerDefaults  `toml:"workers"`
+	Server     ServerConfig               `toml:"server"`
+	Supervisor SupervisorConfig           `toml:"supervisor"`
+	Dir        string                     `toml:"-"`
 }
 
 var validThinkingLevels = map[string]struct{}{
@@ -84,11 +79,20 @@ func Load(path string) (Config, error) {
 }
 
 func (cfg Config) ResolveWorker(name string) (WorkerProfile, error) {
-	profile, ok := cfg.Workers[name]
+	defaults, ok := cfg.Workers[name]
 	if !ok {
 		return WorkerProfile{}, fmt.Errorf("unknown worker type %q", name)
 	}
-	return profile, nil
+	profile, err := cfg.ResolveModel(defaults.ModelType, defaults.ThinkingLevel)
+	if err != nil {
+		return WorkerProfile{}, fmt.Errorf("worker %q: %w", name, err)
+	}
+	return WorkerProfile{
+		Description:   defaults.Description,
+		Provider:      profile.Provider,
+		Model:         profile.Model,
+		ThinkingLevel: profile.ThinkingLevel,
+	}, nil
 }
 
 func (cfg Config) WorkerNames() []string {
@@ -107,27 +111,63 @@ func (cfg Config) ValidateSupervisor() error {
 	if _, err := cfg.Supervisor.Events.Limits(); err != nil {
 		return err
 	}
-	if len(cfg.Workers) == 0 {
-		return fmt.Errorf("at least one worker is required")
+	if err := cfg.validateModelCatalog(); err != nil {
+		return err
 	}
-	for _, name := range cfg.WorkerNames() {
-		profile := cfg.Workers[name]
-		if strings.TrimSpace(name) == "" {
-			return fmt.Errorf("worker name is required")
+	if _, err := cfg.DefaultSessionModelPolicy(); err != nil {
+		return err
+	}
+	return nil
+}
+
+// validateModelCatalog checks the structural invariants of the model catalog:
+// slug-shaped model type IDs, nonempty provider/model, unique provider/model
+// pairs, a nonempty set of valid, non-duplicate thinking levels, and a default
+// thinking level that belongs to the supported set.
+func (cfg Config) validateModelCatalog() error {
+	if len(cfg.Models) == 0 {
+		return fmt.Errorf("at least one model is required")
+	}
+	seenPairs := make(map[string]string, len(cfg.Models))
+	modelTypes := make([]string, 0, len(cfg.Models))
+	for modelType := range cfg.Models {
+		modelTypes = append(modelTypes, modelType)
+	}
+	sort.Strings(modelTypes)
+	for _, modelType := range modelTypes {
+		def := cfg.Models[modelType]
+		if !modelTypeSlugPattern.MatchString(modelType) {
+			return fmt.Errorf("model type %q has invalid name (want ^[a-z0-9][a-z0-9-]{0,62}$)", modelType)
 		}
-		if strings.TrimSpace(profile.Description) == "" {
-			return fmt.Errorf("worker %q description is required", name)
+		if strings.TrimSpace(def.Provider) == "" {
+			return fmt.Errorf("model %q provider is required", modelType)
 		}
-		if strings.TrimSpace(profile.Provider) == "" {
-			return fmt.Errorf("worker %q provider is required", name)
+		if strings.TrimSpace(def.Model) == "" {
+			return fmt.Errorf("model %q model is required", modelType)
 		}
-		if strings.TrimSpace(profile.Model) == "" {
-			return fmt.Errorf("worker %q model is required", name)
+		pair := def.Provider + "/" + def.Model
+		if previous, dup := seenPairs[pair]; dup {
+			return fmt.Errorf("duplicate provider/model %q across model types %q and %q", pair, previous, modelType)
 		}
-		if profile.ThinkingLevel != "" {
-			if _, ok := validThinkingLevels[profile.ThinkingLevel]; !ok {
-				return fmt.Errorf("worker %q has invalid thinking_level %q", name, profile.ThinkingLevel)
+		seenPairs[pair] = modelType
+		if len(def.ThinkingLevels) == 0 {
+			return fmt.Errorf("model %q requires at least one thinking level", modelType)
+		}
+		seenLevels := make(map[string]struct{}, len(def.ThinkingLevels))
+		for _, level := range def.ThinkingLevels {
+			if !validThinkingLevel(level) {
+				return fmt.Errorf("model %q has invalid thinking level %q", modelType, level)
 			}
+			if _, dup := seenLevels[level]; dup {
+				return fmt.Errorf("model %q has duplicate thinking level %q", modelType, level)
+			}
+			seenLevels[level] = struct{}{}
+		}
+		if def.DefaultThinkingLevel == "" {
+			return fmt.Errorf("model %q default_thinking_level is required", modelType)
+		}
+		if !contains(def.ThinkingLevels, def.DefaultThinkingLevel) {
+			return fmt.Errorf("model %q default thinking level %q is not in thinking_levels", modelType, def.DefaultThinkingLevel)
 		}
 	}
 	return nil

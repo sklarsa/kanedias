@@ -1178,7 +1178,10 @@ func (h *liveAcceptance) assertDistinct(root, child supervisor.NodeSnapshot) {
 }
 
 func (h *liveAcceptance) assertWorker(child supervisor.NodeSnapshot, workerType string) {
-	worker := h.cfg.Workers[workerType]
+	worker, err := h.cfg.ResolveWorker(workerType)
+	if err != nil {
+		h.t.Fatalf("resolve worker policy for %s: %v", workerType, err)
+	}
 	if child.WorkerType != workerType || child.Model.Provider != worker.Provider || child.Model.Model != worker.Model || child.Model.ThinkingLevel != worker.ThinkingLevel {
 		h.t.Fatalf("worker policy mismatch for %s: child=%#v configured=%#v", workerType, child, worker)
 	}

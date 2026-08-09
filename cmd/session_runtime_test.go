@@ -17,8 +17,17 @@ import (
 func validSupervisorConfig() config.Config {
 	return config.Config{
 		BaseImage: config.BaseImage{Name: "sandbox", Source: "images:", Image: "debian/13"},
-		Workers: map[string]config.WorkerProfile{"worker": {
-			Description: "work", Provider: "provider", Model: "model",
+		Models: map[string]config.ModelDefinition{
+			"gpt-5-6-sol": {
+				Provider:             "openai-codex",
+				Model:                "gpt-5.6-sol",
+				ThinkingLevels:       []string{"low", "high"},
+				DefaultThinkingLevel: "high",
+			},
+		},
+		Session: config.SessionDefaults{ModelType: "gpt-5-6-sol", ThinkingLevel: "high"},
+		Workers: map[string]config.WorkerDefaults{"worker": {
+			Description: "work", ModelType: "gpt-5-6-sol",
 		}},
 	}
 }
@@ -84,10 +93,17 @@ ipv4 = "10.76.111.1/24"
 name = "sandbox"
 source = "images:"
 image = "debian/13"
+[models.gpt-5-6-sol]
+provider = "openai-codex"
+model = "gpt-5.6-sol"
+thinking_levels = ["high"]
+default_thinking_level = "high"
+[session]
+model_type = "gpt-5-6-sol"
+thinking_level = "high"
 [workers.worker]
 description = "work"
-provider = "provider"
-model = "model"
+model_type = "gpt-5-6-sol"
 
 [supervisor.events]
 max_events = 7
