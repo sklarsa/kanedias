@@ -19,7 +19,7 @@
     if (!event.ctrlKey && event.key === "Enter" && context.target === "deck") return "submit";
     if (!event.ctrlKey && event.key === "Escape" && inConsole && context.canInterrupt) return "interrupt";
     if (!event.ctrlKey || !inConsole) return null;
-    if (key === "a") return "line-start";
+    if (key === "a") return context.target === "deck" ? "line-start" : null;
     if (key === "c") return context.hasSelection ? null : "clear";
     if (key === "o") return "toggle-tools";
     return null;
@@ -121,8 +121,10 @@
 
     if (action === "submit") {
       var steer = documentObject.getElementById("steerBtn");
-      if (steer) steer.click();
-      clearDeck(documentObject.querySelector(".deck-input"), context.Event);
+      if (steer && !steer.disabled) {
+        steer.click();
+        clearDeck(documentObject.querySelector(".deck-input"), context.Event);
+      }
       return true;
     }
     if (action === "line-start") {

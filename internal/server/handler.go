@@ -258,6 +258,14 @@ func makeSessionHandler(fleet fleetManager, templates *template.Template, logger
 				}
 				state, err = fleet.Session(sessionID)
 				if err != nil {
+					emptyState := emptySessionState()
+					if err := patchTemplate(sse, templates, templateDetail, "detail-panel", newDetailView(emptyState, statsView{})); err != nil {
+						return
+					}
+					if err := patchTemplate(sse, templates, templateQuestions, "question-panel", newQuestionPanelView(emptyState)); err != nil {
+						return
+					}
+					_ = patchTemplate(sse, templates, templateActivity, "activity-panel", newActivityView(emptyState))
 					return
 				}
 				if err := patchTemplate(sse, templates, templateDetail, "detail-panel", newDetailView(state, statsFetcher.get(state))); err != nil {

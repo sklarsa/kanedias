@@ -6,6 +6,7 @@ const event = (key, extra = {}) => ({ key, ctrlKey: false, altKey: false, metaKe
 
 test("matches Pi editor and interrupt keys without stealing copy", () => {
   assert.equal(ui.keyAction(event("a", {ctrlKey:true}), {target:"deck", hasSelection:false, canInterrupt:false}), "line-start");
+  assert.equal(ui.keyAction(event("a", {ctrlKey:true}), {target:"body", hasSelection:false, canInterrupt:false}), null);
   assert.equal(ui.keyAction(event("c", {ctrlKey:true}), {target:"deck", hasSelection:true, canInterrupt:false}), null);
   assert.equal(ui.keyAction(event("c", {ctrlKey:true}), {target:"deck", hasSelection:false, canInterrupt:false}), "clear");
   assert.equal(ui.keyAction(event("Escape"), {target:"deck", hasSelection:false, canInterrupt:true}), "interrupt");
@@ -140,25 +141,71 @@ test("Escape works from body only when authorized and never hijacks contentedita
   assert.equal(clicks, 1);
 });
 
-test("clear dispatches a bubbling input event and focuses the deck", () => {
+function fakeSubmitDocument(disabled) {
   const dispatched = [];
   const input = {
     value: "queued",
     dispatchEvent(value) { dispatched.push(value); },
     focus() { this.focused = true; }
   };
-  class FakeEvent {
-    constructor(type, options) { this.type = type; this.bubbles = options.bubbles; }
-  }
+  const steer = {
+    disabled,
+    clicks: 0,
+    click() { if (!this.disabled) this.clicks++; }
+  };
+  return {
+    dispatched,
+    input,
+    steer,
+    document: {
+      getElementById: id => id === "steerBtn" ? steer : null,
+      querySelector: selector => selector === ".deck-input" ? input : null
+    }
+  };
+}
+
+class FakeInputEvent {
+  constructor(type, options) { this.type = type; this.bubbles = options.bubbles; }
+}
+
+function performSubmit(fixture) {
   const keyEvent = {preventDefault() { this.prevented = true; }};
-  const document = {querySelector: selector => selector === ".deck-input" ? input : null};
-  ui.performAction("clear", {event: keyEvent, document, Event: FakeEvent});
+  ui.performAction("submit", {event: keyEvent, document: fixture.document, Event: FakeInputEvent});
+  return keyEvent;
+}
+
+test("enabled submit clicks Steer then clears with a bubbling input event", () => {
+  const fixture = fakeSubmitDocument(false);
+  const keyEvent = performSubmit(fixture);
   assert.equal(keyEvent.prevented, true);
-  assert.equal(input.value, "");
-  assert.equal(input.focused, true);
-  assert.equal(dispatched.length, 1);
-  assert.equal(dispatched[0].type, "input");
-  assert.equal(dispatched[0].bubbles, true);
+  assert.equal(fixture.steer.clicks, 1);
+  assert.equal(fixture.input.value, "");
+  assert.equal(fixture.input.focused, true);
+  assert.equal(fixture.dispatched.length, 1);
+  assert.equal(fixture.dispatched[0].type, "input");
+  assert.equal(fixture.dispatched[0].bubbles, true);
+});
+
+test("disabled submit preserves the command without click or input event", () => {
+  const fixture = fakeSubmitDocument(true);
+  const keyEvent = performSubmit(fixture);
+  assert.equal(keyEvent.prevented, true);
+  assert.equal(fixture.steer.clicks, 0);
+  assert.equal(fixture.input.value, "queued");
+  assert.equal(fixture.input.focused, undefined);
+  assert.equal(fixture.dispatched.length, 0);
+});
+
+test("clear dispatches a bubbling input event and focuses the deck", () => {
+  const fixture = fakeSubmitDocument(false);
+  const keyEvent = {preventDefault() { this.prevented = true; }};
+  ui.performAction("clear", {event: keyEvent, document: fixture.document, Event: FakeInputEvent});
+  assert.equal(keyEvent.prevented, true);
+  assert.equal(fixture.input.value, "");
+  assert.equal(fixture.input.focused, true);
+  assert.equal(fixture.dispatched.length, 1);
+  assert.equal(fixture.dispatched[0].type, "input");
+  assert.equal(fixture.dispatched[0].bubbles, true);
 });
 
 test("Ctrl-O with no cards primes a fresh patched card", () => {

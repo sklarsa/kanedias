@@ -511,12 +511,20 @@ func (m *Manager) removeRootLocked(socketPath string) *rootHandle {
 	return handle
 }
 
-// removeRoutesLocked removes all routes for the given rootID. Must be called
-// with m.mu held.
+// removeRoutesLocked removes all routes for the given rootID and publishes one
+// session invalidation when any route was removed. Must be called with m.mu
+// held. changeFanout.Publish is non-blocking, so publishing here keeps every
+// route-removal path centralized without delaying manager mutations.
 func (m *Manager) removeRoutesLocked(rootID string) {
+	removed := false
 	for sessionID, rid := range m.routes {
 		if rid == rootID {
 			delete(m.routes, sessionID)
+			removed = true
 		}
+	}
+	if removed {
+		m.sessionRevision++
+		m.sessionFanout.Publish(m.sessionRevision)
 	}
 }
