@@ -182,7 +182,7 @@ func TestActionUnauthenticated(t *testing.T) {
 	logger := slog.New(slog.NewTextHandler(&bytes.Buffer{}, nil))
 	ctx, cancel := context.WithCancel(context.Background())
 	defer cancel()
-	handler, err := newHandlerWithOptions(logger, effectiveAddrForTests, &bytes.Buffer{}, fleet, ctx)
+	handler, err := newHandlerWithOptions(logger, effectiveAddrForTests, &bytes.Buffer{}, fleet, ctx, true)
 	if err != nil {
 		t.Fatalf("newHandlerWithOptions: %v", err)
 	}

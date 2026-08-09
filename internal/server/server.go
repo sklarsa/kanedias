@@ -154,7 +154,7 @@ func runApplication(
 		bootstrapOutput = io.Discard
 	}
 	handlerFn := func(effectiveAddress string, streamCtx context.Context) (http.Handler, error) {
-		return newHandlerWithOptions(normalizedOptions.Logger, effectiveAddress, bootstrapOutput, fleet, streamCtx)
+		return newHandlerWithOptions(normalizedOptions.Logger, effectiveAddress, bootstrapOutput, fleet, streamCtx, resolved.RequireSession)
 	}
 
 	return runWithManager(ctx, normalizedOptions, fleet, handlerFn, listen, defaultShutdownTimeout)

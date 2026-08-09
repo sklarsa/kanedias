@@ -28,7 +28,7 @@ import (
 func mustNewHandlerWithAuth(t *testing.T, logger *slog.Logger) (http.Handler, *http.Cookie) {
 	t.Helper()
 	var bootstrapOut bytes.Buffer
-	handler, err := newHandlerWithOptions(logger, "127.0.0.1:0", &bootstrapOut, nil, context.Background())
+	handler, err := newHandlerWithOptions(logger, "127.0.0.1:0", &bootstrapOut, nil, context.Background(), true)
 	if err != nil {
 		t.Fatalf("newHandlerWithOptions: %v", err)
 	}
@@ -603,7 +603,7 @@ func mustNewHandlerWithFleetAuthLogger(t *testing.T, fleet fleetManager, logger 
 	var bootstrapOut bytes.Buffer
 	streamCtx, cancel := context.WithCancel(context.Background())
 	t.Cleanup(cancel)
-	handler, err := newHandlerWithOptions(logger, "127.0.0.1:8080", &bootstrapOut, fleet, streamCtx)
+	handler, err := newHandlerWithOptions(logger, "127.0.0.1:8080", &bootstrapOut, fleet, streamCtx, true)
 	if err != nil {
 		t.Fatalf("newHandlerWithOptions: %v", err)
 	}

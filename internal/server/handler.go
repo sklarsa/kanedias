@@ -25,7 +25,7 @@ func newHandler(logger *slog.Logger) (http.Handler, error) {
 	if logger == nil {
 		return nil, errors.New("logger is required")
 	}
-	return newHandlerWithOptions(logger, "", io.Discard, nil, context.Background())
+	return newHandlerWithOptions(logger, "", io.Discard, nil, context.Background(), true)
 }
 
 // newHandlerWithOptions builds the full handler with security wiring.
@@ -33,7 +33,10 @@ func newHandler(logger *slog.Logger) (http.Handler, error) {
 // bootstrapOutput receives the one-time bootstrap token.
 // fleet is the manager (may be nil in tests).
 // streamCtx is canceled when the server shuts down, closing SSE streams.
-func newHandlerWithOptions(logger *slog.Logger, effectiveAddress string, bootstrapOutput io.Writer, fleet fleetManager, streamCtx context.Context) (http.Handler, error) {
+// requireSession controls whether a /bootstrap session cookie is required to
+// reach the console. The server is loopback-only, so an operator can opt out for
+// a single-user console; the same-origin write boundary is always kept.
+func newHandlerWithOptions(logger *slog.Logger, effectiveAddress string, bootstrapOutput io.Writer, fleet fleetManager, streamCtx context.Context, requireSession bool) (http.Handler, error) {
 	if logger == nil {
 		return nil, errors.New("logger is required")
 	}
@@ -43,10 +46,20 @@ func newHandlerWithOptions(logger *slog.Logger, effectiveAddress string, bootstr
 		return nil, fmt.Errorf("parse web templates: %w", err)
 	}
 
-	// Capability store: prints bootstrap token once to bootstrapOutput.
-	auth, err := newCapabilityStore(defaultRandom, bootstrapOutput)
-	if err != nil {
-		return nil, fmt.Errorf("create capability store: %w", err)
+	// Capability store: prints bootstrap token once to bootstrapOutput. Only
+	// created (and required) when session auth is enabled.
+	auth := (*capabilityStore)(nil)
+	if requireSession {
+		var storeErr error
+		auth, storeErr = newCapabilityStore(defaultRandom, bootstrapOutput)
+		if storeErr != nil {
+			return nil, fmt.Errorf("create capability store: %w", storeErr)
+		}
+	}
+	// sessionRequired is a no-op when auth is disabled.
+	sessionRequired := func(next http.Handler) http.Handler { return next }
+	if auth != nil {
+		sessionRequired = auth.requireSession
 	}
 
 	boundary := newRequestBoundary(effectiveAddress)
@@ -80,7 +93,9 @@ func newHandlerWithOptions(logger *slog.Logger, effectiveAddress string, bootstr
 
 	// Unauthenticated routes.
 	router.Get("/healthz", serveHealth)
-	router.Get("/bootstrap", auth.serveBootstrap)
+	if auth != nil {
+		router.Get("/bootstrap", auth.serveBootstrap)
+	}
 	router.Get("/assets/terminal.css", serveTerminalCSS)
 	router.Get("/assets/app.css", serveCSS)
 	router.Get("/assets/datastar.js", serveJavaScript)
@@ -95,9 +110,9 @@ func newHandlerWithOptions(logger *slog.Logger, effectiveAddress string, bootstr
 		serveSession = http.NotFoundHandler().ServeHTTP
 	}
 
-	// Protected routes (require session cookie).
+	// Protected routes (require session cookie when auth is enabled).
 	router.Group(func(protected chi.Router) {
-		protected.Use(auth.requireSession)
+		protected.Use(sessionRequired)
 		protected.Get("/", serveIndex)
 		protected.Route("/ui", func(ui chi.Router) {
 			ui.Get("/status", serveStatus)
@@ -108,7 +123,7 @@ func newHandlerWithOptions(logger *slog.Logger, effectiveAddress string, bootstr
 
 	// Write boundary applied to all action POSTs.
 	router.Group(func(write chi.Router) {
-		write.Use(auth.requireSession)
+		write.Use(sessionRequired)
 		write.Use(boundary.requireWriteBoundary)
 		if fleet != nil {
 			write.Post("/ui/sessions", makeNewSessionHandler(fleet, templates, logger))
