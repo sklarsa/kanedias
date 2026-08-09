@@ -408,11 +408,11 @@ func toolLanguage(toolName string, args json.RawMessage) string {
 	}
 	var m map[string]json.RawMessage
 	_ = json.Unmarshal(args, &m)
-	raw, _ := m["path"]
+	raw := m["path"]
 	var p string
 	_ = json.Unmarshal(raw, &p)
 	if p == "" {
-		raw, _ = m["file_path"]
+		raw = m["file_path"]
 		_ = json.Unmarshal(raw, &p)
 	}
 	if p == "" {
