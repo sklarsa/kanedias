@@ -137,10 +137,24 @@
     });
   }
 
+  function hasJSONContentType(response) {
+    if (!response || !response.headers || typeof response.headers.get !== "function") return false;
+    var value = response.headers.get("content-type");
+    return typeof value === "string" && value.split(";", 1)[0].trim().toLowerCase() === "application/json";
+  }
+
   function boundedJSON(response) {
+    if (!hasJSONContentType(response)) return Promise.reject(new Error("response is not JSON"));
     return boundedText(response).then(function (text) {
       return text ? JSON.parse(text) : {};
     });
+  }
+
+  function validSuccessBody(body) {
+    if (!body || typeof body !== "object" || Array.isArray(body)) return false;
+    var keys = Object.keys(body);
+    return keys.length === 1 && keys[0] === "sessionId" &&
+      typeof body.sessionId === "string" && body.sessionId.trim() !== "";
   }
 
   function configuredValue(select) {
@@ -227,6 +241,7 @@
     }
 
     function open() {
+      if (pendingSnapshot || dialog.open) return;
       requestGeneration++;
       setPending(false);
       reset();
@@ -234,7 +249,8 @@
       if (rootModel && typeof rootModel.focus === "function") rootModel.focus();
     }
 
-    function closeAndReset() {
+    function closeAndReset(force) {
+      if (pendingSnapshot && !force) return;
       requestGeneration++;
       setPending(false);
       reset();
@@ -271,7 +287,8 @@
       }).then(function (result) {
         if (generation !== requestGeneration) return;
         if (result.response.status === 201) {
-          closeAndReset();
+          if (!validSuccessBody(result.body)) throw new Error("invalid launch success response");
+          closeAndReset(true);
           return;
         }
         setPending(false);

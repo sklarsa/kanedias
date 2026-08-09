@@ -150,6 +150,9 @@ func (cfg Config) validateModelCatalog() error {
 		if !modelTypeSlugPattern.MatchString(modelType) {
 			return fmt.Errorf("model type %q has invalid name (want ^[a-z0-9][a-z0-9-]{0,62}$)", modelType)
 		}
+		if strings.TrimSpace(def.Label) == "" {
+			return fmt.Errorf("model %q label is required", modelType)
+		}
 		if strings.TrimSpace(def.Provider) == "" {
 			return fmt.Errorf("model %q provider is required", modelType)
 		}

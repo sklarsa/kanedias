@@ -87,6 +87,7 @@ func NewLaunchConfiguration(cfg config.Config) (LaunchConfiguration, error) {
 		workerDefs: make(map[string]config.WorkerDefaults, len(cfg.Workers)),
 	}
 	for name, def := range cfg.Models {
+		def.ThinkingLevels = append([]string(nil), def.ThinkingLevels...)
 		lc.modelDefs[name] = def
 		lc.modelOrder = append(lc.modelOrder, name)
 	}

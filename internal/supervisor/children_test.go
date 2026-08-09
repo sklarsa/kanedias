@@ -20,16 +20,6 @@ import (
 	"github.com/sklarsa/kanedias/internal/supervisor/provision"
 )
 
-type childTestWorkers struct{}
-
-func (childTestWorkers) Resolve(name string) (config.WorkerProfile, error) {
-	if name != "reviewer" {
-		return config.WorkerProfile{}, contract.NewError(contract.ErrorUnknownWorkerType, "unknown worker")
-	}
-	return config.WorkerProfile{Description: "review", Provider: "provider", Model: "model"}, nil
-}
-func (childTestWorkers) Summaries() []contract.WorkerSummary { return nil }
-
 type fakeChildProcess struct {
 	readyEntered chan struct{}
 	readyRelease <-chan struct{}
@@ -188,6 +178,53 @@ func readRequest() contract.CreateChildRequest {
 
 func directChildSnapshot(id string) NodeSnapshot {
 	return NodeSnapshot{SessionID: id, ParentSessionID: "root-1", RootSessionID: "root-1", Kind: contract.ChildKindRead, Context: contract.ContextFresh, WorkerType: "reviewer", Lifecycle: string(LifecycleReady), Questions: []QuestionSummary{}, Children: []NodeSnapshot{}}
+}
+
+func TestStartingChildFallbackDoesNotClaimRequestedModelBeforeEffectiveBinding(t *testing.T) {
+	spawnEntered := make(chan struct{})
+	spawnRelease := make(chan struct{})
+	node := childCreationNode(t, func(context.Context, process.Bootstrap) (ChildProcess, error) {
+		close(spawnEntered)
+		<-spawnRelease
+		return nil, errors.New("stop capture")
+	}, func(string) (DescendantClient, error) { return nil, errors.New("unexpected client") })
+	node.deps.NewSessionID = func() (string, error) { return "session-starting", nil }
+	result := make(chan error, 1)
+	go func() {
+		_, err := node.CreateChild(context.Background(), "root-1", readRequest())
+		result <- err
+	}()
+	<-spawnEntered
+
+	snapshot, err := NewRouter(node).Snapshot(context.Background())
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(snapshot.Children) != 1 {
+		t.Fatalf("starting children = %d, want 1", len(snapshot.Children))
+	}
+	if snapshot.Children[0].Model != (config.ModelProfile{}) {
+		t.Fatalf("starting fallback model = %#v, want empty effective model", snapshot.Children[0].Model)
+	}
+
+	effective := config.ModelProfile{Provider: "effective-provider", Model: "effective-model", ThinkingLevel: "xhigh"}
+	entry := node.children.snapshot()[0]
+	entry.setClient(&fakeDescendantClient{snapshot: NodeSnapshot{
+		SessionID: "session-starting", ParentSessionID: "root-1", RootSessionID: "root-1",
+		Kind: contract.ChildKindRead, Context: contract.ContextFresh, WorkerType: "reviewer",
+		Lifecycle: string(LifecycleReady), Model: effective, Questions: []QuestionSummary{}, Children: []NodeSnapshot{},
+	}})
+	snapshot, err = NewRouter(node).Snapshot(context.Background())
+	if err != nil {
+		t.Fatal(err)
+	}
+	if snapshot.Children[0].Model != effective {
+		t.Fatalf("bound child model = %#v, want effective %#v", snapshot.Children[0].Model, effective)
+	}
+	close(spawnRelease)
+	if err := <-result; err == nil {
+		t.Fatal("captured child unexpectedly succeeded")
+	}
 }
 
 func TestCreateChildClonesCompletePolicyAcrossTwoGenerations(t *testing.T) {

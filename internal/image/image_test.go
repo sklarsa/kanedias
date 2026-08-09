@@ -424,6 +424,7 @@ func TestPiRPCLauncherRejectsMissingRootModelAndInvalidThinking(t *testing.T) {
 		{name: "missing provider", env: []string{"KANEDIAS_PI_MODEL=gpt-5.6-sol", "KANEDIAS_PI_THINKING=high"}},
 		{name: "missing model", env: []string{"KANEDIAS_PI_PROVIDER=openai-codex", "KANEDIAS_PI_THINKING=high"}},
 		{name: "invalid thinking", env: []string{"KANEDIAS_PI_PROVIDER=openai-codex", "KANEDIAS_PI_MODEL=gpt-5.6-sol", "KANEDIAS_PI_THINKING=extreme"}},
+		{name: "root session file", env: []string{"KANEDIAS_PI_PROVIDER=openai-codex", "KANEDIAS_PI_MODEL=gpt-5.6-sol", "KANEDIAS_PI_THINKING=high", "KANEDIAS_PI_SESSION_FILE=/sessions/forbidden.jsonl"}},
 	} {
 		t.Run(test.name, func(t *testing.T) {
 			_ = os.Remove(marker)

@@ -297,8 +297,7 @@ func (node *Node) CreateChild(ctx context.Context, parent string, request contra
 	}
 	// Resolve trusted worker policy before allocating an ID, socket, registry
 	// entry, or process.
-	worker, err := node.deps.ModelPolicy.ResolveWorker(request.WorkerType)
-	if err != nil {
+	if _, err := node.deps.ModelPolicy.ResolveWorker(request.WorkerType); err != nil {
 		return TerminalResult{}, contract.NewError(contract.ErrorUnknownWorkerType, err.Error())
 	}
 	if node.deps.SpawnChild == nil || node.deps.DescendantClient == nil {
@@ -330,7 +329,6 @@ func (node *Node) CreateChild(ctx context.Context, parent string, request contra
 		fallback: NodeSnapshot{
 			SessionID: childID, ParentSessionID: identity.SessionID, RootSessionID: identity.RootID,
 			Kind: request.Kind, Context: request.Context, WorkerType: request.WorkerType,
-			Model:     contract.ModelProfile{Provider: worker.Provider, Model: worker.Model, ThinkingLevel: worker.ThinkingLevel},
 			Lifecycle: string(LifecycleStarting), Questions: []QuestionSummary{}, Children: []NodeSnapshot{},
 		},
 	}

@@ -51,6 +51,39 @@ func waitRootBootstrapWrite(done <-chan struct{}) {
 	<-done
 }
 
+const defaultRootAbortWait = 5 * time.Second
+
+// observeRootBootstrapAbort preserves the single Wait owner and boundedly
+// observes its cached completion after aborting a root whose bootstrap could
+// not be delivered. The observation deliberately ignores the request context:
+// cancellation must not allow an unobserved process to escape this abort path.
+func (m *Manager) observeRootBootstrapAbort(spawned spawnedProcess, primary error) error {
+	signalErr := spawned.SignalGroup(syscall.SIGKILL)
+	wait := m.rootAbortWait
+	if wait <= 0 {
+		wait = defaultRootAbortWait
+	}
+	timer := time.NewTimer(wait)
+	defer timer.Stop()
+	select {
+	case <-spawned.Done():
+		var exitErr error
+		if err := spawned.WaitErr(); err != nil {
+			exitErr = fmt.Errorf("manager: root exit after bootstrap abort: %w", err)
+		}
+		return errors.Join(primary, wrapRootAbortSignalError(signalErr), exitErr)
+	case <-timer.C:
+		return errors.Join(primary, wrapRootAbortSignalError(signalErr), fmt.Errorf("manager: timed out after %s observing root bootstrap abort", wait))
+	}
+}
+
+func wrapRootAbortSignalError(err error) error {
+	if err == nil {
+		return nil
+	}
+	return fmt.Errorf("manager: signal root after bootstrap abort: %w", err)
+}
+
 // startedProcess wraps exec.Cmd and caches the Wait result.
 type startedProcess struct {
 	cmd     *exec.Cmd
@@ -247,15 +280,15 @@ func (m *Manager) SpawnRootWithRequest(ctx context.Context, request SessionLaunc
 	case <-writeDone:
 		if writeErr != nil {
 			closeBootstrap()
-			_ = spawned.SignalGroup(syscall.SIGKILL)
-			return "", fmt.Errorf("manager: send root bootstrap: %w", writeErr)
+			primary := fmt.Errorf("manager: send root bootstrap: %w", writeErr)
+			return "", m.observeRootBootstrapAbort(spawned, primary)
 		}
 	case <-ctx.Done():
 		_ = bootstrapWrite.Close()
 		m.waitRootBootstrapWrite(writeDone)
 		closeBootstrap()
-		_ = spawned.SignalGroup(syscall.SIGKILL)
-		return "", ctx.Err()
+		primary := errors.Join(ctx.Err(), writeErr)
+		return "", m.observeRootBootstrapAbort(spawned, primary)
 	}
 	closeBootstrap()
 

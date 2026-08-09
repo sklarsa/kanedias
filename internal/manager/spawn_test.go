@@ -25,11 +25,13 @@ import (
 // ---- fakeProcess for unit tests ----
 
 type fakeProcess struct {
-	mu      sync.Mutex
-	pid     int
-	done    chan struct{}
-	waitErr error
-	signals []syscall.Signal
+	mu         sync.Mutex
+	pid        int
+	done       chan struct{}
+	waitErr    error
+	signals    []syscall.Signal
+	signalErr  error
+	signalHook func(syscall.Signal)
 }
 
 func newFakeProcess(pid int) *fakeProcess {
@@ -42,8 +44,13 @@ func (p *fakeProcess) WaitErr() error        { return p.waitErr }
 func (p *fakeProcess) SignalGroup(sig syscall.Signal) error {
 	p.mu.Lock()
 	p.signals = append(p.signals, sig)
+	err := p.signalErr
+	hook := p.signalHook
 	p.mu.Unlock()
-	return nil
+	if hook != nil {
+		hook(sig)
+	}
+	return err
 }
 func (p *fakeProcess) signalCount() int {
 	p.mu.Lock()
@@ -324,6 +331,44 @@ func TestSpawnRootClosesBootstrapPipeOnWriteFailure(t *testing.T) {
 	fakeProcess.mu.Unlock()
 	if len(signals) != 1 || signals[0] != syscall.SIGKILL {
 		t.Fatalf("bootstrap write failure signals = %v, want [SIGKILL]", signals)
+	}
+}
+
+func TestSpawnRootBootstrapAbortBoundedlyObservesDelayedExit(t *testing.T) {
+	process := newFakeProcess(1239)
+	process.waitErr = errors.New("exit sentinel")
+	process.signalHook = func(sig syscall.Signal) {
+		if sig == syscall.SIGKILL {
+			go func() {
+				time.Sleep(20 * time.Millisecond)
+				close(process.done)
+			}()
+		}
+	}
+	m := configuredSpawnManager(t, &fakeStarter{process: process})
+	m.writeRootBootstrap = func(io.Writer, []byte) error { return errors.New("write sentinel") }
+	m.rootAbortWait = time.Second
+	started := time.Now()
+	_, err := m.SpawnRoot(context.Background())
+	if !strings.Contains(err.Error(), "write sentinel") || !strings.Contains(err.Error(), "exit sentinel") {
+		t.Fatalf("SpawnRoot error = %v, want primary and observed exit errors", err)
+	}
+	if elapsed := time.Since(started); elapsed < 20*time.Millisecond || elapsed > 500*time.Millisecond {
+		t.Fatalf("abort observation elapsed = %v, want bounded delayed observation", elapsed)
+	}
+}
+
+func TestSpawnRootBootstrapAbortJoinsSignalFailureAndTimeout(t *testing.T) {
+	process := newFakeProcess(1240)
+	process.signalErr = errors.New("signal sentinel")
+	m := configuredSpawnManager(t, &fakeStarter{process: process})
+	m.writeRootBootstrap = func(io.Writer, []byte) error { return errors.New("write sentinel") }
+	m.rootAbortWait = 20 * time.Millisecond
+	_, err := m.SpawnRoot(context.Background())
+	for _, want := range []string{"write sentinel", "signal sentinel", "timed out"} {
+		if !strings.Contains(err.Error(), want) {
+			t.Fatalf("SpawnRoot error = %v, want %q", err, want)
+		}
 	}
 }
 

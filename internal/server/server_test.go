@@ -471,13 +471,65 @@ func modelCatalogFixture() config.Config {
 
 func TestRunApplicationRejectsMissingModelLaunchConfig(t *testing.T) {
 	logger, _ := testLogger()
-	cfg := config.Config{} // no model catalog -> launch construction fails
+	cfg := config.Config{} // no lifecycle or model catalog
 	err := runApplication(context.Background(), cfg, Options{
 		ListenAddress: "127.0.0.1:0",
 		Logger:        logger,
 	}, productionManagerFactory, net.Listen)
-	if err == nil || !strings.Contains(err.Error(), "model launch configuration") {
-		t.Fatalf("runApplication error = %v, want model launch configuration error", err)
+	if err == nil || !strings.Contains(err.Error(), "validate supervisor config") {
+		t.Fatalf("runApplication error = %v, want supervisor validation error", err)
+	}
+}
+
+func TestRunApplicationFullyValidatesSupervisorBeforeManagerOrListen(t *testing.T) {
+	zero := 0
+	tests := []struct {
+		name   string
+		mutate func(*config.Config)
+	}{
+		{name: "lifecycle", mutate: func(cfg *config.Config) { cfg.BaseImage.Name = "" }},
+		{name: "event limits", mutate: func(cfg *config.Config) {
+			cfg.Supervisor.Events.MaxEvents = &zero
+			cfg.Supervisor.Events.MaxBytes = &zero
+		}},
+		{name: "invalid unused catalog entry", mutate: func(cfg *config.Config) {
+			cfg.Models["unused"] = config.ModelDefinition{Label: "Unused", Provider: "", Model: "unused", ThinkingLevels: []string{"off"}, DefaultThinkingLevel: "off"}
+		}},
+		{name: "duplicate provider model", mutate: func(cfg *config.Config) {
+			cfg.Models["duplicate"] = config.ModelDefinition{Label: "Duplicate", Provider: "local-executor", Model: "Qwen3.6-27B-GGUF", ThinkingLevels: []string{"off"}, DefaultThinkingLevel: "off"}
+		}},
+		{name: "invalid thinking set", mutate: func(cfg *config.Config) {
+			model := cfg.Models["local-qwen"]
+			model.ThinkingLevels = []string{"off", "off"}
+			cfg.Models["local-qwen"] = model
+		}},
+		{name: "zero workers", mutate: func(cfg *config.Config) { cfg.Workers = nil }},
+		{name: "empty worker description", mutate: func(cfg *config.Config) {
+			worker := cfg.Workers["worker"]
+			worker.Description = ""
+			cfg.Workers["worker"] = worker
+		}},
+		{name: "invalid defaults", mutate: func(cfg *config.Config) { cfg.Session.ModelType = "unknown" }},
+	}
+	for _, test := range tests {
+		t.Run(test.name, func(t *testing.T) {
+			cfg := modelCatalogFixture()
+			test.mutate(&cfg)
+			managerCalls, listenCalls := 0, 0
+			err := runApplication(context.Background(), cfg, Options{ListenAddress: "127.0.0.1:0", Logger: slog.Default()}, func(manager.Options) (fleetManager, error) {
+				managerCalls++
+				return nil, errors.New("unexpected manager construction")
+			}, func(string, string) (net.Listener, error) {
+				listenCalls++
+				return nil, errors.New("unexpected listen")
+			})
+			if err == nil || !strings.Contains(err.Error(), "validate supervisor config") {
+				t.Fatalf("runApplication error = %v, want supervisor validation", err)
+			}
+			if managerCalls != 0 || listenCalls != 0 {
+				t.Fatalf("invalid config side effects: manager=%d listen=%d", managerCalls, listenCalls)
+			}
+		})
 	}
 }
 

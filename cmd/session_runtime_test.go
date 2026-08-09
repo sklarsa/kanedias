@@ -25,6 +25,7 @@ func validSupervisorConfig() config.Config {
 		BaseImage: config.BaseImage{Name: "sandbox", Source: "images:", Image: "debian/13"},
 		Models: map[string]config.ModelDefinition{
 			"gpt-5-6-sol": {
+				Label:                "GPT-5.6 Solver",
 				Provider:             "openai-codex",
 				Model:                "gpt-5.6-sol",
 				ThinkingLevels:       []string{"low", "high"},

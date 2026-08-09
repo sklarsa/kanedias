@@ -363,16 +363,34 @@ func TestValidateSupervisorModelCatalog(t *testing.T) {
 			wantErr: "duplicate provider/model",
 		},
 		{
+			name: "empty label",
+			mutate: func(c *Config) {
+				m := c.Models["gpt-5-6-sol"]
+				m.Label = ""
+				c.Models["gpt-5-6-sol"] = m
+			},
+			wantErr: "label is required",
+		},
+		{
+			name: "whitespace label",
+			mutate: func(c *Config) {
+				m := c.Models["gpt-5-6-sol"]
+				m.Label = "  \t"
+				c.Models["gpt-5-6-sol"] = m
+			},
+			wantErr: "label is required",
+		},
+		{
 			name: "empty provider",
 			mutate: func(c *Config) {
-				c.Models["gpt-5-6-sol"] = ModelDefinition{Model: "gpt-5.6-sol", ThinkingLevels: []string{"high"}, DefaultThinkingLevel: "high"}
+				c.Models["gpt-5-6-sol"] = ModelDefinition{Label: "GPT", Model: "gpt-5.6-sol", ThinkingLevels: []string{"high"}, DefaultThinkingLevel: "high"}
 			},
 			wantErr: "provider is required",
 		},
 		{
 			name: "empty model",
 			mutate: func(c *Config) {
-				c.Models["gpt-5-6-sol"] = ModelDefinition{Provider: "openai-codex", ThinkingLevels: []string{"high"}, DefaultThinkingLevel: "high"}
+				c.Models["gpt-5-6-sol"] = ModelDefinition{Label: "GPT", Provider: "openai-codex", ThinkingLevels: []string{"high"}, DefaultThinkingLevel: "high"}
 			},
 			wantErr: "model is required",
 		},
@@ -457,7 +475,7 @@ func TestValidateSupervisorValidThinkingLevels(t *testing.T) {
 		t.Run(level, func(t *testing.T) {
 			cfg := modelConfigFixture()
 			cfg.Models = map[string]ModelDefinition{"m": {
-				Provider: "provider", Model: "model",
+				Label: "Model", Provider: "provider", Model: "model",
 				ThinkingLevels: []string{level}, DefaultThinkingLevel: level,
 			}}
 			cfg.Session = SessionDefaults{ModelType: "m", ThinkingLevel: level}

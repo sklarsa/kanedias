@@ -172,12 +172,16 @@ function fixture() {
   };
 }
 
-function response(status, body, contentLength) {
+function response(status, body, contentLength, contentType = "application/json") {
   return {
     status,
     ok: status >= 200 && status < 300,
-    headers: { get(name) { return name.toLowerCase() === "content-length" ? contentLength || null : null; } },
-    text: async () => JSON.stringify(body)
+    headers: { get(name) {
+      if (name.toLowerCase() === "content-length") return contentLength || null;
+      if (name.toLowerCase() === "content-type") return contentType;
+      return null;
+    } },
+    text: async () => typeof body === "string" ? body : JSON.stringify(body)
   };
 }
 
@@ -283,6 +287,38 @@ test("Launch posts the exact complete request and disables controls while pendin
   await settle();
 });
 
+test("pending launch cannot be closed or reopened into a duplicate submission", async () => {
+  const f = fixture();
+  const pending = deferred();
+  let fetchCalls = 0;
+  const controller = modalUI.bind(f.document, () => {
+    fetchCalls++;
+    return pending.promise;
+  });
+  f.trigger.dispatch("click");
+  f.form.dispatch("submit");
+  const resets = f.form.resetCalls;
+
+  for (const action of [
+    () => f.document.dispatch("keydown", { key: "Escape" }),
+    () => f.dialog.dispatch("cancel"),
+    () => f.dialog.dispatch("click", { target: f.dialog }),
+    () => f.cancel.dispatch("click"),
+    () => f.close.dispatch("click"),
+    () => controller.close(),
+    () => f.trigger.dispatch("click"),
+    () => f.form.dispatch("submit")
+  ]) action();
+
+  assert.equal(f.dialog.open, true);
+  assert.equal(f.dialog.getAttribute("aria-busy"), "true");
+  assert.equal(f.form.resetCalls, resets);
+  assert.equal(fetchCalls, 1);
+  pending.resolve(response(201, { sessionId: "created" }));
+  await settle();
+  assert.equal(f.dialog.open, false);
+});
+
 test("failed HTTP keeps modal open, restores controls, and shows bounded sanitized text", async () => {
   const f = fixture();
   const unsafe = " <b>not allowed</b> " + "x".repeat(700);
@@ -347,7 +383,7 @@ test("streaming response without Content-Length is canceled at the byte bound", 
   let cancels = 0;
   const reply = {
     status: 201,
-    headers: { get() { return null; } },
+    headers: { get(name) { return name.toLowerCase() === "content-type" ? "application/json" : null; } },
     body: {
       getReader() {
         return {
@@ -369,6 +405,29 @@ test("streaming response without Content-Length is canceled at the byte bound", 
   assert.equal(cancels, 1);
   assert.equal(f.dialog.open, true);
   assert.equal(f.status.textContent, "The session could not be launched. Please try again.");
+});
+
+test("201 success requires exact JSON session object and JSON content type", async () => {
+  const invalidReplies = [
+    response(201, {}),
+    response(201, { sessionId: "" }),
+    response(201, { sessionId: "  " }),
+    response(201, { sessionId: 42 }),
+    response(201, { sessionId: "created", extra: true }),
+    response(201, "not-json"),
+    response(201, { sessionId: "created" }, null, "text/plain"),
+    response(201, { sessionId: "created" }, null, null)
+  ];
+  for (const reply of invalidReplies) {
+    const f = fixture();
+    modalUI.bind(f.document, async () => reply);
+    f.trigger.dispatch("click");
+    f.form.dispatch("submit");
+    await settle();
+    assert.equal(f.dialog.open, true);
+    assert.equal(f.status.textContent, "The session could not be launched. Please try again.");
+    assert.equal(f.dialog.getAttribute("aria-busy"), null);
+  }
 });
 
 test("201 closes and resets the modal", async () => {
@@ -426,37 +485,33 @@ test("Escape is capture-consumed while open before terminal interrupt but unchan
   assert.equal(interrupts, 1);
 });
 
-test("stale resolved and rejected fetches cannot mutate after close, reopen, or destroy", async () => {
+test("stale resolved and rejected fetches cannot mutate after destroy", async () => {
   for (const completion of ["resolve", "reject"]) {
-    for (const action of ["close", "reopen", "destroy"]) {
-      const f = fixture();
-      const pending = deferred();
-      const controller = modalUI.bind(f.document, () => pending.promise);
-      f.trigger.dispatch("click");
-      f.form.dispatch("submit");
-      assert.equal(f.dialog.getAttribute("aria-busy"), "true");
+    const f = fixture();
+    const pending = deferred();
+    const controller = modalUI.bind(f.document, () => pending.promise);
+    f.trigger.dispatch("click");
+    f.form.dispatch("submit");
+    assert.equal(f.dialog.getAttribute("aria-busy"), "true");
 
-      if (action === "close") controller.close();
-      if (action === "reopen") { controller.close(); controller.open(); }
-      if (action === "destroy") controller.destroy();
-      f.status.textContent = completion + "-after-" + action;
-      const snapshot = {
-        open: f.dialog.open,
-        busy: f.dialog.getAttribute("aria-busy"),
-        launchDisabled: f.launch.disabled,
-        status: f.status.textContent
-      };
+    controller.destroy();
+    f.status.textContent = completion + "-after-destroy";
+    const snapshot = {
+      open: f.dialog.open,
+      busy: f.dialog.getAttribute("aria-busy"),
+      launchDisabled: f.launch.disabled,
+      status: f.status.textContent
+    };
 
-      if (completion === "resolve") pending.resolve(response(201, { sessionId: "stale" }));
-      else pending.reject(new Error("stale failure"));
-      await settle();
-      assert.deepEqual({
-        open: f.dialog.open,
-        busy: f.dialog.getAttribute("aria-busy"),
-        launchDisabled: f.launch.disabled,
-        status: f.status.textContent
-      }, snapshot, completion + " completion mutated state after " + action);
-    }
+    if (completion === "resolve") pending.resolve(response(201, { sessionId: "stale" }));
+    else pending.reject(new Error("stale failure"));
+    await settle();
+    assert.deepEqual({
+      open: f.dialog.open,
+      busy: f.dialog.getAttribute("aria-busy"),
+      launchDisabled: f.launch.disabled,
+      status: f.status.textContent
+    }, snapshot, completion + " completion mutated state after destroy");
   }
 });
 

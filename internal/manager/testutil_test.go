@@ -145,6 +145,7 @@ func fakeManager(factory clientFactory) *Manager {
 		newBootstrapPipe:       os.Pipe,
 		writeRootBootstrap:     writeRootBootstrap,
 		waitRootBootstrapWrite: waitRootBootstrapWrite,
+		rootAbortWait:          100 * time.Millisecond,
 		closeCtx:               ctx,
 		closeCancel:            cancel,
 		snapshotCtx:            snapshotCtx,

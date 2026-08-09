@@ -38,6 +38,7 @@ type Manager struct {
 	newBootstrapPipe       func() (*os.File, *os.File, error)
 	writeRootBootstrap     func(io.Writer, []byte) error
 	waitRootBootstrapWrite func(<-chan struct{})
+	rootAbortWait          time.Duration
 	closed                 bool // set once Close begins; blocks new monitor loops
 	clientsClosed          bool // set once clients have been closed (idempotency)
 	quiesced               bool
@@ -172,6 +173,7 @@ func New(opts Options) (*Manager, error) {
 		newBootstrapPipe:       os.Pipe,
 		writeRootBootstrap:     writeRootBootstrap,
 		waitRootBootstrapWrite: waitRootBootstrapWrite,
+		rootAbortWait:          defaultRootAbortWait,
 		closeCtx:               ctx,
 		closeCancel:            cancel,
 		snapshotCtx:            snapshotCtx,

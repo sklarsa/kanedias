@@ -32,8 +32,12 @@ func EncodeRootBootstrap(writer io.Writer, bootstrap RootBootstrap) error {
 	if len(data) > MaxRecordBytes {
 		return ErrRecordTooLarge
 	}
-	if _, err := writer.Write(data); err != nil {
+	n, err := writer.Write(data)
+	if err != nil {
 		return fmt.Errorf("write root bootstrap: %w", err)
+	}
+	if n != len(data) {
+		return fmt.Errorf("write root bootstrap: %w", io.ErrShortWrite)
 	}
 	return nil
 }

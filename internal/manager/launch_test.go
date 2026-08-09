@@ -88,6 +88,14 @@ func TestLaunchConfigurationRejectsMissingWorker(t *testing.T) {
 	assertInvalidRequest(t, err)
 }
 
+func TestLaunchConfigurationRejectsEqualLengthDuplicateWorkerRoles(t *testing.T) {
+	launch := mustLaunchConfiguration(t, modelConfigFixture())
+	request := launch.DefaultRequest()
+	request.Workers[1].WorkerType = request.Workers[0].WorkerType
+	_, err := launch.Resolve(request)
+	assertInvalidRequest(t, err)
+}
+
 func TestLaunchConfigurationRejectsUnknownWorker(t *testing.T) {
 	launch := mustLaunchConfiguration(t, modelConfigFixture())
 	request := launch.DefaultRequest()
@@ -205,6 +213,30 @@ func TestLaunchOptionsDeterministicOrderingAndDefaults(t *testing.T) {
 	}
 	if len(gpt.ThinkingLevels) == 0 || gpt.ThinkingLevels[0] != "minimal" {
 		t.Fatalf("gpt thinking levels = %#v", gpt.ThinkingLevels)
+	}
+}
+
+func TestLaunchConfigurationDoesNotAliasInputThinkingLevels(t *testing.T) {
+	cfg := modelConfigFixture()
+	launch := mustLaunchConfiguration(t, cfg)
+	definition := cfg.Models["local-qwen"]
+	definition.ThinkingLevels[0] = "high"
+	cfg.Models["local-qwen"] = definition
+
+	options := launch.LaunchOptions()
+	var local ModelLaunchOption
+	for _, option := range options.Models {
+		if option.ModelType == "local-qwen" {
+			local = option
+		}
+	}
+	if !reflect.DeepEqual(local.ThinkingLevels, []string{"off"}) {
+		t.Fatalf("launch thinking levels changed through input alias: %v", local.ThinkingLevels)
+	}
+	request := launch.DefaultRequest()
+	request.Root.ThinkingLevel = "high"
+	if _, err := launch.Resolve(request); err == nil {
+		t.Fatal("mutating source config changed launch resolution")
 	}
 }
 

@@ -91,6 +91,18 @@ func TestRootBootstrapEncodeRejectsOversizePolicy(t *testing.T) {
 	}
 }
 
+type shortRootBootstrapWriter struct{}
+
+func (shortRootBootstrapWriter) Write(data []byte) (int, error) {
+	return len(data) - 1, nil
+}
+
+func TestRootBootstrapEncodeRejectsShortWrite(t *testing.T) {
+	if err := EncodeRootBootstrap(shortRootBootstrapWriter{}, RootBootstrap{Policy: validRootPolicy()}); !errors.Is(err, io.ErrShortWrite) {
+		t.Fatalf("EncodeRootBootstrap error = %v, want %v", err, io.ErrShortWrite)
+	}
+}
+
 func TestRootBootstrapEncodeWritesExactlyOneValue(t *testing.T) {
 	bootstrap := RootBootstrap{Policy: validRootPolicy()}
 	var wire bytes.Buffer

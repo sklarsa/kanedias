@@ -221,14 +221,20 @@ func TestRootProvisionerRejectsInvalidModelBeforeConnecting(t *testing.T) {
 	} {
 		t.Run(test.name, func(t *testing.T) {
 			client := &recordingRootClient{}
-			provisioner := newRootProvisioner(rootTestConfig(), testRootDependencies(client))
+			connectCalls := 0
+			deps := testRootDependencies(client)
+			deps.connect = func(context.Context) (rootClient, error) {
+				connectCalls++
+				return client, nil
+			}
+			provisioner := newRootProvisioner(rootTestConfig(), deps)
 			request := validRootRequest()
 			request.Model = test.model
 			if resources, err := provisioner.ProvisionRoot(context.Background(), request); resources != nil || err == nil {
 				t.Fatalf("ProvisionRoot() = (%v, %v), want validation failure", resources, err)
 			}
-			if len(client.calls) != 0 {
-				t.Fatalf("Incus calls = %v, want none", client.calls)
+			if connectCalls != 0 || len(client.calls) != 0 {
+				t.Fatalf("Incus connect/calls = %d/%v, want none", connectCalls, client.calls)
 			}
 		})
 	}

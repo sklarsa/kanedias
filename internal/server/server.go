@@ -120,6 +120,9 @@ func runApplication(
 	if err != nil {
 		return fmt.Errorf("run server: %w", err)
 	}
+	if err := cfg.ValidateSupervisor(); err != nil {
+		return fmt.Errorf("run server: validate supervisor config: %w", err)
+	}
 
 	resolved, err := cfg.Server.Resolve()
 	if err != nil {

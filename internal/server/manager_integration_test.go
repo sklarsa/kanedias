@@ -435,9 +435,10 @@ func minimalTestConfig(t *testing.T, rootSocketDir, sessionLogDir string) (confi
 	requireSession := true
 	catalog := modelCatalogFixture()
 	cfg := config.Config{
-		Models:  catalog.Models,
-		Session: catalog.Session,
-		Workers: catalog.Workers,
+		BaseImage: catalog.BaseImage,
+		Models:    catalog.Models,
+		Session:   catalog.Session,
+		Workers:   catalog.Workers,
 		Server: config.ServerConfig{
 			RootSocketDir:     rootSocketDir,
 			SessionLogDir:     sessionLogDir,
