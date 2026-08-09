@@ -19,31 +19,44 @@
 })(typeof globalThis !== "undefined" ? globalThis : this, function (marked, hljs) {
   "use strict";
 
-  // Allow-list for URL targets in links and images. Relative paths (starting
-  // with # or /) and plain-text data are permitted; every active/remote-exec
-  // scheme and control characters are rejected.
+  // Allow-list for URL targets in links and images. An optional leading scheme
+  // is only permitted when it is http, https, mailto, tel, or ftp; every other
+  // scheme (javascript:, data:, vbscript:, …) is rejected, including control-
+  // character obfuscations which are stripped first. Scheme-less URLs (relative
+  // paths, fragments, plain text) are permitted, matching Pi's sanitizer.
   function sanitizeURL(value) {
     if (typeof value !== "string") return null;
     var url = value.replace(/[\u0000-\u001f\u007f-\u009f]/g, "").trim();
     if (url === "") return null;
-    if (/^(https?:|mailto:|tel:|data:text\/plain)/i.test(url)) return url;
-    if (/^[#/]/.test(url)) return url;
-    return null;
+    var scheme = /^([A-Za-z][A-Za-z0-9+.-]*):/.exec(url);
+    if (scheme && !/^(https?|mailto|tel|ftp)$/i.test(scheme[1])) {
+      return null;
+    }
+    return url;
   }
 
-  // Strict strikethrough tokenizer: only the "~~text~~" form is recognized, so
-  // a lone tilde can never produce accidental formatting.
+  // Strict strikethrough tokenizer matching Pi: an opening and closing double
+  // tilde with non-tilde/space boundaries, lexing the inner span as inline
+  // tokens so nested formatting survives.
+  var strictStrikethroughRegex = /^(~~)(?=[^\s~])((?:\\.|[^\\])*?(?:\\.|[^\s~\\]))\1(?=[^~]|$)/;
+
   function SafeTokenizer() {
     if (marked && marked.Tokenizer) {
       var parent = marked.Tokenizer;
       var proto = Object.create(parent.prototype);
+      // HTML-like input is treated as plain text (literal) so it can never
+      // become a live element; this matches Pi's TUI renderer.
+      proto.html = function () { return undefined; };
+      proto.tag = function () { return undefined; };
       proto.del = function (src) {
-        var cap = /^~~(?=\S)([\s\S]*?\S)~~/.exec(src);
-        if (cap) {
-          var text = cap[1];
-          return { type: "del", raw: cap[0], text: text, tokens: [{ type: "text", raw: text, text: text }] };
-        }
-        return undefined;
+        var match = strictStrikethroughRegex.exec(src);
+        if (!match) return undefined;
+        return {
+          type: "del",
+          raw: match[0],
+          text: match[2],
+          tokens: this.lexer.inlineTokens(match[2])
+        };
       };
       proto.constructor = SafeTokenizer;
       return proto;
@@ -54,20 +67,24 @@
   function escapeText(s) {
     return String(s).replace(/&/g, "&amp;").replace(/</g, "&lt;").replace(/>/g, "&gt;");
   }
+  // Full HTML/attribute escaper: also escapes double quotes and apostrophes so
+  // text placed inside a quoted attribute can never break out of it.
   function escapeAttr(s) {
-    return String(s).replace(/&/g, "&amp;").replace(/"/g, "&quot;").replace(/</g, "&lt;").replace(/>/g, "&gt;");
+    return String(s).replace(/&/g, "&amp;").replace(/</g, "&lt;").replace(/>/g, "&gt;").replace(/"/g, "&quot;").replace(/'/g, "&#39;");
   }
 
   var renderer = {
     // Fenced code becomes a copy-able, scrollable block highlighted with hljs.
+    // Known languages are highlighted directly; absent or unregistered languages
+    // fall back to Pi-style auto-detection, with an escaped fallback on failure.
     code: function (token) {
-      var lang = token.lang || "";
+      var lang = token.lang;
       var body = token.text || "";
       var highlighted = null;
       try {
         if (lang && hljs.getLanguage(lang)) {
           highlighted = hljs.highlight(body, { language: lang }).value;
-        } else if (!lang) {
+        } else {
           highlighted = hljs.highlightAuto(body).value;
         }
       } catch (e) {
@@ -77,22 +94,21 @@
       return '<div class="code-block"><button type="button" class="copy-btn" data-copy-code>copy</button>' +
         '<pre><code class="hljs">' + highlighted + '</code></pre></div>';
     },
-    // Raw HTML is rendered literally (escaped) and can never become a live element.
-    html: function (token) {
-      return escapeText(token.text || token.raw || "");
-    },
     link: function (token) {
       var clean = sanitizeURL(token.href);
-      if (!clean) return escapeText(token.text);
+      // Render the label through parsed inline tokens so nested HTML-like input
+      // stays literal and can never be emitted as an active element.
+      var label = this.parser.parseInline(token.tokens);
+      if (!clean) return label;
       var out = '<a href="' + escapeAttr(clean) + '"';
       if (token.title) out += ' title="' + escapeAttr(token.title) + '"';
-      out += ' rel="noopener noreferrer">' + token.text + '</a>';
+      out += ' rel="noopener noreferrer">' + label + '</a>';
       return out;
     },
     image: function (token) {
       var clean = sanitizeURL(token.href);
-      if (!clean) return escapeText(token.text);
-      var out = '<img src="' + escapeAttr(clean) + '" alt="' + escapeText(token.text) + '"';
+      if (!clean) return escapeAttr(token.text || "");
+      var out = '<img src="' + escapeAttr(clean) + '" alt="' + escapeAttr(token.text || "") + '"';
       if (token.title) out += ' title="' + escapeAttr(token.title) + '"';
       out += ">";
       return out;
@@ -113,18 +129,33 @@
 
   function renderPending(root) {
     if (!root || typeof root.querySelectorAll !== "function") return;
-    var nodes = root.querySelectorAll("[data-markdown]:not([data-markdown-rendered])");
+    var nodes = root.querySelectorAll("[data-markdown]:not([data-markdown-rendered]):not([data-markdown-error])");
     for (var i = 0; i < nodes.length; i++) {
       var el = nodes[i];
-      var original = el.textContent;
+      // Defense in depth: never re-process an element that already failed, so
+      // the rendering failure cannot repeatedly retrigger the activity observer.
+      if (el.getAttribute && el.getAttribute("data-markdown-error") === "true") continue;
+      var original = el.textContent || "";
+      var html;
       try {
-        el.innerHTML = render(original);
-        el.setAttribute("data-markdown-rendered", "true");
+        html = render(original);
       } catch (e) {
-        el.textContent = original;
-        el.setAttribute("data-markdown-error", "true");
+        markError(el, original);
+        continue;
       }
+      try {
+        el.innerHTML = html;
+      } catch (e) {
+        markError(el, original);
+        continue;
+      }
+      if (el.setAttribute) el.setAttribute("data-markdown-rendered", "true");
     }
+  }
+
+  function markError(el, original) {
+    if (el.textContent !== original) el.textContent = original;
+    if (el.setAttribute) el.setAttribute("data-markdown-error", "true");
   }
 
   function highlight(code, language) {

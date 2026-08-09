@@ -381,6 +381,56 @@ func TestAstrolabeConsoleIsInteractive(t *testing.T) {
 	}
 }
 
+func TestActivityUsesMarkdownClassification(t *testing.T) {
+	cases := []struct {
+		kind string
+		want bool
+	}{
+		{"user_message", true},
+		{"message_update", true},
+		{"model_error", false},
+		{"tool_call", false},
+		{"tool_result", false},
+		{"bash_execution", false},
+		{"", false},
+	}
+	for _, c := range cases {
+		if got := activityUsesMarkdown(c.kind); got != c.want {
+			t.Errorf("activityUsesMarkdown(%q) = %v, want %v", c.kind, got, c.want)
+		}
+	}
+
+	// Exercise newActivityView from manager state rather than manually-set flags.
+	state := manager.SessionState{RecentActivity: []manager.ActivityItem{
+		{Seq: 1, Kind: "user_message", Text: "# hi"},
+		{Seq: 2, Kind: "message_update", Text: "**bold**"},
+		{Seq: 3, Kind: "model_error", Text: "boom", IsError: true},
+		{Seq: 4, Kind: "tool_result", Text: "out"},
+	}}
+	view := newActivityView(state)
+	if len(view.Items) != 4 {
+		t.Fatalf("items = %d, want 4", len(view.Items))
+	}
+	if !view.Items[0].IsMarkdown || !view.Items[1].IsMarkdown {
+		t.Error("user_message/message_update should be classified as Markdown")
+	}
+	if view.Items[2].IsMarkdown || view.Items[3].IsMarkdown {
+		t.Error("model_error/tool_result must not be classified as Markdown")
+	}
+
+	templates, err := parseTemplates(webFiles)
+	if err != nil {
+		t.Fatal(err)
+	}
+	html, err := renderTemplate(templates, templateActivity, view)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if got := strings.Count(html, `data-markdown`); got != 2 {
+		t.Fatalf("markdown markers = %d, want 2\n%s", got, html)
+	}
+}
+
 func TestActivityMarksOnlyConversationTextAsMarkdown(t *testing.T) {
 	templates, err := parseTemplates(webFiles)
 	if err != nil {
