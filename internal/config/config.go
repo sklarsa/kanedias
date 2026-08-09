@@ -104,11 +104,22 @@ func (cfg Config) WorkerNames() []string {
 	return names
 }
 
-func (cfg Config) ValidateSupervisor() error {
+// ValidateChildRuntime validates only configuration that remains authoritative
+// for an already-admitted descendant. Model catalog, session, and worker
+// defaults are deliberately excluded because descendants inherit their complete
+// resolved model policy from the parent bootstrap.
+func (cfg Config) ValidateChildRuntime() error {
 	if err := cfg.ValidateLifecycle(); err != nil {
 		return err
 	}
 	if _, err := cfg.Supervisor.Events.Limits(); err != nil {
+		return err
+	}
+	return nil
+}
+
+func (cfg Config) ValidateSupervisor() error {
+	if err := cfg.ValidateChildRuntime(); err != nil {
 		return err
 	}
 	if err := cfg.validateModelCatalog(); err != nil {

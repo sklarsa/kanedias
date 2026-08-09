@@ -38,6 +38,42 @@ func (adapter childRootProvisionAdapter) Destroy(ctx context.Context, resources 
 
 type eventBrokerFactory func(supervisor.EventBrokerOptions) (*supervisor.EventBroker, error)
 
+type productionChildRuntime struct {
+	newChildProvisioner     func(context.Context, config.Config) (provision.ChildProvisioner, func(), error)
+	newDirectChildRecoverer func(context.Context, config.Config) (provision.DirectChildRecoverer, func(), error)
+	dialRPC                 func(context.Context, string) (io.ReadWriteCloser, error)
+	spawnChild              func(string) supervisor.ChildSpawner
+	descendantClient        supervisor.DescendantClientFactory
+	afterReady              func(context.Context, *supervisor.Node) error
+}
+
+func defaultProductionChildRuntime() productionChildRuntime {
+	return productionChildRuntime{
+		newChildProvisioner: func(ctx context.Context, cfg config.Config) (provision.ChildProvisioner, func(), error) {
+			configured, err := provision.NewConfiguredChildProvisioner(ctx, cfg)
+			if err != nil {
+				return nil, nil, err
+			}
+			return configured, configured.Close, nil
+		},
+		newDirectChildRecoverer: func(ctx context.Context, cfg config.Config) (provision.DirectChildRecoverer, func(), error) {
+			configured, err := provision.NewConfiguredDirectChildRecoverer(ctx, cfg)
+			if err != nil {
+				return nil, nil, err
+			}
+			return configured, configured.Close, nil
+		},
+		dialRPC: dialPiRPC,
+		spawnChild: func(configPath string) supervisor.ChildSpawner {
+			spawner := process.Spawner{ConfigPath: configPath}
+			return func(ctx context.Context, bootstrap process.Bootstrap) (supervisor.ChildProcess, error) {
+				return spawner.Spawn(ctx, bootstrap)
+			}
+		},
+		descendantClient: supervisorapi.NewDescendantClient,
+	}
+}
+
 func runSupervisor(ctx context.Context, cfg config.Config, opts SessionOptions, out io.Writer) error {
 	return runSupervisorWithBrokerFactory(ctx, cfg, opts, out, supervisor.NewEventBrokerWithOptions)
 }
@@ -161,7 +197,11 @@ func inheritedChildPolicy(bootstrap process.Bootstrap) (config.SessionModelPolic
 	return policy, worker, nil
 }
 
-func productionChildRunnerWithBrokerFactory(ctx context.Context, bootstrap process.Bootstrap, reporter *process.Reporter, factory eventBrokerFactory) (resultErr error) {
+func productionChildRunnerWithBrokerFactory(ctx context.Context, bootstrap process.Bootstrap, reporter *process.Reporter, factory eventBrokerFactory) error {
+	return productionChildRunnerWithRuntime(ctx, bootstrap, reporter, factory, defaultProductionChildRuntime())
+}
+
+func productionChildRunnerWithRuntime(ctx context.Context, bootstrap process.Bootstrap, reporter *process.Reporter, factory eventBrokerFactory, runtime productionChildRuntime) (resultErr error) {
 	configPath := os.Getenv("KANEDIAS_CONFIG")
 	if configPath == "" || !filepath.IsAbs(configPath) || filepath.Clean(configPath) != configPath {
 		return contract.NewError(contract.ErrorInvalidRequest, "KANEDIAS_CONFIG must name an absolute clean path")
@@ -170,10 +210,14 @@ func productionChildRunnerWithBrokerFactory(ctx context.Context, bootstrap proce
 	if err != nil {
 		return err
 	}
-	if err := cfg.ValidateSupervisor(); err != nil {
+	if err := cfg.ValidateChildRuntime(); err != nil {
 		return err
 	}
 	policy, resolvedWorker, err := inheritedChildPolicy(bootstrap)
+	if err != nil {
+		return err
+	}
+	handoffVerifier, err := supervisor.NewGitHubHandoffVerifier(cfg.Workspace.Repos, nil)
 	if err != nil {
 		return err
 	}
@@ -185,16 +229,16 @@ func productionChildRunnerWithBrokerFactory(ctx context.Context, bootstrap proce
 	if err != nil {
 		return err
 	}
-	childProvisioner, err := provision.NewConfiguredChildProvisioner(ctx, cfg)
+	childProvisioner, closeChildProvisioner, err := runtime.newChildProvisioner(ctx, cfg)
 	if err != nil {
 		return err
 	}
-	defer childProvisioner.Close()
-	directRecoverer, err := provision.NewConfiguredDirectChildRecoverer(ctx, cfg)
+	defer closeChildProvisioner()
+	directRecoverer, closeDirectRecoverer, err := runtime.newDirectChildRecoverer(ctx, cfg)
 	if err != nil {
 		return err
 	}
-	defer directRecoverer.Close()
+	defer closeDirectRecoverer()
 	identity, err := supervisor.NewIdentity(supervisor.IdentitySpec{
 		SessionID: bootstrap.SessionID, ParentID: bootstrap.ParentID, RootID: bootstrap.RootID,
 		Kind: bootstrap.Request.Kind, Context: bootstrap.Request.Context, Worker: bootstrap.Request.WorkerType,
@@ -219,24 +263,18 @@ func productionChildRunnerWithBrokerFactory(ctx context.Context, bootstrap proce
 			return closeCtx.Err()
 		}
 	}
-	spawner := process.Spawner{ConfigPath: configPath}
+	spawnChild := runtime.spawnChild(configPath)
 	var expectedPiBinding *supervisor.PiBinding
 	if bootstrap.Request.Context == contract.ContextFork && bootstrap.Request.Fork != nil {
 		expectedPiBinding = &supervisor.PiBinding{
 			SessionID: bootstrap.Request.Fork.PiSessionID, SessionFile: bootstrap.Request.Fork.SessionFile,
 		}
 	}
-	handoffVerifier, err := supervisor.NewGitHubHandoffVerifier(cfg.Workspace.Repos, nil)
-	if err != nil {
-		return err
-	}
 	node, err := supervisor.NewChild(identity, supervisor.Dependencies{
-		Provisioner: adapter, DialRPC: dialPiRPC, ModelPolicy: policy,
-		SocketPath: bootstrap.SocketPath,
-		SpawnChild: func(ctx context.Context, nested process.Bootstrap) (supervisor.ChildProcess, error) {
-			return spawner.Spawn(ctx, nested)
-		},
-		DescendantClient:     supervisorapi.NewDescendantClient,
+		Provisioner: adapter, DialRPC: runtime.dialRPC, ModelPolicy: policy,
+		SocketPath:           bootstrap.SocketPath,
+		SpawnChild:           spawnChild,
+		DescendantClient:     runtime.descendantClient,
 		DirectChildRecoverer: directRecoverer,
 		CloseListener:        closeListener,
 		ReportWrite:          reporter.Write,
@@ -282,6 +320,11 @@ func productionChildRunnerWithBrokerFactory(ctx context.Context, bootstrap proce
 	started = true
 	if err := reporter.Ready(bootstrap.SocketPath); err != nil {
 		return err
+	}
+	if runtime.afterReady != nil {
+		if err := runtime.afterReady(ctx, node); err != nil {
+			return err
+		}
 	}
 	switch bootstrap.Request.Kind {
 	case contract.ChildKindRead:

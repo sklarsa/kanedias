@@ -1,9 +1,12 @@
 package cmd
 
 import (
+	"bufio"
 	"context"
+	"encoding/json"
 	"errors"
 	"io"
+	"net"
 	"os"
 	"path/filepath"
 	"reflect"
@@ -14,6 +17,7 @@ import (
 	"github.com/sklarsa/kanedias/internal/supervisor"
 	"github.com/sklarsa/kanedias/internal/supervisor/contract"
 	"github.com/sklarsa/kanedias/internal/supervisor/process"
+	"github.com/sklarsa/kanedias/internal/supervisor/provision"
 )
 
 func validSupervisorConfig() config.Config {
@@ -144,6 +148,25 @@ func TestInheritedChildPolicySelectsExactWorkerAndClonesMap(t *testing.T) {
 	}
 }
 
+type recordingRuntimeChildProvisioner struct {
+	request provision.ChildRequest
+}
+
+func (fake *recordingRuntimeChildProvisioner) ProvisionChild(_ context.Context, request provision.ChildRequest) (*provision.Resources, error) {
+	fake.request = request
+	return &provision.Resources{SessionID: request.SessionID, Pool: "pool", Instance: "session-" + request.SessionID, Volume: "workspace-" + request.SessionID, RPCAddr: "pipe"}, nil
+}
+
+func (*recordingRuntimeChildProvisioner) Destroy(context.Context, *provision.Resources) error {
+	return nil
+}
+
+type runtimeTestRecoverer struct{}
+
+func (runtimeTestRecoverer) RecoverDirectChild(context.Context, provision.RecoveryTicket) error {
+	return nil
+}
+
 func TestProductionChildRunnerUsesInheritedPolicyDespiteChangedGlobalDefaults(t *testing.T) {
 	content := `[network]
 ipv4 = "10.76.111.1/24"
@@ -151,17 +174,17 @@ ipv4 = "10.76.111.1/24"
 name = "sandbox"
 source = "images:"
 image = "debian/13"
-[models.changed-default]
-provider = "changed-provider"
-model = "changed-model"
-thinking_levels = ["low"]
-default_thinking_level = "low"
+[models.INVALID_NAME]
+provider = ""
+model = ""
+thinking_levels = ["invalid"]
+default_thinking_level = "missing"
 [session]
-model_type = "changed-default"
-thinking_level = "low"
+model_type = "missing-current-default"
+thinking_level = "invalid"
 [workers.worker]
-description = "changed global worker"
-model_type = "changed-default"
+description = ""
+model_type = "missing-current-worker-default"
 
 [supervisor.events]
 max_events = 7
@@ -207,4 +230,186 @@ max_bytes = 1024
 	if !errors.Is(err, sentinel) {
 		t.Fatalf("error = %v", err)
 	}
+}
+
+func TestProductionChildRunnerRejectsInvalidInfrastructureBeforeBroker(t *testing.T) {
+	content := `[network]
+ipv4 = "10.76.111.1/24"
+[base_image]
+source = "images:"
+image = "debian/13"
+[session]
+model_type = "irrelevant"
+[supervisor.events]
+max_events = 7
+max_bytes = 1024
+`
+	path := filepath.Join(t.TempDir(), "config.toml")
+	if err := os.WriteFile(path, []byte(content), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	t.Setenv("KANEDIAS_CONFIG", path)
+	called := false
+	bootstrap := runtimePolicyBootstrap(t)
+	err := productionChildRunnerWithBrokerFactory(context.Background(), bootstrap, nil, func(supervisor.EventBrokerOptions) (*supervisor.EventBroker, error) {
+		called = true
+		return nil, errors.New("unexpected broker")
+	})
+	if err == nil || !strings.Contains(err.Error(), "base_image.name") {
+		t.Fatalf("infrastructure validation error = %v", err)
+	}
+	if called {
+		t.Fatal("broker created before infrastructure validation")
+	}
+}
+
+func TestProductionChildRunnerRejectsInvalidRepositoryInfrastructure(t *testing.T) {
+	content := `[network]
+ipv4 = "10.76.111.1/24"
+[base_image]
+name = "sandbox"
+source = "images:"
+image = "debian/13"
+[workspace]
+repos = ["not-a-github-slug"]
+[session]
+model_type = "irrelevant"
+`
+	path := filepath.Join(t.TempDir(), "config.toml")
+	if err := os.WriteFile(path, []byte(content), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	t.Setenv("KANEDIAS_CONFIG", path)
+	called := false
+	err := productionChildRunnerWithBrokerFactory(context.Background(), runtimePolicyBootstrap(t), nil, func(supervisor.EventBrokerOptions) (*supervisor.EventBroker, error) {
+		called = true
+		return nil, errors.New("unexpected broker")
+	})
+	if err == nil || !strings.Contains(err.Error(), "trusted workspace repository") {
+		t.Fatalf("repository validation error = %v", err)
+	}
+	if called {
+		t.Fatal("broker created before repository validation")
+	}
+}
+
+func TestProductionChildRunnerConstructsNestedNodeWithInheritedPolicy(t *testing.T) {
+	content := `[network]
+ipv4 = "10.76.111.1/24"
+[base_image]
+name = "sandbox"
+source = "images:"
+image = "debian/13"
+[models.INVALID_NAME]
+provider = ""
+model = ""
+thinking_levels = ["invalid"]
+default_thinking_level = "missing"
+[session]
+model_type = "missing-current-default"
+thinking_level = "invalid"
+[workers.worker]
+description = ""
+model_type = "missing-current-worker-default"
+`
+	path := filepath.Join(t.TempDir(), "config.toml")
+	if err := os.WriteFile(path, []byte(content), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	t.Setenv("KANEDIAS_CONFIG", path)
+	bootstrap := runtimePolicyBootstrap(t)
+	originalPolicy := bootstrap.Policy.Clone()
+	provisioner := &recordingRuntimeChildProvisioner{}
+	var nested []process.Bootstrap
+
+	runtime := defaultProductionChildRuntime()
+	runtime.newChildProvisioner = func(context.Context, config.Config) (provision.ChildProvisioner, func(), error) {
+		return provisioner, func() {}, nil
+	}
+	runtime.newDirectChildRecoverer = func(context.Context, config.Config) (provision.DirectChildRecoverer, func(), error) {
+		return runtimeTestRecoverer{}, func() {}, nil
+	}
+	runtime.dialRPC = func(context.Context, string) (io.ReadWriteCloser, error) {
+		host, peer := net.Pipe()
+		go serveRuntimePolicyState(peer, bootstrap.Policy.Workers[bootstrap.Request.WorkerType])
+		return host, nil
+	}
+	runtime.spawnChild = func(string) supervisor.ChildSpawner {
+		return func(_ context.Context, got process.Bootstrap) (supervisor.ChildProcess, error) {
+			nested = append(nested, got)
+			return nil, errors.New("captured nested bootstrap")
+		}
+	}
+	runtime.descendantClient = func(string) (supervisor.DescendantClient, error) {
+		return nil, errors.New("unexpected descendant client")
+	}
+	sentinel := errors.New("nested policy captured")
+	runtime.afterReady = func(ctx context.Context, node *supervisor.Node) error {
+		request := contract.CreateChildRequest{WorkerType: "reviewer", Kind: contract.ChildKindRead, Context: contract.ContextFresh, Task: "nested review"}
+		_, _ = node.CreateChild(ctx, bootstrap.SessionID, request)
+		if len(nested) != 1 {
+			t.Fatalf("nested spawn count = %d, want 1", len(nested))
+		}
+		if !reflect.DeepEqual(nested[0].Policy, originalPolicy) {
+			t.Fatalf("nested policy = %#v, want original %#v", nested[0].Policy, originalPolicy)
+		}
+		mutated := nested[0].Policy.Workers["reviewer"]
+		mutated.Provider, mutated.Model = "mutated-provider", "mutated-model"
+		nested[0].Policy.Workers["reviewer"] = mutated
+		_, _ = node.CreateChild(ctx, bootstrap.SessionID, request)
+		if len(nested) != 2 || !reflect.DeepEqual(nested[1].Policy, originalPolicy) {
+			t.Fatalf("second nested policy = %#v, want non-aliased original %#v", nested, originalPolicy)
+		}
+		return sentinel
+	}
+	reporter := process.NewAcknowledgedReporter(context.Background(), io.Discard, nil, bootstrap.SessionID)
+	err := productionChildRunnerWithRuntime(context.Background(), bootstrap, reporter, supervisor.NewEventBrokerWithOptions, runtime)
+	if !errors.Is(err, sentinel) {
+		t.Fatalf("runner error = %v, want sentinel", err)
+	}
+	if got, want := provisioner.request.Worker, originalPolicy.Workers[bootstrap.Request.WorkerType]; got != want {
+		t.Fatalf("provisioned worker = %#v, want inherited %#v", got, want)
+	}
+	if len(nested[1].Policy.Workers) != len(originalPolicy.Workers) {
+		t.Fatalf("nested workers = %#v, want every role %#v", nested[1].Policy.Workers, originalPolicy.Workers)
+	}
+}
+
+func runtimePolicyBootstrap(t *testing.T) process.Bootstrap {
+	t.Helper()
+	return process.Bootstrap{
+		SessionID: "session-child", ParentID: "session-parent", RootID: "session-root",
+		SocketPath: filepath.Join(t.TempDir(), "child.sock"), SourceInstance: "session-parent", SourceVolume: "workspace-parent",
+		Policy: config.SessionModelPolicy{
+			Root: config.ModelProfile{Provider: "root-provider", Model: "root-model", ThinkingLevel: "off"},
+			Workers: map[string]config.WorkerProfile{
+				"worker":   {Description: "work", Provider: "admitted-provider", Model: "admitted-model", ThinkingLevel: "xhigh"},
+				"reviewer": {Description: "review", Provider: "review-provider", Model: "review-model", ThinkingLevel: "medium"},
+			},
+		},
+		Request: contract.CreateChildRequest{WorkerType: "worker", Kind: contract.ChildKindRead, Context: contract.ContextFresh, Task: "parent task"},
+	}
+}
+
+func serveRuntimePolicyState(peer net.Conn, worker config.WorkerProfile) {
+	defer peer.Close()
+	line, err := bufio.NewReader(peer).ReadBytes('\n')
+	if err != nil {
+		return
+	}
+	var command struct {
+		ID string `json:"id"`
+	}
+	if json.Unmarshal(line, &command) != nil {
+		return
+	}
+	response, _ := json.Marshal(map[string]any{
+		"id": command.ID, "type": "response", "command": "get_state", "success": true,
+		"data": map[string]any{
+			"sessionId": "pi-child", "sessionFile": "/tmp/pi-child.jsonl", "isStreaming": false,
+			"model": map[string]any{"provider": worker.Provider, "id": worker.Model}, "thinkingLevel": worker.ThinkingLevel,
+		},
+	})
+	_, _ = peer.Write(append(response, '\n'))
+	_, _ = io.Copy(io.Discard, peer)
 }
