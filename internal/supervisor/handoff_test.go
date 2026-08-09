@@ -98,7 +98,7 @@ func TestStopWhileWriterAwaitsHandoffCleansProcessResourcesAndSocket(t *testing.
 			if command.Type == "get_state" {
 				response["data"] = map[string]any{
 					"sessionId": "pi-writer", "sessionFile": "/tmp/writer.jsonl", "isStreaming": false,
-					"model": map[string]any{"provider": "openai-codex", "id": "gpt-5.6-sol"}, "thinkingLevel": "high",
+					"model": map[string]any{"provider": "local-executor", "id": "worker-model"}, "thinkingLevel": "off",
 				}
 			}
 			wire, _ := json.Marshal(response)
@@ -207,7 +207,7 @@ func TestAcceptedHandoffWatchdogForcesCleanupWhenPiDoesNotEOF(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	peerDone := startPiPeer(t, peer, nil)
+	peerDone := startPiPeerWithState(t, peer, nil, "pi-1", "/tmp/pi-1.jsonl", workerModel(testModelPolicy(), "worker"))
 	if err := node.Start(context.Background()); err != nil {
 		t.Fatal(err)
 	}
