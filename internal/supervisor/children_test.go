@@ -175,7 +175,7 @@ func childCreationNode(t *testing.T, spawn ChildSpawner, factory DescendantClien
 		identity: testRootIdentity(t), broker: NewEventBroker(), state: LifecycleReady, started: true,
 		resources: &provision.Resources{SessionID: "root-1", Instance: "instance", Volume: "volume"},
 		children:  newChildRegistry(), startupDone: make(chan struct{}), done: make(chan struct{}),
-		deps: Dependencies{Workers: childTestWorkers{}, SocketPath: "/tmp/root.sock", SpawnChild: spawn, DescendantClient: factory, ChildStopTimeout: 100 * time.Millisecond, CloseListener: func(context.Context) error { return nil }},
+		deps: Dependencies{ModelPolicy: testModelPolicy(), SocketPath: "/tmp/root.sock", SpawnChild: spawn, DescendantClient: factory, ChildStopTimeout: 100 * time.Millisecond, CloseListener: func(context.Context) error { return nil }},
 	}
 	close(node.startupDone)
 	return node

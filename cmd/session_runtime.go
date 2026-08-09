@@ -24,32 +24,6 @@ import (
 
 const supervisorCleanupTimeout = 30 * time.Second
 
-type configWorkerCatalog struct{ config config.Config }
-
-func (catalog configWorkerCatalog) Resolve(name string) (config.WorkerProfile, error) {
-	profile, err := catalog.config.ResolveWorker(name)
-	if err != nil {
-		return config.WorkerProfile{}, contract.NewError(contract.ErrorUnknownWorkerType, err.Error())
-	}
-	return profile, nil
-}
-
-func (catalog configWorkerCatalog) Summaries() []contract.WorkerSummary {
-	names := catalog.config.WorkerNames()
-	result := make([]contract.WorkerSummary, 0, len(names))
-	for _, name := range names {
-		profile, err := catalog.config.ResolveWorker(name)
-		if err != nil {
-			continue
-		}
-		result = append(result, contract.WorkerSummary{
-			WorkerType: name, Description: profile.Description,
-			Profile: contract.ModelProfile{Provider: profile.Provider, Model: profile.Model, ThinkingLevel: profile.ThinkingLevel},
-		})
-	}
-	return result
-}
-
 type childRootProvisionAdapter struct {
 	provisioner provision.ChildProvisioner
 	request     provision.ChildRequest
@@ -126,7 +100,7 @@ func runSupervisorWithBrokerFactory(ctx context.Context, cfg config.Config, opti
 	node, err := supervisor.NewRoot(identity, supervisor.Dependencies{
 		Provisioner: provision.NewRootProvisioner(cfg),
 		DialRPC:     dialPiRPC,
-		Workers:     configWorkerCatalog{config: cfg},
+		ModelPolicy: policy,
 		SocketPath:  socketPath,
 		SpawnChild: func(ctx context.Context, bootstrap process.Bootstrap) (supervisor.ChildProcess, error) {
 			return spawner.Spawn(ctx, bootstrap)
@@ -195,7 +169,11 @@ func productionChildRunnerWithBrokerFactory(ctx context.Context, bootstrap proce
 	if err != nil {
 		return err
 	}
-	resolvedWorker, err := cfg.ResolveWorker(bootstrap.Request.WorkerType)
+	policy, err := cfg.DefaultSessionModelPolicy()
+	if err != nil {
+		return err
+	}
+	resolvedWorker, err := policy.ResolveWorker(bootstrap.Request.WorkerType)
 	if err != nil {
 		return contract.NewError(contract.ErrorUnknownWorkerType, err.Error())
 	}
@@ -248,7 +226,7 @@ func productionChildRunnerWithBrokerFactory(ctx context.Context, bootstrap proce
 		return err
 	}
 	node, err := supervisor.NewChild(identity, supervisor.Dependencies{
-		Provisioner: adapter, DialRPC: dialPiRPC, Workers: configWorkerCatalog{config: cfg},
+		Provisioner: adapter, DialRPC: dialPiRPC, ModelPolicy: policy,
 		SocketPath: bootstrap.SocketPath,
 		SpawnChild: func(ctx context.Context, nested process.Bootstrap) (supervisor.ChildProcess, error) {
 			return spawner.Spawn(ctx, nested)

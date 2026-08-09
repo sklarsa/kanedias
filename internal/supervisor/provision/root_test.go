@@ -111,6 +111,16 @@ func rootTestConfig() config.Config {
 	}
 }
 
+func validRootRequest() RootRequest {
+	return RootRequest{
+		SessionID:  "root-1",
+		SocketPath: "/tmp/root.sock",
+		Model: config.ModelProfile{
+			Provider: "openai-codex", Model: "gpt-5.6-sol", ThinkingLevel: "high",
+		},
+	}
+}
+
 func testRootDependencies(client *recordingRootClient) rootDependencies {
 	return rootDependencies{
 		connect: func(context.Context) (rootClient, error) { return client, nil },
@@ -142,7 +152,7 @@ func TestRootProvisionerChecksProxyBeforeOwnedResources(t *testing.T) {
 	}
 	provisioner := newRootProvisioner(rootTestConfig(), deps)
 
-	resources, err := provisioner.ProvisionRoot(context.Background(), RootRequest{SessionID: "root-1", SocketPath: "/tmp/root.sock"})
+	resources, err := provisioner.ProvisionRoot(context.Background(), validRootRequest())
 	if !errors.Is(err, proxyErr) || resources != nil {
 		t.Fatalf("ProvisionRoot() = (%v, %v), want nil resources and proxy error", resources, err)
 	}
@@ -156,7 +166,7 @@ func TestRootProvisionerCreatesSocketProxyBeforeStarting(t *testing.T) {
 	client := &recordingRootClient{}
 	provisioner := newRootProvisioner(rootTestConfig(), testRootDependencies(client))
 
-	resources, err := provisioner.ProvisionRoot(context.Background(), RootRequest{SessionID: "root-1", SocketPath: "/tmp/root.sock"})
+	resources, err := provisioner.ProvisionRoot(context.Background(), validRootRequest())
 	if err != nil {
 		t.Fatalf("ProvisionRoot() error = %v", err)
 	}
@@ -172,8 +182,8 @@ func TestRootProvisionerCreatesSocketProxyBeforeStarting(t *testing.T) {
 	}
 	wantEnvironment := map[string]string{
 		"environment.KANEDIAS_SESSION_ID": "root-1", "environment.KANEDIAS_SESSION_KIND": "root",
-		"environment.KANEDIAS_WORKER_TYPE": "", "environment.KANEDIAS_PI_PROVIDER": "",
-		"environment.KANEDIAS_PI_MODEL": "", "environment.KANEDIAS_PI_THINKING": "",
+		"environment.KANEDIAS_WORKER_TYPE": "", "environment.KANEDIAS_PI_PROVIDER": "openai-codex",
+		"environment.KANEDIAS_PI_MODEL": "gpt-5.6-sol", "environment.KANEDIAS_PI_THINKING": "high",
 		"environment.KANEDIAS_PI_SESSION_FILE": "", "environment.KANEDIAS_SUPERVISOR_SOCKET": "/run/kanedias/supervisor.sock",
 	}
 	for key, value := range wantEnvironment {
@@ -199,6 +209,31 @@ func TestRootProvisionerCreatesSocketProxyBeforeStarting(t *testing.T) {
 	}
 }
 
+func TestRootProvisionerRejectsInvalidModelBeforeConnecting(t *testing.T) {
+	for _, test := range []struct {
+		name  string
+		model config.ModelProfile
+	}{
+		{name: "missing provider", model: config.ModelProfile{Model: "gpt-5.6-sol", ThinkingLevel: "high"}},
+		{name: "missing model", model: config.ModelProfile{Provider: "openai-codex", ThinkingLevel: "high"}},
+		{name: "empty thinking", model: config.ModelProfile{Provider: "openai-codex", Model: "gpt-5.6-sol"}},
+		{name: "invalid thinking", model: config.ModelProfile{Provider: "openai-codex", Model: "gpt-5.6-sol", ThinkingLevel: "extreme"}},
+	} {
+		t.Run(test.name, func(t *testing.T) {
+			client := &recordingRootClient{}
+			provisioner := newRootProvisioner(rootTestConfig(), testRootDependencies(client))
+			request := validRootRequest()
+			request.Model = test.model
+			if resources, err := provisioner.ProvisionRoot(context.Background(), request); resources != nil || err == nil {
+				t.Fatalf("ProvisionRoot() = (%v, %v), want validation failure", resources, err)
+			}
+			if len(client.calls) != 0 {
+				t.Fatalf("Incus calls = %v, want none", client.calls)
+			}
+		})
+	}
+}
+
 func TestRootProvisionerAwaitsSubmittedVolumeBeforeProbingLateMaterialization(t *testing.T) {
 	primary := errors.New("copy wait cancelled")
 	client := &recordingRootClient{copyErr: primary, lateVolume: true}
@@ -216,7 +251,7 @@ func TestRootProvisionerAwaitsSubmittedVolumeBeforeProbingLateMaterialization(t 
 		return nil
 	}
 	provisioner := newRootProvisioner(rootTestConfig(), deps)
-	if resources, err := provisioner.ProvisionRoot(context.Background(), RootRequest{SessionID: "root-1", SocketPath: "/tmp/root.sock"}); resources != nil || !errors.Is(err, primary) {
+	if resources, err := provisioner.ProvisionRoot(context.Background(), validRootRequest()); resources != nil || !errors.Is(err, primary) {
 		t.Fatalf("ProvisionRoot() = (%v, %v)", resources, err)
 	}
 	calls := strings.Join(client.calls, ",")
@@ -242,7 +277,7 @@ func TestRootProvisionerAwaitsSubmittedCreateBeforeProbingLateInstance(t *testin
 		return nil
 	}
 	provisioner := newRootProvisioner(rootTestConfig(), deps)
-	if resources, err := provisioner.ProvisionRoot(context.Background(), RootRequest{SessionID: "root-1", SocketPath: "/tmp/root.sock"}); resources != nil || !errors.Is(err, primary) {
+	if resources, err := provisioner.ProvisionRoot(context.Background(), validRootRequest()); resources != nil || !errors.Is(err, primary) {
 		t.Fatalf("ProvisionRoot() = (%v, %v)", resources, err)
 	}
 	calls := strings.Join(client.calls, ",")
@@ -268,7 +303,7 @@ func TestRootProvisionerAwaitsSubmittedStartBeforeCleanupProbe(t *testing.T) {
 		return nil
 	}
 	provisioner := newRootProvisioner(rootTestConfig(), deps)
-	if resources, err := provisioner.ProvisionRoot(context.Background(), RootRequest{SessionID: "root-1", SocketPath: "/tmp/root.sock"}); resources != nil || !errors.Is(err, primary) {
+	if resources, err := provisioner.ProvisionRoot(context.Background(), validRootRequest()); resources != nil || !errors.Is(err, primary) {
 		t.Fatalf("ProvisionRoot() = (%v, %v)", resources, err)
 	}
 	calls := strings.Join(client.calls, ",")
@@ -285,7 +320,7 @@ func TestRootProvisionerCleansSubmittedAmbiguityAndJoinsCleanupError(t *testing.
 	deps.operationWasSubmitted = func(err error) bool { return errors.Is(err, primary) }
 	provisioner := newRootProvisioner(rootTestConfig(), deps)
 
-	resources, err := provisioner.ProvisionRoot(context.Background(), RootRequest{SessionID: "root-1", SocketPath: "/tmp/root.sock"})
+	resources, err := provisioner.ProvisionRoot(context.Background(), validRootRequest())
 	if resources != nil || !errors.Is(err, primary) || !errors.Is(err, cleanup) {
 		t.Fatalf("ProvisionRoot() = (%v, %v), want joined primary and cleanup errors", resources, err)
 	}

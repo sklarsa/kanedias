@@ -44,6 +44,7 @@ type DirectChildRecoverer interface {
 type RootRequest struct {
 	SessionID      string
 	SocketPath     string
+	Model          config.ModelProfile
 	RunAttribution string
 }
 

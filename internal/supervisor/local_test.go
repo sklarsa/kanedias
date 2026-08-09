@@ -9,6 +9,7 @@ import (
 	"testing"
 	"time"
 
+	"github.com/sklarsa/kanedias/internal/config"
 	"github.com/sklarsa/kanedias/internal/supervisor/contract"
 	"github.com/sklarsa/kanedias/internal/supervisor/pirpc"
 )
@@ -78,6 +79,36 @@ func TestLocalSessionRejectsEmptyOrChangedPiBinding(t *testing.T) {
 	})
 }
 
+func TestLocalSessionModelBindingMustMatchExpectedProfileBeforeReadiness(t *testing.T) {
+	expected := config.ModelProfile{Provider: "openai-codex", Model: "gpt-5.6-sol", ThinkingLevel: "high"}
+	for _, test := range []struct {
+		name     string
+		provider string
+		model    string
+		thinking string
+	}{
+		{name: "provider mismatch", provider: "anthropic", model: expected.Model, thinking: expected.ThinkingLevel},
+		{name: "model mismatch", provider: expected.Provider, model: "gpt-5.5", thinking: expected.ThinkingLevel},
+		{name: "thinking mismatch", provider: expected.Provider, model: expected.Model, thinking: "medium"},
+	} {
+		t.Run(test.name, func(t *testing.T) {
+			local, peer, _ := newTestLocalSession(t, rootIdentity(t))
+			result := make(chan error, 1)
+			go func() {
+				result <- local.BindExpected(context.Background(), PiExpectation{Model: expected})
+			}()
+			request := readObject(t, peer)
+			writeGetStateModelResponse(t, peer, request.ID, "pi-root", "/sessions/root.jsonl", test.provider, test.model, test.thinking, false)
+			if err := <-result; !errors.Is(err, ErrInvariant) {
+				t.Fatalf("BindExpected() error = %v, want ErrInvariant", err)
+			}
+			if got := local.Snapshot().Lifecycle; got == string(LifecycleReady) {
+				t.Fatal("mismatched model reached ready")
+			}
+		})
+	}
+}
+
 func TestLocalSessionForkBindingMustMatchAdmittedSessionBeforeReadiness(t *testing.T) {
 	for _, test := range []struct {
 		name, sessionID, sessionFile string
@@ -89,7 +120,10 @@ func TestLocalSessionForkBindingMustMatchAdmittedSessionBeforeReadiness(t *testi
 			local, peer, _ := newTestLocalSession(t, writerIdentity(t))
 			result := make(chan error, 1)
 			go func() {
-				result <- local.BindExpected(context.Background(), &PiBinding{SessionID: "expected-pi", SessionFile: "/sessions/fork.jsonl"})
+				result <- local.BindExpected(context.Background(), PiExpectation{
+					Binding: &PiBinding{SessionID: "expected-pi", SessionFile: "/sessions/fork.jsonl"},
+					Model:   config.ModelProfile{Provider: "openai-codex", Model: "gpt-5.6-sol", ThinkingLevel: "high"},
+				})
 			}()
 			request := readObject(t, peer)
 			writeGetStateResponse(t, peer, request.ID, test.sessionID, test.sessionFile, false)
@@ -340,11 +374,16 @@ func callRPCSuccess(t *testing.T, local *LocalSession, peer net.Conn, raw, comma
 
 func writeGetStateResponse(t *testing.T, peer net.Conn, id, sessionID, sessionFile string, streaming bool) {
 	t.Helper()
+	writeGetStateModelResponse(t, peer, id, sessionID, sessionFile, "openai-codex", "gpt-5.6-sol", "high", streaming)
+}
+
+func writeGetStateModelResponse(t *testing.T, peer net.Conn, id, sessionID, sessionFile, provider, model, thinking string, streaming bool) {
+	t.Helper()
 	encoded, err := json.Marshal(map[string]any{
 		"id": id, "type": "response", "command": "get_state", "success": true,
 		"data": map[string]any{
-			"model":         map[string]any{"provider": "openai-codex", "id": "gpt-5.6-sol"},
-			"thinkingLevel": "high", "isStreaming": streaming,
+			"model":         map[string]any{"provider": provider, "id": model},
+			"thinkingLevel": thinking, "isStreaming": streaming,
 			"sessionId": sessionID, "sessionFile": sessionFile,
 		},
 	})

@@ -102,6 +102,9 @@ func defaultRootDependencies() rootDependencies {
 }
 
 func (provisioner *IncusRootProvisioner) ProvisionRoot(ctx context.Context, request RootRequest) (_ *Resources, err error) {
+	if err := validateRootModel(request.Model); err != nil {
+		return nil, contract.NewError(contract.ErrorInvalidRequest, err.Error())
+	}
 	if err := provisioner.config.ValidateLifecycle(); err != nil {
 		return nil, err
 	}
@@ -235,9 +238,9 @@ func (provisioner *IncusRootProvisioner) ProvisionRoot(ctx context.Context, requ
 				"environment.KANEDIAS_SESSION_ID":        request.SessionID,
 				"environment.KANEDIAS_SESSION_KIND":      string(contract.ChildKindRoot),
 				"environment.KANEDIAS_WORKER_TYPE":       "",
-				"environment.KANEDIAS_PI_PROVIDER":       "",
-				"environment.KANEDIAS_PI_MODEL":          "",
-				"environment.KANEDIAS_PI_THINKING":       "",
+				"environment.KANEDIAS_PI_PROVIDER":       request.Model.Provider,
+				"environment.KANEDIAS_PI_MODEL":          request.Model.Model,
+				"environment.KANEDIAS_PI_THINKING":       request.Model.ThinkingLevel,
 				"environment.KANEDIAS_PI_SESSION_FILE":   "",
 				"environment.KANEDIAS_SUPERVISOR_SOCKET": guestSupervisorSocket,
 			},
@@ -386,6 +389,18 @@ func rootGlobalIPv4(state *api.InstanceState) string {
 		}
 	}
 	return ""
+}
+
+func validateRootModel(model config.ModelProfile) error {
+	if strings.TrimSpace(model.Provider) == "" || strings.TrimSpace(model.Model) == "" {
+		return fmt.Errorf("root Pi provider and model are required")
+	}
+	switch model.ThinkingLevel {
+	case "off", "minimal", "low", "medium", "high", "xhigh", "max":
+		return nil
+	default:
+		return fmt.Errorf("root Pi thinking level %q is invalid", model.ThinkingLevel)
+	}
 }
 
 func checkRootProxy(ctx context.Context, cfg config.Config) error {

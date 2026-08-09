@@ -31,15 +31,14 @@ import (
 
 const orderingHelperEnv = "KANEDIAS_ORDERING_HELPER"
 
-type orderingWorkers struct{}
-
-func (orderingWorkers) Resolve(name string) (config.WorkerProfile, error) {
-	if name != "worker" {
-		return config.WorkerProfile{}, contract.NewError(contract.ErrorUnknownWorkerType, "unknown worker")
+func orderingModelPolicy() config.SessionModelPolicy {
+	return config.SessionModelPolicy{
+		Root: config.ModelProfile{Provider: "test", Model: "test-model", ThinkingLevel: "off"},
+		Workers: map[string]config.WorkerProfile{
+			"worker": {Description: "Write code", Provider: "test", Model: "test-model", ThinkingLevel: "off"},
+		},
 	}
-	return config.WorkerProfile{Description: "Write code", Provider: "test", Model: "test-model"}, nil
 }
-func (orderingWorkers) Summaries() []contract.WorkerSummary { return nil }
 
 type orderingRootProvisioner struct{}
 
@@ -111,7 +110,7 @@ func TestIntegratedHandoffOrderingThroughSpawnerReportPipeAndHTTPFlush(t *testin
 	node, err := supervisor.NewRoot(identity, supervisor.Dependencies{
 		Provisioner: orderingRootProvisioner{},
 		DialRPC:     func(context.Context, string) (io.ReadWriteCloser, error) { return clientConn, nil },
-		Workers:     orderingWorkers{}, SocketPath: rootSocket,
+		ModelPolicy: orderingModelPolicy(), SocketPath: rootSocket,
 		SpawnChild: func(ctx context.Context, bootstrap process.Bootstrap) (supervisor.ChildProcess, error) {
 			child, err := spawner.Spawn(ctx, bootstrap)
 			if err != nil {
@@ -257,7 +256,7 @@ func TestUnexpectedCleanDescendantSSEEOFFailsAndCleansOwnedChild(t *testing.T) {
 	node, err := supervisor.NewRoot(identity, supervisor.Dependencies{
 		Provisioner: orderingRootProvisioner{},
 		DialRPC:     func(context.Context, string) (io.ReadWriteCloser, error) { return clientConn, nil },
-		Workers:     orderingWorkers{}, SocketPath: rootSocket,
+		ModelPolicy: orderingModelPolicy(), SocketPath: rootSocket,
 		SpawnChild: func(ctx context.Context, bootstrap process.Bootstrap) (supervisor.ChildProcess, error) {
 			return spawner.Spawn(ctx, bootstrap)
 		},
@@ -318,7 +317,10 @@ func startOrderingPiPeer(peer net.Conn) <-chan struct{} {
 			}
 			response := map[string]any{"id": command.ID, "type": "response", "command": command.Type, "success": true}
 			if command.Type == "get_state" {
-				response["data"] = map[string]any{"sessionId": "pi-root-order", "sessionFile": "/tmp/root-order.jsonl", "isStreaming": false}
+				response["data"] = map[string]any{
+					"sessionId": "pi-root-order", "sessionFile": "/tmp/root-order.jsonl", "isStreaming": false,
+					"model": map[string]any{"provider": "test", "id": "test-model"}, "thinkingLevel": "off",
+				}
 			}
 			wire, _ := json.Marshal(response)
 			if _, err := peer.Write(append(wire, '\n')); err != nil {

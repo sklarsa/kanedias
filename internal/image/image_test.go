@@ -384,7 +384,9 @@ func TestPiRPCLauncherBuildsFreshAndForkArgumentsWithoutEval(t *testing.T) {
 		env  []string
 		want []string
 	}{
-		{name: "root fresh", env: []string{"KANEDIAS_SESSION_ID=root-1", "KANEDIAS_SESSION_KIND=root"}, want: []string{"--mode", "rpc", "-e", "/opt/kanedias/pi-extension/src/index.ts"}},
+		{name: "root fresh", env: []string{"KANEDIAS_SESSION_ID=root-1", "KANEDIAS_SESSION_KIND=root", "KANEDIAS_PI_PROVIDER=openai-codex", "KANEDIAS_PI_MODEL=gpt-5.6-sol", "KANEDIAS_PI_THINKING=high"}, want: []string{"--mode", "rpc", "-e", "/opt/kanedias/pi-extension/src/index.ts", "--provider", "openai-codex", "--model", "gpt-5.6-sol", "--thinking", "high"}},
+		{name: "root off thinking", env: []string{"KANEDIAS_SESSION_ID=root-2", "KANEDIAS_SESSION_KIND=root", "KANEDIAS_PI_PROVIDER=local-executor", "KANEDIAS_PI_MODEL=Qwen3.6-27B-GGUF", "KANEDIAS_PI_THINKING=off"}, want: []string{"--mode", "rpc", "-e", "/opt/kanedias/pi-extension/src/index.ts", "--provider", "local-executor", "--model", "Qwen3.6-27B-GGUF", "--thinking", "off"}},
+		{name: "root empty optional thinking", env: []string{"KANEDIAS_SESSION_ID=root-3", "KANEDIAS_SESSION_KIND=root", "KANEDIAS_PI_PROVIDER=provider", "KANEDIAS_PI_MODEL=model"}, want: []string{"--mode", "rpc", "-e", "/opt/kanedias/pi-extension/src/index.ts", "--provider", "provider", "--model", "model"}},
 		{name: "child fresh", env: []string{"KANEDIAS_SESSION_ID=child-1", "KANEDIAS_SESSION_KIND=read", "KANEDIAS_PI_PROVIDER=provider", "KANEDIAS_PI_MODEL=model", "KANEDIAS_PI_THINKING=high"}, want: []string{"--mode", "rpc", "-e", "/opt/kanedias/pi-extension/src/index.ts", "--provider", "provider", "--model", "model", "--thinking", "high"}},
 		{name: "child fork", env: []string{"KANEDIAS_SESSION_ID=child-2", "KANEDIAS_SESSION_KIND=read", "KANEDIAS_PI_SESSION_FILE=/sessions/branch.jsonl", "KANEDIAS_PI_PROVIDER=provider", "KANEDIAS_PI_MODEL=model", "KANEDIAS_PI_THINKING=xhigh"}, want: []string{"--mode", "rpc", "--session", "/sessions/branch.jsonl", "-e", "/opt/kanedias/pi-extension/src/index.ts", "--provider", "provider", "--model", "model", "--thinking", "xhigh"}},
 	}
@@ -399,6 +401,41 @@ func TestPiRPCLauncherBuildsFreshAndForkArgumentsWithoutEval(t *testing.T) {
 			got := strings.Fields(string(output))
 			if !reflect.DeepEqual(got, tt.want) {
 				t.Fatalf("args = %#v, want %#v", got, tt.want)
+			}
+		})
+	}
+}
+
+func TestPiRPCLauncherRejectsMissingRootModelAndInvalidThinking(t *testing.T) {
+	dir := t.TempDir()
+	launcher := strings.Replace(string(piRPCLauncher), `source "$NVM_DIR/nvm.sh"`, ":", 1)
+	launcherPath := filepath.Join(dir, "launcher")
+	if err := os.WriteFile(launcherPath, []byte(launcher), 0o700); err != nil {
+		t.Fatal(err)
+	}
+	marker := filepath.Join(dir, "pi-invoked")
+	if err := os.WriteFile(filepath.Join(dir, "pi"), []byte("#!/bin/sh\ntouch \"$PI_INVOKED_MARKER\"\n"), 0o700); err != nil {
+		t.Fatal(err)
+	}
+	for _, test := range []struct {
+		name string
+		env  []string
+	}{
+		{name: "missing provider", env: []string{"KANEDIAS_PI_MODEL=gpt-5.6-sol", "KANEDIAS_PI_THINKING=high"}},
+		{name: "missing model", env: []string{"KANEDIAS_PI_PROVIDER=openai-codex", "KANEDIAS_PI_THINKING=high"}},
+		{name: "invalid thinking", env: []string{"KANEDIAS_PI_PROVIDER=openai-codex", "KANEDIAS_PI_MODEL=gpt-5.6-sol", "KANEDIAS_PI_THINKING=extreme"}},
+	} {
+		t.Run(test.name, func(t *testing.T) {
+			_ = os.Remove(marker)
+			command := exec.Command(launcherPath)
+			command.Env = append([]string{
+				"PATH=" + dir + ":/usr/bin:/bin", "KANEDIAS_SESSION_ID=root-1", "KANEDIAS_SESSION_KIND=root", "PI_INVOKED_MARKER=" + marker,
+			}, test.env...)
+			if output, err := command.CombinedOutput(); err == nil {
+				t.Fatalf("launcher succeeded; output: %s", output)
+			}
+			if _, err := os.Stat(marker); !errors.Is(err, os.ErrNotExist) {
+				t.Fatalf("Pi invocation marker stat error = %v, want not exist", err)
 			}
 		})
 	}

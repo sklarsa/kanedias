@@ -70,7 +70,7 @@ func TestStopWhileWriterAwaitsHandoffCleansProcessResourcesAndSocket(t *testing.
 	node, err := NewChild(identity, Dependencies{
 		Provisioner: provisioner,
 		DialRPC:     func(context.Context, string) (io.ReadWriteCloser, error) { return tracked, nil },
-		Workers:     fakeWorkers{}, SocketPath: socket,
+		ModelPolicy: testModelPolicy(), SocketPath: socket,
 		CloseListener:   func(context.Context) error { listenerClosed.Store(true); return listener.Close() },
 		ReportWrite:     func(contract.WriteChildResult) error { return nil },
 		HandoffVerifier: allowAllHandoffs,
@@ -96,7 +96,10 @@ func TestStopWhileWriterAwaitsHandoffCleansProcessResourcesAndSocket(t *testing.
 			}
 			response := map[string]any{"id": command.ID, "type": "response", "command": command.Type, "success": true}
 			if command.Type == "get_state" {
-				response["data"] = map[string]any{"sessionId": "pi-writer", "sessionFile": "/tmp/writer.jsonl", "isStreaming": false}
+				response["data"] = map[string]any{
+					"sessionId": "pi-writer", "sessionFile": "/tmp/writer.jsonl", "isStreaming": false,
+					"model": map[string]any{"provider": "openai-codex", "id": "gpt-5.6-sol"}, "thinkingLevel": "high",
+				}
 			}
 			wire, _ := json.Marshal(response)
 			_, _ = peer.Write(append(wire, '\n'))
@@ -195,7 +198,7 @@ func TestAcceptedHandoffWatchdogForcesCleanupWhenPiDoesNotEOF(t *testing.T) {
 	node, err := NewChild(identity, Dependencies{
 		Provisioner: provisioner,
 		DialRPC:     func(context.Context, string) (io.ReadWriteCloser, error) { return tracked, nil },
-		Workers:     fakeWorkers{}, SocketPath: socket,
+		ModelPolicy: testModelPolicy(), SocketPath: socket,
 		CloseListener:          func(context.Context) error { listenerClosed.Store(true); return listener.Close() },
 		ReportWrite:            func(contract.WriteChildResult) error { return nil },
 		HandoffVerifier:        allowAllHandoffs,

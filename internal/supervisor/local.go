@@ -63,13 +63,21 @@ func NewLocalSession(identity Identity, rpc *pirpc.Client, events *EventBroker) 
 }
 
 func (session *LocalSession) Bind(ctx context.Context) error {
-	return session.BindExpected(ctx, nil)
+	return session.bind(ctx, nil)
 }
 
-// BindExpected admits the first persisted Pi binding. Fork children require an
-// exact match with the branch prepared by their parent; roots and fresh children
-// pass nil and accept any first nonempty persisted binding.
-func (session *LocalSession) BindExpected(ctx context.Context, expected *PiBinding) error {
+// BindExpected admits the first persisted Pi binding and requires Pi's effective
+// provider, model, and thinking level to exactly match the selected profile.
+// Fork children additionally require the branch identity and file prepared by
+// their parent.
+func (session *LocalSession) BindExpected(ctx context.Context, expected PiExpectation) error {
+	if err := validateExpectedModel(expected.Model); err != nil {
+		return err
+	}
+	return session.bind(ctx, &expected)
+}
+
+func (session *LocalSession) bind(ctx context.Context, expected *PiExpectation) error {
 	session.bindMu.Lock()
 	defer session.bindMu.Unlock()
 
@@ -91,16 +99,19 @@ func (session *LocalSession) BindExpected(ctx context.Context, expected *PiBindi
 	if err := validatePiBinding(state.Data.SessionID, state.Data.SessionFile); err != nil {
 		return err
 	}
-	if expected != nil {
-		if state.Data.SessionID != expected.SessionID {
-			return invariantf("fork Pi session ID %q does not match admitted session ID %q", state.Data.SessionID, expected.SessionID)
+	if expected != nil && expected.Binding != nil {
+		if state.Data.SessionID != expected.Binding.SessionID {
+			return invariantf("fork Pi session ID %q does not match admitted session ID %q", state.Data.SessionID, expected.Binding.SessionID)
 		}
-		if state.Data.SessionFile != expected.SessionFile {
-			return invariantf("fork Pi session file %q does not match admitted session file %q", state.Data.SessionFile, expected.SessionFile)
+		if state.Data.SessionFile != expected.Binding.SessionFile {
+			return invariantf("fork Pi session file %q does not match admitted session file %q", state.Data.SessionFile, expected.Binding.SessionFile)
 		}
 	}
 
 	model := modelFromGetState(state.Data)
+	if expected != nil && model != expected.Model {
+		return invariantf("effective Pi model %#v does not match selected model %#v", model, expected.Model)
+	}
 	session.mu.Lock()
 	session.binding = PiBinding{SessionID: state.Data.SessionID, SessionFile: state.Data.SessionFile}
 	session.model = model
