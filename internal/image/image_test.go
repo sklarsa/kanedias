@@ -444,6 +444,79 @@ func TestLoadBuildScriptsRejectsExecutableSymlink(t *testing.T) {
 	}
 }
 
+func TestLoadBuildScriptsRejectsSymlinkReplacementAfterDiscovery(t *testing.T) {
+	cfg := imageConfigWithBuildScripts(t, nil)
+	const name = "10-script.sh"
+	writeBuildScript(t, cfg.BuildScriptsPath(), name, "#!/bin/sh\necho safe\n", 0o700)
+
+	directory, err := os.Open(cfg.BuildScriptsPath())
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer directory.Close()
+	entries, err := directory.ReadDir(-1)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(entries) != 1 {
+		t.Fatalf("entries = %d, want 1", len(entries))
+	}
+	discoveredInfo, err := entries[0].Info()
+	if err != nil {
+		t.Fatal(err)
+	}
+	entries = []os.DirEntry{fixedDirEntry{info: discoveredInfo}}
+
+	outside := filepath.Join(t.TempDir(), "outside.sh")
+	if err := os.WriteFile(outside, []byte("#!/bin/sh\necho outside\n"), 0o700); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.Remove(filepath.Join(cfg.BuildScriptsPath(), name)); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.Symlink(outside, filepath.Join(cfg.BuildScriptsPath(), name)); err != nil {
+		t.Fatal(err)
+	}
+
+	_, err = loadBuildScriptsFromEntries(directory, entries)
+	if err == nil || !strings.Contains(err.Error(), name) || !strings.Contains(err.Error(), "regular file") {
+		t.Fatalf("loadBuildScriptsFromEntries() error = %v, want named regular file error", err)
+	}
+}
+
+func TestLoadBuildScriptsSkipsNonExecutableReplacementAfterDiscovery(t *testing.T) {
+	cfg := imageConfigWithBuildScripts(t, nil)
+	const name = "10-script.sh"
+	writeBuildScript(t, cfg.BuildScriptsPath(), name, "#!/bin/sh\necho executable\n", 0o700)
+
+	directory, err := os.Open(cfg.BuildScriptsPath())
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer directory.Close()
+	entries, err := directory.ReadDir(-1)
+	if err != nil {
+		t.Fatal(err)
+	}
+	discoveredInfo, err := entries[0].Info()
+	if err != nil {
+		t.Fatal(err)
+	}
+	entries = []os.DirEntry{fixedDirEntry{info: discoveredInfo}}
+
+	if err := os.Remove(filepath.Join(cfg.BuildScriptsPath(), name)); err != nil {
+		t.Fatal(err)
+	}
+	writeBuildScript(t, cfg.BuildScriptsPath(), name, "#!/bin/sh\necho replacement\n", 0o600)
+	got, err := loadBuildScriptsFromEntries(directory, entries)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(got) != 0 {
+		t.Fatalf("loadBuildScriptsFromEntries() = %#v, want no scripts", got)
+	}
+}
+
 func TestCreateReadsBuildScriptsBeforeConnecting(t *testing.T) {
 	tests := []struct {
 		name  string
@@ -946,6 +1019,15 @@ type cleanupContextObservation struct {
 }
 
 var errDeleteRunningInstance = errors.New("cannot delete running instance")
+
+type fixedDirEntry struct {
+	info os.FileInfo
+}
+
+func (entry fixedDirEntry) Name() string               { return entry.info.Name() }
+func (entry fixedDirEntry) IsDir() bool                { return entry.info.IsDir() }
+func (entry fixedDirEntry) Type() os.FileMode          { return entry.info.Mode().Type() }
+func (entry fixedDirEntry) Info() (os.FileInfo, error) { return entry.info, nil }
 
 type uploadedFile struct {
 	content []byte

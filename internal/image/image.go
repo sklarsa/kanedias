@@ -8,7 +8,6 @@ import (
 	"fmt"
 	"io"
 	"os"
-	"path/filepath"
 	"sort"
 	"strings"
 	"time"
@@ -18,6 +17,7 @@ import (
 	"github.com/sklarsa/kanedias/internal/incusclient"
 	"github.com/sklarsa/kanedias/internal/network"
 	"github.com/sklarsa/kanedias/internal/profiles"
+	"golang.org/x/sys/unix"
 )
 
 const cleanupTimeout = 30 * time.Second
@@ -145,32 +145,63 @@ func loadBuildScripts(cfg config.Config) ([]buildScript, error) {
 	if path == "" {
 		return nil, nil
 	}
-	entries, err := os.ReadDir(path)
+	directory, err := os.Open(path)
 	if err != nil {
 		return nil, fmt.Errorf("read image build scripts %q: %w", path, err)
 	}
+	defer directory.Close()
+	entries, err := directory.ReadDir(-1)
+	if err != nil {
+		return nil, fmt.Errorf("read image build scripts %q: %w", path, err)
+	}
+	return loadBuildScriptsFromEntries(directory, entries)
+}
 
+func loadBuildScriptsFromEntries(directory *os.File, entries []os.DirEntry) ([]buildScript, error) {
 	var scripts []buildScript
 	for _, entry := range entries {
 		name := entry.Name()
 		if !strings.HasSuffix(name, ".sh") {
 			continue
 		}
-		info, err := entry.Info()
+
+		fd, err := unix.Openat(
+			int(directory.Fd()),
+			name,
+			unix.O_RDONLY|unix.O_CLOEXEC|unix.O_NOFOLLOW|unix.O_NONBLOCK|unix.O_NOCTTY,
+			0,
+		)
 		if err != nil {
-			return nil, fmt.Errorf("inspect image build script %q: %w", name, err)
-		}
-		if info.Mode().Perm()&0o111 == 0 {
-			continue
-		}
-		if !info.Mode().IsRegular() {
-			return nil, fmt.Errorf("image build script %q must be a regular file", name)
-		}
-		content, err := os.ReadFile(filepath.Join(path, name))
-		if err != nil {
+			if errors.Is(err, unix.ELOOP) {
+				return nil, fmt.Errorf("image build script %q must be a regular file", name)
+			}
 			return nil, fmt.Errorf("read image build script %q: %w", name, err)
 		}
-		scripts = append(scripts, buildScript{name: name, content: content})
+		file := os.NewFile(uintptr(fd), name)
+		content, executable, err := func() ([]byte, bool, error) {
+			defer file.Close()
+			info, err := file.Stat()
+			if err != nil {
+				return nil, false, fmt.Errorf("inspect image build script %q: %w", name, err)
+			}
+			if !info.Mode().IsRegular() {
+				return nil, false, fmt.Errorf("image build script %q must be a regular file", name)
+			}
+			if info.Mode().Perm()&0o111 == 0 {
+				return nil, false, nil
+			}
+			content, err := io.ReadAll(file)
+			if err != nil {
+				return nil, false, fmt.Errorf("read image build script %q: %w", name, err)
+			}
+			return content, true, nil
+		}()
+		if err != nil {
+			return nil, err
+		}
+		if executable {
+			scripts = append(scripts, buildScript{name: name, content: content})
+		}
 	}
 	sort.Slice(scripts, func(i, j int) bool {
 		return scripts[i].name < scripts[j].name
