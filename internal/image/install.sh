@@ -491,6 +491,8 @@ EOF
         "$managed_home/.pi/agent" "$managed_home/.pi/agent/themes"
     install -m 0644 -o "$managed_user" -g "$managed_user" \
         "$pi_settings_file" "$managed_home/.pi/agent/settings.json"
+    printf '%s\n' '{"enabled":true}' | install -D -m 0644 -o "$managed_user" -g "$managed_user" \
+        /dev/stdin "$managed_home/.pi/agent/extensions/openai-fast.json"
     install -m 0600 -o "$managed_user" -g "$managed_user" \
         "$pi_auth_file" "$managed_home/.pi/agent/auth.json"
     install -m 0644 -o "$managed_user" -g "$managed_user" \
