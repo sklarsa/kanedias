@@ -29,6 +29,9 @@ var piRPCSocket []byte
 //go:embed kanedias-pi@.service
 var piRPCService []byte
 
+//go:embed kanedias-pi-env
+var piEnvironmentBridge []byte
+
 //go:embed kanedias-pi-rpc
 var piRPCLauncher []byte
 
@@ -205,6 +208,7 @@ func createWithClient(ctx context.Context, client imageClient, cfg config.Config
 		{path: "/root/assets/tmux.conf", content: inputs.tmuxConfig, mode: 0o644},
 		{path: "/root/assets/kanedias-pi.socket", content: piRPCSocket, mode: 0o644},
 		{path: "/root/assets/kanedias-pi@.service", content: piRPCService, mode: 0o644},
+		{path: "/root/assets/kanedias-pi-env", content: piEnvironmentBridge, mode: 0o700},
 		{path: "/root/assets/kanedias-pi-rpc", content: piRPCLauncher, mode: 0o700},
 	}
 	for _, file := range files {

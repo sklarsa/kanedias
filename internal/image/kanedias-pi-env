@@ -1,0 +1,84 @@
+#!/usr/bin/env bash
+set -Eeuo pipefail
+
+source_path=${1:-/proc/1/environ}
+destination=${2:-/run/kanedias/pi.env}
+
+allowlist=(
+    HTTP_PROXY
+    HTTPS_PROXY
+    http_proxy
+    https_proxy
+    GH_TOKEN
+    NO_PROXY
+    no_proxy
+    NODE_EXTRA_CA_CERTS
+    SSL_CERT_FILE
+    KANEDIAS_SESSION_ID
+    KANEDIAS_SESSION_KIND
+    KANEDIAS_WORKER_TYPE
+    KANEDIAS_PI_PROVIDER
+    KANEDIAS_PI_MODEL
+    KANEDIAS_PI_THINKING
+    KANEDIAS_PI_SESSION_FILE
+    KANEDIAS_SUPERVISOR_SOCKET
+    KANEDIAS_E2E_RUN_ID
+)
+required=(
+    KANEDIAS_SESSION_ID
+    KANEDIAS_SESSION_KIND
+    KANEDIAS_SUPERVISOR_SOCKET
+    HTTP_PROXY
+    HTTPS_PROXY
+    GH_TOKEN
+    SSL_CERT_FILE
+    NODE_EXTRA_CA_CERTS
+)
+
+declare -A allowed=()
+declare -A present=()
+declare -A values=()
+for name in "${allowlist[@]}"; do
+    allowed["$name"]=1
+done
+
+while IFS= read -r -d '' entry; do
+    if [[ $entry != *=* ]]; then
+        continue
+    fi
+    name=${entry%%=*}
+    if [[ ${allowed[$name]:-} != 1 ]]; then
+        continue
+    fi
+    value=${entry#*=}
+    if [[ $value == *$'\n'* || $value == *$'\r'* ]]; then
+        printf 'environment value for %s contains a newline\n' "$name" >&2
+        exit 1
+    fi
+    present["$name"]=1
+    values["$name"]=$value
+done < "$source_path"
+
+for name in "${required[@]}"; do
+    if [[ ${present[$name]:-} != 1 || -z ${values[$name]} ]]; then
+        printf 'required environment value %s is missing or empty\n' "$name" >&2
+        exit 1
+    fi
+done
+
+destination_dir=$(dirname -- "$destination")
+temporary=$(mktemp "$destination_dir/.pi.env.XXXXXX")
+trap 'rm -f -- "$temporary"' EXIT
+chmod 0600 "$temporary"
+
+for name in "${allowlist[@]}"; do
+    if [[ ${present[$name]:-} != 1 ]]; then
+        continue
+    fi
+    value=${values[$name]//\\/\\\\}
+    value=${value//\"/\\\"}
+    printf '%s="%s"\n' "$name" "$value" >> "$temporary"
+done
+
+mv -f -- "$temporary" "$destination"
+trap - EXIT
