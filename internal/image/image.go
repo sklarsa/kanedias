@@ -8,6 +8,8 @@ import (
 	"fmt"
 	"io"
 	"os"
+	"path/filepath"
+	"sort"
 	"strings"
 	"time"
 
@@ -67,13 +69,17 @@ type imageClient interface {
 
 type connector func(context.Context) (imageClient, error)
 
+type buildScript struct {
+	name    string
+	content []byte
+}
+
 type buildInputs struct {
 	piSettings []byte
 	piAuth     []byte
 	piModels   []byte
-	piTheme    []byte
-	tmuxConfig []byte
 	profile    []byte
+	scripts    []buildScript
 }
 
 // Create builds and publishes the configured base image through Incus.
@@ -111,8 +117,6 @@ func loadBuildInputs(cfg config.Config) (buildInputs, error) {
 		{name: "pi-settings.json", destination: &inputs.piSettings},
 		{name: "pi-auth.json", destination: &inputs.piAuth},
 		{name: "pi-models.json", destination: &inputs.piModels},
-		{name: "cobalt-ember.json", destination: &inputs.piTheme},
-		{name: "tmux.conf", destination: &inputs.tmuxConfig},
 	}
 	for _, asset := range assets {
 		contents, err := os.ReadFile(cfg.AssetPath(asset.name))
@@ -127,7 +131,51 @@ func loadBuildInputs(cfg config.Config) (buildInputs, error) {
 		return buildInputs{}, fmt.Errorf("render image-build profile: %w", err)
 	}
 	inputs.profile = profile.Bytes()
+
+	scripts, err := loadBuildScripts(cfg)
+	if err != nil {
+		return buildInputs{}, err
+	}
+	inputs.scripts = scripts
 	return inputs, nil
+}
+
+func loadBuildScripts(cfg config.Config) ([]buildScript, error) {
+	path := cfg.BuildScriptsPath()
+	if path == "" {
+		return nil, nil
+	}
+	entries, err := os.ReadDir(path)
+	if err != nil {
+		return nil, fmt.Errorf("read image build scripts %q: %w", path, err)
+	}
+
+	var scripts []buildScript
+	for _, entry := range entries {
+		name := entry.Name()
+		if !strings.HasSuffix(name, ".sh") {
+			continue
+		}
+		info, err := entry.Info()
+		if err != nil {
+			return nil, fmt.Errorf("inspect image build script %q: %w", name, err)
+		}
+		if info.Mode().Perm()&0o111 == 0 {
+			continue
+		}
+		if !info.Mode().IsRegular() {
+			return nil, fmt.Errorf("image build script %q must be a regular file", name)
+		}
+		content, err := os.ReadFile(filepath.Join(path, name))
+		if err != nil {
+			return nil, fmt.Errorf("read image build script %q: %w", name, err)
+		}
+		scripts = append(scripts, buildScript{name: name, content: content})
+	}
+	sort.Slice(scripts, func(i, j int) bool {
+		return scripts[i].name < scripts[j].name
+	})
+	return scripts, nil
 }
 
 func createWithClient(ctx context.Context, client imageClient, cfg config.Config, inputs buildInputs, stdout, stderr io.Writer) (err error) {
@@ -204,8 +252,6 @@ func createWithClient(ctx context.Context, client imageClient, cfg config.Config
 		{path: "/root/assets/pi-settings.json", content: inputs.piSettings, mode: 0o644},
 		{path: "/root/assets/pi-auth.json", content: inputs.piAuth, mode: 0o600},
 		{path: "/root/assets/pi-models.json", content: inputs.piModels, mode: 0o644},
-		{path: "/root/assets/cobalt-ember.json", content: inputs.piTheme, mode: 0o644},
-		{path: "/root/assets/tmux.conf", content: inputs.tmuxConfig, mode: 0o644},
 		{path: "/root/assets/kanedias-pi.socket", content: piRPCSocket, mode: 0o644},
 		{path: "/root/assets/kanedias-pi@.service", content: piRPCService, mode: 0o644},
 		{path: "/root/assets/kanedias-pi-env", content: piEnvironmentBridge, mode: 0o700},
@@ -244,6 +290,29 @@ func createWithClient(ctx context.Context, client imageClient, cfg config.Config
 		Command: []string{"test", "-d", "/opt/kanedias/pi-extension/node_modules/typebox"},
 	}); err != nil {
 		return fmt.Errorf("verify Pi extension production dependencies: %w", err)
+	}
+
+	if len(inputs.scripts) > 0 {
+		if _, _, err := client.Exec(ctx, instanceName, incusclient.ExecRequest{
+			Command: []string{"install", "-d", "-m", "0700", "/root/build-scripts"},
+		}); err != nil {
+			return fmt.Errorf("create image build script directory: %w", err)
+		}
+		for _, script := range inputs.scripts {
+			destination := "/root/build-scripts/" + script.name
+			if err := client.PushFile(ctx, instanceName, destination, script.content, 0o700); err != nil {
+				return fmt.Errorf("upload image build script %q: %w", script.name, err)
+			}
+		}
+		for _, script := range inputs.scripts {
+			_, _ = fmt.Fprintf(stdout, "Running image build script %s...\n", script.name)
+			path := "/root/build-scripts/" + script.name
+			if _, _, err := client.Exec(ctx, instanceName, incusclient.ExecRequest{
+				Command: []string{path}, Stdout: stdout, Stderr: stderr,
+			}); err != nil {
+				return fmt.Errorf("run image build script %q: %w", script.name, err)
+			}
+		}
 	}
 
 	_, _ = fmt.Fprintf(stdout, "Stopping temporary instance %s...\n", instanceName)

@@ -404,8 +404,109 @@ func TestPiRPCLauncherRequiresSessionIDBeforeInvokingPi(t *testing.T) {
 	}
 }
 
+func TestLoadBuildScriptsFiltersAndSorts(t *testing.T) {
+	cfg := imageConfigWithBuildScripts(t, nil)
+	writeBuildScript(t, cfg.BuildScriptsPath(), "20-second.sh", "#!/bin/sh\necho second\n", 0o700)
+	writeBuildScript(t, cfg.BuildScriptsPath(), "10-first.sh", "#!/bin/sh\necho first\n", 0o700)
+	writeBuildScript(t, cfg.BuildScriptsPath(), "ignored.sh", "#!/bin/sh\necho ignored\n", 0o600)
+	writeBuildScript(t, cfg.BuildScriptsPath(), "ignored.txt", "ignored\n", 0o700)
+	if err := os.Mkdir(filepath.Join(cfg.BuildScriptsPath(), "nested"), 0o700); err != nil {
+		t.Fatal(err)
+	}
+	writeBuildScript(t, filepath.Join(cfg.BuildScriptsPath(), "nested"), "05-nested.sh", "#!/bin/sh\necho nested\n", 0o700)
+
+	got, err := loadBuildScripts(cfg)
+	if err != nil {
+		t.Fatal(err)
+	}
+	want := []buildScript{
+		{name: "10-first.sh", content: []byte("#!/bin/sh\necho first\n")},
+		{name: "20-second.sh", content: []byte("#!/bin/sh\necho second\n")},
+	}
+	if !reflect.DeepEqual(got, want) {
+		t.Fatalf("loadBuildScripts() = %#v, want %#v", got, want)
+	}
+}
+
+func TestLoadBuildScriptsRejectsExecutableSymlink(t *testing.T) {
+	cfg := imageConfigWithBuildScripts(t, nil)
+	target := filepath.Join(t.TempDir(), "target.sh")
+	if err := os.WriteFile(target, []byte("#!/bin/sh\n"), 0o700); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.Symlink(target, filepath.Join(cfg.BuildScriptsPath(), "linked.sh")); err != nil {
+		t.Fatal(err)
+	}
+
+	_, err := loadBuildScripts(cfg)
+	if err == nil || !strings.Contains(err.Error(), "linked.sh") || !strings.Contains(err.Error(), "regular file") {
+		t.Fatalf("loadBuildScripts() error = %v, want linked.sh regular file error", err)
+	}
+}
+
+func TestCreateReadsBuildScriptsBeforeConnecting(t *testing.T) {
+	tests := []struct {
+		name  string
+		setup func(*testing.T, config.Config)
+	}{
+		{
+			name: "missing",
+			setup: func(t *testing.T, cfg config.Config) {
+				if err := os.Remove(cfg.BuildScriptsPath()); err != nil {
+					t.Fatal(err)
+				}
+			},
+		},
+		{
+			name: "unreadable",
+			setup: func(t *testing.T, cfg config.Config) {
+				if err := os.Chmod(cfg.BuildScriptsPath(), 0o000); err != nil {
+					t.Fatal(err)
+				}
+				t.Cleanup(func() {
+					if err := os.Chmod(cfg.BuildScriptsPath(), 0o700); err != nil {
+						t.Errorf("restore build script directory permissions: %v", err)
+					}
+				})
+			},
+		},
+		{
+			name: "regular file",
+			setup: func(t *testing.T, cfg config.Config) {
+				if err := os.Remove(cfg.BuildScriptsPath()); err != nil {
+					t.Fatal(err)
+				}
+				if err := os.WriteFile(cfg.BuildScriptsPath(), []byte("not a directory"), 0o600); err != nil {
+					t.Fatal(err)
+				}
+			},
+		},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			cfg := imageConfigWithBuildScripts(t, nil)
+			tt.setup(t, cfg)
+			connected := false
+
+			err := create(context.Background(), cfg, io.Discard, io.Discard, func(context.Context) (imageClient, error) {
+				connected = true
+				return &recordingClient{}, nil
+			})
+			if err == nil || !strings.Contains(err.Error(), "read image build scripts") {
+				t.Fatalf("create() error = %v, want read image build scripts error", err)
+			}
+			if connected {
+				t.Fatal("connected to Incus before image build scripts were read")
+			}
+		})
+	}
+}
+
 func TestCreateRunsImageWorkflowInOrder(t *testing.T) {
-	cfg := imageConfig(t, []string{"github.com", "gitlab.com"})
+	cfg := imageConfigWithBuildScripts(t, []string{"github.com", "gitlab.com"})
+	writeBuildScript(t, cfg.BuildScriptsPath(), "20-second.sh", "#!/bin/sh\necho second\n", 0o700)
+	writeBuildScript(t, cfg.BuildScriptsPath(), "10-first.sh", "#!/bin/sh\necho first\n", 0o700)
 	client := &recordingClient{files: make(map[string]uploadedFile)}
 
 	var stdout bytes.Buffer
@@ -429,8 +530,6 @@ func TestCreateRunsImageWorkflowInOrder(t *testing.T) {
 		"push /root/assets/pi-settings.json",
 		"push /root/assets/pi-auth.json",
 		"push /root/assets/pi-models.json",
-		"push /root/assets/cobalt-ember.json",
-		"push /root/assets/tmux.conf",
 		"push /root/assets/kanedias-pi.socket",
 		"push /root/assets/kanedias-pi@.service",
 		"push /root/assets/kanedias-pi-env",
@@ -448,6 +547,11 @@ func TestCreateRunsImageWorkflowInOrder(t *testing.T) {
 		"push /root/assets/pi-extension/src/types.ts",
 		"exec bash /root/install.sh",
 		"exec test -d /opt/kanedias/pi-extension/node_modules/typebox",
+		"exec install -d -m 0700 /root/build-scripts",
+		"push /root/build-scripts/10-first.sh",
+		"push /root/build-scripts/20-second.sh",
+		"exec /root/build-scripts/10-first.sh",
+		"exec /root/build-scripts/20-second.sh",
 		"stop",
 		"publish",
 		"cleanup-delete-instance",
@@ -483,6 +587,18 @@ func TestCreateRunsImageWorkflowInOrder(t *testing.T) {
 	}
 	if got := string(client.files["/root/assets/authorized_hosts"].content); got != "github.com\ngitlab.com" {
 		t.Errorf("authorized_hosts = %q, want newline-joined hosts", got)
+	}
+	for path, want := range map[string]string{
+		"/root/build-scripts/10-first.sh":  "#!/bin/sh\necho first\n",
+		"/root/build-scripts/20-second.sh": "#!/bin/sh\necho second\n",
+	} {
+		file := client.files[path]
+		if got := string(file.content); got != want {
+			t.Errorf("%s content = %q, want %q", path, got, want)
+		}
+		if file.mode != 0o700 {
+			t.Errorf("%s mode = %#o, want 0700", path, file.mode)
+		}
 	}
 	socket := string(client.files["/root/assets/kanedias-pi.socket"].content)
 	if !strings.Contains(socket, "ListenStream=0.0.0.0:7777") ||
@@ -570,6 +686,92 @@ func TestCreateRunsImageWorkflowInOrder(t *testing.T) {
 	}
 }
 
+func TestCreateSkipsBuildScriptOperationsWhenConfigurationIsOmitted(t *testing.T) {
+	cfg := imageConfig(t, nil)
+	client := &recordingClient{files: make(map[string]uploadedFile)}
+
+	if err := create(context.Background(), cfg, io.Discard, io.Discard, func(context.Context) (imageClient, error) {
+		return client, nil
+	}); err != nil {
+		t.Fatal(err)
+	}
+	for _, call := range client.calls {
+		if strings.Contains(call, "/root/build-scripts") {
+			t.Fatalf("unexpected build script operation: %q", call)
+		}
+	}
+}
+
+func TestCreateStopsAfterNamedBuildScriptFailureAndCleansUp(t *testing.T) {
+	cfg := imageConfigWithBuildScripts(t, nil)
+	writeBuildScript(t, cfg.BuildScriptsPath(), "10-first.sh", "#!/bin/sh\necho first\n", 0o700)
+	writeBuildScript(t, cfg.BuildScriptsPath(), "20-fail.sh", "#!/bin/sh\nexit 1\n", 0o700)
+	writeBuildScript(t, cfg.BuildScriptsPath(), "30-later.sh", "#!/bin/sh\necho later\n", 0o700)
+	sentinel := errors.New("script failed")
+	client := &recordingClient{
+		files: make(map[string]uploadedFile),
+		execCommand: func(command []string) error {
+			if reflect.DeepEqual(command, []string{"/root/build-scripts/20-fail.sh"}) {
+				return sentinel
+			}
+			return nil
+		},
+	}
+	var stdout bytes.Buffer
+
+	err := create(context.Background(), cfg, &stdout, io.Discard, func(context.Context) (imageClient, error) {
+		return client, nil
+	})
+	if !errors.Is(err, sentinel) || !strings.Contains(err.Error(), "20-fail.sh") {
+		t.Fatalf("create() error = %v, want named sentinel build script error", err)
+	}
+	if !strings.Contains(stdout.String(), "10-first.sh output") {
+		t.Fatalf("stdout = %q, want first build script output", stdout.String())
+	}
+	for _, forbidden := range []string{"exec /root/build-scripts/30-later.sh", "stop", "publish"} {
+		if containsCall(client.calls, forbidden) {
+			t.Errorf("calls contain %q after script failure: %#v", forbidden, client.calls)
+		}
+	}
+	if got, want := client.calls[len(client.calls)-2:], []string{"cleanup-stop", "cleanup-delete-instance"}; !reflect.DeepEqual(got, want) {
+		t.Fatalf("cleanup calls = %#v, want %#v", got, want)
+	}
+}
+
+func TestCreateUploadsAllBuildScriptsBeforeExecution(t *testing.T) {
+	cfg := imageConfigWithBuildScripts(t, nil)
+	writeBuildScript(t, cfg.BuildScriptsPath(), "10-first.sh", "#!/bin/sh\necho first\n", 0o700)
+	writeBuildScript(t, cfg.BuildScriptsPath(), "20-second.sh", "#!/bin/sh\necho second\n", 0o700)
+	sentinel := errors.New("upload failed")
+	client := &recordingClient{
+		files: make(map[string]uploadedFile),
+		pushFile: func(path string) error {
+			if path == "/root/build-scripts/20-second.sh" {
+				return sentinel
+			}
+			return nil
+		},
+	}
+
+	err := create(context.Background(), cfg, io.Discard, io.Discard, func(context.Context) (imageClient, error) {
+		return client, nil
+	})
+	if !errors.Is(err, sentinel) || !strings.Contains(err.Error(), "20-second.sh") {
+		t.Fatalf("create() error = %v, want named sentinel upload error", err)
+	}
+	for _, call := range client.calls {
+		if strings.HasPrefix(call, "exec /root/build-scripts/") {
+			t.Errorf("custom script executed after partial upload: %q", call)
+		}
+	}
+	if containsCall(client.calls, "publish") {
+		t.Errorf("calls contain publish after upload failure: %#v", client.calls)
+	}
+	if got, want := client.calls[len(client.calls)-2:], []string{"cleanup-stop", "cleanup-delete-instance"}; !reflect.DeepEqual(got, want) {
+		t.Fatalf("cleanup calls = %#v, want %#v", got, want)
+	}
+}
+
 func TestCreateUploadsEmptyAuthorizedHosts(t *testing.T) {
 	cfg := imageConfig(t, nil)
 	client := &recordingClient{files: make(map[string]uploadedFile)}
@@ -647,7 +849,7 @@ func TestCreateJoinsPrimaryAndRunningInstanceCleanupErrors(t *testing.T) {
 
 func TestCreateReadsAssetsBeforeConnecting(t *testing.T) {
 	cfg := imageConfig(t, nil)
-	if err := os.Remove(cfg.AssetPath("tmux.conf")); err != nil {
+	if err := os.Remove(cfg.AssetPath("pi-models.json")); err != nil {
 		t.Fatal(err)
 	}
 	connected := false
@@ -656,7 +858,7 @@ func TestCreateReadsAssetsBeforeConnecting(t *testing.T) {
 		connected = true
 		return &recordingClient{}, nil
 	})
-	if err == nil || !strings.Contains(err.Error(), "tmux.conf") {
+	if err == nil || !strings.Contains(err.Error(), "pi-models.json") {
 		t.Fatalf("create() error = %v, want missing asset error", err)
 	}
 	if connected {
@@ -689,11 +891,9 @@ func imageConfig(t *testing.T, hosts []string) config.Config {
 		t.Fatal(err)
 	}
 	for name, content := range map[string]string{
-		"pi-settings.json":  "settings",
-		"pi-auth.json":      "auth",
-		"pi-models.json":    "models",
-		"cobalt-ember.json": "theme",
-		"tmux.conf":         "tmux",
+		"pi-settings.json": "settings",
+		"pi-auth.json":     "auth",
+		"pi-models.json":   "models",
 	} {
 		if err := os.WriteFile(filepath.Join(assetDir, name), []byte(content), 0o600); err != nil {
 			t.Fatal(err)
@@ -709,6 +909,32 @@ func imageConfig(t *testing.T, hosts []string) config.Config {
 			AuthorizedHosts: hosts,
 		},
 	}
+}
+
+func imageConfigWithBuildScripts(t *testing.T, hosts []string) config.Config {
+	t.Helper()
+	cfg := imageConfig(t, hosts)
+	cfg.BaseImage.BuildScriptsDir = "image-build.d"
+	if err := os.Mkdir(cfg.BuildScriptsPath(), 0o700); err != nil {
+		t.Fatal(err)
+	}
+	return cfg
+}
+
+func writeBuildScript(t *testing.T, dir, name, content string, mode os.FileMode) {
+	t.Helper()
+	if err := os.WriteFile(filepath.Join(dir, name), []byte(content), mode); err != nil {
+		t.Fatal(err)
+	}
+}
+
+func containsCall(calls []string, want string) bool {
+	for _, call := range calls {
+		if call == want {
+			return true
+		}
+	}
+	return false
 }
 
 type imageRequestContextKey struct{}
@@ -734,6 +960,8 @@ type recordingClient struct {
 	publishAlias       string
 	publishDescription string
 	exec               func() error
+	execCommand        func([]string) error
+	pushFile           func(string) error
 	running            bool
 	stopErr            error
 	cleanupContexts    []cleanupContextObservation
@@ -769,6 +997,11 @@ func (c *recordingClient) CreateInstance(_ context.Context, request api.Instance
 
 func (c *recordingClient) PushFile(_ context.Context, _ string, path string, content []byte, mode int) error {
 	c.calls = append(c.calls, "push "+path)
+	if c.pushFile != nil {
+		if err := c.pushFile(path); err != nil {
+			return err
+		}
+	}
 	c.files[path] = uploadedFile{content: append([]byte(nil), content...), mode: mode}
 	return nil
 }
@@ -778,7 +1011,17 @@ func (c *recordingClient) Exec(_ context.Context, _ string, request incusclient.
 	if c.exec != nil {
 		return "", "", c.exec()
 	}
-	const output = "installer output"
+	if c.execCommand != nil {
+		if err := c.execCommand(request.Command); err != nil {
+			return "", "", err
+		}
+	}
+	output := "command output"
+	if reflect.DeepEqual(request.Command, []string{"bash", "/root/install.sh"}) {
+		output = "installer output"
+	} else if len(request.Command) > 0 {
+		output = filepath.Base(request.Command[len(request.Command)-1]) + " output"
+	}
 	// Mirror the real Incus layer: output is streamed to the caller's writer as
 	// it arrives, not only returned after the command completes.
 	if request.Stdout != nil {
