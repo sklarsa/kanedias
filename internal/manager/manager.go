@@ -8,6 +8,7 @@ import (
 	"os"
 	"os/user"
 	"path/filepath"
+	"sort"
 	"strings"
 	"sync"
 	"time"
@@ -271,6 +272,9 @@ func (m *Manager) Fleet() FleetSnapshot {
 		})
 	}
 	issues := append([]DiscoveryIssue(nil), m.discoveryIssues...)
+	// Sort roots deterministically (map iteration is unordered) so the fleet does
+	// not reshuffle between SSE re-renders.
+	sort.Slice(roots, func(i, j int) bool { return roots[i].RootSessionID < roots[j].RootSessionID })
 	return FleetSnapshot{Roots: roots, Issues: issues, Revision: m.fleetRevision}
 }
 

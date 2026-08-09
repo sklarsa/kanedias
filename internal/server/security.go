@@ -37,7 +37,6 @@ type capabilityStore struct {
 	mu              sync.RWMutex
 	random          io.Reader
 	bootstrapDigest [sha256.Size]byte
-	bootstrapUsed   bool
 	sessions        []sessionRecord
 	sessionTTL      time.Duration
 	output          io.Writer
@@ -110,16 +109,13 @@ func (s *capabilityStore) validSession(token string) bool {
 // bootstrap capability query parameter and issues a browser session cookie.
 func (s *capabilityStore) serveBootstrap(w http.ResponseWriter, r *http.Request) {
 	provided := sha256.Sum256([]byte(r.URL.Query().Get(bootstrapQueryName)))
-	s.mu.Lock()
-	if s.bootstrapUsed || subtle.ConstantTimeCompare(provided[:], s.bootstrapDigest[:]) != 1 {
-		s.mu.Unlock()
+	// The bootstrap token is valid for the server's lifetime: any number of
+	// browsers can exchange it for a session, and a server restart mints a fresh
+	// token (rotating it). Sessions themselves carry a TTL and are evicted.
+	if subtle.ConstantTimeCompare(provided[:], s.bootstrapDigest[:]) != 1 {
 		http.Error(w, "Forbidden", http.StatusForbidden)
 		return
 	}
-	// The bootstrap is a one-time exchange: the first successful use invalidates
-	// the token so it cannot be replayed to mint unlimited sessions.
-	s.bootstrapUsed = true
-	s.mu.Unlock()
 
 	browserToken, browserDigest, err := newCapability(s.random)
 	if err != nil {

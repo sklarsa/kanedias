@@ -274,12 +274,17 @@ func TestBootstrapIsSingleUse(t *testing.T) {
 		t.Fatalf("first bootstrap set %d session cookies, want 1", len(cookies))
 	}
 
-	// The one-time bootstrap token must NOT be replayable.
+	// The bootstrap token is reusable until the server is restarted (a fresh
+	// store+token rotates it), so a browser that loses its cookie or a second
+	// browser can re-bootstrap without a server restart.
 	second := httptest.NewRequest(http.MethodGet, "/bootstrap?"+bootstrapQueryName+"="+token, nil)
 	w2 := httptest.NewRecorder()
 	store.serveBootstrap(w2, second)
-	if w2.Code != http.StatusForbidden {
-		t.Fatalf("replayed bootstrap status = %d, want %d (one-time token)", w2.Code, http.StatusForbidden)
+	if w2.Code != http.StatusSeeOther {
+		t.Fatalf("re-bootstrap status = %d, want %d (token valid until restart)", w2.Code, http.StatusSeeOther)
+	}
+	if len(store.sessions) != 2 {
+		t.Fatalf("two bootstraps should mint two sessions, got %d", len(store.sessions))
 	}
 }
 
