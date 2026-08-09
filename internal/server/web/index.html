@@ -40,7 +40,7 @@
     <span class="deck-lbl">alidade ›</span>
     <input class="deck-input" type="text" placeholder="steer — type a directive…" aria-label="Command input"
       data-bind="commandMessage">
-    <button class="dbtn steer"
+    <button class="dbtn steer" id="steerBtn"
       data-on:click="@post('/ui/sessions/'+$selectedSessionId+'/steer', {payload:{message:$commandMessage}})">
       <span class="g">→</span> Steer
     </button>

@@ -6,8 +6,8 @@
     <div class="transcript">
       {{range .Items}}
       <div class="t-turn {{if .IsError}}t-error{{end}}">
-        <span class="t-role {{.Kind}}">{{.Kind}}{{if .ToolName}} · {{.ToolName}}{{end}}</span>
-        <div class="t-body">{{.Text}}</div>
+        <span class="t-role {{.Kind}}">{{.Label}}</span>
+        {{if .Text}}<div class="t-body">{{.Text}}</div>{{end}}
       </div>
       {{end}}
     </div>

@@ -93,6 +93,16 @@
     if (window.matchMedia("(max-width:820px)").matches) closeSheet(sidebar, scrim);
   }
 
+  /* -------- Enter in the deck input sends a steering message (delegated) -------- */
+  document.addEventListener("keydown", function (e) {
+    if (e.key !== "Enter") return;
+    var input = e.target.closest(".deck-input");
+    if (!input) return;
+    e.preventDefault();
+    var btn = document.getElementById("steerBtn");
+    if (btn) btn.click();
+  });
+
   /* -------- Alert banner jumps to first question (delegated) -------- */
   document.addEventListener("click", function (e) {
     if (!e.target.closest("#alertBanner")) return;
