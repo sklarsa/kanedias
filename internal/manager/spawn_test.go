@@ -1,9 +1,11 @@
 package manager
 
 import (
+	"bytes"
 	"context"
 	"errors"
 	"fmt"
+	"io"
 	"os"
 	"os/exec"
 	"path/filepath"
@@ -68,29 +70,65 @@ type rootBootstrapResult struct {
 	err       error
 }
 
+type retainingStarter struct {
+	process       *fakeProcess
+	started       chan error
+	inheritedRead *os.File
+}
+
+type closingBootstrapStarter struct{ process *fakeProcess }
+
+func (starter closingBootstrapStarter) Start(spec spawnSpec) (spawnedProcess, error) {
+	if len(spec.ExtraFiles) != 1 {
+		return nil, fmt.Errorf("ExtraFiles = %d, want 1", len(spec.ExtraFiles))
+	}
+	duplicate, err := unix.Dup(int(spec.ExtraFiles[0].Fd()))
+	if err != nil {
+		return nil, err
+	}
+	if err := unix.Close(duplicate); err != nil {
+		return nil, err
+	}
+	return starter.process, nil
+}
+
+func (starter *retainingStarter) Start(spec spawnSpec) (spawnedProcess, error) {
+	if len(spec.ExtraFiles) != 1 {
+		err := fmt.Errorf("ExtraFiles = %d, want 1", len(spec.ExtraFiles))
+		starter.started <- err
+		return nil, err
+	}
+	duplicate, err := unix.Dup(int(spec.ExtraFiles[0].Fd()))
+	if err != nil {
+		starter.started <- err
+		return nil, err
+	}
+	starter.inheritedRead = os.NewFile(uintptr(duplicate), "retained-root-bootstrap")
+	starter.started <- nil
+	return starter.process, nil
+}
+
 func (fs *fakeStarter) Start(spec spawnSpec) (spawnedProcess, error) {
 	fs.lastSpec = spec
 	fs.starts++
 	if fs.err != nil {
 		return nil, fs.err
 	}
-	if fs.rootBootstraps != nil {
-		if len(spec.ExtraFiles) != 1 {
-			fs.rootBootstraps <- rootBootstrapResult{err: fmt.Errorf("ExtraFiles = %d, want 1", len(spec.ExtraFiles))}
-		} else {
-			duplicate, err := unix.Dup(int(spec.ExtraFiles[0].Fd()))
-			if err != nil {
-				fs.rootBootstraps <- rootBootstrapResult{err: err}
-			} else {
-				file := os.NewFile(uintptr(duplicate), "fake-root-bootstrap")
-				go func() {
-					bootstrap, decodeErr := process.DecodeRootBootstrap(file)
-					closeErr := file.Close()
-					fs.rootBootstraps <- rootBootstrapResult{bootstrap: bootstrap, err: errors.Join(decodeErr, closeErr)}
-				}()
-			}
-		}
+	if len(spec.ExtraFiles) != 1 {
+		return nil, fmt.Errorf("ExtraFiles = %d, want 1", len(spec.ExtraFiles))
 	}
+	duplicate, err := unix.Dup(int(spec.ExtraFiles[0].Fd()))
+	if err != nil {
+		return nil, err
+	}
+	file := os.NewFile(uintptr(duplicate), "fake-root-bootstrap")
+	go func() {
+		bootstrap, decodeErr := process.DecodeRootBootstrap(file)
+		closeErr := file.Close()
+		if fs.rootBootstraps != nil {
+			fs.rootBootstraps <- rootBootstrapResult{bootstrap: bootstrap, err: errors.Join(decodeErr, closeErr)}
+		}
+	}()
 	return fs.process, nil
 }
 
@@ -268,15 +306,12 @@ func TestSpawnRootClosesBootstrapPipeOnStartFailure(t *testing.T) {
 }
 
 func TestSpawnRootClosesBootstrapPipeOnWriteFailure(t *testing.T) {
-	fs := &fakeStarter{process: newFakeProcess(1237)}
-	m := configuredSpawnManager(t, fs)
+	fakeProcess := newFakeProcess(1237)
+	m := configuredSpawnManager(t, closingBootstrapStarter{process: fakeProcess})
 	var readEnd, writeEnd *os.File
 	m.newBootstrapPipe = func() (*os.File, *os.File, error) {
 		var err error
 		readEnd, writeEnd, err = os.Pipe()
-		if err == nil {
-			_ = readEnd.Close()
-		}
 		return readEnd, writeEnd, err
 	}
 	if _, err := m.SpawnRoot(context.Background()); err == nil || !strings.Contains(err.Error(), "bootstrap") {
@@ -284,11 +319,101 @@ func TestSpawnRootClosesBootstrapPipeOnWriteFailure(t *testing.T) {
 	}
 	assertFileClosed(t, readEnd)
 	assertFileClosed(t, writeEnd)
-	fs.process.mu.Lock()
-	signals := append([]syscall.Signal(nil), fs.process.signals...)
-	fs.process.mu.Unlock()
+	fakeProcess.mu.Lock()
+	signals := append([]syscall.Signal(nil), fakeProcess.signals...)
+	fakeProcess.mu.Unlock()
 	if len(signals) != 1 || signals[0] != syscall.SIGKILL {
 		t.Fatalf("bootstrap write failure signals = %v, want [SIGKILL]", signals)
+	}
+}
+
+func TestSpawnRootCancellationJoinsBlockedBootstrapWriter(t *testing.T) {
+	starter := &retainingStarter{process: newFakeProcess(1238), started: make(chan error, 1)}
+	m := configuredSpawnManager(t, starter)
+	cfg := modelConfigFixture()
+	worker := cfg.Workers["worker"]
+	worker.Description = strings.Repeat("x", process.MaxRecordBytes-4096)
+	cfg.Workers["worker"] = worker
+	launch, err := NewLaunchConfiguration(cfg)
+	if err != nil {
+		t.Fatal(err)
+	}
+	m.launch = launch
+	policy, err := launch.Resolve(launch.DefaultRequest())
+	if err != nil {
+		t.Fatal(err)
+	}
+	var encoded bytes.Buffer
+	if err := process.EncodeRootBootstrap(&encoded, process.RootBootstrap{Policy: policy}); err != nil {
+		t.Fatal(err)
+	}
+	if encoded.Len() < 64*1024 {
+		t.Fatalf("bootstrap length = %d, want enough to block an unread pipe", encoded.Len())
+	}
+
+	var parentRead, parentWrite *os.File
+	m.newBootstrapPipe = func() (*os.File, *os.File, error) {
+		var pipeErr error
+		parentRead, parentWrite, pipeErr = os.Pipe()
+		return parentRead, parentWrite, pipeErr
+	}
+	ctx, cancel := context.WithCancel(context.Background())
+	result := make(chan error, 1)
+	go func() {
+		_, spawnErr := m.SpawnRoot(ctx)
+		result <- spawnErr
+	}()
+	if startErr := <-starter.started; startErr != nil {
+		t.Fatal(startErr)
+	}
+	deadline := time.Now().Add(time.Second)
+	for {
+		available, ioctlErr := unix.IoctlGetInt(int(starter.inheritedRead.Fd()), unix.TIOCINQ)
+		if ioctlErr != nil {
+			t.Fatal(ioctlErr)
+		}
+		if available > 0 {
+			break
+		}
+		if time.Now().After(deadline) {
+			t.Fatal("bootstrap writer did not begin filling retained unread pipe")
+		}
+		time.Sleep(time.Millisecond)
+	}
+
+	cancel()
+	select {
+	case spawnErr := <-result:
+		if !errors.Is(spawnErr, context.Canceled) {
+			t.Fatalf("SpawnRoot error = %v, want %v", spawnErr, context.Canceled)
+		}
+	case <-time.After(time.Second):
+		t.Fatal("SpawnRoot did not promptly join blocked bootstrap writer after cancellation")
+	}
+	assertFileClosed(t, parentRead)
+	assertFileClosed(t, parentWrite)
+	starter.process.mu.Lock()
+	signals := append([]syscall.Signal(nil), starter.process.signals...)
+	starter.process.mu.Unlock()
+	if len(signals) != 1 || signals[0] != syscall.SIGKILL {
+		t.Fatalf("cancellation signals = %v, want [SIGKILL]", signals)
+	}
+
+	drained := make(chan error, 1)
+	go func() {
+		_, readErr := io.ReadAll(starter.inheritedRead)
+		drained <- readErr
+	}()
+	select {
+	case readErr := <-drained:
+		if readErr != nil {
+			t.Fatalf("drain retained read endpoint: %v", readErr)
+		}
+	case <-time.After(time.Second):
+		t.Fatal("retained endpoint did not reach EOF; bootstrap writer was not closed/joined")
+	}
+	if err := starter.inheritedRead.Close(); err != nil {
+		t.Fatal(err)
 	}
 }
 
@@ -398,8 +523,8 @@ func TestSpawnRootAdmissionTimeout(t *testing.T) {
 
 	ctx := context.Background()
 	_, err := m.SpawnRoot(ctx)
-	if err == nil {
-		t.Fatal("expected timeout error, got nil")
+	if !errors.Is(err, context.DeadlineExceeded) {
+		t.Fatalf("SpawnRoot error = %v, want admission deadline exceeded", err)
 	}
 }
 
@@ -422,8 +547,8 @@ func TestSpawnRootProcessExitBeforeAdmission(t *testing.T) {
 
 	ctx := context.Background()
 	_, err := m.SpawnRoot(ctx)
-	if err == nil {
-		t.Fatal("expected error when process exits, got nil")
+	if err == nil || !strings.Contains(err.Error(), "root exited before admission") || !errors.Is(err, exec.ErrNotFound) {
+		t.Fatalf("SpawnRoot error = %v, want root-exited-before-admission wrapping %v", err, exec.ErrNotFound)
 	}
 }
 

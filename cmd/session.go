@@ -25,27 +25,12 @@ func newSessionCommand(service services, configPath func() string) *cobra.Comman
 		Use:   "session",
 		Short: "Run a foreground supervised Pi session",
 		Args:  cobra.NoArgs,
-		PreRunE: func(_ *cobra.Command, _ []string) error {
-			if socketPath == "" {
-				return fmt.Errorf("--socket is required")
-			}
-			return nil
-		},
 		RunE: func(cmd *cobra.Command, _ []string) error {
-			selectedConfig := configPath()
-			absoluteConfig, err := filepath.Abs(selectedConfig)
-			if err != nil {
-				return fmt.Errorf("resolve config path %q: %w", selectedConfig, err)
-			}
-			cfg, err := service.loadConfig(selectedConfig)
-			if err != nil {
-				return err
-			}
-
+			inheritedBootstrap := cmd.Flags().Changed("bootstrap-fd")
 			var policy config.SessionModelPolicy
-			if cmd.Flags().Changed("bootstrap-fd") {
-				if bootstrapFD < 0 {
-					return fmt.Errorf("--bootstrap-fd must be a non-negative descriptor")
+			if inheritedBootstrap {
+				if bootstrapFD < process.RootBootstrapFD {
+					return fmt.Errorf("--bootstrap-fd must be at least %d", process.RootBootstrapFD)
 				}
 				syscall.CloseOnExec(bootstrapFD)
 				bootstrapFile := os.NewFile(uintptr(bootstrapFD), "root-bootstrap")
@@ -58,7 +43,21 @@ func newSessionCommand(service services, configPath func() string) *cobra.Comman
 					return errors.Join(decodeErr, closeErr)
 				}
 				policy = bootstrap.Policy
-			} else {
+			}
+			if socketPath == "" {
+				return fmt.Errorf("--socket is required")
+			}
+
+			selectedConfig := configPath()
+			absoluteConfig, err := filepath.Abs(selectedConfig)
+			if err != nil {
+				return fmt.Errorf("resolve config path %q: %w", selectedConfig, err)
+			}
+			cfg, err := service.loadConfig(selectedConfig)
+			if err != nil {
+				return err
+			}
+			if !inheritedBootstrap {
 				policy, err = cfg.DefaultSessionModelPolicy()
 				if err != nil {
 					return fmt.Errorf("resolve default session model policy: %w", err)
