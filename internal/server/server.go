@@ -81,6 +81,17 @@ func ValidateListenAddress(address string) error {
 	return nil
 }
 
+func advertisedAddress(effectiveAddress, configuredHostname string) (string, error) {
+	host, port, err := net.SplitHostPort(effectiveAddress)
+	if err != nil {
+		return "", fmt.Errorf("derive advertised address from %q: %w", effectiveAddress, err)
+	}
+	if configuredHostname != "" {
+		host = configuredHostname
+	}
+	return net.JoinHostPort(host, port), nil
+}
+
 // Run is the public entry point used by cmd/server.go.
 func Run(ctx context.Context, cfg config.Config, options Options) error {
 	return runApplication(ctx, cfg, options, productionManagerFactory, net.Listen)
@@ -149,7 +160,11 @@ func runApplication(
 		bootstrapOutput = io.Discard
 	}
 	handlerFn := func(effectiveAddress string, streamCtx context.Context) (http.Handler, error) {
-		return newHandlerWithOptions(normalizedOptions.Logger, effectiveAddress, bootstrapOutput, fleet, streamCtx, resolved.RequireSession)
+		advertised, addressErr := advertisedAddress(effectiveAddress, resolved.Hostname)
+		if addressErr != nil {
+			return nil, fmt.Errorf("construct advertised address: %w", addressErr)
+		}
+		return newHandlerWithOptions(normalizedOptions.Logger, advertised, bootstrapOutput, fleet, streamCtx, resolved.RequireSession)
 	}
 
 	return runWithManager(ctx, normalizedOptions, fleet, handlerFn, listen, defaultShutdownTimeout)

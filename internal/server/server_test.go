@@ -64,6 +64,24 @@ func TestValidateListenAddressRejectsMalformedOrUnsupportedAddresses(t *testing.
 	}
 }
 
+func TestAdvertisedAddressUsesConfiguredHostnameAndEffectivePort(t *testing.T) {
+	tests := []struct {
+		effective string
+		hostname  string
+		want      string
+	}{
+		{"0.0.0.0:8080", "steven-desktop", "steven-desktop:8080"},
+		{"127.0.0.1:9090", "", "127.0.0.1:9090"},
+		{"[::]:8080", "steven-desktop", "steven-desktop:8080"},
+	}
+	for _, tt := range tests {
+		got, err := advertisedAddress(tt.effective, tt.hostname)
+		if err != nil || got != tt.want {
+			t.Errorf("advertisedAddress(%q, %q) = %q, %v; want %q", tt.effective, tt.hostname, got, err, tt.want)
+		}
+	}
+}
+
 func TestRunRejectsNilContext(t *testing.T) {
 	logger := slog.New(slog.NewTextHandler(io.Discard, nil))
 	listenCalled := false

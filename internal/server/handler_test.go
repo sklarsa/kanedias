@@ -7,6 +7,7 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
+	"io"
 	"io/fs"
 	"log/slog"
 	"net/http"
@@ -85,6 +86,28 @@ func serveAuthenticatedRequest(t *testing.T, handler http.Handler, method, path 
 	}
 	handler.ServeHTTP(response, req)
 	return response
+}
+
+func TestHandlerPrintsAdvertisedURLs(t *testing.T) {
+	for _, requireSession := range []bool{false, true} {
+		t.Run(fmt.Sprintf("require_session_%t", requireSession), func(t *testing.T) {
+			var output bytes.Buffer
+			logger := slog.New(slog.NewTextHandler(io.Discard, nil))
+			_, err := newHandlerWithOptions(
+				logger, "steven-desktop:8080", &output, nil, context.Background(), requireSession,
+			)
+			if err != nil {
+				t.Fatal(err)
+			}
+			if !strings.Contains(output.String(), "Web UI: http://steven-desktop:8080/\n") {
+				t.Fatalf("operator output = %q, want advertised Web UI URL", output.String())
+			}
+			hasBootstrap := strings.Contains(output.String(), "Bootstrap URL: http://steven-desktop:8080/bootstrap?capability=")
+			if hasBootstrap != requireSession {
+				t.Fatalf("bootstrap URL present = %t, want %t; output = %q", hasBootstrap, requireSession, output.String())
+			}
+		})
+	}
 }
 
 // indexBody returns the body of an authenticated GET /.

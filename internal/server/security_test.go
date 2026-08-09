@@ -54,7 +54,7 @@ func TestCapabilityTokenIsBase64URLOf32Bytes(t *testing.T) {
 
 func TestCapabilityStoreOnlyRetainsDigests(t *testing.T) {
 	var out bytes.Buffer
-	store, err := newCapabilityStore(newDeterministicReader(), &out)
+	store, err := newCapabilityStore(newDeterministicReader(), &out, DefaultListenAddress)
 	if err != nil {
 		t.Fatalf("newCapabilityStore: %v", err)
 	}
@@ -78,11 +78,14 @@ func TestCapabilityStoreOnlyRetainsDigests(t *testing.T) {
 
 func TestBootstrapPrintsTokenOnce(t *testing.T) {
 	var out bytes.Buffer
-	_, err := newCapabilityStore(newDeterministicReader(), &out)
+	_, err := newCapabilityStore(newDeterministicReader(), &out, "steven-desktop:8080")
 	if err != nil {
 		t.Fatalf("newCapabilityStore: %v", err)
 	}
 	output := out.String()
+	if !strings.HasPrefix(output, "Bootstrap URL: http://steven-desktop:8080/bootstrap?capability=") {
+		t.Fatalf("bootstrap output = %q, want absolute advertised URL", output)
+	}
 	if !strings.Contains(output, bootstrapQueryName+"=") {
 		t.Errorf("bootstrap output = %q, want capability= prefix", output)
 	}
@@ -104,7 +107,7 @@ func TestBootstrapPrintsTokenOnce(t *testing.T) {
 
 func TestInvalidBootstrapReturns403(t *testing.T) {
 	var out bytes.Buffer
-	store, err := newCapabilityStore(newDeterministicReader(), &out)
+	store, err := newCapabilityStore(newDeterministicReader(), &out, DefaultListenAddress)
 	if err != nil {
 		t.Fatalf("newCapabilityStore: %v", err)
 	}
@@ -119,7 +122,7 @@ func TestInvalidBootstrapReturns403(t *testing.T) {
 
 func TestValidBootstrapRedirectsAndSetsCookie(t *testing.T) {
 	var out bytes.Buffer
-	store, err := newCapabilityStore(newDeterministicReader(), &out)
+	store, err := newCapabilityStore(newDeterministicReader(), &out, DefaultListenAddress)
 	if err != nil {
 		t.Fatalf("newCapabilityStore: %v", err)
 	}
@@ -171,7 +174,7 @@ func TestValidBootstrapRedirectsAndSetsCookie(t *testing.T) {
 // the capability in the query string is neither cached nor leaked via Referer.
 func TestBootstrapSetsNoStoreAndNoReferrer(t *testing.T) {
 	var out bytes.Buffer
-	store, err := newCapabilityStore(newDeterministicReader(), &out)
+	store, err := newCapabilityStore(newDeterministicReader(), &out, DefaultListenAddress)
 	if err != nil {
 		t.Fatalf("newCapabilityStore: %v", err)
 	}
@@ -199,7 +202,7 @@ func TestBootstrapSetsNoStoreAndNoReferrer(t *testing.T) {
 
 func TestSessionCookieIssuedByValidBootstrap(t *testing.T) {
 	var out bytes.Buffer
-	store, err := newCapabilityStore(newDeterministicReader(), &out)
+	store, err := newCapabilityStore(newDeterministicReader(), &out, DefaultListenAddress)
 	if err != nil {
 		t.Fatalf("newCapabilityStore: %v", err)
 	}
@@ -247,7 +250,7 @@ func TestSessionCookieIssuedByValidBootstrap(t *testing.T) {
 
 func TestBootstrapIsSingleUse(t *testing.T) {
 	var out bytes.Buffer
-	store, err := newCapabilityStore(newDeterministicReader(), &out)
+	store, err := newCapabilityStore(newDeterministicReader(), &out, DefaultListenAddress)
 	if err != nil {
 		t.Fatalf("newCapabilityStore: %v", err)
 	}
@@ -290,7 +293,7 @@ func TestBootstrapIsSingleUse(t *testing.T) {
 
 func TestSessionExpiresAfterTTL(t *testing.T) {
 	var out bytes.Buffer
-	store, err := newCapabilityStore(newDeterministicReader(), &out)
+	store, err := newCapabilityStore(newDeterministicReader(), &out, DefaultListenAddress)
 	if err != nil {
 		t.Fatalf("newCapabilityStore: %v", err)
 	}
@@ -313,7 +316,7 @@ func TestSessionExpiresAfterTTL(t *testing.T) {
 func TestNewStoreRejectsCookiesFromPreviousStore(t *testing.T) {
 	// Issue a session from the first store.
 	var out1 bytes.Buffer
-	store1, err := newCapabilityStore(newDeterministicReader(), &out1)
+	store1, err := newCapabilityStore(newDeterministicReader(), &out1, DefaultListenAddress)
 	if err != nil {
 		t.Fatalf("newCapabilityStore: %v", err)
 	}
@@ -336,7 +339,7 @@ func TestNewStoreRejectsCookiesFromPreviousStore(t *testing.T) {
 
 	// Create a second store — it must not accept tokens from the first.
 	var out2 bytes.Buffer
-	store2, err := newCapabilityStore(newDeterministicReader(), &out2)
+	store2, err := newCapabilityStore(newDeterministicReader(), &out2, DefaultListenAddress)
 	if err != nil {
 		t.Fatalf("newCapabilityStore: %v", err)
 	}
@@ -476,7 +479,7 @@ func TestRequestBoundaryAcceptsAbsentOrigin(t *testing.T) {
 
 func TestRequireSessionRejects401WithoutCookie(t *testing.T) {
 	var out bytes.Buffer
-	store, err := newCapabilityStore(newDeterministicReader(), &out)
+	store, err := newCapabilityStore(newDeterministicReader(), &out, DefaultListenAddress)
 	if err != nil {
 		t.Fatalf("newCapabilityStore: %v", err)
 	}
@@ -494,7 +497,7 @@ func TestRequireSessionRejects401WithoutCookie(t *testing.T) {
 
 func TestRequireSessionRejectsUnknownCookie(t *testing.T) {
 	var out bytes.Buffer
-	store, err := newCapabilityStore(newDeterministicReader(), &out)
+	store, err := newCapabilityStore(newDeterministicReader(), &out, DefaultListenAddress)
 	if err != nil {
 		t.Fatalf("newCapabilityStore: %v", err)
 	}

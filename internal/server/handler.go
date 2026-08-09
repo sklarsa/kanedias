@@ -25,20 +25,26 @@ func newHandler(logger *slog.Logger) (http.Handler, error) {
 	if logger == nil {
 		return nil, errors.New("logger is required")
 	}
-	return newHandlerWithOptions(logger, "", io.Discard, nil, context.Background(), true)
+	return newHandlerWithOptions(logger, DefaultListenAddress, io.Discard, nil, context.Background(), true)
 }
 
 // newHandlerWithOptions builds the full handler with security wiring.
-// effectiveAddress is the listener's address used for same-origin checks.
-// bootstrapOutput receives the one-time bootstrap token.
+// advertisedAddress is the public authority used for operator URLs and same-origin checks.
+// bootstrapOutput receives the Web UI URL and one-time bootstrap token.
 // fleet is the manager (may be nil in tests).
 // streamCtx is canceled when the server shuts down, closing SSE streams.
 // requireSession controls whether a /bootstrap session cookie is required to
 // reach the console. The server is loopback-only, so an operator can opt out for
 // a single-user console; the same-origin write boundary is always kept.
-func newHandlerWithOptions(logger *slog.Logger, effectiveAddress string, bootstrapOutput io.Writer, fleet fleetManager, streamCtx context.Context, requireSession bool) (http.Handler, error) {
+func newHandlerWithOptions(logger *slog.Logger, advertisedAddress string, bootstrapOutput io.Writer, fleet fleetManager, streamCtx context.Context, requireSession bool) (http.Handler, error) {
 	if logger == nil {
 		return nil, errors.New("logger is required")
+	}
+	if bootstrapOutput == nil {
+		bootstrapOutput = io.Discard
+	}
+	if _, err := fmt.Fprintf(bootstrapOutput, "Web UI: %s\n", absoluteHTTPURL(advertisedAddress, "/", nil)); err != nil {
+		return nil, fmt.Errorf("write Web UI URL: %w", err)
 	}
 
 	templates, err := parseTemplates(webFiles)
@@ -51,7 +57,7 @@ func newHandlerWithOptions(logger *slog.Logger, effectiveAddress string, bootstr
 	auth := (*capabilityStore)(nil)
 	if requireSession {
 		var storeErr error
-		auth, storeErr = newCapabilityStore(defaultRandom, bootstrapOutput)
+		auth, storeErr = newCapabilityStore(defaultRandom, bootstrapOutput, advertisedAddress)
 		if storeErr != nil {
 			return nil, fmt.Errorf("create capability store: %w", storeErr)
 		}
@@ -62,7 +68,7 @@ func newHandlerWithOptions(logger *slog.Logger, effectiveAddress string, bootstr
 		sessionRequired = auth.requireSession
 	}
 
-	boundary := newRequestBoundary(effectiveAddress)
+	boundary := newRequestBoundary(advertisedAddress)
 
 	serveIndex := func(w http.ResponseWriter, _ *http.Request) {
 		w.Header().Set("Content-Type", "text/html; charset=utf-8")

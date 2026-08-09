@@ -42,13 +42,20 @@ type capabilityStore struct {
 	output          io.Writer
 }
 
+func absoluteHTTPURL(authority, path string, query url.Values) string {
+	u := url.URL{Scheme: "http", Host: authority, Path: path}
+	u.RawQuery = query.Encode()
+	return u.String()
+}
+
 // newCapabilityStore creates a store, generates a bootstrap token, and prints it once to output.
-func newCapabilityStore(random io.Reader, output io.Writer) (*capabilityStore, error) {
+func newCapabilityStore(random io.Reader, output io.Writer, advertisedAddress string) (*capabilityStore, error) {
 	token, digest, err := newCapability(random)
 	if err != nil {
 		return nil, fmt.Errorf("generate bootstrap token: %w", err)
 	}
-	if _, err := fmt.Fprintf(output, "Bootstrap URL: /bootstrap?%s=%s\n", bootstrapQueryName, token); err != nil {
+	bootstrapURL := absoluteHTTPURL(advertisedAddress, "/bootstrap", url.Values{bootstrapQueryName: {token}})
+	if _, err := fmt.Fprintf(output, "Bootstrap URL: %s\n", bootstrapURL); err != nil {
 		return nil, fmt.Errorf("write bootstrap token: %w", err)
 	}
 	return &capabilityStore{
