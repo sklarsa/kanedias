@@ -87,9 +87,6 @@ authorized_hosts = ["github.com", "gitlab.com"]
 pool = "default"
 volume = "workspace"
 repos = ["owner/repo", "other/project"]
-[workspace.incus]
-volume = "nested-state"
-images = ["images:debian/13", "images:ubuntu/24.04"]
 `)
 
 	cfg, err := Load(path)
@@ -109,10 +106,6 @@ images = ["images:debian/13", "images:ubuntu/24.04"]
 		Pool:   "default",
 		Volume: "workspace",
 		Repos:  []string{"owner/repo", "other/project"},
-		Incus: IncusWorkspace{
-			Volume: "nested-state",
-			Images: []string{"images:debian/13", "images:ubuntu/24.04"},
-		},
 	}); !reflect.DeepEqual(got, want) {
 		t.Errorf("Workspace = %#v, want %#v", got, want)
 	}
@@ -142,12 +135,6 @@ repos = []
 	}
 	if cfg.Workspace.Volume != DefaultWorkspaceVolume {
 		t.Fatalf("Workspace.Volume = %q, want %q", cfg.Workspace.Volume, DefaultWorkspaceVolume)
-	}
-	if got := cfg.Workspace.Incus.Volume; got != DefaultIncusWorkspaceVolume {
-		t.Fatalf("Workspace.Incus.Volume = %q, want %q", got, DefaultIncusWorkspaceVolume)
-	}
-	if cfg.Workspace.Incus.Images != nil {
-		t.Fatalf("Workspace.Incus.Images = %#v, want nil", cfg.Workspace.Incus.Images)
 	}
 	wantDir, err := filepath.Abs(filepath.Dir(path))
 	if err != nil {
@@ -202,19 +189,6 @@ func TestValidateLifecycleRequiredFields(t *testing.T) {
 				t.Fatalf("ValidateLifecycle() error = %v, want %q", err, tt.wantErr)
 			}
 		})
-	}
-}
-
-func TestValidateLifecycleRejectsIdenticalWorkspaceSeeds(t *testing.T) {
-	cfg := Config{
-		BaseImage: BaseImage{Name: "sandbox", Source: "images:", Image: "debian/13"},
-		Workspace: Workspace{
-			Volume: "shared-seed",
-			Incus:  IncusWorkspace{Volume: "shared-seed"},
-		},
-	}
-	if err := cfg.ValidateLifecycle(); err == nil || !strings.Contains(err.Error(), "must be different") {
-		t.Fatalf("ValidateLifecycle() error = %v, want distinct seed validation", err)
 	}
 }
 

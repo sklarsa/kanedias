@@ -26,13 +26,11 @@ import (
 func TestCommandHierarchyAndFlags(t *testing.T) {
 	root := newRootCommand(stubServices(), testProxyOptions())
 
-	assertChildCommands(t, root, "image", "profile", "proxy", "sandbox", "server", "session", "workspace")
+	assertChildCommands(t, root, "image", "profile", "proxy", "server", "session", "workspace")
 	assertChildCommands(t, mustFindCommand(t, root, "image"), "create")
 	assertChildCommands(t, mustFindCommand(t, root, "proxy"), "init-ca", "login", "run")
 	assertChildCommands(t, mustFindCommand(t, root, "proxy", "login"), "openai-codex")
-	assertChildCommands(t, mustFindCommand(t, root, "sandbox"), "create", "destroy")
-	assertChildCommands(t, mustFindCommand(t, root, "workspace"), "incus", "repos")
-	assertChildCommands(t, mustFindCommand(t, root, "workspace", "incus"), "sync")
+	assertChildCommands(t, mustFindCommand(t, root, "workspace"), "repos")
 	assertChildCommands(t, mustFindCommand(t, root, "workspace", "repos"), "sync")
 
 	command, remaining, err := root.Find([]string{"workspace", "sync"})
@@ -49,13 +47,9 @@ func TestCommandHierarchyAndFlags(t *testing.T) {
 		{"proxy", "init-ca"},
 		{"proxy", "login"},
 		{"proxy", "login", "openai-codex"},
-		{"sandbox"},
-		{"sandbox", "create"},
-		{"sandbox", "destroy"},
 		{"server"},
 		{"session"},
 		{"workspace"},
-		{"workspace", "incus", "sync"},
 		{"workspace", "repos", "sync"},
 	} {
 		command, remaining, err := root.Find(path)
@@ -113,9 +107,6 @@ func TestCommandHierarchyAndFlags(t *testing.T) {
 
 	for _, path := range [][]string{
 		{"image", "create"},
-		{"sandbox", "create"},
-		{"sandbox", "destroy"},
-		{"workspace", "incus", "sync"},
 		{"workspace", "repos", "sync"},
 	} {
 		command := mustFindCommand(t, root, path...)
@@ -138,10 +129,6 @@ func TestWorkspaceParentShowsHelpAndRejectsLegacySync(t *testing.T) {
 	}
 	service.syncRepos = func(context.Context, config.Config, io.Writer, io.Writer) error {
 		t.Fatal("syncRepos called by workspace parent command")
-		return nil
-	}
-	service.syncIncusWorkspace = func(context.Context, config.Config, io.Writer, io.Writer) error {
-		t.Fatal("syncIncusWorkspace called by workspace parent command")
 		return nil
 	}
 
@@ -444,12 +431,7 @@ func TestLifecycleCommandDelegation(t *testing.T) {
 		wantName string
 	}{
 		{name: "image create", args: []string{"image", "create"}, workflow: "image"},
-		{name: "sandbox create default", args: []string{"sandbox", "create"}, workflow: "sandbox-create", wantName: "sandbox"},
-		{name: "sandbox create named", args: []string{"sandbox", "create", "personal"}, workflow: "sandbox-create", wantName: "personal"},
-		{name: "sandbox destroy default", args: []string{"sandbox", "destroy"}, workflow: "sandbox-destroy", wantName: "sandbox"},
-		{name: "sandbox destroy named", args: []string{"sandbox", "destroy", "personal"}, workflow: "sandbox-destroy", wantName: "personal"},
 		{name: "workspace repos sync", args: []string{"workspace", "repos", "sync"}, workflow: "workspace-repos"},
-		{name: "workspace incus sync", args: []string{"workspace", "incus", "sync"}, workflow: "workspace-incus"},
 	}
 
 	for _, tt := range tests {
@@ -492,17 +474,8 @@ func TestLifecycleCommandDelegation(t *testing.T) {
 			service.createImage = func(ctx context.Context, cfg config.Config, stdout, stderr io.Writer) error {
 				return check(ctx, cfg, stdout, stderr, "image", "")
 			}
-			service.createSandbox = func(ctx context.Context, cfg config.Config, name string, stdout, stderr io.Writer) error {
-				return check(ctx, cfg, stdout, stderr, "sandbox-create", name)
-			}
-			service.destroySandbox = func(ctx context.Context, cfg config.Config, name string, stdout, stderr io.Writer) error {
-				return check(ctx, cfg, stdout, stderr, "sandbox-destroy", name)
-			}
 			service.syncRepos = func(ctx context.Context, cfg config.Config, stdout, stderr io.Writer) error {
 				return check(ctx, cfg, stdout, stderr, "workspace-repos", "")
-			}
-			service.syncIncusWorkspace = func(ctx context.Context, cfg config.Config, stdout, stderr io.Writer) error {
-				return check(ctx, cfg, stdout, stderr, "workspace-incus", "")
 			}
 
 			root := newRootCommand(service, testProxyOptions())
@@ -524,9 +497,6 @@ func TestLifecycleCommandsStopWhenConfigLoadFails(t *testing.T) {
 	loadErr := errors.New("load failed")
 	for _, args := range [][]string{
 		{"image", "create"},
-		{"sandbox", "create"},
-		{"sandbox", "destroy", "personal"},
-		{"workspace", "incus", "sync"},
 		{"workspace", "repos", "sync"},
 	} {
 		t.Run(strings.Join(args, " "), func(t *testing.T) {
@@ -540,20 +510,8 @@ func TestLifecycleCommandsStopWhenConfigLoadFails(t *testing.T) {
 				t.Fatal("createImage called after config error")
 				return nil
 			}
-			service.createSandbox = func(context.Context, config.Config, string, io.Writer, io.Writer) error {
-				t.Fatal("createSandbox called after config error")
-				return nil
-			}
-			service.destroySandbox = func(context.Context, config.Config, string, io.Writer, io.Writer) error {
-				t.Fatal("destroySandbox called after config error")
-				return nil
-			}
 			service.syncRepos = func(context.Context, config.Config, io.Writer, io.Writer) error {
 				t.Fatal("syncRepos called after config error")
-				return nil
-			}
-			service.syncIncusWorkspace = func(context.Context, config.Config, io.Writer, io.Writer) error {
-				t.Fatal("syncIncusWorkspace called after config error")
 				return nil
 			}
 
@@ -574,10 +532,7 @@ func TestLifecycleCommandsStopWhenConfigLoadFails(t *testing.T) {
 func TestLifecycleCommandsRejectExtraArguments(t *testing.T) {
 	for _, args := range [][]string{
 		{"image", "create", "extra"},
-		{"sandbox", "create", "one", "two"},
-		{"sandbox", "destroy", "one", "two"},
 		{"session", "extra"},
-		{"workspace", "incus", "sync", "extra"},
 		{"workspace", "repos", "sync", "extra"},
 	} {
 		root := newRootCommand(stubServices(), testProxyOptions())
@@ -753,19 +708,10 @@ func stubServices() services {
 		createImage: func(context.Context, config.Config, io.Writer, io.Writer) error {
 			return nil
 		},
-		createSandbox: func(context.Context, config.Config, string, io.Writer, io.Writer) error {
-			return nil
-		},
-		destroySandbox: func(context.Context, config.Config, string, io.Writer, io.Writer) error {
-			return nil
-		},
 		runSupervisor: func(context.Context, config.Config, SessionOptions, io.Writer) error {
 			return nil
 		},
 		syncRepos: func(context.Context, config.Config, io.Writer, io.Writer) error {
-			return nil
-		},
-		syncIncusWorkspace: func(context.Context, config.Config, io.Writer, io.Writer) error {
 			return nil
 		},
 		runServer: func(context.Context, config.Config, server.Options) error { return nil },
@@ -806,24 +752,12 @@ func serverServicesThatRejectDependencies(t *testing.T) services {
 		t.Fatal("createImage called by server command")
 		return nil
 	}
-	service.createSandbox = func(context.Context, config.Config, string, io.Writer, io.Writer) error {
-		t.Fatal("createSandbox called by server command")
-		return nil
-	}
-	service.destroySandbox = func(context.Context, config.Config, string, io.Writer, io.Writer) error {
-		t.Fatal("destroySandbox called by server command")
-		return nil
-	}
 	service.runSupervisor = func(context.Context, config.Config, SessionOptions, io.Writer) error {
 		t.Fatal("runSupervisor called by server command")
 		return nil
 	}
 	service.syncRepos = func(context.Context, config.Config, io.Writer, io.Writer) error {
 		t.Fatal("syncRepos called by server command")
-		return nil
-	}
-	service.syncIncusWorkspace = func(context.Context, config.Config, io.Writer, io.Writer) error {
-		t.Fatal("syncIncusWorkspace called by server command")
 		return nil
 	}
 	return service

@@ -102,9 +102,3 @@ func (c *Client) copyStorageVolume(ctx context.Context, pool, source, target str
 func (c *Client) CopyStorageVolume(ctx context.Context, pool, source, target string) error {
 	return c.copyStorageVolume(ctx, pool, source, target, submitAndWaitRemoteOperation)
 }
-
-// CopyStorageVolumeUntilTerminal cancels the remote target on caller
-// cancellation but does not return until the submitted copy is terminal.
-func (c *Client) CopyStorageVolumeUntilTerminal(ctx context.Context, pool, source, target string) error {
-	return c.copyStorageVolume(ctx, pool, source, target, submitAndWaitRemoteOperationUntilTerminal)
-}

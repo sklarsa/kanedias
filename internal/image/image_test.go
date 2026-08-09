@@ -9,7 +9,6 @@ import (
 	"os/exec"
 	"path/filepath"
 	"reflect"
-	"slices"
 	"strings"
 	"testing"
 	"time"
@@ -19,44 +18,11 @@ import (
 	"github.com/sklarsa/kanedias/internal/incusclient"
 )
 
-func TestInstallerIncludesUninitializedContainerOnlyIncus(t *testing.T) {
+func TestInstallerExcludesNestedIncus(t *testing.T) {
 	script := string(installer)
-	const startMarker = "apt-get install -y --no-install-recommends \\\n"
-	start := strings.Index(script, startMarker)
-	if start < 0 {
-		t.Fatal("installer initial package batch not found")
-	}
-	packageBlock := script[start+len(startMarker):]
-	end := strings.Index(packageBlock, "\n\nrun_as_managed_user()")
-	if end < 0 {
-		t.Fatal("installer initial package batch terminator not found")
-	}
-	packages := strings.Fields(strings.ReplaceAll(packageBlock[:end], "\\\n", " "))
-
-	if !slices.Contains(packages, "incus-base") {
-		t.Error("initial package batch does not include incus-base")
-	}
-	if slices.Contains(packages, "incus") {
-		t.Error("initial package batch includes VM-oriented incus metapackage")
-	}
-	if !strings.Contains(script, `usermod --append --groups sudo,incus-admin "$managed_user"`) {
-		t.Error("managed user is not added to incus-admin")
-	}
-	if !strings.Contains(script, `[[ $(id -u "$managed_user") != 1000 || $(id -g "$managed_user") != 1000 ]]`) {
-		t.Error("managed user numeric UID/GID 1000 is not asserted before image publication")
-	}
-	if strings.Contains(script, "incus admin init") {
-		t.Error("installer initializes Incus")
-	}
-
-	allowedIncusLines := map[string]bool{
-		`incus-base \`: true,
-		`usermod --append --groups sudo,incus-admin "$managed_user"`: true,
-	}
-	for _, line := range strings.Split(script, "\n") {
-		line = strings.TrimSpace(line)
-		if strings.Contains(line, "incus") && !allowedIncusLines[line] {
-			t.Errorf("installer contains unexpected Incus operation %q", line)
+	for _, forbidden := range []string{"incus-base", "incus-admin", "incus admin init"} {
+		if strings.Contains(script, forbidden) {
+			t.Errorf("installer contains nested Incus setup %q", forbidden)
 		}
 	}
 }

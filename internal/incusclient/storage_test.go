@@ -156,44 +156,6 @@ type storageRemoteOperation struct {
 func (o *storageRemoteOperation) Wait() error         { return o.fake.Wait() }
 func (o *storageRemoteOperation) CancelTarget() error { return o.fake.CancelTarget() }
 
-func TestCopyStorageVolumeUntilTerminalUsesAdapterAndHoldsCancellationUntilRemoteTerminal(t *testing.T) {
-	waitErr := errors.New("remote operation cancelled")
-	remote := &fakeRemoteOperation{
-		waitStarted: make(chan struct{}),
-		waitRelease: make(chan struct{}),
-		cancelled:   make(chan struct{}),
-		waitErr:     waitErr,
-	}
-	server := &storageAdapterServer{
-		volume:        &api.StorageVolume{Name: "seed"},
-		copyOperation: &storageRemoteOperation{fake: remote},
-	}
-	client := &Client{server: server}
-	ctx, cancel := context.WithCancel(context.Background())
-	result := make(chan error, 1)
-	go func() {
-		result <- client.CopyStorageVolumeUntilTerminal(ctx, "pool1", "seed", "clone")
-	}()
-	<-remote.waitStarted
-	cancel()
-
-	select {
-	case <-remote.cancelled:
-	case <-time.After(time.Second):
-		t.Fatal("CopyStorageVolumeUntilTerminal did not call CancelTarget")
-	}
-	select {
-	case err := <-result:
-		t.Fatalf("CopyStorageVolumeUntilTerminal returned before remote terminal state: %v", err)
-	default:
-	}
-
-	close(remote.waitRelease)
-	if err := <-result; !errors.Is(err, context.Canceled) || !errors.Is(err, waitErr) || !OperationWasSubmitted(err) {
-		t.Fatalf("CopyStorageVolumeUntilTerminal() error = %v, want submitted cancellation joined with terminal error", err)
-	}
-}
-
 func TestCopyStorageVolumeCancellationReturnsSubmittedOperationPromptlyAndRemainsAwaitable(t *testing.T) {
 	remote := &fakeRemoteOperation{
 		waitStarted: make(chan struct{}),
