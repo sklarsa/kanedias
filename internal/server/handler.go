@@ -72,7 +72,11 @@ func newHandlerWithOptions(logger *slog.Logger, advertisedAddress string, bootst
 
 	serveIndex := func(w http.ResponseWriter, _ *http.Request) {
 		w.Header().Set("Content-Type", "text/html; charset=utf-8")
-		if err := templates.ExecuteTemplate(w, "index.html", nil); err != nil {
+		view := indexView{SessionModal: sessionModalView{}}
+		if fleet != nil {
+			view = newIndexView(fleet.LaunchOptions())
+		}
+		if err := templates.ExecuteTemplate(w, "index.html", view); err != nil {
 			logger.Error("render index", "error", err)
 		}
 	}
@@ -97,6 +101,7 @@ func newHandlerWithOptions(logger *slog.Logger, advertisedAddress string, bootst
 	serveHighlight := serveEmbeddedAsset(logger, "web/highlight.min.js", "text/javascript; charset=utf-8")
 	serveMarkdownRenderer := serveEmbeddedAsset(logger, "web/markdown-renderer.js", "text/javascript; charset=utf-8")
 	serveTerminalUI := serveEmbeddedAsset(logger, "web/terminal-ui.js", "text/javascript; charset=utf-8")
+	serveSessionModal := serveEmbeddedAsset(logger, "web/session-modal.js", "text/javascript; charset=utf-8")
 
 	router := chi.NewRouter()
 	router.Use(requestLogger(logger), recoverPanics(logger))
@@ -113,6 +118,7 @@ func newHandlerWithOptions(logger *slog.Logger, advertisedAddress string, bootst
 	router.Get("/assets/highlight.min.js", serveHighlight)
 	router.Get("/assets/markdown-renderer.js", serveMarkdownRenderer)
 	router.Get("/assets/terminal-ui.js", serveTerminalUI)
+	router.Get("/assets/session-modal.js", serveSessionModal)
 	router.Get("/assets/app.js", serveAppJS)
 
 	var serveFleet, serveSession http.HandlerFunc
@@ -140,7 +146,7 @@ func newHandlerWithOptions(logger *slog.Logger, advertisedAddress string, bootst
 		write.Use(sessionRequired)
 		write.Use(writeRequired)
 		if fleet != nil {
-			write.Post("/ui/sessions", makeNewSessionHandler(fleet, templates, logger))
+			write.Post("/ui/sessions", makeNewSessionHandler(fleet, logger))
 			write.Post("/ui/sessions/{sessionID}/steer", makeSteerHandler(fleet, templates, logger))
 			write.Post("/ui/sessions/{sessionID}/interrupt", makeInterruptHandler(fleet, templates, logger))
 			write.Post("/ui/sessions/{sessionID}/stop", makeStopSessionHandler(fleet, templates, logger))
@@ -376,7 +382,7 @@ func patchSessionTargets(sse *datastar.ServerSentEventGenerator, templates *temp
 }
 
 func parseTemplates(fsys fs.FS) (*template.Template, error) {
-	return template.ParseFS(fsys, "web/index.html", "web/fleet.html", "web/detail.html",
+	return template.ParseFS(fsys, "web/index.html", "web/session-modal.html", "web/fleet.html", "web/detail.html",
 		"web/questions.html", "web/activity.html", "web/deck-status.html")
 }
 

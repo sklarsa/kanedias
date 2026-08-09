@@ -433,7 +433,12 @@ func minimalTestConfig(t *testing.T, rootSocketDir, sessionLogDir string) (confi
 	disc := config.Duration{Duration: 200 * time.Millisecond}
 	snap := config.Duration{Duration: 200 * time.Millisecond}
 	requireSession := true
+	catalog := modelCatalogFixture()
 	cfg := config.Config{
+		BaseImage: catalog.BaseImage,
+		Models:    catalog.Models,
+		Session:   catalog.Session,
+		Workers:   catalog.Workers,
 		Server: config.ServerConfig{
 			RootSocketDir:     rootSocketDir,
 			SessionLogDir:     sessionLogDir,
@@ -502,12 +507,18 @@ func newSelectedRouteFixture(t *testing.T) *selectedRouteFixture {
 	waitForSocketFile(t, socketPath, 3*time.Second)
 
 	logger, _ := testLogger()
+	launch, err := manager.NewLaunchConfiguration(modelCatalogFixture())
+	if err != nil {
+		rootCancel()
+		t.Fatalf("manager.NewLaunchConfiguration: %v", err)
+	}
 	fleet, err := manager.New(manager.Options{
 		RootSocketDir:     filepath.Join(base, "r"),
 		SessionLogDir:     filepath.Join(base, "l"),
 		DiscoveryInterval: 20 * time.Millisecond,
 		SnapshotInterval:  20 * time.Millisecond,
 		EventLimits:       supervisor.EventBrokerOptions{MaxEvents: 100},
+		Launch:            launch,
 		Logger:            logger,
 	})
 	if err != nil {

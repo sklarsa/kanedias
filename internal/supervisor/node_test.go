@@ -62,10 +62,20 @@ func (fake *fakeRootProvisioner) Destroy(ctx context.Context, _ *provision.Resou
 	return fake.destroyErr
 }
 
-type fakeWorkers struct{}
+func testModelPolicy() config.SessionModelPolicy {
+	return config.SessionModelPolicy{
+		Root: config.ModelProfile{Provider: "openai-codex", Model: "gpt-5.6-sol", ThinkingLevel: "high"},
+		Workers: map[string]config.WorkerProfile{
+			"reviewer": {Description: "Review", Provider: "anthropic", Model: "claude-review", ThinkingLevel: "medium"},
+			"worker":   {Description: "Implement", Provider: "local-executor", Model: "worker-model", ThinkingLevel: "off"},
+		},
+	}
+}
 
-func (fakeWorkers) Resolve(string) (config.WorkerProfile, error) { return config.WorkerProfile{}, nil }
-func (fakeWorkers) Summaries() []contract.WorkerSummary          { return nil }
+func workerModel(policy config.SessionModelPolicy, name string) config.ModelProfile {
+	worker := policy.Workers[name]
+	return config.ModelProfile{Provider: worker.Provider, Model: worker.Model, ThinkingLevel: worker.ThinkingLevel}
+}
 
 type trackedConn struct {
 	io.ReadWriteCloser
@@ -100,6 +110,11 @@ func boundSocket(t *testing.T) (string, net.Listener) {
 
 func startPiPeer(t *testing.T, peer net.Conn, beforeResponse json.RawMessage) <-chan struct{} {
 	t.Helper()
+	return startPiPeerWithState(t, peer, beforeResponse, "pi-1", "/tmp/pi-1.jsonl", testModelPolicy().Root)
+}
+
+func startPiPeerWithState(t *testing.T, peer net.Conn, beforeResponse json.RawMessage, sessionID, sessionFile string, model config.ModelProfile) <-chan struct{} {
+	t.Helper()
 	done := make(chan struct{})
 	go func() {
 		defer close(done)
@@ -118,11 +133,122 @@ func startPiPeer(t *testing.T, peer net.Conn, beforeResponse json.RawMessage) <-
 		if beforeResponse != nil {
 			_, _ = peer.Write(append(append([]byte(nil), beforeResponse...), '\n'))
 		}
-		response := map[string]any{"id": command.ID, "type": "response", "command": "get_state", "success": true, "data": map[string]any{"sessionId": "pi-1", "sessionFile": "/tmp/pi-1.jsonl", "isStreaming": false}}
+		response := map[string]any{"id": command.ID, "type": "response", "command": "get_state", "success": true, "data": map[string]any{
+			"sessionId": sessionID, "sessionFile": sessionFile, "isStreaming": false,
+			"model": map[string]any{"provider": model.Provider, "id": model.Model}, "thinkingLevel": model.ThinkingLevel,
+		}}
 		wire, _ := json.Marshal(response)
 		_, _ = peer.Write(append(wire, '\n'))
 	}()
 	return done
+}
+
+func TestNodeStartSelectsDistinctRootAndFreshChildModels(t *testing.T) {
+	policy := testModelPolicy()
+	reviewerIdentity, err := NewIdentity(IdentitySpec{
+		SessionID: "reviewer-1", ParentID: "root-1", RootID: "root-1",
+		Kind: contract.ChildKindRead, Context: contract.ContextFresh, Worker: "reviewer",
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	for _, test := range []struct {
+		name     string
+		identity Identity
+		model    config.ModelProfile
+		newNode  func(Identity, Dependencies, *EventBroker) (*Node, error)
+	}{
+		{name: "root", identity: testRootIdentity(t), model: policy.Root, newNode: NewRoot},
+		{name: "fresh reviewer child", identity: reviewerIdentity, model: workerModel(policy, "reviewer"), newNode: NewChild},
+	} {
+		t.Run(test.name, func(t *testing.T) {
+			socket, listener := boundSocket(t)
+			clientConn, peer := net.Pipe()
+			t.Cleanup(func() { _ = peer.Close() })
+			connection := &trackedConn{ReadWriteCloser: clientConn}
+			fake := &fakeRootProvisioner{resources: &provision.Resources{SessionID: test.identity.sessionID, Instance: "instance", Volume: "volume", RPCAddr: "rpc"}}
+			node, err := test.newNode(test.identity, Dependencies{
+				Provisioner: fake, SocketPath: socket,
+				DialRPC:       func(context.Context, string) (io.ReadWriteCloser, error) { return connection, nil },
+				ModelPolicy:   policy,
+				CloseListener: func(context.Context) error { return listener.Close() },
+			}, NewEventBroker())
+			if err != nil {
+				t.Fatal(err)
+			}
+			peerDone := startPiPeerWithState(t, peer, nil, "pi-selected", "/tmp/selected.jsonl", test.model)
+			if err := node.Start(context.Background()); err != nil {
+				t.Fatalf("Start() error = %v", err)
+			}
+			<-peerDone
+			snapshot := node.Snapshot()
+			if snapshot.Lifecycle != string(LifecycleReady) || snapshot.Model != test.model {
+				t.Fatalf("selected model snapshot = %#v, want ready with %#v", snapshot, test.model)
+			}
+			if err := node.Stop(context.Background(), StopReasonRequested); err != nil {
+				t.Fatal(err)
+			}
+			if !connection.closed.Load() || fake.destroyed != 1 {
+				t.Fatalf("cleanup = connection closed %v, destroy calls %d", connection.closed.Load(), fake.destroyed)
+			}
+		})
+	}
+}
+
+func TestForkChildEffectiveWorkerModelMismatchFailsBeforeReadyAndCleansEverything(t *testing.T) {
+	policy := testModelPolicy()
+	expected := workerModel(policy, "worker")
+	identity, err := NewIdentity(IdentitySpec{
+		SessionID: "writer", ParentID: "root", RootID: "root",
+		Kind: contract.ChildKindWrite, Context: contract.ContextFork, Worker: "worker",
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	for _, test := range []struct {
+		name   string
+		mutate func(*config.ModelProfile)
+	}{
+		{name: "provider", mutate: func(model *config.ModelProfile) { model.Provider = "wrong-provider" }},
+		{name: "model", mutate: func(model *config.ModelProfile) { model.Model = "wrong-model" }},
+		{name: "thinking", mutate: func(model *config.ModelProfile) { model.ThinkingLevel = "xhigh" }},
+	} {
+		t.Run(test.name, func(t *testing.T) {
+			socket, listener := boundSocket(t)
+			clientConn, peer := net.Pipe()
+			t.Cleanup(func() { _ = peer.Close() })
+			connection := &trackedConn{ReadWriteCloser: clientConn}
+			fake := &fakeRootProvisioner{resources: &provision.Resources{SessionID: "writer", Instance: "instance", Volume: "volume", RPCAddr: "rpc"}}
+			listenerClosed := false
+			node, err := NewChild(identity, Dependencies{
+				Provisioner: fake, SocketPath: socket,
+				DialRPC:           func(context.Context, string) (io.ReadWriteCloser, error) { return connection, nil },
+				ModelPolicy:       policy,
+				ExpectedPiBinding: &PiBinding{SessionID: "admitted-pi", SessionFile: "/tmp/admitted.jsonl"},
+				CloseListener:     func(context.Context) error { listenerClosed = true; return listener.Close() },
+			}, NewEventBroker())
+			if err != nil {
+				t.Fatal(err)
+			}
+			actual := expected
+			test.mutate(&actual)
+			peerDone := startPiPeerWithState(t, peer, nil, "admitted-pi", "/tmp/admitted.jsonl", actual)
+			if err := node.Start(context.Background()); !errors.Is(err, ErrInvariant) {
+				t.Fatalf("Start() error = %v, want model invariant", err)
+			}
+			<-peerDone
+			snapshot := node.Snapshot()
+			if snapshot.PiSessionID != "" || snapshot.SessionFile != "" || snapshot.Model != (config.ModelProfile{}) {
+				t.Fatalf("mismatched effective model was retained: %#v", snapshot)
+			}
+			if snapshot.Lifecycle != string(LifecycleFailed) {
+				t.Fatalf("lifecycle = %s, want failed", snapshot.Lifecycle)
+			}
+			if !connection.closed.Load() || fake.destroyed != 1 || !listenerClosed {
+				t.Fatalf("failure cleanup = connection closed %v, destroy calls %d, listener closed %v", connection.closed.Load(), fake.destroyed, listenerClosed)
+			}
+		})
+	}
 }
 
 func TestForkChildBindingMismatchFailsBeforeReadyAndCleansEverything(t *testing.T) {
@@ -134,14 +260,14 @@ func TestForkChildBindingMismatchFailsBeforeReadyAndCleansEverything(t *testing.
 	listenerClosed := false
 	node, err := NewChild(writerIdentity(t), Dependencies{
 		Provisioner: fake, SocketPath: socket,
-		DialRPC: func(context.Context, string) (io.ReadWriteCloser, error) { return connection, nil },
-		Workers: fakeWorkers{}, ExpectedPiBinding: &PiBinding{SessionID: "admitted-pi", SessionFile: "/tmp/admitted.jsonl"},
+		DialRPC:     func(context.Context, string) (io.ReadWriteCloser, error) { return connection, nil },
+		ModelPolicy: testModelPolicy(), ExpectedPiBinding: &PiBinding{SessionID: "admitted-pi", SessionFile: "/tmp/admitted.jsonl"},
 		CloseListener: func(context.Context) error { listenerClosed = true; return listener.Close() },
 	}, NewEventBroker())
 	if err != nil {
 		t.Fatal(err)
 	}
-	peerDone := startPiPeer(t, peer, nil)
+	peerDone := startPiPeerWithState(t, peer, nil, "pi-1", "/tmp/pi-1.jsonl", workerModel(testModelPolicy(), "worker"))
 	if err := node.Start(context.Background()); !errors.Is(err, ErrInvariant) {
 		t.Fatalf("Start() error = %v, want fork binding invariant", err)
 	}
@@ -185,7 +311,7 @@ func TestNewRootRejectsSocketThatIsNotReadyBeforeProvisioning(t *testing.T) {
 	} {
 		t.Run(test.name, func(t *testing.T) {
 			fake := &fakeRootProvisioner{resources: &provision.Resources{SessionID: "root-1", RPCAddr: "rpc"}}
-			node, err := NewRoot(testRootIdentity(t), Dependencies{Provisioner: fake, SocketPath: test.prepare(t), DialRPC: func(context.Context, string) (io.ReadWriteCloser, error) { t.Fatal("DialRPC called"); return nil, nil }, Workers: fakeWorkers{}, CloseListener: func(context.Context) error { return nil }}, NewEventBroker())
+			node, err := NewRoot(testRootIdentity(t), Dependencies{Provisioner: fake, SocketPath: test.prepare(t), DialRPC: func(context.Context, string) (io.ReadWriteCloser, error) { t.Fatal("DialRPC called"); return nil, nil }, ModelPolicy: testModelPolicy(), CloseListener: func(context.Context) error { return nil }}, NewEventBroker())
 			if test.name == "empty" || test.name == "relative" {
 				if err == nil || node != nil {
 					t.Fatalf("NewRoot() = (%v, %v), want validation error", node, err)
@@ -216,7 +342,7 @@ func TestRootNodeProvisioningFailureNeverDialsRPC(t *testing.T) {
 			t.Fatal("DialRPC called after provisioning failure")
 			return nil, nil
 		},
-		Workers: fakeWorkers{}, CloseListener: func(context.Context) error { return nil },
+		ModelPolicy: testModelPolicy(), CloseListener: func(context.Context) error { return nil },
 	}, nil)
 	if err != nil {
 		t.Fatal(err)
@@ -229,11 +355,41 @@ func TestRootNodeProvisioningFailureNeverDialsRPC(t *testing.T) {
 	}
 }
 
+func TestNodeClonesPolicyAndReturnsSortedWorkerSummaries(t *testing.T) {
+	path, _ := boundSocket(t)
+	policy := testModelPolicy()
+	policy.Workers["alpha"] = config.WorkerProfile{Description: "First", Provider: "test", Model: "alpha", ThinkingLevel: "off"}
+	node, err := NewRoot(testRootIdentity(t), Dependencies{
+		Provisioner: &fakeRootProvisioner{}, SocketPath: path,
+		DialRPC:     func(context.Context, string) (io.ReadWriteCloser, error) { return nil, errors.New("unused") },
+		ModelPolicy: policy, CloseListener: func(context.Context) error { return nil },
+	}, nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	mutated := policy.Workers["alpha"]
+	mutated.Description = "mutated after construction"
+	policy.Workers["alpha"] = mutated
+	delete(policy.Workers, "reviewer")
+
+	summaries := node.WorkerSummaries()
+	gotNames := make([]string, 0, len(summaries))
+	for _, summary := range summaries {
+		gotNames = append(gotNames, summary.WorkerType)
+	}
+	if got, want := strings.Join(gotNames, ","), "alpha,reviewer,worker"; got != want {
+		t.Fatalf("worker order = %q, want %q", got, want)
+	}
+	if summaries[0].Description != "First" {
+		t.Fatalf("cloned worker description = %q, want First", summaries[0].Description)
+	}
+}
+
 func TestRootNodeTCPConnectionAloneIsNotReady(t *testing.T) {
 	path, _ := boundSocket(t)
 	host, peer := net.Pipe()
 	fake := &fakeRootProvisioner{resources: &provision.Resources{SessionID: "root-1", RPCAddr: "rpc"}}
-	node, err := NewRoot(testRootIdentity(t), Dependencies{Provisioner: fake, SocketPath: path, DialRPC: func(context.Context, string) (io.ReadWriteCloser, error) { return host, nil }, Workers: fakeWorkers{}, CloseListener: func(context.Context) error { return nil }}, nil)
+	node, err := NewRoot(testRootIdentity(t), Dependencies{Provisioner: fake, SocketPath: path, DialRPC: func(context.Context, string) (io.ReadWriteCloser, error) { return host, nil }, ModelPolicy: testModelPolicy(), CloseListener: func(context.Context) error { return nil }}, nil)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -257,7 +413,7 @@ func TestRootNodeBindsOnlyAfterGetStateAndBuffersInitialEvent(t *testing.T) {
 	defer func() { _ = peer.Close() }()
 	fake := &fakeRootProvisioner{resources: &provision.Resources{SessionID: "root-1", Pool: "btrfs", Instance: "i", Volume: "v", RPCAddr: "rpc"}}
 	broker := NewEventBroker()
-	node, err := NewRoot(testRootIdentity(t), Dependencies{Provisioner: fake, SocketPath: path, DialRPC: func(context.Context, string) (io.ReadWriteCloser, error) { return host, nil }, Workers: fakeWorkers{}, CloseListener: func(context.Context) error { return nil }}, broker)
+	node, err := NewRoot(testRootIdentity(t), Dependencies{Provisioner: fake, SocketPath: path, DialRPC: func(context.Context, string) (io.ReadWriteCloser, error) { return host, nil }, ModelPolicy: testModelPolicy(), CloseListener: func(context.Context) error { return nil }}, broker)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -290,6 +446,9 @@ func TestRootNodeBindsOnlyAfterGetStateAndBuffersInitialEvent(t *testing.T) {
 	if fake.request.SocketPath != path {
 		t.Fatalf("provision socket = %q, want %q", fake.request.SocketPath, path)
 	}
+	if fake.request.Model != testModelPolicy().Root {
+		t.Fatalf("provision model = %#v, want %#v", fake.request.Model, testModelPolicy().Root)
+	}
 }
 
 func TestRootNodeForbiddenRPCIsNotWritten(t *testing.T) {
@@ -297,7 +456,7 @@ func TestRootNodeForbiddenRPCIsNotWritten(t *testing.T) {
 	host, peer := net.Pipe()
 	defer func() { _ = peer.Close() }()
 	fake := &fakeRootProvisioner{resources: &provision.Resources{SessionID: "root-1", RPCAddr: "rpc"}}
-	node, err := NewRoot(testRootIdentity(t), Dependencies{Provisioner: fake, SocketPath: path, DialRPC: func(context.Context, string) (io.ReadWriteCloser, error) { return host, nil }, Workers: fakeWorkers{}, CloseListener: func(context.Context) error { return nil }}, nil)
+	node, err := NewRoot(testRootIdentity(t), Dependencies{Provisioner: fake, SocketPath: path, DialRPC: func(context.Context, string) (io.ReadWriteCloser, error) { return host, nil }, ModelPolicy: testModelPolicy(), CloseListener: func(context.Context) error { return nil }}, nil)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -321,7 +480,7 @@ func TestRootNodeEOFEndsPendingCallAndFailsNode(t *testing.T) {
 	path, _ := boundSocket(t)
 	host, peer := net.Pipe()
 	fake := &fakeRootProvisioner{resources: &provision.Resources{SessionID: "root-1", RPCAddr: "rpc"}}
-	node, err := NewRoot(testRootIdentity(t), Dependencies{Provisioner: fake, SocketPath: path, DialRPC: func(context.Context, string) (io.ReadWriteCloser, error) { return host, nil }, Workers: fakeWorkers{}, CloseListener: func(context.Context) error { return nil }}, nil)
+	node, err := NewRoot(testRootIdentity(t), Dependencies{Provisioner: fake, SocketPath: path, DialRPC: func(context.Context, string) (io.ReadWriteCloser, error) { return host, nil }, ModelPolicy: testModelPolicy(), CloseListener: func(context.Context) error { return nil }}, nil)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -357,7 +516,7 @@ func TestRootNodeWaitsForBufferedPiEventsBeforeDoneAndCleanup(t *testing.T) {
 	host, peer := net.Pipe()
 	fake := &fakeRootProvisioner{resources: &provision.Resources{SessionID: "root-1", Instance: "i", Volume: "v", RPCAddr: "rpc"}}
 	broker := NewEventBroker()
-	node, err := NewRoot(testRootIdentity(t), Dependencies{Provisioner: fake, SocketPath: path, DialRPC: func(context.Context, string) (io.ReadWriteCloser, error) { return host, nil }, Workers: fakeWorkers{}, CloseListener: func(context.Context) error { return nil }}, broker)
+	node, err := NewRoot(testRootIdentity(t), Dependencies{Provisioner: fake, SocketPath: path, DialRPC: func(context.Context, string) (io.ReadWriteCloser, error) { return host, nil }, ModelPolicy: testModelPolicy(), CloseListener: func(context.Context) error { return nil }}, broker)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -418,7 +577,7 @@ func TestRootNodeStopIsIdempotentAndClosesPiBeforeDestroy(t *testing.T) {
 		orderMu.Unlock()
 	}
 	listenerCalls := 0
-	node, err := NewRoot(testRootIdentity(t), Dependencies{Provisioner: fake, SocketPath: path, DialRPC: func(context.Context, string) (io.ReadWriteCloser, error) { return tracked, nil }, Workers: fakeWorkers{}, CloseListener: func(context.Context) error {
+	node, err := NewRoot(testRootIdentity(t), Dependencies{Provisioner: fake, SocketPath: path, DialRPC: func(context.Context, string) (io.ReadWriteCloser, error) { return tracked, nil }, ModelPolicy: testModelPolicy(), CloseListener: func(context.Context) error {
 		orderMu.Lock()
 		defer orderMu.Unlock()
 		listenerCalls++
@@ -458,7 +617,7 @@ func TestRootNodeClosesBrokerBeforeListenerCancellationAndWait(t *testing.T) {
 		Provisioner: fake,
 		SocketPath:  path,
 		DialRPC:     func(context.Context, string) (io.ReadWriteCloser, error) { return nil, errors.New("unused") },
-		Workers:     fakeWorkers{},
+		ModelPolicy: testModelPolicy(),
 		CloseListener: func(context.Context) error {
 			listenerCalled.Store(true)
 			select {
@@ -487,7 +646,7 @@ func TestRootNodeClosesBrokerBeforeListenerCancellationAndWait(t *testing.T) {
 func TestNewRootRequiresListenerLifecycleHook(t *testing.T) {
 	path, _ := boundSocket(t)
 	fake := &fakeRootProvisioner{}
-	node, err := NewRoot(testRootIdentity(t), Dependencies{Provisioner: fake, SocketPath: path, DialRPC: func(context.Context, string) (io.ReadWriteCloser, error) { return nil, nil }, Workers: fakeWorkers{}}, nil)
+	node, err := NewRoot(testRootIdentity(t), Dependencies{Provisioner: fake, SocketPath: path, DialRPC: func(context.Context, string) (io.ReadWriteCloser, error) { return nil, nil }, ModelPolicy: testModelPolicy()}, nil)
 	if err == nil || node != nil {
 		t.Fatalf("NewRoot without CloseListener = (%v, %v)", node, err)
 	}
@@ -501,7 +660,7 @@ func TestRootNodeStopBeforeStartPreventsProvisioning(t *testing.T) {
 		DialRPC: func(context.Context, string) (io.ReadWriteCloser, error) {
 			t.Fatal("DialRPC called after stop-before-start")
 			return nil, nil
-		}, Workers: fakeWorkers{}, CloseListener: func(context.Context) error { return nil },
+		}, ModelPolicy: testModelPolicy(), CloseListener: func(context.Context) error { return nil },
 	}, nil)
 	if err != nil {
 		t.Fatal(err)
@@ -532,7 +691,7 @@ func TestRootNodeStopWhileProvisioningDestroysLateResourcesWithoutDialing(t *tes
 		DialRPC: func(context.Context, string) (io.ReadWriteCloser, error) {
 			t.Fatal("DialRPC called after stop won provisioning race")
 			return nil, nil
-		}, Workers: fakeWorkers{}, CloseListener: func(context.Context) error { return nil },
+		}, ModelPolicy: testModelPolicy(), CloseListener: func(context.Context) error { return nil },
 	}, nil)
 	if err != nil {
 		t.Fatal(err)
@@ -579,7 +738,7 @@ func TestRootNodeExpiredStopStillFinalizesLateProvisioning(t *testing.T) {
 		DialRPC: func(context.Context, string) (io.ReadWriteCloser, error) {
 			dialed.Store(true)
 			return nil, errors.New("unexpected Pi dial")
-		}, Workers: fakeWorkers{}, CloseListener: func(context.Context) error { return nil },
+		}, ModelPolicy: testModelPolicy(), CloseListener: func(context.Context) error { return nil },
 	}, nil)
 	if err != nil {
 		t.Fatal(err)
@@ -630,7 +789,7 @@ func TestRootNodeChangedPiIdentityIsTerminalAndCleansResources(t *testing.T) {
 	path, _ := boundSocket(t)
 	host, peer := net.Pipe()
 	fake := &fakeRootProvisioner{resources: &provision.Resources{SessionID: "root-1", Instance: "i", Volume: "v", RPCAddr: "rpc"}}
-	node, err := NewRoot(testRootIdentity(t), Dependencies{Provisioner: fake, SocketPath: path, DialRPC: func(context.Context, string) (io.ReadWriteCloser, error) { return host, nil }, Workers: fakeWorkers{}, CloseListener: func(context.Context) error { return nil }}, nil)
+	node, err := NewRoot(testRootIdentity(t), Dependencies{Provisioner: fake, SocketPath: path, DialRPC: func(context.Context, string) (io.ReadWriteCloser, error) { return host, nil }, ModelPolicy: testModelPolicy(), CloseListener: func(context.Context) error { return nil }}, nil)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -676,7 +835,7 @@ func TestRootNodeStartJoinsBindingAndCleanupErrors(t *testing.T) {
 	cleanupErr := errors.New("cleanup failed")
 	listenerErr := errors.New("listener cleanup failed")
 	fake := &fakeRootProvisioner{resources: &provision.Resources{SessionID: "root-1", RPCAddr: "rpc"}, destroyErr: cleanupErr}
-	node, err := NewRoot(testRootIdentity(t), Dependencies{Provisioner: fake, SocketPath: path, DialRPC: func(context.Context, string) (io.ReadWriteCloser, error) { return host, nil }, Workers: fakeWorkers{}, CloseListener: func(context.Context) error { return listenerErr }}, nil)
+	node, err := NewRoot(testRootIdentity(t), Dependencies{Provisioner: fake, SocketPath: path, DialRPC: func(context.Context, string) (io.ReadWriteCloser, error) { return host, nil }, ModelPolicy: testModelPolicy(), CloseListener: func(context.Context) error { return listenerErr }}, nil)
 	if err != nil {
 		t.Fatal(err)
 	}

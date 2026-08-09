@@ -61,6 +61,7 @@ type Child struct {
 }
 
 func (spawner Spawner) Spawn(ctx context.Context, bootstrap Bootstrap) (*Child, error) {
+	bootstrap.Policy = bootstrap.Policy.Clone()
 	if err := bootstrap.Validate(); err != nil {
 		return nil, err
 	}

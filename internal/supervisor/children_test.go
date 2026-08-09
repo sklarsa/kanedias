@@ -8,6 +8,7 @@ import (
 	"net"
 	"os"
 	"path/filepath"
+	"reflect"
 	"sync"
 	"sync/atomic"
 	"testing"
@@ -18,16 +19,6 @@ import (
 	"github.com/sklarsa/kanedias/internal/supervisor/process"
 	"github.com/sklarsa/kanedias/internal/supervisor/provision"
 )
-
-type childTestWorkers struct{}
-
-func (childTestWorkers) Resolve(name string) (config.WorkerProfile, error) {
-	if name != "reviewer" {
-		return config.WorkerProfile{}, contract.NewError(contract.ErrorUnknownWorkerType, "unknown worker")
-	}
-	return config.WorkerProfile{Description: "review", Provider: "provider", Model: "model"}, nil
-}
-func (childTestWorkers) Summaries() []contract.WorkerSummary { return nil }
 
 type fakeChildProcess struct {
 	readyEntered chan struct{}
@@ -175,7 +166,7 @@ func childCreationNode(t *testing.T, spawn ChildSpawner, factory DescendantClien
 		identity: testRootIdentity(t), broker: NewEventBroker(), state: LifecycleReady, started: true,
 		resources: &provision.Resources{SessionID: "root-1", Instance: "instance", Volume: "volume"},
 		children:  newChildRegistry(), startupDone: make(chan struct{}), done: make(chan struct{}),
-		deps: Dependencies{Workers: childTestWorkers{}, SocketPath: "/tmp/root.sock", SpawnChild: spawn, DescendantClient: factory, ChildStopTimeout: 100 * time.Millisecond, CloseListener: func(context.Context) error { return nil }},
+		deps: Dependencies{ModelPolicy: testModelPolicy(), SocketPath: "/tmp/root.sock", SpawnChild: spawn, DescendantClient: factory, ChildStopTimeout: 100 * time.Millisecond, CloseListener: func(context.Context) error { return nil }},
 	}
 	close(node.startupDone)
 	return node
@@ -187,6 +178,122 @@ func readRequest() contract.CreateChildRequest {
 
 func directChildSnapshot(id string) NodeSnapshot {
 	return NodeSnapshot{SessionID: id, ParentSessionID: "root-1", RootSessionID: "root-1", Kind: contract.ChildKindRead, Context: contract.ContextFresh, WorkerType: "reviewer", Lifecycle: string(LifecycleReady), Questions: []QuestionSummary{}, Children: []NodeSnapshot{}}
+}
+
+func TestStartingChildFallbackDoesNotClaimRequestedModelBeforeEffectiveBinding(t *testing.T) {
+	spawnEntered := make(chan struct{})
+	spawnRelease := make(chan struct{})
+	node := childCreationNode(t, func(context.Context, process.Bootstrap) (ChildProcess, error) {
+		close(spawnEntered)
+		<-spawnRelease
+		return nil, errors.New("stop capture")
+	}, func(string) (DescendantClient, error) { return nil, errors.New("unexpected client") })
+	node.deps.NewSessionID = func() (string, error) { return "session-starting", nil }
+	result := make(chan error, 1)
+	go func() {
+		_, err := node.CreateChild(context.Background(), "root-1", readRequest())
+		result <- err
+	}()
+	<-spawnEntered
+
+	snapshot, err := NewRouter(node).Snapshot(context.Background())
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(snapshot.Children) != 1 {
+		t.Fatalf("starting children = %d, want 1", len(snapshot.Children))
+	}
+	if snapshot.Children[0].Model != (config.ModelProfile{}) {
+		t.Fatalf("starting fallback model = %#v, want empty effective model", snapshot.Children[0].Model)
+	}
+
+	effective := config.ModelProfile{Provider: "effective-provider", Model: "effective-model", ThinkingLevel: "xhigh"}
+	entry := node.children.snapshot()[0]
+	entry.setClient(&fakeDescendantClient{snapshot: NodeSnapshot{
+		SessionID: "session-starting", ParentSessionID: "root-1", RootSessionID: "root-1",
+		Kind: contract.ChildKindRead, Context: contract.ContextFresh, WorkerType: "reviewer",
+		Lifecycle: string(LifecycleReady), Model: effective, Questions: []QuestionSummary{}, Children: []NodeSnapshot{},
+	}})
+	snapshot, err = NewRouter(node).Snapshot(context.Background())
+	if err != nil {
+		t.Fatal(err)
+	}
+	if snapshot.Children[0].Model != effective {
+		t.Fatalf("bound child model = %#v, want effective %#v", snapshot.Children[0].Model, effective)
+	}
+	close(spawnRelease)
+	if err := <-result; err == nil {
+		t.Fatal("captured child unexpectedly succeeded")
+	}
+}
+
+func TestCreateChildClonesCompletePolicyAcrossTwoGenerations(t *testing.T) {
+	admitted := testModelPolicy()
+	var childBootstrap process.Bootstrap
+	root := childCreationNode(t, func(_ context.Context, got process.Bootstrap) (ChildProcess, error) {
+		childBootstrap = got
+		return nil, errors.New("capture child bootstrap")
+	}, func(string) (DescendantClient, error) { return nil, errors.New("unexpected client") })
+	root.deps.ModelPolicy = admitted.Clone()
+	root.deps.NewSessionID = func() (string, error) { return "child-1", nil }
+
+	_, _ = root.CreateChild(context.Background(), "root-1", readRequest())
+	if !reflect.DeepEqual(childBootstrap.Policy, admitted) {
+		t.Fatalf("child policy = %#v, want %#v", childBootstrap.Policy, admitted)
+	}
+	if len(childBootstrap.Policy.Workers) != len(admitted.Workers) {
+		t.Fatalf("child worker roles = %#v, want all roles %#v", childBootstrap.Policy.Workers, admitted.Workers)
+	}
+	inherited := childBootstrap.Policy.Clone()
+	mutated := childBootstrap.Policy.Workers["reviewer"]
+	mutated.Model = "mutated-bootstrap-model"
+	childBootstrap.Policy.Workers["reviewer"] = mutated
+	if reflect.DeepEqual(root.deps.ModelPolicy, childBootstrap.Policy) {
+		t.Fatal("child bootstrap policy aliases root node policy")
+	}
+
+	childIdentity, err := NewIdentity(IdentitySpec{
+		SessionID: "child-1", ParentID: "root-1", RootID: "root-1",
+		Kind: contract.ChildKindRead, Context: contract.ContextFresh, Worker: "reviewer",
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	var grandchildBootstrap process.Bootstrap
+	child := &Node{
+		identity: childIdentity, broker: NewEventBroker(), state: LifecycleReady, started: true,
+		resources: &provision.Resources{SessionID: "child-1", Instance: "child-instance", Volume: "child-volume"},
+		children:  newChildRegistry(), startupDone: make(chan struct{}), done: make(chan struct{}),
+		deps: Dependencies{
+			ModelPolicy: inherited.Clone(), SocketPath: "/tmp/child-1.sock",
+			SpawnChild: func(_ context.Context, got process.Bootstrap) (ChildProcess, error) {
+				grandchildBootstrap = got
+				return nil, errors.New("capture grandchild bootstrap")
+			},
+			DescendantClient: func(string) (DescendantClient, error) { return nil, errors.New("unexpected client") },
+			NewSessionID:     func() (string, error) { return "grandchild-1", nil },
+			CloseListener:    func(context.Context) error { return nil },
+		},
+	}
+	close(child.startupDone)
+
+	// Simulate global defaults changing after root admission. Descendant policy
+	// authority must remain the originally inherited policy.
+	changedGlobals := admitted.Clone()
+	changed := changedGlobals.Workers["worker"]
+	changed.Provider, changed.Model, changed.ThinkingLevel = "changed-provider", "changed-model", "xhigh"
+	changedGlobals.Workers["worker"] = changed
+
+	grandchildRequest := readRequest()
+	grandchildRequest.WorkerType = "worker"
+	_, _ = child.CreateChild(context.Background(), "child-1", grandchildRequest)
+	if !reflect.DeepEqual(grandchildBootstrap.Policy, inherited) {
+		t.Fatalf("grandchild policy = %#v, want original inherited policy %#v (changed globals %#v)", grandchildBootstrap.Policy, inherited, changedGlobals)
+	}
+	grandchildBootstrap.Policy.Workers["worker"] = changed
+	if reflect.DeepEqual(child.deps.ModelPolicy, grandchildBootstrap.Policy) {
+		t.Fatal("grandchild bootstrap policy aliases child node policy")
+	}
 }
 
 func TestCreateChildResolvesWorkerBeforeAnyProcessSideEffect(t *testing.T) {

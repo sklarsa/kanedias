@@ -5,6 +5,7 @@ import (
 	"strings"
 	"testing"
 
+	"github.com/sklarsa/kanedias/internal/config"
 	"github.com/sklarsa/kanedias/internal/manager"
 	"github.com/sklarsa/kanedias/internal/supervisor"
 )
@@ -148,6 +149,48 @@ func TestActionCapabilitiesFollowCurrentSessionState(t *testing.T) {
 				t.Fatalf("capabilities = %#v", got)
 			}
 		})
+	}
+}
+
+func TestDetailRendersEffectiveModelFromSnapshot(t *testing.T) {
+	templates, err := parseTemplates(webFiles)
+	if err != nil {
+		t.Fatal(err)
+	}
+	state := manager.SessionState{
+		RootSessionID: "session-model",
+		Node: supervisor.NodeSnapshot{
+			SessionID: "session-model",
+			Lifecycle: "ready",
+			Model:     config.ModelProfile{Provider: "effective-provider", Model: "effective/model-id", ThinkingLevel: "high"},
+		},
+	}
+	html, err := renderTemplate(templates, templateDetail, newDetailView(state, statsView{}))
+	if err != nil {
+		t.Fatal(err)
+	}
+	for _, want := range []string{"Provider", "effective-provider", "Model", "effective/model-id", "Thinking", "high"} {
+		if !strings.Contains(html, want) {
+			t.Errorf("detail does not contain %q:\n%s", want, html)
+		}
+	}
+}
+
+func TestDetailRendersDashForPrebindModel(t *testing.T) {
+	templates, err := parseTemplates(webFiles)
+	if err != nil {
+		t.Fatal(err)
+	}
+	state := manager.SessionState{RootSessionID: "session-starting", Node: supervisor.NodeSnapshot{SessionID: "session-starting", Lifecycle: "starting"}}
+	html, err := renderTemplate(templates, templateDetail, newDetailView(state, statsView{}))
+	if err != nil {
+		t.Fatal(err)
+	}
+	for _, label := range []string{"Provider", "Model", "Thinking"} {
+		marker := `<div class="metric"><div class="k">` + label + `</div><div class="v num">—</div></div>`
+		if !strings.Contains(html, marker) {
+			t.Errorf("detail does not render prebind dash for %s:\n%s", label, html)
+		}
 	}
 }
 

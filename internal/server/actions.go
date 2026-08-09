@@ -2,11 +2,14 @@ package server
 
 import (
 	"encoding/json"
+	"errors"
 	"html/template"
 	"log/slog"
 	"net/http"
 
 	"github.com/go-chi/chi/v5"
+	"github.com/sklarsa/kanedias/internal/manager"
+	"github.com/sklarsa/kanedias/internal/supervisor/contract"
 	"github.com/starfederation/datastar-go/datastar"
 )
 
@@ -66,12 +69,36 @@ func makeStopSessionHandler(fleet fleetManager, templates *template.Template, lo
 	}
 }
 
-// makeNewSessionHandler returns the handler for POST /ui/sessions.
-func makeNewSessionHandler(fleet fleetManager, templates *template.Template, logger *slog.Logger) http.HandlerFunc {
+// makeNewSessionHandler returns the strict direct-JSON handler for POST /ui/sessions.
+func makeNewSessionHandler(fleet fleetManager, logger *slog.Logger) http.HandlerFunc {
 	return func(w http.ResponseWriter, r *http.Request) {
-		_, err := fleet.SpawnRoot(r.Context())
-		patchDeckStatusAction(w, r, templates, logger, err)
+		request, err := decodeJSON[manager.SessionLaunchRequest](w, r)
+		if err != nil {
+			writeLaunchJSON(w, http.StatusBadRequest, map[string]string{"error": "The session configuration was not valid."})
+			return
+		}
+
+		sessionID, err := fleet.SpawnRootWithRequest(r.Context(), request)
+		if err != nil {
+			logger.Error("launch session failed", "method", r.Method, "path", r.URL.Path, "error", err)
+			status := http.StatusServiceUnavailable
+			message := "The session could not be started."
+			var contractErr *contract.Error
+			if errors.As(err, &contractErr) && contractErr.Code == contract.ErrorInvalidRequest {
+				status = http.StatusBadRequest
+				message = "The session configuration was not valid."
+			}
+			writeLaunchJSON(w, status, map[string]string{"error": message})
+			return
+		}
+		writeLaunchJSON(w, http.StatusCreated, map[string]string{"sessionId": sessionID})
 	}
+}
+
+func writeLaunchJSON(w http.ResponseWriter, status int, value map[string]string) {
+	w.Header().Set("Content-Type", "application/json")
+	w.WriteHeader(status)
+	_ = json.NewEncoder(w).Encode(value)
 }
 
 // makeAnswerQuestionHandler returns the handler for POST /ui/sessions/{sessionID}/questions/{questionID}.

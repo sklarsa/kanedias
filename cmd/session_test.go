@@ -3,18 +3,24 @@ package cmd
 import (
 	"bytes"
 	"context"
+	"errors"
 	"io"
+	"os"
 	"path/filepath"
 	"reflect"
+	"strconv"
+	"strings"
 	"testing"
 
 	"github.com/sklarsa/kanedias/internal/config"
 	"github.com/sklarsa/kanedias/internal/supervisor/contract"
 	"github.com/sklarsa/kanedias/internal/supervisor/process"
+	"golang.org/x/sys/unix"
 )
 
 func TestSessionRequiresSocketAndRunsForegroundSupervisor(t *testing.T) {
-	cfg := config.Config{BaseImage: config.BaseImage{Name: "sentinel"}}
+	cfg := validSupervisorConfig()
+	cfg.BaseImage.Name = "sentinel"
 	var output bytes.Buffer
 	service := stubServices()
 	service.loadConfig = func(path string) (config.Config, error) {
@@ -42,7 +48,11 @@ func TestSessionRequiresSocketAndRunsForegroundSupervisor(t *testing.T) {
 		t.Fatal(err)
 	}
 	wantConfig, _ := filepath.Abs("/tmp/custom.toml")
-	if gotOptions.SocketPath != "./root.sock" || gotOptions.ConfigPath != wantConfig {
+	wantPolicy, err := cfg.DefaultSessionModelPolicy()
+	if err != nil {
+		t.Fatal(err)
+	}
+	if gotOptions.SocketPath != "./root.sock" || gotOptions.ConfigPath != wantConfig || !reflect.DeepEqual(gotOptions.Policy, wantPolicy) {
 		t.Fatalf("options = %#v", gotOptions)
 	}
 }
@@ -64,6 +74,7 @@ func TestSessionRejectsMissingSocketBeforeLoadingConfig(t *testing.T) {
 
 func TestSessionDoesNotReadStdin(t *testing.T) {
 	service := stubServices()
+	service.loadConfig = func(string) (config.Config, error) { return validSupervisorConfig(), nil }
 	service.runSupervisor = func(context.Context, config.Config, SessionOptions, io.Writer) error { return nil }
 	root := newRootCommand(service, testProxyOptions())
 	root.SetIn(readerThatFails{t: t})
@@ -75,11 +86,202 @@ func TestSessionDoesNotReadStdin(t *testing.T) {
 	}
 }
 
+func TestSessionInheritedRootBootstrapUsesExactFDAndKeepsStdinUntouched(t *testing.T) {
+	cfg := validSupervisorConfig()
+	policy, err := cfg.DefaultSessionModelPolicy()
+	if err != nil {
+		t.Fatal(err)
+	}
+	policy.Root = config.ModelProfile{Provider: "local-executor", Model: "Qwen3.6-27B-GGUF", ThinkingLevel: "off"}
+	bootstrapFD := rootBootstrapReadFDForPolicy(t, policy)
+
+	service := stubServices()
+	service.loadConfig = func(string) (config.Config, error) { return cfg, nil }
+	var got SessionOptions
+	service.runSupervisor = func(_ context.Context, _ config.Config, options SessionOptions, _ io.Writer) error {
+		got = options
+		return nil
+	}
+	root := newRootCommand(service, testProxyOptions())
+	root.SetIn(readerThatFails{t: t})
+	root.SetOut(io.Discard)
+	root.SetErr(io.Discard)
+	root.SetArgs([]string{"session", "--socket", "/tmp/root.sock", "--bootstrap-fd", strconv.Itoa(bootstrapFD)})
+	if err := root.Execute(); err != nil {
+		t.Fatal(err)
+	}
+	if !reflect.DeepEqual(got.Policy, policy) {
+		t.Fatalf("policy = %#v, want %#v", got.Policy, policy)
+	}
+	assertDescriptorClosed(t, bootstrapFD)
+}
+
+func TestSessionInheritedBootstrapClosesDescriptorWhenSocketValidationFails(t *testing.T) {
+	bootstrapFD := rootBootstrapReadFD(t)
+	service := stubServices()
+	service.loadConfig = func(string) (config.Config, error) {
+		t.Fatal("loadConfig called without required --socket")
+		return config.Config{}, nil
+	}
+	root := newRootCommand(service, testProxyOptions())
+	root.SetOut(io.Discard)
+	root.SetErr(io.Discard)
+	root.SetArgs([]string{"session", "--bootstrap-fd", strconv.Itoa(bootstrapFD)})
+	if err := root.Execute(); err == nil || !strings.Contains(err.Error(), "--socket is required") {
+		t.Fatalf("Execute error = %v, want socket validation error", err)
+	}
+	assertDescriptorClosed(t, bootstrapFD)
+}
+
+func TestSessionInheritedBootstrapClosesDescriptorWhenConfigLoadFails(t *testing.T) {
+	bootstrapFD := rootBootstrapReadFD(t)
+	sentinel := errors.New("load config sentinel")
+	service := stubServices()
+	service.loadConfig = func(string) (config.Config, error) { return config.Config{}, sentinel }
+	root := newRootCommand(service, testProxyOptions())
+	root.SetOut(io.Discard)
+	root.SetErr(io.Discard)
+	root.SetArgs([]string{"session", "--socket", "/tmp/root.sock", "--bootstrap-fd", strconv.Itoa(bootstrapFD)})
+	if err := root.Execute(); !errors.Is(err, sentinel) {
+		t.Fatalf("Execute error = %v, want %v", err, sentinel)
+	}
+	assertDescriptorClosed(t, bootstrapFD)
+}
+
+func TestSessionInheritedBootstrapClosesDescriptorWhenConfigPathResolutionFails(t *testing.T) {
+	bootstrapFD := rootBootstrapReadFD(t)
+	originalDir, err := os.Getwd()
+	if err != nil {
+		t.Fatal(err)
+	}
+	removedDir, err := os.MkdirTemp("", "kanedias-removed-cwd-")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := os.Chdir(removedDir); err != nil {
+		t.Fatal(err)
+	}
+	defer func() {
+		if restoreErr := os.Chdir(originalDir); restoreErr != nil {
+			t.Errorf("restore working directory: %v", restoreErr)
+		}
+	}()
+	if err := os.Remove(removedDir); err != nil {
+		t.Fatal(err)
+	}
+
+	service := stubServices()
+	service.loadConfig = func(string) (config.Config, error) {
+		t.Fatal("loadConfig called after config-path resolution failure")
+		return config.Config{}, nil
+	}
+	root := newRootCommand(service, testProxyOptions())
+	root.SetOut(io.Discard)
+	root.SetErr(io.Discard)
+	root.SetArgs([]string{"--config", "relative.toml", "session", "--socket", "/tmp/root.sock", "--bootstrap-fd", strconv.Itoa(bootstrapFD)})
+	if err := root.Execute(); err == nil || !strings.Contains(err.Error(), "resolve config path") {
+		t.Fatalf("Execute error = %v, want config path resolution error", err)
+	}
+	assertDescriptorClosed(t, bootstrapFD)
+}
+
+func TestSessionRejectsBootstrapOnStdinWithoutClosingIt(t *testing.T) {
+	savedStdin, err := unix.Dup(0)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer func() {
+		if restoreErr := unix.Dup2(savedStdin, 0); restoreErr != nil {
+			t.Errorf("restore stdin: %v", restoreErr)
+		}
+		_ = unix.Close(savedStdin)
+	}()
+
+	bootstrapFD := rootBootstrapReadFD(t)
+	if err := unix.Dup2(bootstrapFD, 0); err != nil {
+		t.Fatal(err)
+	}
+	if err := unix.Close(bootstrapFD); err != nil {
+		t.Fatal(err)
+	}
+
+	loaded := false
+	service := stubServices()
+	service.loadConfig = func(string) (config.Config, error) {
+		loaded = true
+		return validSupervisorConfig(), nil
+	}
+	root := newRootCommand(service, testProxyOptions())
+	root.SetOut(io.Discard)
+	root.SetErr(io.Discard)
+	root.SetArgs([]string{"session", "--socket", "/tmp/root.sock", "--bootstrap-fd", "0"})
+	if err := root.Execute(); err == nil || !strings.Contains(err.Error(), "at least 3") {
+		t.Fatalf("Execute error = %v, want descriptor >= 3 rejection", err)
+	}
+	if loaded {
+		t.Fatal("config loaded before bootstrap descriptor validation")
+	}
+	if _, err := unix.FcntlInt(0, unix.F_GETFD, 0); err != nil {
+		t.Fatalf("stdin was closed: %v", err)
+	}
+}
+
+func rootBootstrapReadFD(t *testing.T) int {
+	t.Helper()
+	cfg := validSupervisorConfig()
+	policy, err := cfg.DefaultSessionModelPolicy()
+	if err != nil {
+		t.Fatal(err)
+	}
+	return rootBootstrapReadFDForPolicy(t, policy)
+}
+
+func rootBootstrapReadFDForPolicy(t *testing.T, policy config.SessionModelPolicy) int {
+	t.Helper()
+	var descriptors [2]int
+	if err := unix.Pipe2(descriptors[:], unix.O_CLOEXEC); err != nil {
+		t.Fatal(err)
+	}
+	writeEnd := os.NewFile(uintptr(descriptors[1]), "test-root-bootstrap-write")
+	if err := process.EncodeRootBootstrap(writeEnd, process.RootBootstrap{Policy: policy}); err != nil {
+		_ = unix.Close(descriptors[0])
+		_ = writeEnd.Close()
+		t.Fatal(err)
+	}
+	if err := writeEnd.Close(); err != nil {
+		_ = unix.Close(descriptors[0])
+		t.Fatal(err)
+	}
+	return descriptors[0]
+}
+
+func assertDescriptorClosed(t *testing.T, descriptor int) {
+	t.Helper()
+	if _, err := unix.FcntlInt(uintptr(descriptor), unix.F_GETFD, 0); !errors.Is(err, unix.EBADF) {
+		t.Fatalf("descriptor %d remains open: %v", descriptor, err)
+	}
+}
+
+func TestSessionBootstrapFlagIsHiddenAndDefaultsAbsent(t *testing.T) {
+	root := newRootCommand(stubServices(), testProxyOptions())
+	command, _, err := root.Find([]string{"session"})
+	if err != nil {
+		t.Fatal(err)
+	}
+	flag := command.Flags().Lookup("bootstrap-fd")
+	if flag == nil || flag.DefValue != "-1" || !flag.Hidden {
+		t.Fatalf("--bootstrap-fd = %#v, want hidden default -1", flag)
+	}
+}
+
 func TestProductionChildRequiresAbsoluteConfigBeforeProvisioning(t *testing.T) {
 	bootstrap := process.Bootstrap{
 		SessionID: "child", ParentID: "parent", RootID: "root", SocketPath: filepath.Join(t.TempDir(), "child.sock"),
 		SourceInstance: "parent-instance", SourceVolume: "parent-volume",
-		Worker:  config.WorkerProfile{Description: "review", Provider: "provider", Model: "model"},
+		Policy: config.SessionModelPolicy{
+			Root:    config.ModelProfile{Provider: "provider", Model: "root-model", ThinkingLevel: "off"},
+			Workers: map[string]config.WorkerProfile{"reviewer": {Description: "review", Provider: "provider", Model: "model", ThinkingLevel: "off"}},
+		},
 		Request: contract.CreateChildRequest{WorkerType: "reviewer", Kind: contract.ChildKindRead, Context: contract.ContextFresh, Task: "review"},
 	}
 	for _, path := range []string{"", "relative.toml"} {

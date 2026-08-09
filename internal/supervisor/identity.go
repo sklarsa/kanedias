@@ -43,9 +43,21 @@ type PiBinding struct {
 	SessionFile string `json:"sessionFile"`
 }
 
-type WorkerCatalog interface {
-	Resolve(name string) (config.WorkerProfile, error)
-	Summaries() []contract.WorkerSummary
+type PiExpectation struct {
+	Binding *PiBinding
+	Model   config.ModelProfile
+}
+
+func validateExpectedModel(model config.ModelProfile) error {
+	if strings.TrimSpace(model.Provider) == "" || strings.TrimSpace(model.Model) == "" {
+		return invariantf("expected Pi provider and model are required")
+	}
+	switch model.ThinkingLevel {
+	case "off", "minimal", "low", "medium", "high", "xhigh", "max":
+		return nil
+	default:
+		return invariantf("expected Pi thinking level %q is invalid", model.ThinkingLevel)
+	}
 }
 
 func NewIdentity(spec IdentitySpec) (Identity, error) {

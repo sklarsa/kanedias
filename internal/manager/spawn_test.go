@@ -1,28 +1,37 @@
 package manager
 
 import (
+	"bytes"
 	"context"
+	"errors"
+	"fmt"
+	"io"
 	"os"
 	"os/exec"
 	"path/filepath"
+	"reflect"
 	"runtime"
+	"strings"
 	"sync"
 	"syscall"
 	"testing"
 	"time"
 
 	"github.com/sklarsa/kanedias/internal/supervisor"
+	"github.com/sklarsa/kanedias/internal/supervisor/process"
 	"golang.org/x/sys/unix"
 )
 
 // ---- fakeProcess for unit tests ----
 
 type fakeProcess struct {
-	mu      sync.Mutex
-	pid     int
-	done    chan struct{}
-	waitErr error
-	signals []syscall.Signal
+	mu         sync.Mutex
+	pid        int
+	done       chan struct{}
+	waitErr    error
+	signals    []syscall.Signal
+	signalErr  error
+	signalHook func(syscall.Signal)
 }
 
 func newFakeProcess(pid int) *fakeProcess {
@@ -35,8 +44,13 @@ func (p *fakeProcess) WaitErr() error        { return p.waitErr }
 func (p *fakeProcess) SignalGroup(sig syscall.Signal) error {
 	p.mu.Lock()
 	p.signals = append(p.signals, sig)
+	err := p.signalErr
+	hook := p.signalHook
 	p.mu.Unlock()
-	return nil
+	if hook != nil {
+		hook(sig)
+	}
+	return err
 }
 func (p *fakeProcess) signalCount() int {
 	p.mu.Lock()
@@ -51,16 +65,77 @@ func (p *fakeProcess) exit(err error) {
 // ---- fakeStarter ----
 
 type fakeStarter struct {
-	lastSpec spawnSpec
-	process  *fakeProcess
-	err      error
+	lastSpec       spawnSpec
+	process        *fakeProcess
+	err            error
+	starts         int
+	rootBootstraps chan rootBootstrapResult
+}
+
+type rootBootstrapResult struct {
+	bootstrap process.RootBootstrap
+	err       error
+}
+
+type retainingStarter struct {
+	process       *fakeProcess
+	started       chan error
+	inheritedRead *os.File
+}
+
+type closingBootstrapStarter struct{ process *fakeProcess }
+
+func (starter closingBootstrapStarter) Start(spec spawnSpec) (spawnedProcess, error) {
+	if len(spec.ExtraFiles) != 1 {
+		return nil, fmt.Errorf("ExtraFiles = %d, want 1", len(spec.ExtraFiles))
+	}
+	duplicate, err := unix.Dup(int(spec.ExtraFiles[0].Fd()))
+	if err != nil {
+		return nil, err
+	}
+	if err := unix.Close(duplicate); err != nil {
+		return nil, err
+	}
+	return starter.process, nil
+}
+
+func (starter *retainingStarter) Start(spec spawnSpec) (spawnedProcess, error) {
+	if len(spec.ExtraFiles) != 1 {
+		err := fmt.Errorf("ExtraFiles = %d, want 1", len(spec.ExtraFiles))
+		starter.started <- err
+		return nil, err
+	}
+	duplicate, err := unix.Dup(int(spec.ExtraFiles[0].Fd()))
+	if err != nil {
+		starter.started <- err
+		return nil, err
+	}
+	starter.inheritedRead = os.NewFile(uintptr(duplicate), "retained-root-bootstrap")
+	starter.started <- nil
+	return starter.process, nil
 }
 
 func (fs *fakeStarter) Start(spec spawnSpec) (spawnedProcess, error) {
 	fs.lastSpec = spec
+	fs.starts++
 	if fs.err != nil {
 		return nil, fs.err
 	}
+	if len(spec.ExtraFiles) != 1 {
+		return nil, fmt.Errorf("ExtraFiles = %d, want 1", len(spec.ExtraFiles))
+	}
+	duplicate, err := unix.Dup(int(spec.ExtraFiles[0].Fd()))
+	if err != nil {
+		return nil, err
+	}
+	file := os.NewFile(uintptr(duplicate), "fake-root-bootstrap")
+	go func() {
+		bootstrap, decodeErr := process.DecodeRootBootstrap(file)
+		closeErr := file.Close()
+		if fs.rootBootstraps != nil {
+			fs.rootBootstraps <- rootBootstrapResult{bootstrap: bootstrap, err: errors.Join(decodeErr, closeErr)}
+		}
+	}()
 	return fs.process, nil
 }
 
@@ -114,6 +189,348 @@ func TestRootSpawnerArgvAndSetsid(t *testing.T) {
 	}
 	if spec.SysProcAttr == nil || !spec.SysProcAttr.Setsid {
 		t.Fatalf("SysProcAttr.Setsid must be true, got %+v", spec.SysProcAttr)
+	}
+}
+
+func TestSpawnRootWithRequestValidatesBeforeSideEffects(t *testing.T) {
+	fs := &fakeStarter{process: newFakeProcess(1235)}
+	m := fakeManager(nil)
+	m.starter = fs
+	m.opts.SessionBinary = "/usr/bin/kanedias"
+	m.opts.ConfigPath = "/etc/kanedias/config.toml"
+	rootDir, logDir := shortTempDirs(t)
+	m.opts.RootSocketDir = rootDir
+	m.opts.SessionLogDir = logDir
+
+	tokens, pipes := 0, 0
+	m.newSpawnToken = func() (string, error) {
+		tokens++
+		return "token", nil
+	}
+	m.newBootstrapPipe = func() (*os.File, *os.File, error) {
+		pipes++
+		return os.Pipe()
+	}
+	invalid := m.launch.DefaultRequest()
+	invalid.Root.ModelType = "not-allowlisted"
+	if _, err := m.SpawnRootWithRequest(context.Background(), invalid); err == nil {
+		t.Fatal("invalid request succeeded")
+	}
+	if tokens != 0 || pipes != 0 || fs.starts != 0 {
+		t.Fatalf("side effects after invalid request: tokens=%d pipes=%d starts=%d", tokens, pipes, fs.starts)
+	}
+	entries, err := os.ReadDir(logDir)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(entries) != 0 {
+		t.Fatalf("invalid request created log files: %v", entries)
+	}
+}
+
+func TestSpawnRootWithRequestTransfersResolvedPolicyOnlyThroughFD3(t *testing.T) {
+	fs := &fakeStarter{process: newFakeProcess(1236), rootBootstraps: make(chan rootBootstrapResult, 1)}
+	m := fakeManager(nil)
+	m.starter = fs
+	m.opts.SessionBinary = "/usr/bin/kanedias"
+	m.opts.ConfigPath = "/etc/kanedias/config.toml"
+	rootDir, logDir := shortTempDirs(t)
+	m.opts.RootSocketDir = rootDir
+	m.opts.SessionLogDir = logDir
+	m.opts.SpawnTimeout = time.Second
+	m.newSpawnToken = func() (string, error) { return "fixed-token", nil }
+	var parentRead, parentWrite *os.File
+	m.newBootstrapPipe = func() (*os.File, *os.File, error) {
+		var pipeErr error
+		parentRead, parentWrite, pipeErr = os.Pipe()
+		return parentRead, parentWrite, pipeErr
+	}
+
+	request := m.launch.DefaultRequest()
+	request.Root = ModelSelection{ModelType: "local-qwen", ThinkingLevel: "off"}
+	for index := range request.Workers {
+		request.Workers[index].ModelType = "local-qwen"
+		request.Workers[index].ThinkingLevel = "off"
+	}
+	wantPolicy, err := m.launch.Resolve(request)
+	if err != nil {
+		t.Fatal(err)
+	}
+	go func() {
+		time.Sleep(20 * time.Millisecond)
+		fs.process.exit(nil)
+	}()
+	_, _ = m.SpawnRootWithRequest(context.Background(), request)
+
+	select {
+	case result := <-fs.rootBootstraps:
+		if result.err != nil {
+			t.Fatal(result.err)
+		}
+		if !reflect.DeepEqual(result.bootstrap.Policy, wantPolicy) {
+			t.Fatalf("bootstrap policy = %#v, want %#v", result.bootstrap.Policy, wantPolicy)
+		}
+	case <-time.After(time.Second):
+		t.Fatal("timed out decoding inherited root bootstrap")
+	}
+	assertFileClosed(t, parentRead)
+	assertFileClosed(t, parentWrite)
+
+	spec := fs.lastSpec
+	wantSuffix := []string{"session", "--socket", filepath.Join(rootDir, "fixed-token.root.sock"), "--bootstrap-fd", "3"}
+	if len(spec.Args) < len(wantSuffix) || !reflect.DeepEqual(spec.Args[len(spec.Args)-len(wantSuffix):], wantSuffix) {
+		t.Fatalf("argv = %#v, want suffix %#v", spec.Args, wantSuffix)
+	}
+	if len(spec.ExtraFiles) != 1 {
+		t.Fatalf("ExtraFiles = %d, want 1", len(spec.ExtraFiles))
+	}
+	argv := strings.Join(spec.Args, "\x00")
+	environment := strings.Join(spec.Env, "\x00")
+	for _, value := range []string{wantPolicy.Root.Provider, wantPolicy.Root.Model, `"provider"`, `"workers"`} {
+		if strings.Contains(argv, value) || strings.Contains(environment, value) {
+			t.Fatalf("private policy value %q leaked into argv or environment", value)
+		}
+	}
+	if !reflect.DeepEqual(spec.Env, os.Environ()) {
+		t.Fatal("root spawn modified the inherited environment to carry policy")
+	}
+}
+
+func TestSpawnRootClosesBootstrapPipeOnStartFailure(t *testing.T) {
+	fs := &fakeStarter{err: errors.New("start sentinel")}
+	m := configuredSpawnManager(t, fs)
+	var readEnd, writeEnd *os.File
+	m.newBootstrapPipe = func() (*os.File, *os.File, error) {
+		var err error
+		readEnd, writeEnd, err = os.Pipe()
+		return readEnd, writeEnd, err
+	}
+	if _, err := m.SpawnRoot(context.Background()); err == nil || !strings.Contains(err.Error(), "start sentinel") {
+		t.Fatalf("SpawnRoot error = %v", err)
+	}
+	assertFileClosed(t, readEnd)
+	assertFileClosed(t, writeEnd)
+}
+
+func TestSpawnRootClosesBootstrapPipeOnWriteFailure(t *testing.T) {
+	fakeProcess := newFakeProcess(1237)
+	m := configuredSpawnManager(t, closingBootstrapStarter{process: fakeProcess})
+	var readEnd, writeEnd *os.File
+	m.newBootstrapPipe = func() (*os.File, *os.File, error) {
+		var err error
+		readEnd, writeEnd, err = os.Pipe()
+		return readEnd, writeEnd, err
+	}
+	if _, err := m.SpawnRoot(context.Background()); err == nil || !strings.Contains(err.Error(), "bootstrap") {
+		t.Fatalf("SpawnRoot error = %v, want bootstrap write failure", err)
+	}
+	assertFileClosed(t, readEnd)
+	assertFileClosed(t, writeEnd)
+	fakeProcess.mu.Lock()
+	signals := append([]syscall.Signal(nil), fakeProcess.signals...)
+	fakeProcess.mu.Unlock()
+	if len(signals) != 1 || signals[0] != syscall.SIGKILL {
+		t.Fatalf("bootstrap write failure signals = %v, want [SIGKILL]", signals)
+	}
+}
+
+func TestSpawnRootBootstrapAbortBoundedlyObservesDelayedExit(t *testing.T) {
+	process := newFakeProcess(1239)
+	process.waitErr = errors.New("exit sentinel")
+	process.signalHook = func(sig syscall.Signal) {
+		if sig == syscall.SIGKILL {
+			go func() {
+				time.Sleep(20 * time.Millisecond)
+				close(process.done)
+			}()
+		}
+	}
+	m := configuredSpawnManager(t, &fakeStarter{process: process})
+	m.writeRootBootstrap = func(io.Writer, []byte) error { return errors.New("write sentinel") }
+	m.rootAbortWait = time.Second
+	started := time.Now()
+	_, err := m.SpawnRoot(context.Background())
+	if !strings.Contains(err.Error(), "write sentinel") || !strings.Contains(err.Error(), "exit sentinel") {
+		t.Fatalf("SpawnRoot error = %v, want primary and observed exit errors", err)
+	}
+	if elapsed := time.Since(started); elapsed < 20*time.Millisecond || elapsed > 500*time.Millisecond {
+		t.Fatalf("abort observation elapsed = %v, want bounded delayed observation", elapsed)
+	}
+}
+
+func TestSpawnRootBootstrapAbortJoinsSignalFailureAndTimeout(t *testing.T) {
+	process := newFakeProcess(1240)
+	process.signalErr = errors.New("signal sentinel")
+	m := configuredSpawnManager(t, &fakeStarter{process: process})
+	m.writeRootBootstrap = func(io.Writer, []byte) error { return errors.New("write sentinel") }
+	m.rootAbortWait = 20 * time.Millisecond
+	_, err := m.SpawnRoot(context.Background())
+	for _, want := range []string{"write sentinel", "signal sentinel", "timed out"} {
+		if !strings.Contains(err.Error(), want) {
+			t.Fatalf("SpawnRoot error = %v, want %q", err, want)
+		}
+	}
+}
+
+func TestSpawnRootCancellationJoinsBlockedBootstrapWriter(t *testing.T) {
+	starter := &retainingStarter{process: newFakeProcess(1238), started: make(chan error, 1)}
+	m := configuredSpawnManager(t, starter)
+	writerStarted := make(chan struct{})
+	writerUnblocked := make(chan struct{})
+	allowWriterCompletion := make(chan struct{})
+	writerCompleted := make(chan struct{})
+	joinStarted := make(chan struct{})
+	writeRootBootstrap := m.writeRootBootstrap
+	m.writeRootBootstrap = func(writer io.Writer, encoded []byte) error {
+		close(writerStarted)
+		err := writeRootBootstrap(writer, encoded)
+		close(writerUnblocked)
+		<-allowWriterCompletion
+		close(writerCompleted)
+		return err
+	}
+	waitRootBootstrapWrite := m.waitRootBootstrapWrite
+	m.waitRootBootstrapWrite = func(done <-chan struct{}) {
+		close(joinStarted)
+		waitRootBootstrapWrite(done)
+	}
+	cfg := modelConfigFixture()
+	worker := cfg.Workers["worker"]
+	worker.Description = strings.Repeat("x", process.MaxRecordBytes-4096)
+	cfg.Workers["worker"] = worker
+	launch, err := NewLaunchConfiguration(cfg)
+	if err != nil {
+		t.Fatal(err)
+	}
+	m.launch = launch
+	policy, err := launch.Resolve(launch.DefaultRequest())
+	if err != nil {
+		t.Fatal(err)
+	}
+	var encoded bytes.Buffer
+	if err := process.EncodeRootBootstrap(&encoded, process.RootBootstrap{Policy: policy}); err != nil {
+		t.Fatal(err)
+	}
+	if encoded.Len() < 64*1024 {
+		t.Fatalf("bootstrap length = %d, want enough to block an unread pipe", encoded.Len())
+	}
+
+	var parentRead, parentWrite *os.File
+	m.newBootstrapPipe = func() (*os.File, *os.File, error) {
+		var pipeErr error
+		parentRead, parentWrite, pipeErr = os.Pipe()
+		return parentRead, parentWrite, pipeErr
+	}
+	ctx, cancel := context.WithCancel(context.Background())
+	result := make(chan error, 1)
+	go func() {
+		_, spawnErr := m.SpawnRoot(ctx)
+		result <- spawnErr
+	}()
+	if startErr := <-starter.started; startErr != nil {
+		t.Fatal(startErr)
+	}
+	select {
+	case <-writerStarted:
+	case <-time.After(time.Second):
+		t.Fatal("bootstrap writer did not start")
+	}
+	deadline := time.Now().Add(time.Second)
+	for {
+		available, ioctlErr := unix.IoctlGetInt(int(starter.inheritedRead.Fd()), unix.TIOCINQ)
+		if ioctlErr != nil {
+			t.Fatal(ioctlErr)
+		}
+		if available > 0 {
+			if available >= encoded.Len() {
+				t.Fatalf("queued bootstrap bytes = %d, encoded length = %d; write may have completed", available, encoded.Len())
+			}
+			break
+		}
+		if time.Now().After(deadline) {
+			t.Fatal("bootstrap writer did not begin filling retained unread pipe")
+		}
+		time.Sleep(time.Millisecond)
+	}
+	select {
+	case <-writerUnblocked:
+		t.Fatal("real encoded bootstrap write returned before cancellation")
+	default:
+	}
+	select {
+	case spawnErr := <-result:
+		t.Fatalf("SpawnRoot returned before cancellation while bootstrap remained incomplete: %v", spawnErr)
+	default:
+	}
+	select {
+	case <-writerCompleted:
+		t.Fatal("bootstrap writer completed despite unread queued bytes being shorter than the encoded record")
+	default:
+	}
+
+	cancel()
+	select {
+	case <-joinStarted:
+	case <-time.After(time.Second):
+		t.Fatal("SpawnRoot did not enter the bootstrap-writer join after cancellation")
+	}
+	select {
+	case <-writerUnblocked:
+	case <-time.After(time.Second):
+		t.Fatal("closing the parent writer did not unblock the blocked bootstrap write")
+	}
+	select {
+	case spawnErr := <-result:
+		t.Fatalf("SpawnRoot returned without joining the deliberately paused writer: %v", spawnErr)
+	default:
+	}
+	close(allowWriterCompletion)
+	select {
+	case spawnErr := <-result:
+		if !errors.Is(spawnErr, context.Canceled) {
+			t.Fatalf("SpawnRoot error = %v, want %v", spawnErr, context.Canceled)
+		}
+	case <-time.After(time.Second):
+		t.Fatal("SpawnRoot did not promptly join the released bootstrap writer after cancellation")
+	}
+	select {
+	case <-writerCompleted:
+	default:
+		t.Fatal("SpawnRoot returned before the bootstrap writer completed and joined")
+	}
+	assertFileClosed(t, parentRead)
+	assertFileClosed(t, parentWrite)
+	starter.process.mu.Lock()
+	signals := append([]syscall.Signal(nil), starter.process.signals...)
+	starter.process.mu.Unlock()
+	if len(signals) != 1 || signals[0] != syscall.SIGKILL {
+		t.Fatalf("cancellation signals = %v, want [SIGKILL]", signals)
+	}
+
+	if err := starter.inheritedRead.Close(); err != nil {
+		t.Fatal(err)
+	}
+}
+
+func configuredSpawnManager(t *testing.T, starter processStarter) *Manager {
+	t.Helper()
+	m := fakeManager(nil)
+	m.starter = starter
+	m.opts.SessionBinary = "/usr/bin/kanedias"
+	m.opts.ConfigPath = "/etc/kanedias/config.toml"
+	m.opts.RootSocketDir, m.opts.SessionLogDir = shortTempDirs(t)
+	m.opts.SpawnTimeout = 50 * time.Millisecond
+	m.newSpawnToken = func() (string, error) { return "fixed-token", nil }
+	return m
+}
+
+func assertFileClosed(t *testing.T, file *os.File) {
+	t.Helper()
+	if file == nil {
+		t.Fatal("file was not created")
+	}
+	if _, err := file.Stat(); !errors.Is(err, os.ErrClosed) {
+		t.Fatalf("file %q remains open: Stat error = %v", file.Name(), err)
 	}
 }
 
@@ -201,8 +618,8 @@ func TestSpawnRootAdmissionTimeout(t *testing.T) {
 
 	ctx := context.Background()
 	_, err := m.SpawnRoot(ctx)
-	if err == nil {
-		t.Fatal("expected timeout error, got nil")
+	if !errors.Is(err, context.DeadlineExceeded) {
+		t.Fatalf("SpawnRoot error = %v, want admission deadline exceeded", err)
 	}
 }
 
@@ -225,8 +642,8 @@ func TestSpawnRootProcessExitBeforeAdmission(t *testing.T) {
 
 	ctx := context.Background()
 	_, err := m.SpawnRoot(ctx)
-	if err == nil {
-		t.Fatal("expected error when process exits, got nil")
+	if err == nil || !strings.Contains(err.Error(), "root exited before admission") || !errors.Is(err, exec.ErrNotFound) {
+		t.Fatalf("SpawnRoot error = %v, want root-exited-before-admission wrapping %v", err, exec.ErrNotFound)
 	}
 }
 

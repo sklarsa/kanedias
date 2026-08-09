@@ -150,6 +150,21 @@ func indexBody(t *testing.T) string {
 	return response.Body.String()
 }
 
+func launchOptionsFixture() manager.SessionLaunchOptions {
+	return manager.SessionLaunchOptions{
+		Models: []manager.ModelLaunchOption{
+			{ModelType: "fast-model", Label: "Fast & safe", ThinkingLevels: []string{"off", "medium"}, DefaultThinkingLevel: "off"},
+			{ModelType: "deep-model", Label: "Deep model", ThinkingLevels: []string{"high", "xhigh"}, DefaultThinkingLevel: "high"},
+		},
+		Root: manager.ModelSelection{ModelType: "deep-model", ThinkingLevel: "xhigh"},
+		Workers: []manager.WorkerLaunchOption{
+			{WorkerType: "worker", Description: "Implement changes", ModelType: "deep-model", ThinkingLevel: "xhigh"},
+			{WorkerType: "oracle", Description: "Advise <carefully> & independently", ModelType: "deep-model", ThinkingLevel: "high"},
+			{WorkerType: "reviewer", Description: "Review & verify", ModelType: "fast-model", ThinkingLevel: "medium"},
+		},
+	}
+}
+
 func TestHandlerRoutes(t *testing.T) {
 	handler, cookie := mustNewHandlerWithAuth(t, slog.New(slog.NewTextHandler(&bytes.Buffer{}, nil)))
 
@@ -232,6 +247,13 @@ func TestHandlerRoutes(t *testing.T) {
 			contentType: "text/javascript; charset=utf-8",
 		},
 		{
+			name:        "session modal controller",
+			path:        "/assets/session-modal.js",
+			method:      http.MethodGet,
+			status:      http.StatusOK,
+			contentType: "text/javascript; charset=utf-8",
+		},
+		{
 			name:   "unknown",
 			path:   "/unknown",
 			method: http.MethodGet,
@@ -291,6 +313,7 @@ func TestHandlerRejectsUnsupportedMethods(t *testing.T) {
 		{"/assets/terminal.css", false},
 		{"/assets/app.css", false},
 		{"/assets/datastar.js", false},
+		{"/assets/session-modal.js", false},
 		{"/", true},
 		{"/ui/status", true},
 	}
@@ -313,8 +336,70 @@ func TestHandlerRejectsUnsupportedMethods(t *testing.T) {
 	}
 }
 
+func TestInitialPageRendersSessionModalFromLaunchOptions(t *testing.T) {
+	fleet := newStreamFakeFleet()
+	fleet.launchOptions = launchOptionsFixture()
+	handler, cookie := mustNewHandlerWithFleetAuth(t, fleet)
+	response := serveAuthenticatedRequest(t, handler, http.MethodGet, "/", cookie)
+	if response.Code != http.StatusOK {
+		t.Fatalf("GET / status = %d, want 200; body = %q", response.Code, response.Body.String())
+	}
+	body := response.Body.String()
+
+	required := []string{
+		`<dialog id="new-session-modal"`, `id="new-session-form"`, `aria-labelledby="new-session-title"`,
+		`id="new-session-title"`, `New session`, `aria-label="Close"`,
+		`id="root-model"`, `data-root-model`, `id="root-thinking"`, `data-root-thinking`, `value="deep-model" selected`, `value="xhigh" selected`,
+		`data-thinking-levels="off,medium"`, `data-default-thinking="off"`, `data-worker-row`, `data-worker-model`, `data-worker-thinking`, `data-modal-close`,
+		`Fast &amp; safe`, `Deep model`, `<summary>Subagent model profiles</summary>`,
+		`id="new-session-cancel"`, `id="new-session-launch"`, `id="new-session-status"`, `aria-live="polite"`,
+	}
+	for _, want := range required {
+		if !strings.Contains(body, want) {
+			t.Errorf("session modal does not contain %q", want)
+		}
+	}
+	if strings.Contains(body, `<dialog id="new-session-modal" open`) {
+		t.Error("session modal must be closed initially")
+	}
+	if deep, fast := strings.Index(body, `>Deep model</option>`), strings.Index(body, `>Fast &amp; safe</option>`); deep < 0 || fast < 0 || deep >= fast {
+		t.Error("model options are not in deterministic model-type order")
+	}
+	lastWorker := -1
+	for _, role := range []string{"oracle", "reviewer", "worker"} {
+		marker := `data-worker-type="` + role + `"`
+		if got := strings.Count(body, marker); got != 1 {
+			t.Errorf("worker %q row count = %d, want 1", role, got)
+		}
+		position := strings.Index(body, marker)
+		if position <= lastWorker {
+			t.Errorf("worker %q is not in deterministic role order", role)
+		}
+		lastWorker = position
+	}
+	for _, want := range []string{`Advise &lt;carefully&gt; &amp; independently`, `Review &amp; verify`} {
+		if !strings.Contains(body, want) {
+			t.Errorf("escaped worker description missing %q", want)
+		}
+	}
+	for _, forbidden := range []string{"openai-codex", "gpt-5.6-sol", "anthropic", "claude-sonnet-4"} {
+		if strings.Contains(body, forbidden) {
+			t.Errorf("session modal leaked raw provider/model %q", forbidden)
+		}
+	}
+	if !strings.Contains(body, `id="new-session-button"`) || !strings.Contains(body, `type="button"`) {
+		t.Error("New Session trigger is not a stable type=button control")
+	}
+	if strings.Contains(body, `@post('/ui/sessions', {payload:{}})`) {
+		t.Error("New Session trigger still posts an empty request")
+	}
+}
+
 func TestInitialPageContainsAstrolabeConsole(t *testing.T) {
 	body := indexBody(t)
+	if !strings.Contains(body, `id="new-session-button" disabled`) {
+		t.Error("nil-fleet index must render a disabled New Session trigger")
+	}
 	required := []string{
 		`<html lang="en" data-theme="dark">`,
 		// shell stable Datastar patch roots
@@ -375,19 +460,23 @@ func TestInitialPageContainsAstrolabeConsole(t *testing.T) {
 }
 
 func TestAstrolabeConsoleIsInteractive(t *testing.T) {
-	body := indexBody(t)
+	fleet := newStreamFakeFleet()
+	fleet.launchOptions = launchOptionsFixture()
+	handler, cookie := mustNewHandlerWithFleetAuth(t, fleet)
+	response := serveAuthenticatedRequest(t, handler, http.MethodGet, "/", cookie)
+	body := response.Body.String()
 
 	// The console is wired by local asset modules (Datastar, Marked, Highlight,
-	// the Markdown renderer, and app.js delegated behavior). No external scripts
-	// and no inline controller.
+	// the Markdown renderer, terminal decisions, the session modal, and app.js).
+	// There are no external scripts and no inline controller.
 	scriptRE := regexp.MustCompile(`(?s)<script\b([^>]*)>(.*?)</script>`)
 	scripts := scriptRE.FindAllStringSubmatch(body, -1)
-	wantScripts := 6 // Datastar + 3 Markdown assets + terminal decisions + app.js
+	wantScripts := 7 // Datastar + 3 Markdown assets + terminal decisions + session modal + app.js
 	if len(scripts) != wantScripts {
-		t.Fatalf("script count = %d, want %d (Datastar + 3 Markdown assets + terminal-ui.js + app.js)", len(scripts), wantScripts)
+		t.Fatalf("script count = %d, want %d (Datastar + 3 Markdown assets + terminal-ui.js + session-modal.js + app.js)", len(scripts), wantScripts)
 	}
 
-	var sawDatastar, sawTerminalUI, sawAppJS bool
+	var sawDatastar, sawTerminalUI, sawSessionModal, sawAppJS bool
 	markdownAssets := []string{
 		`src="/assets/marked.min.js"`,
 		`src="/assets/highlight.min.js"`,
@@ -414,6 +503,12 @@ func TestAstrolabeConsoleIsInteractive(t *testing.T) {
 			}
 			sawTerminalUI = true
 		}
+		if strings.Contains(attrs, `src="/assets/session-modal.js"`) {
+			if inner != "" {
+				t.Errorf("session-modal.js script has unexpected inline body %q", inner)
+			}
+			sawSessionModal = true
+		}
 		if strings.Contains(attrs, `src="/assets/app.js"`) {
 			if inner != "" {
 				t.Errorf("app.js script has unexpected inline body %q", inner)
@@ -431,6 +526,9 @@ func TestAstrolabeConsoleIsInteractive(t *testing.T) {
 	}
 	if !sawTerminalUI {
 		t.Error("page is missing the local terminal-ui.js script")
+	}
+	if !sawSessionModal {
+		t.Error("page is missing the local session-modal.js script")
 	}
 	if !sawAppJS {
 		t.Error("page is missing the app.js script")
@@ -717,6 +815,10 @@ type streamFakeFleet struct {
 	stats          manager.SessionStats
 	statsErr       error
 	statsCalls     int
+	launchOptions  manager.SessionLaunchOptions
+	spawnRequest   manager.SessionLaunchRequest
+	spawnSessionID string
+	spawnErr       error
 }
 
 func newStreamFakeFleet() *streamFakeFleet {
@@ -755,6 +857,16 @@ func (f *streamFakeFleet) SubscribeSession(id string) (manager.ChangeSubscriptio
 		return manager.ChangeSubscription{}, errors.New("not found")
 	}
 	return manager.ChangeSubscription{Updates: ch, Close: func() {}}, nil
+}
+func (f *streamFakeFleet) LaunchOptions() manager.SessionLaunchOptions { return f.launchOptions }
+func (f *streamFakeFleet) SpawnRootWithRequest(_ context.Context, request manager.SessionLaunchRequest) (string, error) {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	f.spawnRequest = request
+	if f.spawnSessionID == "" {
+		f.spawnSessionID = "session-new"
+	}
+	return f.spawnSessionID, f.spawnErr
 }
 func (f *streamFakeFleet) SpawnRoot(context.Context) (string, error)   { return "", nil }
 func (f *streamFakeFleet) Steer(context.Context, string, string) error { return nil }
@@ -1186,7 +1298,7 @@ func TestAssetsAreEmbedded(t *testing.T) {
 	})
 
 	// Unauthenticated paths.
-	for _, path := range []string{"/healthz", "/assets/terminal.css", "/assets/app.css", "/assets/datastar.js", "/assets/terminal-ui.js", "/assets/app.js"} {
+	for _, path := range []string{"/healthz", "/assets/terminal.css", "/assets/app.css", "/assets/datastar.js", "/assets/terminal-ui.js", "/assets/session-modal.js", "/assets/app.js"} {
 		if response := serveRequest(handler, http.MethodGet, path); response.Code != http.StatusOK {
 			t.Errorf("GET %s status = %d, want %d", path, response.Code, http.StatusOK)
 		}
@@ -1244,6 +1356,7 @@ func TestRenderedPageHasOnlyOrderedLocalRuntimeAssets(t *testing.T) {
 		"/assets/highlight.min.js",
 		"/assets/markdown-renderer.js",
 		"/assets/terminal-ui.js",
+		"/assets/session-modal.js",
 		"/assets/app.js",
 	}
 	if len(matches) != len(want) {
@@ -1288,10 +1401,31 @@ func TestProjectStylesDefineAstrolabeVisualSystem(t *testing.T) {
 		// responsive: sidebar collapses to a slide-over on narrow screens
 		"@media (max-width:820px)",
 		".sidebar.open",
+		// native modal has its own backdrop, visible focus, scroll, pending,
+		// and 44px mobile targets without reusing the sidebar scrim.
+		"#new-session-modal::backdrop",
+		"#new-session-modal details{",
+		"#new-session-modal form{",
+		"overflow-y:auto",
+		"#new-session-modal .modal-actions{",
+		"position:sticky",
+		"bottom:0",
+		"flex:0 0 auto",
+		"#new-session-modal[aria-busy=\"true\"]",
+		"#new-session-modal select:focus-visible",
+		"min-height:44px",
 	}
 	for _, want := range required {
 		if !strings.Contains(styles, want) {
 			t.Errorf("project stylesheet does not contain %q", want)
+		}
+	}
+	for description, pattern := range map[string]string{
+		"full modal form scrolls within its cap": `(?s)#new-session-modal form\{[^}]*overflow-y:auto`,
+		"modal actions stay reachable":           `(?s)#new-session-modal \.modal-actions\{[^}]*position:sticky[^}]*bottom:0[^}]*flex:0 0 auto`,
+	} {
+		if !regexp.MustCompile(pattern).MatchString(styles) {
+			t.Errorf("project stylesheet does not prove %s", description)
 		}
 	}
 

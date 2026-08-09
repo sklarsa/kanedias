@@ -10,9 +10,11 @@ import (
 	"errors"
 	"fmt"
 	"io"
+	"mime"
 	"net"
 	"net/http"
 	"net/http/cookiejar"
+	"net/http/httptest"
 	"net/url"
 	"os"
 	"os/exec"
@@ -32,6 +34,7 @@ import (
 	"github.com/pelletier/go-toml/v2"
 	"github.com/sklarsa/kanedias/internal/config"
 	"github.com/sklarsa/kanedias/internal/incusclient"
+	"github.com/sklarsa/kanedias/internal/manager"
 	"github.com/sklarsa/kanedias/internal/supervisor"
 	"github.com/sklarsa/kanedias/internal/supervisor/contract"
 )
@@ -48,6 +51,83 @@ const (
 	metadataVolume  = "user.kanedias.workspace_volume"
 	metadataRun     = "user.kanedias.e2e_run"
 )
+
+func TestPostNewSessionJSONContract(t *testing.T) {
+	requestBody := manager.SessionLaunchRequest{
+		Root: manager.ModelSelection{ModelType: "root-model", ThinkingLevel: "high"},
+		Workers: []manager.WorkerModelSelection{
+			{WorkerType: "worker", ModelType: "worker-model", ThinkingLevel: "medium"},
+		},
+	}
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if r.Method != http.MethodPost {
+			t.Errorf("method = %s, want POST", r.Method)
+		}
+		origin := "http://" + r.Host
+		if got := r.Header.Get("Origin"); got != origin {
+			t.Errorf("Origin = %q, want %q", got, origin)
+		}
+		if got := r.Header.Get("Sec-Fetch-Site"); got != "same-origin" {
+			t.Errorf("Sec-Fetch-Site = %q, want same-origin", got)
+		}
+		if got := r.Header.Get("Content-Type"); got != "application/json" {
+			t.Errorf("Content-Type = %q, want application/json", got)
+		}
+		var got manager.SessionLaunchRequest
+		decoder := json.NewDecoder(r.Body)
+		decoder.DisallowUnknownFields()
+		if err := decoder.Decode(&got); err != nil {
+			t.Errorf("decode request: %v", err)
+		}
+		if !reflect.DeepEqual(got, requestBody) {
+			t.Errorf("request = %#v, want %#v", got, requestBody)
+		}
+		w.Header().Set("Content-Type", "application/json")
+		w.WriteHeader(http.StatusCreated)
+		_, _ = io.WriteString(w, `{"sessionId":"created-session"}`)
+	}))
+	defer server.Close()
+
+	sessionID, err := postNewSession(server.Client(), server.URL+"/ui/sessions", requestBody)
+	if err != nil {
+		t.Fatalf("postNewSession: %v", err)
+	}
+	if sessionID != "created-session" {
+		t.Fatalf("session ID = %q, want created-session", sessionID)
+	}
+}
+
+func TestPostNewSessionJSONRejectsInvalidResponses(t *testing.T) {
+	tests := []struct {
+		name        string
+		status      int
+		contentType string
+		body        string
+		wantError   string
+	}{
+		{name: "requires exact created", status: http.StatusOK, contentType: "application/json", body: `{"sessionId":"created"}`, wantError: "status=200"},
+		{name: "requires JSON content type", status: http.StatusCreated, contentType: "text/plain", body: `{"sessionId":"created"}`, wantError: "Content-Type"},
+		{name: "requires body", status: http.StatusCreated, contentType: "application/json", body: ``, wantError: "decode"},
+		{name: "requires nonempty session ID", status: http.StatusCreated, contentType: "application/json", body: `{"sessionId":"  "}`, wantError: "sessionId"},
+		{name: "rejects unknown field", status: http.StatusCreated, contentType: "application/json", body: `{"sessionId":"created","extra":true}`, wantError: "decode"},
+		{name: "rejects trailing JSON", status: http.StatusCreated, contentType: "application/json", body: `{"sessionId":"created"}{}`, wantError: "trailing"},
+		{name: "bounds response", status: http.StatusCreated, contentType: "application/json", body: `{"sessionId":"` + strings.Repeat("x", 70<<10) + `"}`, wantError: "too large"},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
+				w.Header().Set("Content-Type", tt.contentType)
+				w.WriteHeader(tt.status)
+				_, _ = io.WriteString(w, tt.body)
+			}))
+			defer server.Close()
+			_, err := postNewSession(server.Client(), server.URL+"/ui/sessions", map[string]any{"root": map[string]any{}})
+			if err == nil || !strings.Contains(err.Error(), tt.wantError) {
+				t.Fatalf("error = %v, want containing %q", err, tt.wantError)
+			}
+		})
+	}
+}
 
 func TestWriteManagedConfigMergesExistingTables(t *testing.T) {
 	dir := t.TempDir()
@@ -85,6 +165,110 @@ value = "preserved"
 	}
 	if document["extra"].(map[string]any)["value"] != "preserved" {
 		t.Fatalf("unrelated table was not preserved: %#v", document)
+	}
+}
+
+func TestWriteManagedConfigWorkerOverride(t *testing.T) {
+	dir := t.TempDir()
+	source := filepath.Join(dir, "source.toml")
+	if err := os.WriteFile(source, []byte(`[network]
+ipv4 = "10.76.111.1/24"
+
+[base_image]
+name = "sandbox"
+source = "https://images.linuxcontainers.org"
+image = "debian/13"
+
+[models.gpt-5-6-sol]
+label = "GPT-5.6 Solver"
+provider = "openai-codex"
+model = "gpt-5.6-sol"
+thinking_levels = ["low", "high", "xhigh"]
+default_thinking_level = "high"
+
+[models.local-qwen]
+label = "Local Qwen"
+provider = "local-executor"
+model = "Qwen3.6-27B-GGUF"
+thinking_levels = ["off"]
+default_thinking_level = "off"
+
+[session]
+model_type = "local-qwen"
+thinking_level = "off"
+
+[workers.researcher]
+description = "Research external sources."
+model_type = "gpt-5-6-sol"
+thinking_level = "high"
+
+[workers.reviewer]
+description = "Review code and designs."
+model_type = "gpt-5-6-sol"
+thinking_level = "xhigh"
+
+[workers.worker]
+description = "Implement changes."
+model_type = "gpt-5-6-sol"
+thinking_level = "high"
+`), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	cfg, err := config.Load(source)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := cfg.ValidateSupervisor(); err != nil {
+		t.Fatalf("source config invalid: %v", err)
+	}
+
+	h := &liveAcceptance{t: t, runDir: dir, configPath: source, binary: "/tmp/kanedias", cfg: cfg}
+
+	tests := []struct {
+		name     string
+		provider string
+		model    string
+	}{
+		// existing model already has the requested provider/model: it must be reused without
+		// creating a duplicate provider/model pair
+		{name: "reuse existing matching model", provider: "local-executor", model: "Qwen3.6-27B-GGUF"},
+		// no configured model has the requested provider/model: a matching model def is added
+		{name: "add new model definition", provider: "myexec", model: "MyModel-7B"},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			h.t = t
+			t.Setenv("KANEDIAS_E2E_WORKER_PROVIDER", tt.provider)
+			t.Setenv("KANEDIAS_E2E_WORKER_MODEL", tt.model)
+			generated := h.writeManagedConfig("/tmp/roots", "/tmp/logs")
+
+			loaded, err := config.Load(generated)
+			if err != nil {
+				t.Fatalf("generated config fails to load: %v", err)
+			}
+			if err := loaded.ValidateSupervisor(); err != nil {
+				raw, _ := os.ReadFile(generated)
+				t.Fatalf("generated config fails validation: %v\n%s", err, raw)
+			}
+			// Every worker must be redirected to the requested provider/model while retaining
+			// its administrator-owned description and configured thinking level.
+			for _, name := range loaded.WorkerNames() {
+				want := cfg.Workers[name]
+				worker, err := loaded.ResolveWorker(name)
+				if err != nil {
+					t.Fatalf("resolve worker %s: %v", name, err)
+				}
+				if worker.Provider != tt.provider || worker.Model != tt.model {
+					t.Fatalf("worker %s resolved to %s/%s, want %s/%s", name, worker.Provider, worker.Model, tt.provider, tt.model)
+				}
+				if worker.Description != want.Description {
+					t.Fatalf("worker %s description = %q, want %q", name, worker.Description, want.Description)
+				}
+				if worker.ThinkingLevel != want.ThinkingLevel {
+					t.Fatalf("worker %s thinking = %q, want %q", name, worker.ThinkingLevel, want.ThinkingLevel)
+				}
+			}
+		})
 	}
 }
 
@@ -1178,7 +1362,10 @@ func (h *liveAcceptance) assertDistinct(root, child supervisor.NodeSnapshot) {
 }
 
 func (h *liveAcceptance) assertWorker(child supervisor.NodeSnapshot, workerType string) {
-	worker := h.cfg.Workers[workerType]
+	worker, err := h.cfg.ResolveWorker(workerType)
+	if err != nil {
+		h.t.Fatalf("resolve worker policy for %s: %v", workerType, err)
+	}
 	if child.WorkerType != workerType || child.Model.Provider != worker.Provider || child.Model.Model != worker.Model || child.Model.ThinkingLevel != worker.ThinkingLevel {
 		h.t.Fatalf("worker policy mismatch for %s: child=%#v configured=%#v", workerType, child, worker)
 	}
@@ -1719,6 +1906,15 @@ func (h *liveAcceptance) runServerManaged() {
 	}
 
 	managedConfig := h.writeManagedConfig(rootSocketDir, sessionLogDir)
+	managedCfg, err := config.Load(managedConfig)
+	if err != nil {
+		h.t.Fatalf("load managed server configuration: %v", err)
+	}
+	launchConfiguration, err := manager.NewLaunchConfiguration(managedCfg)
+	if err != nil {
+		h.t.Fatalf("build managed server launch configuration: %v", err)
+	}
+	defaultLaunchRequest := launchConfiguration.DefaultRequest()
 
 	// Start the server. It spawns roots via SpawnRoot on POST /ui/sessions.
 	server := h.startProcess("managed-server", h.binary, "--config", managedConfig, "server", "--listen", "127.0.0.1:0")
@@ -1727,9 +1923,11 @@ func (h *liveAcceptance) runServerManaged() {
 	// and "Bootstrap URL:" to stderr). Bootstrap the HTTP client with a cookie jar.
 	serverOrigin, client := h.bootstrapManagedServer(server)
 
-	// POST New Session twice to spawn two server-managed roots.
+	// POST New Session twice with the complete configured default launch request.
 	for range 2 {
-		h.postDatastar(client, serverOrigin+"/ui/sessions", map[string]any{})
+		if _, err := postNewSession(client, serverOrigin+"/ui/sessions", defaultLaunchRequest); err != nil {
+			h.t.Fatalf("POST managed New Session: %v", err)
+		}
 	}
 
 	// Discover both roots by scanning the socket directory.
@@ -1835,16 +2033,61 @@ func (h *liveAcceptance) writeManagedConfig(rootSocketDir, sessionLogDir string)
 	eventsTable["max_events"] = int64(256)
 	eventsTable["max_bytes"] = int64(4 << 20)
 
-	// Point every worker at a free local model when requested, preserving each
-	// worker's description and thinking level.
+	// Redirect every worker to a free local model when requested, preserving
+	// each worker's administrator-owned description and thinking level. The new
+	// catalog schema requires workers to reference a model type rather than a raw
+	// provider/model, so the override points each worker at a model definition
+	// that matches the requested provider/model: either an existing model of the
+	// same provider/model (whose supported thinking levels are broadened to keep
+	// every configured worker thinking level and its default valid) or a newly
+	// added model. A single model type is added at most once, so validation's
+	// unique provider/model rule is never violated.
 	if provider := strings.TrimSpace(os.Getenv("KANEDIAS_E2E_WORKER_PROVIDER")); provider != "" {
 		if model := strings.TrimSpace(os.Getenv("KANEDIAS_E2E_WORKER_MODEL")); model != "" {
+			// Union of every worker's configured thinking levels plus a safe
+			// fallback so the redirected model supports all of them.
+			levels := map[string]struct{}{}
+			for _, profile := range h.cfg.Workers {
+				if profile.ThinkingLevel != "" {
+					levels[profile.ThinkingLevel] = struct{}{}
+				}
+			}
+			if len(levels) == 0 {
+				levels["high"] = struct{}{}
+			}
+
+			modelsTable := table(document, "models")
+			modelType := ""
+			for existing, def := range h.cfg.Models {
+				if def.Provider == provider && def.Model == model {
+					if overrideModel, ok := modelsTable[existing].(map[string]any); ok {
+						// Reuse the matching model. Broaden, not replace, its levels
+						// so its configured default thinking level stays valid.
+						for _, level := range def.ThinkingLevels {
+							levels[level] = struct{}{}
+						}
+						modelType = existing
+						overrideModel["thinking_levels"] = sortedKeys(levels)
+					}
+					break
+				}
+			}
+			if modelType == "" {
+				modelType = uniqueModelType("e2e-local", modelsTable)
+				modelsTable[modelType] = map[string]any{
+					"label":                  "E2E override",
+					"provider":               provider,
+					"model":                  model,
+					"thinking_levels":        sortedKeys(levels),
+					"default_thinking_level": sortedKeys(levels)[0],
+				}
+			}
+
 			workersTable := table(document, "workers")
 			for name, profile := range h.cfg.Workers {
 				w := table(workersTable, name)
 				w["description"] = profile.Description
-				w["provider"] = provider
-				w["model"] = model
+				w["model_type"] = modelType
 				w["thinking_level"] = profile.ThinkingLevel
 			}
 		}
@@ -1859,6 +2102,28 @@ func (h *liveAcceptance) writeManagedConfig(rootSocketDir, sessionLogDir string)
 		h.t.Fatal(err)
 	}
 	return dest
+}
+
+// sortedKeys returns the sorted string keys of a set.
+func sortedKeys(set map[string]struct{}) []string {
+	keys := make([]string, 0, len(set))
+	for key := range set {
+		keys = append(keys, key)
+	}
+	sort.Strings(keys)
+	return keys
+}
+
+// uniqueModelType returns a model type slug that does not collide with any model
+// already present in the generated document.
+func uniqueModelType(base string, modelsTable map[string]any) string {
+	candidate := base
+	for i := 2; ; i++ {
+		if _, exists := modelsTable[candidate]; !exists {
+			return candidate
+		}
+		candidate = fmt.Sprintf("%s-%d", base, i)
+	}
 }
 
 // waitForBootstrapURL polls the process log file until the "Bootstrap URL:"
@@ -1968,9 +2233,71 @@ func (h *liveAcceptance) bootstrapManagedServer(server *acceptanceProcess) (stri
 	return origin, httpClient
 }
 
+const maxNewSessionResponseBytes = 64 << 10
+
+// postNewSession sends the direct JSON New Session contract with the browser's
+// same-origin write-boundary headers. It accepts only the endpoint's exact 201
+// response and strictly decodes a bounded, nonempty session ID.
+func postNewSession(client *http.Client, fullURL string, body any) (string, error) {
+	encoded, err := json.Marshal(body)
+	if err != nil {
+		return "", fmt.Errorf("marshal body: %w", err)
+	}
+	parsed, err := url.Parse(fullURL)
+	if err != nil {
+		return "", fmt.Errorf("parse URL %q: %w", fullURL, err)
+	}
+	origin := parsed.Scheme + "://" + parsed.Host
+	req, err := http.NewRequest(http.MethodPost, fullURL, bytes.NewReader(encoded))
+	if err != nil {
+		return "", fmt.Errorf("new request: %w", err)
+	}
+	req.Host = parsed.Host
+	req.Header.Set("Content-Type", "application/json")
+	req.Header.Set("Origin", origin)
+	req.Header.Set("Sec-Fetch-Site", "same-origin")
+
+	resp, err := client.Do(req)
+	if err != nil {
+		return "", fmt.Errorf("POST: %w", err)
+	}
+	responseBody, readErr := io.ReadAll(io.LimitReader(resp.Body, maxNewSessionResponseBytes+1))
+	_ = resp.Body.Close()
+	if readErr != nil {
+		return "", fmt.Errorf("read response: %w", readErr)
+	}
+	if len(responseBody) > maxNewSessionResponseBytes {
+		return "", errors.New("response body is too large")
+	}
+	if resp.StatusCode != http.StatusCreated {
+		return "", fmt.Errorf("status=%d, want 201", resp.StatusCode)
+	}
+	mediaType, _, err := mime.ParseMediaType(resp.Header.Get("Content-Type"))
+	if err != nil || mediaType != "application/json" {
+		return "", fmt.Errorf("response Content-Type = %q, want application/json", resp.Header.Get("Content-Type"))
+	}
+
+	var result struct {
+		SessionID string `json:"sessionId"`
+	}
+	decoder := json.NewDecoder(bytes.NewReader(responseBody))
+	decoder.DisallowUnknownFields()
+	if err := decoder.Decode(&result); err != nil {
+		return "", fmt.Errorf("decode response: %w", err)
+	}
+	var trailing any
+	if err := decoder.Decode(&trailing); !errors.Is(err, io.EOF) {
+		return "", errors.New("response contains trailing JSON")
+	}
+	if strings.TrimSpace(result.SessionID) == "" {
+		return "", errors.New("response sessionId is empty")
+	}
+	return result.SessionID, nil
+}
+
 // postDatastar sends a write-boundary-compliant POST to a server action URL.
 // It sets Origin, Sec-Fetch-Site, and Content-Type exactly as the browser would.
-func (h *liveAcceptance) postDatastar(client *http.Client, fullURL string, body map[string]any) {
+func (h *liveAcceptance) postDatastar(client *http.Client, fullURL string, body any) {
 	encoded, err := json.Marshal(body)
 	if err != nil {
 		h.t.Fatalf("postDatastar: marshal body: %v", err)

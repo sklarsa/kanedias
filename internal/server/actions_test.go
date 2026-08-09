@@ -8,9 +8,11 @@ import (
 	"log/slog"
 	"net/http"
 	"net/http/httptest"
+	"reflect"
 	"strings"
 	"testing"
 
+	"github.com/sklarsa/kanedias/internal/manager"
 	"github.com/sklarsa/kanedias/internal/supervisor/contract"
 )
 
@@ -77,19 +79,127 @@ func TestStopActionPatchesDeckStatus(t *testing.T) {
 	}
 }
 
-// TestNewSessionActionPatchesDeckStatus verifies that a new session action
-// patches #deck-status.
-func TestNewSessionActionPatchesDeckStatus(t *testing.T) {
+func TestNewSessionActionAcceptsStrictJSONAndReturnsCreatedSession(t *testing.T) {
 	fleet := newStreamFakeFleet()
+	fleet.launchOptions = launchOptionsFixture()
+	fleet.spawnSessionID = "session-created"
 	handler, cookie := mustNewHandlerWithFleetAuth(t, fleet)
+	body := `{"root":{"modelType":"deep-model","thinkingLevel":"xhigh"},"workers":[{"workerType":"oracle","modelType":"deep-model","thinkingLevel":"high"},{"workerType":"reviewer","modelType":"fast-model","thinkingLevel":"medium"},{"workerType":"worker","modelType":"deep-model","thinkingLevel":"xhigh"}]}`
 
-	resp := serveActionRequest(t, handler, "/ui/sessions", `{}`, cookie)
-	if resp.Code != http.StatusOK {
-		t.Fatalf("new session status = %d, want %d; body = %q", resp.Code, http.StatusOK, resp.Body.String())
+	resp := serveActionRequest(t, handler, "/ui/sessions", body, cookie)
+	if resp.Code != http.StatusCreated {
+		t.Fatalf("new session status = %d, want %d; body = %q", resp.Code, http.StatusCreated, resp.Body.String())
 	}
-	body := resp.Body.String()
-	if !strings.Contains(body, "deck-status") {
-		t.Errorf("new session response does not patch #deck-status:\n%s", body)
+	if got := resp.Header().Get("Content-Type"); got != "application/json" {
+		t.Fatalf("Content-Type = %q, want application/json", got)
+	}
+	if got := strings.TrimSpace(resp.Body.String()); got != `{"sessionId":"session-created"}` {
+		t.Fatalf("response = %q", got)
+	}
+	want := manager.SessionLaunchRequest{
+		Root: manager.ModelSelection{ModelType: "deep-model", ThinkingLevel: "xhigh"},
+		Workers: []manager.WorkerModelSelection{
+			{WorkerType: "oracle", ModelType: "deep-model", ThinkingLevel: "high"},
+			{WorkerType: "reviewer", ModelType: "fast-model", ThinkingLevel: "medium"},
+			{WorkerType: "worker", ModelType: "deep-model", ThinkingLevel: "xhigh"},
+		},
+	}
+	if !reflect.DeepEqual(fleet.spawnRequest, want) {
+		t.Fatalf("recorded request = %#v, want %#v", fleet.spawnRequest, want)
+	}
+}
+
+func TestNewSessionActionRejectsInvalidJSON(t *testing.T) {
+	tests := []struct {
+		name string
+		body string
+	}{
+		{name: "malformed", body: `{"root":`},
+		{name: "unknown field", body: `{"root":{},"workers":[],"unexpected":true}`},
+		{name: "trailing value", body: `{"root":{},"workers":[]} {}`},
+		{name: "oversize", body: `{"root":{},"workers":[` + strings.Repeat(`{"workerType":"worker","modelType":"deep-model","thinkingLevel":"high"},`, 1000) + `{}]}`},
+	}
+	for _, test := range tests {
+		t.Run(test.name, func(t *testing.T) {
+			fleet := newStreamFakeFleet()
+			handler, cookie := mustNewHandlerWithFleetAuth(t, fleet)
+			resp := serveActionRequest(t, handler, "/ui/sessions", test.body, cookie)
+			if resp.Code != http.StatusBadRequest {
+				t.Fatalf("status = %d, want 400; body = %q", resp.Code, resp.Body.String())
+			}
+			if got := strings.TrimSpace(resp.Body.String()); got != `{"error":"The session configuration was not valid."}` {
+				t.Fatalf("response = %q", got)
+			}
+			if strings.Contains(resp.Body.String(), "unexpected") || strings.Contains(resp.Body.String(), "invalid character") {
+				t.Errorf("response leaked decoder detail: %s", resp.Body.String())
+			}
+		})
+	}
+}
+
+func TestNewSessionActionPreservesAuthenticationAndSameOriginBoundary(t *testing.T) {
+	fleet := newStreamFakeFleet()
+	logger := slog.New(slog.NewTextHandler(&bytes.Buffer{}, nil))
+	var bootstrap bytes.Buffer
+	handler, err := newHandlerWithOptions(logger, effectiveAddrForTests, &bootstrap, fleet, context.Background(), true)
+	if err != nil {
+		t.Fatal(err)
+	}
+	body := `{"root":{},"workers":[]}`
+
+	unauthenticated := httptest.NewRequest(http.MethodPost, "/ui/sessions", strings.NewReader(body))
+	unauthenticated.Host = effectiveAddrForTests
+	unauthenticated.Header.Set("Content-Type", "application/json")
+	unauthenticatedResponse := httptest.NewRecorder()
+	handler.ServeHTTP(unauthenticatedResponse, unauthenticated)
+	if unauthenticatedResponse.Code != http.StatusUnauthorized {
+		t.Fatalf("unauthenticated status = %d, want 401", unauthenticatedResponse.Code)
+	}
+
+	// Use a handler/cookie pair from the same capability store for the boundary check.
+	boundaryHandler, boundaryCookie := mustNewHandlerWithFleetAuth(t, fleet)
+	crossOrigin := httptest.NewRequest(http.MethodPost, "/ui/sessions", strings.NewReader(body))
+	crossOrigin.Host = effectiveAddrForTests
+	crossOrigin.Header.Set("Content-Type", "application/json")
+	crossOrigin.Header.Set("Origin", "http://attacker.example")
+	crossOrigin.AddCookie(boundaryCookie)
+	crossOriginResponse := httptest.NewRecorder()
+	boundaryHandler.ServeHTTP(crossOriginResponse, crossOrigin)
+	if crossOriginResponse.Code != http.StatusForbidden {
+		t.Fatalf("cross-origin status = %d, want 403", crossOriginResponse.Code)
+	}
+}
+
+func TestNewSessionActionMapsTypedInvalidAndSpawnFailure(t *testing.T) {
+	tests := []struct {
+		name       string
+		err        error
+		wantStatus int
+		wantBody   string
+	}{
+		{name: "invalid request", err: contract.NewError(contract.ErrorInvalidRequest, "unknown private model"), wantStatus: http.StatusBadRequest, wantBody: `{"error":"The session configuration was not valid."}`},
+		{name: "admission failure", err: errors.New("private socket path /run/secret.sock"), wantStatus: http.StatusServiceUnavailable, wantBody: `{"error":"The session could not be started."}`},
+	}
+	for _, test := range tests {
+		t.Run(test.name, func(t *testing.T) {
+			var logs bytes.Buffer
+			fleet := newStreamFakeFleet()
+			fleet.spawnErr = test.err
+			handler, cookie := mustNewHandlerWithFleetAuthLogger(t, fleet, slog.New(slog.NewTextHandler(&logs, nil)))
+			resp := serveActionRequest(t, handler, "/ui/sessions", `{"root":{},"workers":[]}`, cookie)
+			if resp.Code != test.wantStatus {
+				t.Fatalf("status = %d, want %d; body = %q", resp.Code, test.wantStatus, resp.Body.String())
+			}
+			if got := strings.TrimSpace(resp.Body.String()); got != test.wantBody {
+				t.Fatalf("response = %q, want %q", got, test.wantBody)
+			}
+			if strings.Contains(resp.Body.String(), test.err.Error()) {
+				t.Errorf("response leaked real error: %s", resp.Body.String())
+			}
+			if !strings.Contains(logs.String(), test.err.Error()) {
+				t.Errorf("server log does not contain real error: %s", logs.String())
+			}
+		})
 	}
 }
 
@@ -227,6 +337,9 @@ func (e *errFleet) Steer(context.Context, string, string) error { return e.mutat
 func (e *errFleet) Interrupt(context.Context, string) error     { return e.mutationErr }
 func (e *errFleet) StopSession(context.Context, string) error   { return e.mutationErr }
 func (e *errFleet) SpawnRoot(context.Context) (string, error)   { return "", e.mutationErr }
+func (e *errFleet) SpawnRootWithRequest(context.Context, manager.SessionLaunchRequest) (string, error) {
+	return "", e.mutationErr
+}
 func (e *errFleet) AnswerQuestion(context.Context, string, string, json.RawMessage) error {
 	return e.mutationErr
 }

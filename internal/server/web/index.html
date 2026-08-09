@@ -56,13 +56,14 @@
       data-on:click="@post('/ui/sessions/'+$selectedSessionId+'/stop', {payload:{}})">
       <span class="g">▣</span> Stop Session
     </button>
-    <button class="dbtn new-session"
-      data-on:click="@post('/ui/sessions', {payload:{}})">
+    <button class="dbtn new-session" type="button" id="new-session-button"{{if not .SessionModal.Enabled}} disabled{{end}}>
       <span class="g">＋</span> New Session
     </button>
   </footer>
 
 </div>
+
+{{template "session-modal.html" .SessionModal}}
 
 <div class="scrim" id="scrim"></div>
 
@@ -70,6 +71,7 @@
 <script src="/assets/highlight.min.js"></script>
 <script src="/assets/markdown-renderer.js"></script>
 <script src="/assets/terminal-ui.js"></script>
+<script src="/assets/session-modal.js"></script>
 <script type="module" src="/assets/app.js"></script>
 </body>
 </html>

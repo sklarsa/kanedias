@@ -4,6 +4,7 @@ import (
 	"context"
 	"errors"
 	"fmt"
+	"io"
 	"net"
 	"os"
 	"os/user"
@@ -31,9 +32,16 @@ type Manager struct {
 	discoveryIssues []DiscoveryIssue
 	factory         clientFactory
 	starter         processStarter
-	closed          bool // set once Close begins; blocks new monitor loops
-	clientsClosed   bool // set once clients have been closed (idempotency)
-	quiesced        bool
+	// Root-bootstrap write/join seams retain production behavior while making
+	// blocked-write lifecycle ownership deterministic in tests.
+	newSpawnToken          func() (string, error)
+	newBootstrapPipe       func() (*os.File, *os.File, error)
+	writeRootBootstrap     func(io.Writer, []byte) error
+	waitRootBootstrapWrite func(<-chan struct{})
+	rootAbortWait          time.Duration
+	closed                 bool // set once Close begins; blocks new monitor loops
+	clientsClosed          bool // set once clients have been closed (idempotency)
+	quiesced               bool
 	// monitoring infrastructure
 	closeCtx        context.Context
 	closeCancel     context.CancelFunc
@@ -48,6 +56,9 @@ type Manager struct {
 	// commitTree and monitorRoot. Test-only seam for the MGR-D interleaving; nil
 	// in production.
 	afterCommitSpawnHook func(committed *rootHandle)
+
+	// launch is the immutable allowlisted launch catalog resolved from Options.
+	launch LaunchConfiguration
 }
 
 // New normalizes and validates options, resolves defaults, and creates the
@@ -58,6 +69,9 @@ func New(opts Options) (*Manager, error) {
 	}
 	if opts.Logger == nil {
 		return nil, errors.New("manager: logger is required")
+	}
+	if len(opts.Launch.modelOrder) == 0 {
+		return nil, errors.New("manager: launch configuration is required")
 	}
 
 	// Resolve RootSocketDir default.
@@ -150,19 +164,31 @@ func New(opts Options) (*Manager, error) {
 	ctx, cancel := context.WithCancel(context.Background())
 	snapshotCtx, snapshotCancel := context.WithCancel(ctx)
 	m := &Manager{
-		opts:           opts,
-		roots:          make(map[string]*rootHandle),
-		routes:         make(map[string]string),
-		factory:        defaultClientFactory,
-		starter:        osProcessStarter{},
-		closeCtx:       ctx,
-		closeCancel:    cancel,
-		snapshotCtx:    snapshotCtx,
-		snapshotCancel: snapshotCancel,
-		fleetFanout:    newChangeFanout(supervisor.DefaultSubscriberMailboxCapacity),
-		sessionFanout:  newChangeFanout(supervisor.DefaultSubscriberMailboxCapacity),
+		opts:                   opts,
+		roots:                  make(map[string]*rootHandle),
+		routes:                 make(map[string]string),
+		factory:                defaultClientFactory,
+		starter:                osProcessStarter{},
+		newSpawnToken:          generateToken,
+		newBootstrapPipe:       os.Pipe,
+		writeRootBootstrap:     writeRootBootstrap,
+		waitRootBootstrapWrite: waitRootBootstrapWrite,
+		rootAbortWait:          defaultRootAbortWait,
+		closeCtx:               ctx,
+		closeCancel:            cancel,
+		snapshotCtx:            snapshotCtx,
+		snapshotCancel:         snapshotCancel,
+		fleetFanout:            newChangeFanout(supervisor.DefaultSubscriberMailboxCapacity),
+		sessionFanout:          newChangeFanout(supervisor.DefaultSubscriberMailboxCapacity),
+		launch:                 opts.Launch,
 	}
 	return m, nil
+}
+
+// LaunchOptions returns the manager's read-only launch view for the server to
+// render. The returned value carries copied slices and is safe to retain.
+func (m *Manager) LaunchOptions() SessionLaunchOptions {
+	return m.launch.LaunchOptions()
 }
 
 func defaultClientFactory(socketPath string) (rootClient, error) {

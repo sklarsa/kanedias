@@ -20,6 +20,7 @@ type Options struct {
 	SnapshotInterval  time.Duration
 	SpawnTimeout      time.Duration
 	EventLimits       supervisor.EventBrokerOptions
+	Launch            LaunchConfiguration
 	Logger            *slog.Logger
 }
 

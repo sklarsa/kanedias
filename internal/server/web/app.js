@@ -1,6 +1,9 @@
 (function () {
   "use strict";
 
+  /* -------- Accessible New Session modal -------- */
+  window.KanediasSessionModal.bind(document, window.fetch.bind(window));
+
   /* -------- Tab switching (delegated) -------- */
   document.addEventListener("click", function (e) {
     var tab = e.target.closest(".tab");

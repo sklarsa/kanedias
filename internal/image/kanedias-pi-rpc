@@ -9,7 +9,21 @@ source "$NVM_DIR/nvm.sh"
 : "${KANEDIAS_SESSION_KIND:?KANEDIAS_SESSION_KIND is required}"
 kind=$KANEDIAS_SESSION_KIND
 session_file=${KANEDIAS_PI_SESSION_FILE:-}
+provider=${KANEDIAS_PI_PROVIDER:-}
+model=${KANEDIAS_PI_MODEL:-}
+thinking=${KANEDIAS_PI_THINKING:-}
 args=(--mode rpc)
+
+if [[ -z $provider || -z $model ]]; then
+    echo "Pi provider and model are required" >&2
+    exit 1
+fi
+if [[ -n $thinking ]]; then
+    case "$thinking" in
+        off | minimal | low | medium | high | xhigh | max) ;;
+        *) echo "invalid Pi thinking level" >&2; exit 1 ;;
+    esac
+fi
 
 case "$kind" in
     root)
@@ -19,24 +33,8 @@ case "$kind" in
         fi
         ;;
     read | write)
-        provider=${KANEDIAS_PI_PROVIDER:-}
-        model=${KANEDIAS_PI_MODEL:-}
-        thinking=${KANEDIAS_PI_THINKING:-}
-        if [[ -z $provider || -z $model ]]; then
-            echo "child Pi provider and model are required" >&2
-            exit 1
-        fi
         if [[ -n $session_file ]]; then
             args+=(--session "$session_file")
-        fi
-        args+=(-e /opt/kanedias/pi-extension/src/index.ts)
-        args+=(--provider "$provider" --model "$model")
-        if [[ -n $thinking ]]; then
-            case "$thinking" in
-                off | minimal | low | medium | high | xhigh | max) ;;
-                *) echo "invalid child Pi thinking level" >&2; exit 1 ;;
-            esac
-            args+=(--thinking "$thinking")
         fi
         ;;
     *)
@@ -45,7 +43,9 @@ case "$kind" in
         ;;
 esac
 
-if [[ $kind == root ]]; then
-    args+=(-e /opt/kanedias/pi-extension/src/index.ts)
+args+=(-e /opt/kanedias/pi-extension/src/index.ts)
+args+=(--provider "$provider" --model "$model")
+if [[ -n $thinking ]]; then
+    args+=(--thinking "$thinking")
 fi
 exec pi "${args[@]}"

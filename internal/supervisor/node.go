@@ -13,6 +13,7 @@ import (
 	"sync"
 	"time"
 
+	"github.com/sklarsa/kanedias/internal/config"
 	"github.com/sklarsa/kanedias/internal/supervisor/contract"
 	"github.com/sklarsa/kanedias/internal/supervisor/pirpc"
 	"github.com/sklarsa/kanedias/internal/supervisor/process"
@@ -22,7 +23,7 @@ import (
 type Dependencies struct {
 	Provisioner            provision.RootProvisioner
 	DialRPC                func(context.Context, string) (io.ReadWriteCloser, error)
-	Workers                WorkerCatalog
+	ModelPolicy            config.SessionModelPolicy
 	SocketPath             string
 	SpawnChild             ChildSpawner
 	DescendantClient       DescendantClientFactory
@@ -92,8 +93,15 @@ func newNode(identity Identity, deps Dependencies, broker *EventBroker) (*Node, 
 	if deps.DialRPC == nil {
 		return nil, invariantf("Pi RPC dialer is required")
 	}
-	if deps.Workers == nil {
-		return nil, invariantf("worker catalog is required")
+	if err := deps.ModelPolicy.Validate(); err != nil {
+		return nil, invariantf("session model policy is invalid: %v", err)
+	}
+	deps.ModelPolicy = deps.ModelPolicy.Clone()
+	identitySnapshot := identity.Snapshot()
+	if identitySnapshot.Kind != contract.ChildKindRoot {
+		if _, err := deps.ModelPolicy.ResolveWorker(identitySnapshot.Worker); err != nil {
+			return nil, invariantf("selected worker model is unavailable: %v", err)
+		}
 	}
 	if deps.CloseListener == nil {
 		return nil, invariantf("listener lifecycle hook is required")
@@ -141,9 +149,19 @@ func (node *Node) Start(ctx context.Context) error {
 	}
 
 	identity := node.identity.Snapshot()
+	selectedModel := node.deps.ModelPolicy.Root
+	if identity.Kind != contract.ChildKindRoot {
+		worker, resolveErr := node.deps.ModelPolicy.ResolveWorker(identity.Worker)
+		if resolveErr != nil {
+			node.failStart(ctx, invariantf("resolve selected worker model: %v", resolveErr))
+			return node.finishedError()
+		}
+		selectedModel = config.ModelProfile{Provider: worker.Provider, Model: worker.Model, ThinkingLevel: worker.ThinkingLevel}
+	}
 	resources, err := node.deps.Provisioner.ProvisionRoot(startupCtx, provision.RootRequest{
 		SessionID:      identity.SessionID,
 		SocketPath:     node.deps.SocketPath,
+		Model:          node.deps.ModelPolicy.Root,
 		RunAttribution: node.deps.RunAttribution,
 	})
 	node.mu.Lock()
@@ -203,7 +221,7 @@ func (node *Node) Start(ctx context.Context) error {
 
 	// A successful transport dial is not readiness. Bind performs the correlated
 	// get_state handshake and moves the local session to ready only on success.
-	if err := local.BindExpected(startupCtx, node.deps.ExpectedPiBinding); err != nil {
+	if err := local.BindExpected(startupCtx, PiExpectation{Binding: node.deps.ExpectedPiBinding, Model: selectedModel}); err != nil {
 		if node.startupWasStopped() {
 			return errors.Join(contract.NewError(contract.ErrorSessionStopping, "root startup was cancelled while binding Pi"), err)
 		}
@@ -279,9 +297,8 @@ func (node *Node) CreateChild(ctx context.Context, parent string, request contra
 	}
 	// Resolve trusted worker policy before allocating an ID, socket, registry
 	// entry, or process.
-	worker, err := node.deps.Workers.Resolve(request.WorkerType)
-	if err != nil {
-		return TerminalResult{}, err
+	if _, err := node.deps.ModelPolicy.ResolveWorker(request.WorkerType); err != nil {
+		return TerminalResult{}, contract.NewError(contract.ErrorUnknownWorkerType, err.Error())
 	}
 	if node.deps.SpawnChild == nil || node.deps.DescendantClient == nil {
 		return TerminalResult{}, contract.NewError(contract.ErrorInternal, "child runtime dependencies are unavailable")
@@ -312,7 +329,6 @@ func (node *Node) CreateChild(ctx context.Context, parent string, request contra
 		fallback: NodeSnapshot{
 			SessionID: childID, ParentSessionID: identity.SessionID, RootSessionID: identity.RootID,
 			Kind: request.Kind, Context: request.Context, WorkerType: request.WorkerType,
-			Model:     contract.ModelProfile{Provider: worker.Provider, Model: worker.Model, ThinkingLevel: worker.ThinkingLevel},
 			Lifecycle: string(LifecycleStarting), Questions: []QuestionSummary{}, Children: []NodeSnapshot{},
 		},
 	}
@@ -325,7 +341,7 @@ func (node *Node) CreateChild(ctx context.Context, parent string, request contra
 	bootstrap := process.Bootstrap{
 		SessionID: childID, ParentID: identity.SessionID, RootID: identity.RootID,
 		SocketPath: childSocket, SourceInstance: resources.Instance, SourceVolume: resources.Volume,
-		Worker: worker, Request: request, RunAttribution: node.deps.RunAttribution,
+		Policy: node.deps.ModelPolicy.Clone(), Request: request, RunAttribution: node.deps.RunAttribution,
 	}
 	child, err := node.deps.SpawnChild(spawnCtx, bootstrap)
 	if err != nil {
@@ -489,7 +505,16 @@ func (node *Node) AnswerQuestion(ctx context.Context, id string, answer json.Raw
 }
 
 func (node *Node) WorkerSummaries() []contract.WorkerSummary {
-	return node.deps.Workers.Summaries()
+	names := node.deps.ModelPolicy.WorkerNames()
+	result := make([]contract.WorkerSummary, 0, len(names))
+	for _, name := range names {
+		worker := node.deps.ModelPolicy.Workers[name]
+		result = append(result, contract.WorkerSummary{
+			WorkerType: name, Description: worker.Description,
+			Profile: config.ModelProfile{Provider: worker.Provider, Model: worker.Model, ThinkingLevel: worker.ThinkingLevel},
+		})
+	}
+	return result
 }
 
 func (node *Node) watchRPC(rpc *pirpc.Client, local *LocalSession) {

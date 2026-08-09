@@ -39,7 +39,8 @@ type fleetManager interface {
 	Session(sessionID string) (manager.SessionState, error)
 	SubscribeFleet() manager.ChangeSubscription
 	SubscribeSession(sessionID string) (manager.ChangeSubscription, error)
-	SpawnRoot(ctx context.Context) (string, error)
+	LaunchOptions() manager.SessionLaunchOptions
+	SpawnRootWithRequest(ctx context.Context, request manager.SessionLaunchRequest) (string, error)
 	Steer(ctx context.Context, sessionID string, message string) error
 	Interrupt(ctx context.Context, sessionID string) error
 	StopSession(ctx context.Context, sessionID string) error
@@ -119,6 +120,9 @@ func runApplication(
 	if err != nil {
 		return fmt.Errorf("run server: %w", err)
 	}
+	if err := cfg.ValidateSupervisor(); err != nil {
+		return fmt.Errorf("run server: validate supervisor config: %w", err)
+	}
 
 	resolved, err := cfg.Server.Resolve()
 	if err != nil {
@@ -128,6 +132,11 @@ func runApplication(
 	limits, err := cfg.Supervisor.Events.Limits()
 	if err != nil {
 		return fmt.Errorf("run server: resolve event limits: %w", err)
+	}
+
+	launch, err := manager.NewLaunchConfiguration(cfg)
+	if err != nil {
+		return fmt.Errorf("run server: model launch configuration: %w", err)
 	}
 
 	fleet, err := newManager(manager.Options{
@@ -142,6 +151,7 @@ func runApplication(
 			MaxEvents: limits.MaxEvents,
 			MaxBytes:  limits.MaxBytes,
 		},
+		Launch: launch,
 		Logger: normalizedOptions.Logger,
 	})
 	if err != nil {
