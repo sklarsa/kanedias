@@ -31,7 +31,7 @@
   <!-- Stable Datastar patch roots -->
   <div id="fleet-panel"></div>
   <div id="main-stack">
-    <div id="detail-panel"></div>
+    <div id="detail-panel" data-can-steer="false" data-can-interrupt="false" data-can-stop="false"></div>
     <div id="question-panel"></div>
     <div id="activity-panel"></div>
     <div id="deck-status" role="status"></div>
@@ -41,14 +41,16 @@
   <footer class="deck">
     <span class="deck-lbl">alidade ›</span>
     <input class="deck-input" type="text" placeholder="steer — type a directive…" aria-label="Command input"
+      aria-keyshortcuts="Control+A Control+C Enter" title="Ctrl+A: home · Ctrl+C: clear or copy · Enter: steer"
       data-bind="commandMessage">
+    <span class="deck-hint" aria-hidden="true">^A home · ^C clear/copy · esc abort · ^O tools</span>
     <button class="dbtn steer" id="steerBtn"
       data-on:click="@post('/ui/sessions/'+$selectedSessionId+'/steer', {payload:{message:$commandMessage}})">
       <span class="g">→</span> Steer
     </button>
-    <button class="dbtn interrupt"
+    <button class="dbtn interrupt" id="interruptBtn" aria-keyshortcuts="Escape" title="Escape: interrupt current turn"
       data-on:click="@post('/ui/sessions/'+$selectedSessionId+'/interrupt', {payload:{}})">
-      <span class="g">◇</span> Interrupt Turn
+      <span class="g">◇</span> Interrupt Turn <kbd class="shortcut-key" aria-hidden="true">ESC</kbd>
     </button>
     <button class="dbtn stop"
       data-on:click="@post('/ui/sessions/'+$selectedSessionId+'/stop', {payload:{}})">
@@ -67,6 +69,7 @@
 <script src="/assets/marked.min.js"></script>
 <script src="/assets/highlight.min.js"></script>
 <script src="/assets/markdown-renderer.js"></script>
+<script src="/assets/terminal-ui.js"></script>
 <script type="module" src="/assets/app.js"></script>
 </body>
 </html>

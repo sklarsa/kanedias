@@ -90,6 +90,7 @@ func newHandlerWithOptions(logger *slog.Logger, effectiveAddress string, bootstr
 	serveMarked := serveEmbeddedAsset(logger, "web/marked.min.js", "text/javascript; charset=utf-8")
 	serveHighlight := serveEmbeddedAsset(logger, "web/highlight.min.js", "text/javascript; charset=utf-8")
 	serveMarkdownRenderer := serveEmbeddedAsset(logger, "web/markdown-renderer.js", "text/javascript; charset=utf-8")
+	serveTerminalUI := serveEmbeddedAsset(logger, "web/terminal-ui.js", "text/javascript; charset=utf-8")
 
 	router := chi.NewRouter()
 	router.Use(requestLogger(logger), recoverPanics(logger))
@@ -105,6 +106,7 @@ func newHandlerWithOptions(logger *slog.Logger, effectiveAddress string, bootstr
 	router.Get("/assets/marked.min.js", serveMarked)
 	router.Get("/assets/highlight.min.js", serveHighlight)
 	router.Get("/assets/markdown-renderer.js", serveMarkdownRenderer)
+	router.Get("/assets/terminal-ui.js", serveTerminalUI)
 	router.Get("/assets/app.js", serveAppJS)
 
 	var serveFleet, serveSession http.HandlerFunc

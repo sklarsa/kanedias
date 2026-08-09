@@ -93,17 +93,91 @@
     if (window.matchMedia("(max-width:820px)").matches) closeSheet(sidebar, scrim);
   }
 
-  /* -------- Enter in the deck input sends a steering message (delegated) -------- */
-  document.addEventListener("keydown", function (e) {
-    if (e.key !== "Enter") return;
-    var input = e.target.closest(".deck-input");
+  /* -------- Pi-like keyboard decisions (delegated) -------- */
+  var toolExpansionMode = null;
+
+  function applyToolExpansionMode(root) {
+    if (toolExpansionMode === null) return;
+    var cards = root.querySelectorAll("[data-tool-card]");
+    for (var i = 0; i < cards.length; i++) {
+      if (cards[i].open !== toolExpansionMode) cards[i].open = toolExpansionMode;
+    }
+  }
+
+  function hasTextSelection(target) {
+    var selection = window.getSelection && window.getSelection();
+    if (selection && !selection.isCollapsed && String(selection) !== "") return true;
+    if (target && (target.tagName === "INPUT" || target.tagName === "TEXTAREA") &&
+        typeof target.selectionStart === "number" && typeof target.selectionEnd === "number") {
+      return target.selectionStart !== target.selectionEnd;
+    }
+    return false;
+  }
+
+  function keyboardTarget(target) {
+    if (target && target.closest && target.closest(".deck-input")) return "deck";
+    if (target && target.closest && target.closest("input, textarea, select, button, [contenteditable]:not([contenteditable='false'])")) {
+      return "other-editable";
+    }
+    return "body";
+  }
+
+  function detailCapability(name) {
+    var detail = document.getElementById("detail-panel");
+    return !!detail && detail.getAttribute("data-can-" + name) === "true";
+  }
+
+  function clearDeck(input) {
     if (!input) return;
-    e.preventDefault();
-    var btn = document.getElementById("steerBtn");
-    if (btn) btn.click();
-    // Clear the just-sent command so it is not left queued in the box.
     input.value = "";
     input.dispatchEvent(new Event("input", { bubbles: true }));
+    input.focus();
+  }
+
+  document.addEventListener("keydown", function (e) {
+    if (!window.KanediasTerminalUI || typeof window.KanediasTerminalUI.keyAction !== "function") return;
+    var input = document.querySelector(".deck-input");
+    var action = window.KanediasTerminalUI.keyAction(e, {
+      target: keyboardTarget(e.target),
+      hasSelection: hasTextSelection(e.target),
+      canInterrupt: detailCapability("interrupt")
+    });
+    if (!action) return;
+
+    if (action === "submit") {
+      e.preventDefault();
+      var steer = document.getElementById("steerBtn");
+      if (steer) steer.click();
+      clearDeck(input);
+      return;
+    }
+    if (action === "line-start") {
+      e.preventDefault();
+      if (input) {
+        input.focus();
+        input.setSelectionRange(0, 0);
+      }
+      return;
+    }
+    if (action === "clear") {
+      e.preventDefault();
+      clearDeck(input);
+      return;
+    }
+    if (action === "interrupt") {
+      e.preventDefault();
+      var interrupt = document.getElementById("interruptBtn");
+      if (interrupt && !interrupt.disabled) interrupt.click();
+      return;
+    }
+    if (action === "toggle-tools") {
+      e.preventDefault();
+      var cards = Array.prototype.slice.call(document.querySelectorAll("[data-tool-card]"));
+      toolExpansionMode = window.KanediasTerminalUI.nextToolExpansion(cards.map(function (card) {
+        return card.open;
+      }));
+      applyToolExpansionMode(document);
+    }
   });
 
   /* -------- Transcript auto-scrolls to the newest content (TUI-like) -------- */
@@ -153,6 +227,7 @@
     // highlight tool blocks before measuring for auto-scroll so the rendered
     // height is correct.
     function refresh() {
+      applyToolExpansionMode(panel);
       if (window.KanediasMarkdown && window.KanediasMarkdown.renderPending) {
         window.KanediasMarkdown.renderPending(panel);
       }
@@ -223,24 +298,35 @@
     finish(ok);
   }
 
-  /* -------- Deck controls reflect the selected session's capability -------- */
-  function setDeckState(sessionID, lifecycle) {
-    var canAct = !!sessionID && (lifecycle === "ready" || lifecycle === "running" ||
-      lifecycle === "active" || lifecycle === "question" || lifecycle === "starting");
-    var sel = function (sel) { return document.querySelector(sel); };
-    var steer = sel("#steerBtn");
-    var itr = sel(".dbtn.interrupt");
-    var stop = sel(".dbtn.stop");
-    if (steer) steer.disabled = !canAct;
-    if (stop) stop.disabled = !canAct;
-    if (itr) itr.disabled = !(!!sessionID && lifecycle === "running");
+  /* -------- Detail stream is authoritative for deck capabilities -------- */
+  function setActionControlState(control, enabled) {
+    if (!control) return;
+    control.disabled = !enabled;
+    control.setAttribute("aria-disabled", enabled ? "false" : "true");
+    control.classList.toggle("armed", enabled);
   }
+
+  function syncDeckState() {
+    setActionControlState(document.getElementById("steerBtn"), detailCapability("steer"));
+    setActionControlState(document.getElementById("interruptBtn"), detailCapability("interrupt"));
+    setActionControlState(document.querySelector(".dbtn.stop"), detailCapability("stop"));
+  }
+
+  function disarmSessionActions() {
+    setActionControlState(document.getElementById("steerBtn"), false);
+    setActionControlState(document.getElementById("interruptBtn"), false);
+    setActionControlState(document.querySelector(".dbtn.stop"), false);
+  }
+
   document.addEventListener("click", function (e) {
     var row = e.target.closest(".row");
     if (!row) return;
-    setDeckState(row.getAttribute("data-session-id"), row.getAttribute("data-lifecycle"));
+    disarmSessionActions();
   });
-  setDeckState("", "");
+
+  var mainStack = document.getElementById("main-stack");
+  if (mainStack) new MutationObserver(syncDeckState).observe(mainStack, { childList: true });
+  syncDeckState();
 
   /* -------- Alert banner jumps to first question (delegated) -------- */
   document.addEventListener("click", function (e) {

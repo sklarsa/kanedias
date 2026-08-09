@@ -173,6 +173,13 @@ func TestHandlerRoutes(t *testing.T) {
 			contentType: "text/javascript; charset=utf-8",
 		},
 		{
+			name:        "terminal decisions",
+			path:        "/assets/terminal-ui.js",
+			method:      http.MethodGet,
+			status:      http.StatusOK,
+			contentType: "text/javascript; charset=utf-8",
+		},
+		{
 			name:   "unknown",
 			path:   "/unknown",
 			method: http.MethodGet,
@@ -261,6 +268,9 @@ func TestInitialPageContainsAstrolabeConsole(t *testing.T) {
 		// shell stable Datastar patch roots
 		`id="fleet-panel"`,
 		`id="detail-panel"`,
+		`data-can-steer="false"`,
+		`data-can-interrupt="false"`,
+		`data-can-stop="false"`,
 		`id="question-panel"`,
 		`id="activity-panel"`,
 		`id="deck-status"`,
@@ -320,12 +330,12 @@ func TestAstrolabeConsoleIsInteractive(t *testing.T) {
 	// and no inline controller.
 	scriptRE := regexp.MustCompile(`(?s)<script\b([^>]*)>(.*?)</script>`)
 	scripts := scriptRE.FindAllStringSubmatch(body, -1)
-	wantScripts := 5 // Datastar module + app.js module + 3 local Markdown assets
+	wantScripts := 6 // Datastar + 3 Markdown assets + terminal decisions + app.js
 	if len(scripts) != wantScripts {
-		t.Fatalf("script count = %d, want %d (Datastar + 3 Markdown assets + app.js)", len(scripts), wantScripts)
+		t.Fatalf("script count = %d, want %d (Datastar + 3 Markdown assets + terminal-ui.js + app.js)", len(scripts), wantScripts)
 	}
 
-	var sawDatastar, sawAppJS bool
+	var sawDatastar, sawTerminalUI, sawAppJS bool
 	markdownAssets := []string{
 		`src="/assets/marked.min.js"`,
 		`src="/assets/highlight.min.js"`,
@@ -346,6 +356,12 @@ func TestAstrolabeConsoleIsInteractive(t *testing.T) {
 			}
 			sawDatastar = true
 		}
+		if strings.Contains(attrs, `src="/assets/terminal-ui.js"`) {
+			if inner != "" {
+				t.Errorf("terminal-ui.js script has unexpected inline body %q", inner)
+			}
+			sawTerminalUI = true
+		}
 		if strings.Contains(attrs, `src="/assets/app.js"`) {
 			if inner != "" {
 				t.Errorf("app.js script has unexpected inline body %q", inner)
@@ -361,6 +377,9 @@ func TestAstrolabeConsoleIsInteractive(t *testing.T) {
 	if !sawDatastar {
 		t.Error("page is missing the local Datastar module script")
 	}
+	if !sawTerminalUI {
+		t.Error("page is missing the local terminal-ui.js script")
+	}
 	if !sawAppJS {
 		t.Error("page is missing the app.js script")
 	}
@@ -371,13 +390,21 @@ func TestAstrolabeConsoleIsInteractive(t *testing.T) {
 	}
 
 	// The console is a working control surface with delegated Datastar wiring.
-	for _, want := range []string{`class="deck-input"`, `data-bind="commandMessage"`, `data-on:click=`} {
+	for _, want := range []string{
+		`class="deck-input"`, `data-bind="commandMessage"`, `data-on:click=`,
+		`aria-keyshortcuts="Control+A Control+C Enter"`,
+		`aria-keyshortcuts="Escape"`,
+		`^A home · ^C clear/copy · esc abort · ^O tools`,
+	} {
 		if !strings.Contains(body, want) {
 			t.Errorf("interactive console is missing wiring %q", want)
 		}
 	}
 	if strings.Contains(body, " disabled") {
 		t.Error("Astrolabe console must not ship disabled placeholder controls")
+	}
+	if strings.Contains(strings.ToLower(body), "onkeydown=") || strings.Contains(strings.ToLower(body), "onkeyup=") {
+		t.Error("Astrolabe console must use delegated keyboard handling, not inline key handlers")
 	}
 }
 
@@ -1090,7 +1117,7 @@ func TestAssetsAreEmbedded(t *testing.T) {
 	})
 
 	// Unauthenticated paths.
-	for _, path := range []string{"/healthz", "/assets/terminal.css", "/assets/app.css", "/assets/datastar.js", "/assets/app.js"} {
+	for _, path := range []string{"/healthz", "/assets/terminal.css", "/assets/app.css", "/assets/datastar.js", "/assets/terminal-ui.js", "/assets/app.js"} {
 		if response := serveRequest(handler, http.MethodGet, path); response.Code != http.StatusOK {
 			t.Errorf("GET %s status = %d, want %d", path, response.Code, http.StatusOK)
 		}
@@ -1147,6 +1174,7 @@ func TestRenderedPageHasOnlyOrderedLocalRuntimeAssets(t *testing.T) {
 		"/assets/marked.min.js",
 		"/assets/highlight.min.js",
 		"/assets/markdown-renderer.js",
+		"/assets/terminal-ui.js",
 		"/assets/app.js",
 	}
 	if len(matches) != len(want) {

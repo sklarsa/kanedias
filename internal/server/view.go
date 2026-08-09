@@ -81,6 +81,17 @@ type detailView struct {
 	Incomplete      bool
 	GapText         string
 	Stats           statsView
+	CanSteer        bool
+	CanInterrupt    bool
+	CanStop         bool
+}
+
+// actionCapabilities is the server-authoritative projection of which session
+// actions are valid for the current lifecycle.
+type actionCapabilities struct {
+	CanSteer     bool
+	CanInterrupt bool
+	CanStop      bool
 }
 
 // questionPanelView is the template data for questions.html.
@@ -254,6 +265,20 @@ func newQuestionSummaryView(q supervisor.QuestionSummary) questionSummaryView {
 	}
 }
 
+// newActionCapabilities derives action availability from the current session
+// state. Stream connectivity is deliberately not an authorization signal.
+func newActionCapabilities(state manager.SessionState) actionCapabilities {
+	lifecycle := supervisor.LifecycleState(state.Node.Lifecycle)
+	canSteer := !state.RootStale && (lifecycle == supervisor.LifecycleReady ||
+		lifecycle == supervisor.LifecycleRunning || lifecycle == supervisor.LifecycleAwaitingHandoff)
+	return actionCapabilities{
+		CanSteer:     canSteer,
+		CanInterrupt: !state.RootStale && lifecycle == supervisor.LifecycleRunning,
+		CanStop: state.Node.Lifecycle != "" && lifecycle != supervisor.LifecycleStopping &&
+			lifecycle != supervisor.LifecycleStopped,
+	}
+}
+
 // newDetailView converts a SessionState and (optional) stats into the detail
 // template data. A zero statsView (HasStats false) renders metrics as "—".
 func newDetailView(state manager.SessionState, stats statsView) detailView {
@@ -262,6 +287,7 @@ func newDetailView(state manager.SessionState, stats statsView) detailView {
 		gapText = fmt.Sprintf("replay gap: expected seq %d, first available %d",
 			state.Gap.ExpectedSeq, state.Gap.FirstAvailableSeq)
 	}
+	capabilities := newActionCapabilities(state)
 	return detailView{
 		SessionID:       state.Node.SessionID,
 		WorkerType:      state.Node.WorkerType,
@@ -272,6 +298,9 @@ func newDetailView(state manager.SessionState, stats statsView) detailView {
 		Incomplete:      state.Incomplete,
 		GapText:         gapText,
 		Stats:           stats,
+		CanSteer:        capabilities.CanSteer,
+		CanInterrupt:    capabilities.CanInterrupt,
+		CanStop:         capabilities.CanStop,
 	}
 }
 
