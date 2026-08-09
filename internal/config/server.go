@@ -36,6 +36,7 @@ type ServerConfig struct {
 	SnapshotInterval  *Duration `toml:"snapshot_interval"`
 	SpawnTimeout      *Duration `toml:"spawn_timeout"`
 	SessionBinary     string    `toml:"session_binary"`
+	RequireSession    *bool     `toml:"require_session"`
 }
 
 // SupervisorConfig holds supervisor-wide settings.
@@ -91,10 +92,15 @@ type ResolvedServerConfig struct {
 	SnapshotInterval  time.Duration
 	SpawnTimeout      time.Duration
 	SessionBinary     string
+	RequireSession    bool
 }
 
 // Resolve applies duration defaults and rejects zero or negative intervals.
 func (c ServerConfig) Resolve() (ResolvedServerConfig, error) {
+	requireSession := true
+	if c.RequireSession != nil {
+		requireSession = *c.RequireSession
+	}
 	resolved := ResolvedServerConfig{
 		RootSocketDir:     c.RootSocketDir,
 		SessionLogDir:     c.SessionLogDir,
@@ -102,6 +108,7 @@ func (c ServerConfig) Resolve() (ResolvedServerConfig, error) {
 		DiscoveryInterval: DefaultServerDiscoveryInterval,
 		SnapshotInterval:  DefaultServerSnapshotInterval,
 		SpawnTimeout:      DefaultServerSpawnTimeout,
+		RequireSession:    requireSession,
 	}
 	if c.DiscoveryInterval != nil {
 		resolved.DiscoveryInterval = c.DiscoveryInterval.Duration
