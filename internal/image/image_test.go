@@ -3,8 +3,10 @@ package image
 import (
 	"bytes"
 	"context"
+	"encoding/json"
 	"errors"
 	"io"
+	"net"
 	"os"
 	"os/exec"
 	"path/filepath"
@@ -16,6 +18,7 @@ import (
 	"github.com/lxc/incus/v7/shared/api"
 	"github.com/sklarsa/kanedias/internal/config"
 	"github.com/sklarsa/kanedias/internal/incusclient"
+	"golang.org/x/sys/unix"
 )
 
 func TestInstallerExcludesNestedIncus(t *testing.T) {
@@ -50,14 +53,115 @@ func TestInstallerActivatesOnlyKanediasDelegationExtensionAndSkills(t *testing.T
 	}
 }
 
-func TestInstallerEnablesOpenAIFastByDefault(t *testing.T) {
+func TestCoreInstallerExcludesMovedToolchainPackages(t *testing.T) {
 	script := string(installer)
-	for _, required := range []string{
-		`{"enabled":true}`,
-		`$managed_home/.pi/agent/extensions/openai-fast.json`,
+	const command = "apt-get install -y --no-install-recommends \\\n"
+	_, packages, found := strings.Cut(script, command)
+	if !found {
+		t.Fatalf("core installer missing initial apt package command")
+	}
+	packages, _, found = strings.Cut(packages, "\n\n")
+	if !found {
+		t.Fatalf("core installer initial apt package command is not delimited")
+	}
+	installed := make(map[string]bool)
+	for _, field := range strings.Fields(packages) {
+		if field != `\` {
+			installed[field] = true
+		}
+	}
+	for _, forbidden := range []string{"clang", "gcc", "nodejs"} {
+		if installed[forbidden] {
+			t.Errorf("core installer initial apt packages contain moved package %q", forbidden)
+		}
+	}
+}
+
+func TestInstallerExcludesOperatorAdditions(t *testing.T) {
+	piExtras, err := os.ReadFile(filepath.Join("..", "..", "image-build.d", "40-pi-extras.sh"))
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	for _, forbidden := range []string{
+		"install_cloud_apt_packages",
+		"install_aws_cli",
+		"install_session_manager_plugin",
+		"install_container_tools",
+		"install_" + "claude_code",
+		"install_go",
+		"install_pulumi",
+		"install_uv",
+		"install_tfenv",
+		"pi-web-suite",
+		"superpowers",
+		"openai-fast.json",
+		"cobalt" + "-ember",
 	} {
-		if !strings.Contains(script, required) {
-			t.Errorf("installer missing OpenAI Fast default %q", required)
+		if strings.Contains(string(installer), forbidden) {
+			t.Errorf("core installer contains operator addition %q", forbidden)
+		}
+	}
+
+	for _, required := range []string{
+		"git:github.com/obra/superpowers",
+		"npm:pi-web-suite",
+		"npm:@diegopetrucci/pi-openai-fast",
+		"openai-fast.json",
+	} {
+		if !strings.Contains(string(piExtras), required) {
+			t.Errorf("Pi extras script missing %q", required)
+		}
+	}
+}
+
+func TestCustomBuildScriptsContainExpectedToolsAndAreExecutable(t *testing.T) {
+	tests := []struct {
+		name    string
+		markers []string
+	}{
+		{name: "10-cloud-tools.sh", markers: []string{"azure-cli", "awscli.amazonaws.com", "session-manager-plugin"}},
+		{name: "20-container-tools.sh", markers: []string{"docker-ce", "derailed/k9s", "kubernetes-sigs/kind"}},
+		{name: "30-dev-toolchains.sh", markers: []string{"clang", "gcc", "go.dev/dl", "get.pulumi.com", "astral.sh/uv", "tfutils/tfenv"}},
+		{name: "40-pi-extras.sh", markers: []string{"git:github.com/obra/superpowers", "npm:pi-web-suite", "npm:@diegopetrucci/pi-openai-fast"}},
+		{name: "50-user-config.sh", markers: []string{".tmux.conf", "set -g mouse on", "set -g extended-keys on"}},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			path := filepath.Join("..", "..", "image-build.d", tt.name)
+			script, err := os.ReadFile(path)
+			if err != nil {
+				t.Fatal(err)
+			}
+			for _, marker := range tt.markers {
+				if !strings.Contains(string(script), marker) {
+					t.Errorf("script missing tool marker %q", marker)
+				}
+			}
+			info, err := os.Stat(path)
+			if err != nil {
+				t.Fatal(err)
+			}
+			if info.Mode().Perm()&0o111 == 0 {
+				t.Errorf("script mode = %#o, want an execute bit", info.Mode().Perm())
+			}
+		})
+	}
+}
+
+func TestCorePiSettingsExcludeOperatorRegistrations(t *testing.T) {
+	contents, err := os.ReadFile(filepath.Join("..", "..", "assets", "pi-settings.json"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	var settings map[string]any
+	if err := json.Unmarshal(contents, &settings); err != nil {
+		t.Fatal(err)
+	}
+	for _, key := range []string{"theme", "packages"} {
+		if _, present := settings[key]; present {
+			t.Errorf("core Pi settings contain operator registration %q", key)
 		}
 	}
 }
@@ -326,8 +430,283 @@ func TestPiRPCLauncherRequiresSessionIDBeforeInvokingPi(t *testing.T) {
 	}
 }
 
+func TestLoadBuildScriptsFiltersAndSorts(t *testing.T) {
+	cfg := imageConfigWithBuildScripts(t, nil)
+	writeBuildScript(t, cfg.BuildScriptsPath(), "20-second.sh", "#!/bin/sh\necho second\n", 0o700)
+	writeBuildScript(t, cfg.BuildScriptsPath(), "10-first.sh", "#!/bin/sh\necho first\n", 0o700)
+	writeBuildScript(t, cfg.BuildScriptsPath(), "ignored.sh", "#!/bin/sh\necho ignored\n", 0o600)
+	writeBuildScript(t, cfg.BuildScriptsPath(), "ignored.txt", "ignored\n", 0o700)
+	if err := os.Mkdir(filepath.Join(cfg.BuildScriptsPath(), "nested"), 0o700); err != nil {
+		t.Fatal(err)
+	}
+	writeBuildScript(t, filepath.Join(cfg.BuildScriptsPath(), "nested"), "05-nested.sh", "#!/bin/sh\necho nested\n", 0o700)
+
+	got, err := loadBuildScripts(cfg)
+	if err != nil {
+		t.Fatal(err)
+	}
+	want := []buildScript{
+		{name: "10-first.sh", content: []byte("#!/bin/sh\necho first\n")},
+		{name: "20-second.sh", content: []byte("#!/bin/sh\necho second\n")},
+	}
+	if !reflect.DeepEqual(got, want) {
+		t.Fatalf("loadBuildScripts() = %#v, want %#v", got, want)
+	}
+}
+
+func TestLoadBuildScriptsRejectsExecutableSymlink(t *testing.T) {
+	cfg := imageConfigWithBuildScripts(t, nil)
+	target := filepath.Join(t.TempDir(), "target.sh")
+	if err := os.WriteFile(target, []byte("#!/bin/sh\n"), 0o700); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.Symlink(target, filepath.Join(cfg.BuildScriptsPath(), "linked.sh")); err != nil {
+		t.Fatal(err)
+	}
+
+	_, err := loadBuildScripts(cfg)
+	if err == nil || !strings.Contains(err.Error(), "linked.sh") || !strings.Contains(err.Error(), "regular file") {
+		t.Fatalf("loadBuildScripts() error = %v, want linked.sh regular file error", err)
+	}
+}
+
+func TestLoadBuildScriptsRejectsExecutableSocketAsNonRegular(t *testing.T) {
+	cfg := imageConfigWithBuildScripts(t, nil)
+	const name = "socket.sh"
+	path := filepath.Join(cfg.BuildScriptsPath(), name)
+	listener, err := net.Listen("unix", path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer func() { _ = listener.Close() }()
+	if err := os.Chmod(path, 0o700); err != nil {
+		t.Fatal(err)
+	}
+
+	_, err = loadBuildScripts(cfg)
+	if err == nil || !strings.Contains(err.Error(), name) || !strings.Contains(err.Error(), "regular file") {
+		t.Fatalf("loadBuildScripts() error = %v, want named regular file error", err)
+	}
+}
+
+func TestLoadBuildScriptsIgnoresNonExecutableEntries(t *testing.T) {
+	cfg := imageConfigWithBuildScripts(t, nil)
+	writeBuildScript(t, cfg.BuildScriptsPath(), "ignored-unreadable.sh", "ignored\n", 0o000)
+	if err := unix.Mkfifo(filepath.Join(cfg.BuildScriptsPath(), "ignored-fifo.sh"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.Mkdir(filepath.Join(cfg.BuildScriptsPath(), "ignored-directory.sh"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	socketPath := filepath.Join(cfg.BuildScriptsPath(), "ignored-socket.sh")
+	listener, err := net.Listen("unix", socketPath)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer func() { _ = listener.Close() }()
+	if err := os.Chmod(socketPath, 0o600); err != nil {
+		t.Fatal(err)
+	}
+
+	got, err := loadBuildScripts(cfg)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(got) != 0 {
+		t.Fatalf("loadBuildScripts() = %#v, want no scripts", got)
+	}
+}
+
+func TestLoadBuildScriptsRejectsSymlinkReplacementAfterDiscovery(t *testing.T) {
+	cfg := imageConfigWithBuildScripts(t, nil)
+	const name = "10-script.sh"
+	writeBuildScript(t, cfg.BuildScriptsPath(), name, "#!/bin/sh\necho safe\n", 0o700)
+
+	directory, err := os.Open(cfg.BuildScriptsPath())
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer func() { _ = directory.Close() }()
+	entries, err := directory.ReadDir(-1)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(entries) != 1 {
+		t.Fatalf("entries = %d, want 1", len(entries))
+	}
+	discoveredInfo, err := entries[0].Info()
+	if err != nil {
+		t.Fatal(err)
+	}
+	entries = []os.DirEntry{fixedDirEntry{info: discoveredInfo}}
+
+	outside := filepath.Join(t.TempDir(), "outside.sh")
+	if err := os.WriteFile(outside, []byte("#!/bin/sh\necho outside\n"), 0o700); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.Remove(filepath.Join(cfg.BuildScriptsPath(), name)); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.Symlink(outside, filepath.Join(cfg.BuildScriptsPath(), name)); err != nil {
+		t.Fatal(err)
+	}
+
+	_, err = loadBuildScriptsFromEntries(directory, entries)
+	if err == nil || !strings.Contains(err.Error(), name) || !strings.Contains(err.Error(), "regular file") {
+		t.Fatalf("loadBuildScriptsFromEntries() error = %v, want named regular file error", err)
+	}
+}
+
+func TestLoadBuildScriptsSkipsNonExecutableReplacementAfterDiscovery(t *testing.T) {
+	cfg := imageConfigWithBuildScripts(t, nil)
+	const name = "10-script.sh"
+	writeBuildScript(t, cfg.BuildScriptsPath(), name, "#!/bin/sh\necho executable\n", 0o700)
+
+	directory, err := os.Open(cfg.BuildScriptsPath())
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer func() { _ = directory.Close() }()
+	entries, err := directory.ReadDir(-1)
+	if err != nil {
+		t.Fatal(err)
+	}
+	discoveredInfo, err := entries[0].Info()
+	if err != nil {
+		t.Fatal(err)
+	}
+	entries = []os.DirEntry{fixedDirEntry{info: discoveredInfo}}
+
+	if err := os.Remove(filepath.Join(cfg.BuildScriptsPath(), name)); err != nil {
+		t.Fatal(err)
+	}
+	writeBuildScript(t, cfg.BuildScriptsPath(), name, "#!/bin/sh\necho replacement\n", 0o600)
+	got, err := loadBuildScriptsFromEntries(directory, entries)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(got) != 0 {
+		t.Fatalf("loadBuildScriptsFromEntries() = %#v, want no scripts", got)
+	}
+}
+
+func TestCreateRejectsFIFOConfiguredAsBuildScriptsDirectoryWithoutHanging(t *testing.T) {
+	cfg := imageConfigWithBuildScripts(t, nil)
+	if err := os.Remove(cfg.BuildScriptsPath()); err != nil {
+		t.Fatal(err)
+	}
+	if err := unix.Mkfifo(cfg.BuildScriptsPath(), 0o700); err != nil {
+		t.Fatal(err)
+	}
+	connected := false
+	result := make(chan error, 1)
+	go func() {
+		result <- create(context.Background(), cfg, io.Discard, io.Discard, func(context.Context) (imageClient, error) {
+			connected = true
+			return &recordingClient{}, nil
+		})
+	}()
+
+	select {
+	case err := <-result:
+		if err == nil || !strings.Contains(err.Error(), "read image build scripts") || !errors.Is(err, unix.ENOTDIR) {
+			t.Fatalf("create() error = %v, want wrapped read image build scripts ENOTDIR error", err)
+		}
+		if connected {
+			t.Fatal("connected to Incus before rejecting FIFO image build scripts path")
+		}
+	case <-time.After(500 * time.Millisecond):
+		fd, err := unix.Open(cfg.BuildScriptsPath(), unix.O_WRONLY|unix.O_NONBLOCK|unix.O_CLOEXEC, 0)
+		if err == nil {
+			_ = unix.Close(fd)
+		}
+		select {
+		case <-result:
+		case <-time.After(2 * time.Second):
+		}
+		t.Fatal("create() hung while opening FIFO image build scripts path")
+	}
+}
+
+func TestCreateReadsBuildScriptsBeforeConnecting(t *testing.T) {
+	tests := []struct {
+		name  string
+		setup func(*testing.T, config.Config)
+	}{
+		{
+			name: "missing",
+			setup: func(t *testing.T, cfg config.Config) {
+				if err := os.Remove(cfg.BuildScriptsPath()); err != nil {
+					t.Fatal(err)
+				}
+			},
+		},
+		{
+			name: "regular file",
+			setup: func(t *testing.T, cfg config.Config) {
+				if err := os.Remove(cfg.BuildScriptsPath()); err != nil {
+					t.Fatal(err)
+				}
+				if err := os.WriteFile(cfg.BuildScriptsPath(), []byte("not a directory"), 0o600); err != nil {
+					t.Fatal(err)
+				}
+			},
+		},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			cfg := imageConfigWithBuildScripts(t, nil)
+			tt.setup(t, cfg)
+			connected := false
+
+			err := create(context.Background(), cfg, io.Discard, io.Discard, func(context.Context) (imageClient, error) {
+				connected = true
+				return &recordingClient{}, nil
+			})
+			if err == nil || !strings.Contains(err.Error(), "read image build scripts") {
+				t.Fatalf("create() error = %v, want read image build scripts error", err)
+			}
+			if connected {
+				t.Fatal("connected to Incus before image build scripts were read")
+			}
+		})
+	}
+}
+
+func TestCreateReturnsBuildScriptDirectoryPermissionErrorBeforeConnecting(t *testing.T) {
+	cfg := imageConfigWithBuildScripts(t, nil)
+	connected := false
+	openDirectory := func(path string) (*os.File, error) {
+		if path != cfg.BuildScriptsPath() {
+			t.Fatalf("open directory path = %q, want %q", path, cfg.BuildScriptsPath())
+		}
+		return nil, unix.EACCES
+	}
+
+	err := createWithBuildScriptsDirectoryOpener(
+		context.Background(),
+		cfg,
+		io.Discard,
+		io.Discard,
+		func(context.Context) (imageClient, error) {
+			connected = true
+			return &recordingClient{}, nil
+		},
+		openDirectory,
+	)
+	if err == nil || !strings.Contains(err.Error(), "read image build scripts") || !errors.Is(err, unix.EACCES) {
+		t.Fatalf("create() error = %v, want wrapped read image build scripts permission error", err)
+	}
+	if connected {
+		t.Fatal("connected to Incus before image build script directory permission error")
+	}
+}
+
 func TestCreateRunsImageWorkflowInOrder(t *testing.T) {
-	cfg := imageConfig(t, []string{"github.com", "gitlab.com"})
+	cfg := imageConfigWithBuildScripts(t, []string{"github.com", "gitlab.com"})
+	writeBuildScript(t, cfg.BuildScriptsPath(), "20-second.sh", "#!/bin/sh\necho second\n", 0o700)
+	writeBuildScript(t, cfg.BuildScriptsPath(), "10-first.sh", "#!/bin/sh\necho first\n", 0o700)
 	client := &recordingClient{files: make(map[string]uploadedFile)}
 
 	var stdout bytes.Buffer
@@ -351,8 +730,6 @@ func TestCreateRunsImageWorkflowInOrder(t *testing.T) {
 		"push /root/assets/pi-settings.json",
 		"push /root/assets/pi-auth.json",
 		"push /root/assets/pi-models.json",
-		"push /root/assets/cobalt-ember.json",
-		"push /root/assets/tmux.conf",
 		"push /root/assets/kanedias-pi.socket",
 		"push /root/assets/kanedias-pi@.service",
 		"push /root/assets/kanedias-pi-env",
@@ -370,6 +747,11 @@ func TestCreateRunsImageWorkflowInOrder(t *testing.T) {
 		"push /root/assets/pi-extension/src/types.ts",
 		"exec bash /root/install.sh",
 		"exec test -d /opt/kanedias/pi-extension/node_modules/typebox",
+		"exec install -d -m 0700 /root/build-scripts",
+		"push /root/build-scripts/10-first.sh",
+		"push /root/build-scripts/20-second.sh",
+		"exec /root/build-scripts/10-first.sh",
+		"exec /root/build-scripts/20-second.sh",
 		"stop",
 		"publish",
 		"cleanup-delete-instance",
@@ -405,6 +787,28 @@ func TestCreateRunsImageWorkflowInOrder(t *testing.T) {
 	}
 	if got := string(client.files["/root/assets/authorized_hosts"].content); got != "github.com\ngitlab.com" {
 		t.Errorf("authorized_hosts = %q, want newline-joined hosts", got)
+	}
+	for _, want := range []string{"10-first.sh stdout", "20-second.sh stdout"} {
+		if !strings.Contains(stdout.String(), want) {
+			t.Errorf("stdout = %q, want build script stream %q", stdout.String(), want)
+		}
+	}
+	for _, want := range []string{"10-first.sh stderr", "20-second.sh stderr"} {
+		if !strings.Contains(stderr.String(), want) {
+			t.Errorf("stderr = %q, want build script stream %q", stderr.String(), want)
+		}
+	}
+	for path, want := range map[string]string{
+		"/root/build-scripts/10-first.sh":  "#!/bin/sh\necho first\n",
+		"/root/build-scripts/20-second.sh": "#!/bin/sh\necho second\n",
+	} {
+		file := client.files[path]
+		if got := string(file.content); got != want {
+			t.Errorf("%s content = %q, want %q", path, got, want)
+		}
+		if file.mode != 0o700 {
+			t.Errorf("%s mode = %#o, want 0700", path, file.mode)
+		}
 	}
 	socket := string(client.files["/root/assets/kanedias-pi.socket"].content)
 	if !strings.Contains(socket, "ListenStream=0.0.0.0:7777") ||
@@ -484,11 +888,97 @@ func TestCreateRunsImageWorkflowInOrder(t *testing.T) {
 	if got, want := client.publishDescription, "kanedias sandbox from https://images.linuxcontainers.org/debian/13"; got != want {
 		t.Errorf("published description = %q, want %q", got, want)
 	}
-	if stderr.Len() != 0 {
-		t.Errorf("stderr = %q, want empty", stderr.String())
+	if got, want := stderr.String(), "10-first.sh stderr20-second.sh stderr"; got != want {
+		t.Errorf("stderr = %q, want only build script streams %q", got, want)
 	}
 	if got := stdout.String(); !strings.Contains(got, "installer output") {
 		t.Errorf("stdout = %q, want streamed installer output", got)
+	}
+}
+
+func TestCreateSkipsBuildScriptOperationsWhenConfigurationIsOmitted(t *testing.T) {
+	cfg := imageConfig(t, nil)
+	client := &recordingClient{files: make(map[string]uploadedFile)}
+
+	if err := create(context.Background(), cfg, io.Discard, io.Discard, func(context.Context) (imageClient, error) {
+		return client, nil
+	}); err != nil {
+		t.Fatal(err)
+	}
+	for _, call := range client.calls {
+		if strings.Contains(call, "/root/build-scripts") {
+			t.Fatalf("unexpected build script operation: %q", call)
+		}
+	}
+}
+
+func TestCreateStopsAfterNamedBuildScriptFailureAndCleansUp(t *testing.T) {
+	cfg := imageConfigWithBuildScripts(t, nil)
+	writeBuildScript(t, cfg.BuildScriptsPath(), "10-first.sh", "#!/bin/sh\necho first\n", 0o700)
+	writeBuildScript(t, cfg.BuildScriptsPath(), "20-fail.sh", "#!/bin/sh\nexit 1\n", 0o700)
+	writeBuildScript(t, cfg.BuildScriptsPath(), "30-later.sh", "#!/bin/sh\necho later\n", 0o700)
+	sentinel := errors.New("script failed")
+	client := &recordingClient{
+		files: make(map[string]uploadedFile),
+		execCommand: func(command []string) error {
+			if reflect.DeepEqual(command, []string{"/root/build-scripts/20-fail.sh"}) {
+				return sentinel
+			}
+			return nil
+		},
+	}
+	var stdout bytes.Buffer
+
+	err := create(context.Background(), cfg, &stdout, io.Discard, func(context.Context) (imageClient, error) {
+		return client, nil
+	})
+	if !errors.Is(err, sentinel) || !strings.Contains(err.Error(), "20-fail.sh") {
+		t.Fatalf("create() error = %v, want named sentinel build script error", err)
+	}
+	if !strings.Contains(stdout.String(), "10-first.sh stdout") {
+		t.Fatalf("stdout = %q, want first build script stdout", stdout.String())
+	}
+	for _, forbidden := range []string{"exec /root/build-scripts/30-later.sh", "stop", "publish"} {
+		if containsCall(client.calls, forbidden) {
+			t.Errorf("calls contain %q after script failure: %#v", forbidden, client.calls)
+		}
+	}
+	if got, want := client.calls[len(client.calls)-2:], []string{"cleanup-stop", "cleanup-delete-instance"}; !reflect.DeepEqual(got, want) {
+		t.Fatalf("cleanup calls = %#v, want %#v", got, want)
+	}
+}
+
+func TestCreateUploadsAllBuildScriptsBeforeExecution(t *testing.T) {
+	cfg := imageConfigWithBuildScripts(t, nil)
+	writeBuildScript(t, cfg.BuildScriptsPath(), "10-first.sh", "#!/bin/sh\necho first\n", 0o700)
+	writeBuildScript(t, cfg.BuildScriptsPath(), "20-second.sh", "#!/bin/sh\necho second\n", 0o700)
+	sentinel := errors.New("upload failed")
+	client := &recordingClient{
+		files: make(map[string]uploadedFile),
+		pushFile: func(path string) error {
+			if path == "/root/build-scripts/20-second.sh" {
+				return sentinel
+			}
+			return nil
+		},
+	}
+
+	err := create(context.Background(), cfg, io.Discard, io.Discard, func(context.Context) (imageClient, error) {
+		return client, nil
+	})
+	if !errors.Is(err, sentinel) || !strings.Contains(err.Error(), "20-second.sh") {
+		t.Fatalf("create() error = %v, want named sentinel upload error", err)
+	}
+	for _, call := range client.calls {
+		if strings.HasPrefix(call, "exec /root/build-scripts/") {
+			t.Errorf("custom script executed after partial upload: %q", call)
+		}
+	}
+	if containsCall(client.calls, "publish") {
+		t.Errorf("calls contain publish after upload failure: %#v", client.calls)
+	}
+	if got, want := client.calls[len(client.calls)-2:], []string{"cleanup-stop", "cleanup-delete-instance"}; !reflect.DeepEqual(got, want) {
+		t.Fatalf("cleanup calls = %#v, want %#v", got, want)
 	}
 }
 
@@ -569,7 +1059,7 @@ func TestCreateJoinsPrimaryAndRunningInstanceCleanupErrors(t *testing.T) {
 
 func TestCreateReadsAssetsBeforeConnecting(t *testing.T) {
 	cfg := imageConfig(t, nil)
-	if err := os.Remove(cfg.AssetPath("tmux.conf")); err != nil {
+	if err := os.Remove(cfg.AssetPath("pi-models.json")); err != nil {
 		t.Fatal(err)
 	}
 	connected := false
@@ -578,7 +1068,7 @@ func TestCreateReadsAssetsBeforeConnecting(t *testing.T) {
 		connected = true
 		return &recordingClient{}, nil
 	})
-	if err == nil || !strings.Contains(err.Error(), "tmux.conf") {
+	if err == nil || !strings.Contains(err.Error(), "pi-models.json") {
 		t.Fatalf("create() error = %v, want missing asset error", err)
 	}
 	if connected {
@@ -611,11 +1101,9 @@ func imageConfig(t *testing.T, hosts []string) config.Config {
 		t.Fatal(err)
 	}
 	for name, content := range map[string]string{
-		"pi-settings.json":  "settings",
-		"pi-auth.json":      "auth",
-		"pi-models.json":    "models",
-		"cobalt-ember.json": "theme",
-		"tmux.conf":         "tmux",
+		"pi-settings.json": "settings",
+		"pi-auth.json":     "auth",
+		"pi-models.json":   "models",
 	} {
 		if err := os.WriteFile(filepath.Join(assetDir, name), []byte(content), 0o600); err != nil {
 			t.Fatal(err)
@@ -633,6 +1121,32 @@ func imageConfig(t *testing.T, hosts []string) config.Config {
 	}
 }
 
+func imageConfigWithBuildScripts(t *testing.T, hosts []string) config.Config {
+	t.Helper()
+	cfg := imageConfig(t, hosts)
+	cfg.BaseImage.BuildScriptsDir = "image-build.d"
+	if err := os.Mkdir(cfg.BuildScriptsPath(), 0o700); err != nil {
+		t.Fatal(err)
+	}
+	return cfg
+}
+
+func writeBuildScript(t *testing.T, dir, name, content string, mode os.FileMode) {
+	t.Helper()
+	if err := os.WriteFile(filepath.Join(dir, name), []byte(content), mode); err != nil {
+		t.Fatal(err)
+	}
+}
+
+func containsCall(calls []string, want string) bool {
+	for _, call := range calls {
+		if call == want {
+			return true
+		}
+	}
+	return false
+}
+
 type imageRequestContextKey struct{}
 
 type cleanupContextObservation struct {
@@ -642,6 +1156,15 @@ type cleanupContextObservation struct {
 }
 
 var errDeleteRunningInstance = errors.New("cannot delete running instance")
+
+type fixedDirEntry struct {
+	info os.FileInfo
+}
+
+func (entry fixedDirEntry) Name() string               { return entry.info.Name() }
+func (entry fixedDirEntry) IsDir() bool                { return entry.info.IsDir() }
+func (entry fixedDirEntry) Type() os.FileMode          { return entry.info.Mode().Type() }
+func (entry fixedDirEntry) Info() (os.FileInfo, error) { return entry.info, nil }
 
 type uploadedFile struct {
 	content []byte
@@ -656,6 +1179,8 @@ type recordingClient struct {
 	publishAlias       string
 	publishDescription string
 	exec               func() error
+	execCommand        func([]string) error
+	pushFile           func(string) error
 	running            bool
 	stopErr            error
 	cleanupContexts    []cleanupContextObservation
@@ -691,6 +1216,11 @@ func (c *recordingClient) CreateInstance(_ context.Context, request api.Instance
 
 func (c *recordingClient) PushFile(_ context.Context, _ string, path string, content []byte, mode int) error {
 	c.calls = append(c.calls, "push "+path)
+	if c.pushFile != nil {
+		if err := c.pushFile(path); err != nil {
+			return err
+		}
+	}
 	c.files[path] = uploadedFile{content: append([]byte(nil), content...), mode: mode}
 	return nil
 }
@@ -700,13 +1230,33 @@ func (c *recordingClient) Exec(_ context.Context, _ string, request incusclient.
 	if c.exec != nil {
 		return "", "", c.exec()
 	}
-	const output = "installer output"
-	// Mirror the real Incus layer: output is streamed to the caller's writer as
+	if c.execCommand != nil {
+		if err := c.execCommand(request.Command); err != nil {
+			return "", "", err
+		}
+	}
+	stdout := "command output"
+	stderr := ""
+	if reflect.DeepEqual(request.Command, []string{"bash", "/root/install.sh"}) {
+		stdout = "installer output"
+	} else if len(request.Command) > 0 {
+		name := filepath.Base(request.Command[len(request.Command)-1])
+		if strings.HasPrefix(request.Command[0], "/root/build-scripts/") {
+			stdout = name + " stdout"
+			stderr = name + " stderr"
+		} else {
+			stdout = name + " output"
+		}
+	}
+	// Mirror the real Incus layer: output is streamed to the caller's writers as
 	// it arrives, not only returned after the command completes.
 	if request.Stdout != nil {
-		_, _ = io.WriteString(request.Stdout, output)
+		_, _ = io.WriteString(request.Stdout, stdout)
 	}
-	return output, "", nil
+	if request.Stderr != nil {
+		_, _ = io.WriteString(request.Stderr, stderr)
+	}
+	return stdout, stderr, nil
 }
 
 func (c *recordingClient) StopInstance(ctx context.Context, _ string, force bool) error {

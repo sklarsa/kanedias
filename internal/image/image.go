@@ -8,6 +8,7 @@ import (
 	"fmt"
 	"io"
 	"os"
+	"sort"
 	"strings"
 	"time"
 
@@ -16,6 +17,7 @@ import (
 	"github.com/sklarsa/kanedias/internal/incusclient"
 	"github.com/sklarsa/kanedias/internal/network"
 	"github.com/sklarsa/kanedias/internal/profiles"
+	"golang.org/x/sys/unix"
 )
 
 const cleanupTimeout = 30 * time.Second
@@ -67,13 +69,19 @@ type imageClient interface {
 
 type connector func(context.Context) (imageClient, error)
 
+type buildScriptsDirectoryOpener func(string) (*os.File, error)
+
+type buildScript struct {
+	name    string
+	content []byte
+}
+
 type buildInputs struct {
 	piSettings []byte
 	piAuth     []byte
 	piModels   []byte
-	piTheme    []byte
-	tmuxConfig []byte
 	profile    []byte
+	scripts    []buildScript
 }
 
 // Create builds and publishes the configured base image through Incus.
@@ -84,11 +92,21 @@ func Create(ctx context.Context, cfg config.Config, stdout, stderr io.Writer) er
 }
 
 func create(ctx context.Context, cfg config.Config, stdout, stderr io.Writer, connect connector) error {
+	return createWithBuildScriptsDirectoryOpener(ctx, cfg, stdout, stderr, connect, openBuildScriptsDirectory)
+}
+
+func createWithBuildScriptsDirectoryOpener(
+	ctx context.Context,
+	cfg config.Config,
+	stdout, stderr io.Writer,
+	connect connector,
+	openDirectory buildScriptsDirectoryOpener,
+) error {
 	if err := cfg.ValidateLifecycle(); err != nil {
 		return err
 	}
 
-	inputs, err := loadBuildInputs(cfg)
+	inputs, err := loadBuildInputs(cfg, openDirectory)
 	if err != nil {
 		return err
 	}
@@ -102,7 +120,7 @@ func create(ctx context.Context, cfg config.Config, stdout, stderr io.Writer, co
 	return createWithClient(ctx, client, cfg, inputs, stdout, stderr)
 }
 
-func loadBuildInputs(cfg config.Config) (buildInputs, error) {
+func loadBuildInputs(cfg config.Config, openDirectory buildScriptsDirectoryOpener) (buildInputs, error) {
 	var inputs buildInputs
 	assets := []struct {
 		name        string
@@ -111,8 +129,6 @@ func loadBuildInputs(cfg config.Config) (buildInputs, error) {
 		{name: "pi-settings.json", destination: &inputs.piSettings},
 		{name: "pi-auth.json", destination: &inputs.piAuth},
 		{name: "pi-models.json", destination: &inputs.piModels},
-		{name: "cobalt-ember.json", destination: &inputs.piTheme},
-		{name: "tmux.conf", destination: &inputs.tmuxConfig},
 	}
 	for _, asset := range assets {
 		contents, err := os.ReadFile(cfg.AssetPath(asset.name))
@@ -127,7 +143,151 @@ func loadBuildInputs(cfg config.Config) (buildInputs, error) {
 		return buildInputs{}, fmt.Errorf("render image-build profile: %w", err)
 	}
 	inputs.profile = profile.Bytes()
+
+	scripts, err := loadBuildScriptsWithDirectoryOpener(cfg, openDirectory)
+	if err != nil {
+		return buildInputs{}, err
+	}
+	inputs.scripts = scripts
 	return inputs, nil
+}
+
+func loadBuildScripts(cfg config.Config) ([]buildScript, error) {
+	return loadBuildScriptsWithDirectoryOpener(cfg, openBuildScriptsDirectory)
+}
+
+func loadBuildScriptsWithDirectoryOpener(cfg config.Config, openDirectory buildScriptsDirectoryOpener) ([]buildScript, error) {
+	path := cfg.BuildScriptsPath()
+	if path == "" {
+		return nil, nil
+	}
+	directory, err := openDirectory(path)
+	if err != nil {
+		return nil, fmt.Errorf("read image build scripts %q: %w", path, err)
+	}
+	defer func() { _ = directory.Close() }()
+	entries, err := directory.ReadDir(-1)
+	if err != nil {
+		return nil, fmt.Errorf("read image build scripts %q: %w", path, err)
+	}
+	return loadBuildScriptsFromEntries(directory, entries)
+}
+
+func openBuildScriptsDirectory(path string) (*os.File, error) {
+	fd, err := unix.Open(
+		path,
+		unix.O_RDONLY|unix.O_DIRECTORY|unix.O_NONBLOCK|unix.O_CLOEXEC|unix.O_NOCTTY,
+		0,
+	)
+	if err != nil {
+		return nil, err
+	}
+	return os.NewFile(uintptr(fd), path), nil
+}
+
+func loadBuildScriptsFromEntries(directory *os.File, entries []os.DirEntry) ([]buildScript, error) {
+	var scripts []buildScript
+	for _, entry := range entries {
+		name := entry.Name()
+		if !strings.HasSuffix(name, ".sh") {
+			continue
+		}
+		content, executable, err := loadBuildScriptAt(int(directory.Fd()), name)
+		if err != nil {
+			return nil, err
+		}
+		if executable {
+			scripts = append(scripts, buildScript{name: name, content: content})
+		}
+	}
+	sort.Slice(scripts, func(i, j int) bool {
+		return scripts[i].name < scripts[j].name
+	})
+	return scripts, nil
+}
+
+func loadBuildScriptAt(directoryFD int, name string) ([]byte, bool, error) {
+	const maxAttempts = 3
+	for range maxAttempts {
+		metadataFD, metadata, err := inspectBuildScriptAt(directoryFD, name)
+		if err != nil {
+			return nil, false, err
+		}
+		if metadata.Mode&0o111 == 0 {
+			_ = unix.Close(metadataFD)
+			return nil, false, nil
+		}
+		if metadata.Mode&unix.S_IFMT != unix.S_IFREG {
+			_ = unix.Close(metadataFD)
+			return nil, false, fmt.Errorf("image build script %q must be a regular file", name)
+		}
+
+		readFD, openErr := unix.Openat(
+			directoryFD,
+			name,
+			unix.O_RDONLY|unix.O_CLOEXEC|unix.O_NOFOLLOW|unix.O_NONBLOCK|unix.O_NOCTTY,
+			0,
+		)
+		if openErr != nil {
+			currentFD, current, inspectErr := inspectBuildScriptAt(directoryFD, name)
+			if inspectErr == nil {
+				_ = unix.Close(currentFD)
+			}
+			changed := inspectErr == nil && (!sameBuildScriptObject(metadata, current) || metadata.Mode != current.Mode)
+			_ = unix.Close(metadataFD)
+			if changed {
+				continue
+			}
+			return nil, false, fmt.Errorf("read image build script %q: %w", name, openErr)
+		}
+
+		var opened unix.Stat_t
+		if err := unix.Fstat(readFD, &opened); err != nil {
+			_ = unix.Close(readFD)
+			_ = unix.Close(metadataFD)
+			return nil, false, fmt.Errorf("inspect image build script %q: %w", name, err)
+		}
+		if !sameBuildScriptObject(metadata, opened) {
+			_ = unix.Close(readFD)
+			_ = unix.Close(metadataFD)
+			continue
+		}
+		_ = unix.Close(metadataFD)
+		if opened.Mode&0o111 == 0 {
+			_ = unix.Close(readFD)
+			return nil, false, nil
+		}
+		if opened.Mode&unix.S_IFMT != unix.S_IFREG {
+			_ = unix.Close(readFD)
+			return nil, false, fmt.Errorf("image build script %q must be a regular file", name)
+		}
+
+		file := os.NewFile(uintptr(readFD), name)
+		content, err := io.ReadAll(file)
+		_ = file.Close()
+		if err != nil {
+			return nil, false, fmt.Errorf("read image build script %q: %w", name, err)
+		}
+		return content, true, nil
+	}
+	return nil, false, fmt.Errorf("read image build script %q: changed during preflight", name)
+}
+
+func inspectBuildScriptAt(directoryFD int, name string) (int, unix.Stat_t, error) {
+	fd, err := unix.Openat(directoryFD, name, unix.O_PATH|unix.O_CLOEXEC|unix.O_NOFOLLOW, 0)
+	if err != nil {
+		return -1, unix.Stat_t{}, fmt.Errorf("inspect image build script %q: %w", name, err)
+	}
+	var stat unix.Stat_t
+	if err := unix.Fstat(fd, &stat); err != nil {
+		_ = unix.Close(fd)
+		return -1, unix.Stat_t{}, fmt.Errorf("inspect image build script %q: %w", name, err)
+	}
+	return fd, stat, nil
+}
+
+func sameBuildScriptObject(left, right unix.Stat_t) bool {
+	return left.Dev == right.Dev && left.Ino == right.Ino
 }
 
 func createWithClient(ctx context.Context, client imageClient, cfg config.Config, inputs buildInputs, stdout, stderr io.Writer) (err error) {
@@ -204,8 +364,6 @@ func createWithClient(ctx context.Context, client imageClient, cfg config.Config
 		{path: "/root/assets/pi-settings.json", content: inputs.piSettings, mode: 0o644},
 		{path: "/root/assets/pi-auth.json", content: inputs.piAuth, mode: 0o600},
 		{path: "/root/assets/pi-models.json", content: inputs.piModels, mode: 0o644},
-		{path: "/root/assets/cobalt-ember.json", content: inputs.piTheme, mode: 0o644},
-		{path: "/root/assets/tmux.conf", content: inputs.tmuxConfig, mode: 0o644},
 		{path: "/root/assets/kanedias-pi.socket", content: piRPCSocket, mode: 0o644},
 		{path: "/root/assets/kanedias-pi@.service", content: piRPCService, mode: 0o644},
 		{path: "/root/assets/kanedias-pi-env", content: piEnvironmentBridge, mode: 0o700},
@@ -244,6 +402,29 @@ func createWithClient(ctx context.Context, client imageClient, cfg config.Config
 		Command: []string{"test", "-d", "/opt/kanedias/pi-extension/node_modules/typebox"},
 	}); err != nil {
 		return fmt.Errorf("verify Pi extension production dependencies: %w", err)
+	}
+
+	if len(inputs.scripts) > 0 {
+		if _, _, err := client.Exec(ctx, instanceName, incusclient.ExecRequest{
+			Command: []string{"install", "-d", "-m", "0700", "/root/build-scripts"},
+		}); err != nil {
+			return fmt.Errorf("create image build script directory: %w", err)
+		}
+		for _, script := range inputs.scripts {
+			destination := "/root/build-scripts/" + script.name
+			if err := client.PushFile(ctx, instanceName, destination, script.content, 0o700); err != nil {
+				return fmt.Errorf("upload image build script %q: %w", script.name, err)
+			}
+		}
+		for _, script := range inputs.scripts {
+			_, _ = fmt.Fprintf(stdout, "Running image build script %s...\n", script.name)
+			path := "/root/build-scripts/" + script.name
+			if _, _, err := client.Exec(ctx, instanceName, incusclient.ExecRequest{
+				Command: []string{path}, Stdout: stdout, Stderr: stderr,
+			}); err != nil {
+				return fmt.Errorf("run image build script %q: %w", script.name, err)
+			}
+		}
 	}
 
 	_, _ = fmt.Fprintf(stdout, "Stopping temporary instance %s...\n", instanceName)

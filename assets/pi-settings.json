@@ -1,13 +1,7 @@
 {
   "lastChangelogVersion": "0.83.0",
-  "theme": "cobalt-ember",
   "defaultProvider": "local-executor",
   "defaultModel": "Qwen3.6-27B-GGUF",
   "defaultThinkingLevel": "xhigh",
-  "packages": [
-    "git:github.com/obra/superpowers",
-    "npm:pi-web-suite",
-    "npm:@diegopetrucci/pi-openai-fast"
-  ],
   "hideThinkingBlock": true
 }

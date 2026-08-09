@@ -83,6 +83,7 @@ name = "sandbox"
 source = "https://images.linuxcontainers.org"
 image = "debian/13"
 authorized_hosts = ["github.com", "gitlab.com"]
+build_scripts_dir = "image-build.d"
 [workspace]
 pool = "default"
 volume = "workspace"
@@ -99,6 +100,7 @@ repos = ["owner/repo", "other/project"]
 		Source:          "https://images.linuxcontainers.org",
 		Image:           "debian/13",
 		AuthorizedHosts: []string{"github.com", "gitlab.com"},
+		BuildScriptsDir: "image-build.d",
 	}); !reflect.DeepEqual(got, want) {
 		t.Errorf("BaseImage = %#v, want %#v", got, want)
 	}
@@ -108,6 +110,27 @@ repos = ["owner/repo", "other/project"]
 		Repos:  []string{"owner/repo", "other/project"},
 	}); !reflect.DeepEqual(got, want) {
 		t.Errorf("Workspace = %#v, want %#v", got, want)
+	}
+}
+
+func TestBuildScriptsPath(t *testing.T) {
+	dir := t.TempDir()
+	absolute := filepath.Join(t.TempDir(), "scripts")
+	tests := []struct {
+		name string
+		cfg  Config
+		want string
+	}{
+		{name: "omitted", cfg: Config{Dir: dir}, want: ""},
+		{name: "relative", cfg: Config{Dir: dir, BaseImage: BaseImage{BuildScriptsDir: "image-build.d"}}, want: filepath.Join(dir, "image-build.d")},
+		{name: "absolute", cfg: Config{Dir: dir, BaseImage: BaseImage{BuildScriptsDir: absolute}}, want: absolute},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			if got := tt.cfg.BuildScriptsPath(); got != tt.want {
+				t.Fatalf("BuildScriptsPath() = %q, want %q", got, tt.want)
+			}
+		})
 	}
 }
 
