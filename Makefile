@@ -1,6 +1,11 @@
 BINARY := bin/kanedias
 # Config the CLI/server/proxy commands load. Override with CONFIG=/path/to/config.toml.
 CONFIG ?= config.toml
+# Web server listen address. Override with, for example,
+# `make run BIND=127.0.0.1 PORT=9000`.
+BIND ?= 0.0.0.0
+PORT ?= 8080
+LISTEN := $(BIND):$(PORT)
 
 .DEFAULT_GOAL := help
 
@@ -39,7 +44,7 @@ lint: ## Check formatting (gofmt) and run golangci-lint
 		echo "The following files need gofmt:"; echo "$$files"; exit 1; fi
 	golangci-lint run ./...
 
-run: build ## Run the egress proxy (only if not already up) + web server on 127.0.0.1:8080; Ctrl-C stops the server (and the proxy only if we started it)
+run: build ## Run the egress proxy (only if not already up) + web server on BIND:PORT (defaults to 0.0.0.0:8080); Ctrl-C stops the server (and the proxy only if we started it)
 	@if ss -ltn 2>/dev/null | grep -q ':3128 '; then \
 		echo "Egress proxy (10.76.111.1:3128) already running; reusing it."; \
 	else \
@@ -48,10 +53,10 @@ run: build ## Run the egress proxy (only if not already up) + web server on 127.
 		proxy_pid=$$!; \
 		trap 'echo "stopping proxy..."; kill $$proxy_pid 2>/dev/null || true' EXIT INT TERM; \
 	fi; \
-	$(BINARY) --config $(CONFIG) server --listen 127.0.0.1:8080
+	$(BINARY) --config $(CONFIG) server --listen $(LISTEN)
 
-server: build ## Run the web server on 127.0.0.1:8080 (sessions also need the proxy; see `proxy` or `run`)
-	$(BINARY) --config $(CONFIG) server --listen 127.0.0.1:8080
+server: build ## Run the web server on BIND:PORT (defaults to 0.0.0.0:8080; sessions also need the proxy; see `proxy` or `run`)
+	$(BINARY) --config $(CONFIG) server --listen $(LISTEN)
 
 proxy: build ## Run the egress credential proxy (needed for sandboxed sessions to reach the network/model)
 	$(BINARY) --config $(CONFIG) proxy run
