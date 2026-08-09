@@ -418,15 +418,19 @@ func minimalTestConfig(t *testing.T, rootSocketDir, sessionLogDir string) (confi
 		t.Fatalf("write config: %v", err)
 	}
 
-	// Build the config struct with short intervals for responsive tests.
+	// Build the config struct with short intervals for responsive tests. This
+	// fixture exercises the bootstrap flow, so session auth must be explicit now
+	// that trusted-network mode is the default.
 	disc := config.Duration{Duration: 200 * time.Millisecond}
 	snap := config.Duration{Duration: 200 * time.Millisecond}
+	requireSession := true
 	cfg := config.Config{
 		Server: config.ServerConfig{
 			RootSocketDir:     rootSocketDir,
 			SessionLogDir:     sessionLogDir,
 			DiscoveryInterval: &disc,
 			SnapshotInterval:  &snap,
+			RequireSession:    &requireSession,
 		},
 	}
 	return cfg, cfgPath
