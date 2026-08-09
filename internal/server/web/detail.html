@@ -4,28 +4,19 @@
     <div class="detail-inner">
       {{if .SessionID}}
       <div class="det-head">
-        <div class="instrument" role="img" aria-label="context usage {{.Stats.Context.PercentText}}">
-          <div class="dial"></div>
-          <div class="ticks"></div>
-          <div class="ticks major"></div>
-          <div class="inner-ring"></div>
-          <div class="inner-ring2"></div>
-          <div class="alidade" id="alidade"{{if .Stats.Context.HasPercent}} style="transform: rotate({{.Stats.Context.DialDegrees}}deg)"{{end}}></div>
-          <div class="hub"></div>
-          <div class="dial-cap">context</div>
-          <div class="dial-value" id="contextValue">{{.Stats.Context.PercentText}}</div>
-        </div>
         <div class="det-ident">
           <div class="breadcrumb" id="breadcrumb">
             <b>{{.RootSessionID}}</b>
             {{if ne .SessionID .RootSessionID}}<span class="sep">›</span><b>{{.SessionID}}</b>{{end}}
           </div>
-          <h1 id="detName">{{if .WorkerType}}{{.WorkerType}}{{else}}{{.SessionID}}{{end}}</h1>
-          <div class="det-badges">
-            <span class="state-badge {{.Lifecycle}}" id="detState">
-              {{if eq .Lifecycle "question"}}◇ question{{else if eq .Lifecycle "completed"}}○ complete{{else}}● {{.Lifecycle}}{{end}}
-            </span>
-            <span class="type-badge" id="detType">session</span>
+          <div class="det-title-row">
+            <h1 id="detName">{{if .WorkerType}}{{.WorkerType}}{{else}}{{.SessionID}}{{end}}</h1>
+            <div class="det-badges">
+              <span class="state-badge {{.Lifecycle}}" id="detState">
+                {{if eq .Lifecycle "question"}}◇ question{{else if eq .Lifecycle "completed"}}○ complete{{else}}● {{.Lifecycle}}{{end}}
+              </span>
+              <span class="type-badge" id="detType">session</span>
+            </div>
           </div>
         </div>
       </div>
