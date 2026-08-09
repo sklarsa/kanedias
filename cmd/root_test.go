@@ -87,6 +87,9 @@ func TestCommandHierarchyAndFlags(t *testing.T) {
 	if listenFlag.DefValue != server.DefaultListenAddress {
 		t.Errorf("server listen default = %q, want %q", listenFlag.DefValue, server.DefaultListenAddress)
 	}
+	if !strings.Contains(listenFlag.Usage, "bind") {
+		t.Errorf("server listen usage = %q, want bind-address wording", listenFlag.Usage)
+	}
 
 	configFlag := root.PersistentFlags().Lookup("config")
 	if configFlag == nil {
@@ -274,12 +277,12 @@ func TestServerCommandRejectsPositionalArguments(t *testing.T) {
 	}
 }
 
-func TestServerCommandRejectsUnsafeListenAddressBeforeDelegation(t *testing.T) {
-	for _, address := range []string{"0.0.0.0:8080", "192.0.2.1:8080", ":8080"} {
+func TestServerCommandRejectsInvalidListenAddressBeforeDelegation(t *testing.T) {
+	for _, address := range []string{":8080", "example.com:8080"} {
 		t.Run(address, func(t *testing.T) {
 			service := serverServicesThatRejectDependencies(t)
 			service.runServer = func(context.Context, config.Config, server.Options) error {
-				t.Fatal("runServer called with an unsafe listen address")
+				t.Fatal("runServer called with an invalid listen address")
 				return nil
 			}
 
@@ -327,8 +330,8 @@ func TestServerCommandDelegates(t *testing.T) {
 		if gotContext != ctx {
 			t.Error("runServer did not receive the exact command context")
 		}
-		if options.ListenAddress != "localhost:9090" {
-			t.Errorf("listen address = %q, want localhost:9090", options.ListenAddress)
+		if options.ListenAddress != "0.0.0.0:9090" {
+			t.Errorf("listen address = %q, want 0.0.0.0:9090", options.ListenAddress)
 		}
 		if options.Logger == nil {
 			t.Fatal("runServer received a nil logger")
@@ -347,7 +350,7 @@ func TestServerCommandDelegates(t *testing.T) {
 	root.SetContext(ctx)
 	root.SetOut(io.Discard)
 	root.SetErr(&stderr)
-	root.SetArgs([]string{"--config", configFile, "server", "--listen", "localhost:9090"})
+	root.SetArgs([]string{"--config", configFile, "server", "--listen", "0.0.0.0:9090"})
 	if err := root.Execute(); !errors.Is(err, runErr) {
 		t.Fatalf("Execute() error = %v, want run server sentinel", err)
 	}

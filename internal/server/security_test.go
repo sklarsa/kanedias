@@ -54,7 +54,7 @@ func TestCapabilityTokenIsBase64URLOf32Bytes(t *testing.T) {
 
 func TestCapabilityStoreOnlyRetainsDigests(t *testing.T) {
 	var out bytes.Buffer
-	store, err := newCapabilityStore(newDeterministicReader(), &out)
+	store, err := newCapabilityStore(newDeterministicReader(), &out, DefaultListenAddress)
 	if err != nil {
 		t.Fatalf("newCapabilityStore: %v", err)
 	}
@@ -78,11 +78,14 @@ func TestCapabilityStoreOnlyRetainsDigests(t *testing.T) {
 
 func TestBootstrapPrintsTokenOnce(t *testing.T) {
 	var out bytes.Buffer
-	_, err := newCapabilityStore(newDeterministicReader(), &out)
+	_, err := newCapabilityStore(newDeterministicReader(), &out, "steven-desktop:8080")
 	if err != nil {
 		t.Fatalf("newCapabilityStore: %v", err)
 	}
 	output := out.String()
+	if !strings.HasPrefix(output, "Bootstrap URL: http://steven-desktop:8080/bootstrap?capability=") {
+		t.Fatalf("bootstrap output = %q, want absolute advertised URL", output)
+	}
 	if !strings.Contains(output, bootstrapQueryName+"=") {
 		t.Errorf("bootstrap output = %q, want capability= prefix", output)
 	}
@@ -104,7 +107,7 @@ func TestBootstrapPrintsTokenOnce(t *testing.T) {
 
 func TestInvalidBootstrapReturns403(t *testing.T) {
 	var out bytes.Buffer
-	store, err := newCapabilityStore(newDeterministicReader(), &out)
+	store, err := newCapabilityStore(newDeterministicReader(), &out, DefaultListenAddress)
 	if err != nil {
 		t.Fatalf("newCapabilityStore: %v", err)
 	}
@@ -119,7 +122,7 @@ func TestInvalidBootstrapReturns403(t *testing.T) {
 
 func TestValidBootstrapRedirectsAndSetsCookie(t *testing.T) {
 	var out bytes.Buffer
-	store, err := newCapabilityStore(newDeterministicReader(), &out)
+	store, err := newCapabilityStore(newDeterministicReader(), &out, DefaultListenAddress)
 	if err != nil {
 		t.Fatalf("newCapabilityStore: %v", err)
 	}
@@ -171,7 +174,7 @@ func TestValidBootstrapRedirectsAndSetsCookie(t *testing.T) {
 // the capability in the query string is neither cached nor leaked via Referer.
 func TestBootstrapSetsNoStoreAndNoReferrer(t *testing.T) {
 	var out bytes.Buffer
-	store, err := newCapabilityStore(newDeterministicReader(), &out)
+	store, err := newCapabilityStore(newDeterministicReader(), &out, DefaultListenAddress)
 	if err != nil {
 		t.Fatalf("newCapabilityStore: %v", err)
 	}
@@ -199,7 +202,7 @@ func TestBootstrapSetsNoStoreAndNoReferrer(t *testing.T) {
 
 func TestSessionCookieIssuedByValidBootstrap(t *testing.T) {
 	var out bytes.Buffer
-	store, err := newCapabilityStore(newDeterministicReader(), &out)
+	store, err := newCapabilityStore(newDeterministicReader(), &out, DefaultListenAddress)
 	if err != nil {
 		t.Fatalf("newCapabilityStore: %v", err)
 	}
@@ -247,7 +250,7 @@ func TestSessionCookieIssuedByValidBootstrap(t *testing.T) {
 
 func TestBootstrapIsSingleUse(t *testing.T) {
 	var out bytes.Buffer
-	store, err := newCapabilityStore(newDeterministicReader(), &out)
+	store, err := newCapabilityStore(newDeterministicReader(), &out, DefaultListenAddress)
 	if err != nil {
 		t.Fatalf("newCapabilityStore: %v", err)
 	}
@@ -290,7 +293,7 @@ func TestBootstrapIsSingleUse(t *testing.T) {
 
 func TestSessionExpiresAfterTTL(t *testing.T) {
 	var out bytes.Buffer
-	store, err := newCapabilityStore(newDeterministicReader(), &out)
+	store, err := newCapabilityStore(newDeterministicReader(), &out, DefaultListenAddress)
 	if err != nil {
 		t.Fatalf("newCapabilityStore: %v", err)
 	}
@@ -313,7 +316,7 @@ func TestSessionExpiresAfterTTL(t *testing.T) {
 func TestNewStoreRejectsCookiesFromPreviousStore(t *testing.T) {
 	// Issue a session from the first store.
 	var out1 bytes.Buffer
-	store1, err := newCapabilityStore(newDeterministicReader(), &out1)
+	store1, err := newCapabilityStore(newDeterministicReader(), &out1, DefaultListenAddress)
 	if err != nil {
 		t.Fatalf("newCapabilityStore: %v", err)
 	}
@@ -336,7 +339,7 @@ func TestNewStoreRejectsCookiesFromPreviousStore(t *testing.T) {
 
 	// Create a second store — it must not accept tokens from the first.
 	var out2 bytes.Buffer
-	store2, err := newCapabilityStore(newDeterministicReader(), &out2)
+	store2, err := newCapabilityStore(newDeterministicReader(), &out2, DefaultListenAddress)
 	if err != nil {
 		t.Fatalf("newCapabilityStore: %v", err)
 	}
@@ -350,6 +353,62 @@ func TestNewStoreRejectsCookiesFromPreviousStore(t *testing.T) {
 	protected.ServeHTTP(w2, req2)
 	if w2.Code != http.StatusUnauthorized {
 		t.Errorf("cross-store cookie status = %d, want 401", w2.Code)
+	}
+}
+
+func TestRequestBoundaryWildcardUsesActualRequestHost(t *testing.T) {
+	boundary := newRequestBoundary("0.0.0.0:8080")
+	handler := boundary.requireWriteBoundary(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
+		w.WriteHeader(http.StatusOK)
+	}))
+	tests := []struct {
+		name   string
+		host   string
+		origin string
+		want   int
+	}{
+		{"matching private hostname", "steven-desktop:8080", "http://steven-desktop:8080", http.StatusOK},
+		{"different origin", "steven-desktop:8080", "http://other-host:8080", http.StatusForbidden},
+		{"wrong port", "steven-desktop:9090", "http://steven-desktop:9090", http.StatusForbidden},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			req := httptest.NewRequest(http.MethodPost, "/ui/sessions", nil)
+			req.Host = tt.host
+			req.Header.Set("Origin", tt.origin)
+			req.Header.Set("Sec-Fetch-Site", "same-origin")
+			req.Header.Set("Content-Type", "application/json")
+			w := httptest.NewRecorder()
+			handler.ServeHTTP(w, req)
+			if w.Code != tt.want {
+				t.Errorf("status = %d, want %d", w.Code, tt.want)
+			}
+		})
+	}
+}
+
+func TestRequestBoundaryConfiguredHostnameIsCanonical(t *testing.T) {
+	boundary := newRequestBoundary("steven-desktop:8080")
+	handler := boundary.requireWriteBoundary(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
+		w.WriteHeader(http.StatusOK)
+	}))
+	for _, tt := range []struct {
+		host string
+		want int
+	}{
+		{"steven-desktop:8080", http.StatusOK},
+		{"192.168.1.10:8080", http.StatusForbidden},
+	} {
+		req := httptest.NewRequest(http.MethodPost, "/ui/sessions", nil)
+		req.Host = tt.host
+		req.Header.Set("Origin", "http://"+tt.host)
+		req.Header.Set("Sec-Fetch-Site", "same-origin")
+		req.Header.Set("Content-Type", "application/json")
+		w := httptest.NewRecorder()
+		handler.ServeHTTP(w, req)
+		if w.Code != tt.want {
+			t.Errorf("host %q status = %d, want %d", tt.host, w.Code, tt.want)
+		}
 	}
 }
 
@@ -476,7 +535,7 @@ func TestRequestBoundaryAcceptsAbsentOrigin(t *testing.T) {
 
 func TestRequireSessionRejects401WithoutCookie(t *testing.T) {
 	var out bytes.Buffer
-	store, err := newCapabilityStore(newDeterministicReader(), &out)
+	store, err := newCapabilityStore(newDeterministicReader(), &out, DefaultListenAddress)
 	if err != nil {
 		t.Fatalf("newCapabilityStore: %v", err)
 	}
@@ -494,7 +553,7 @@ func TestRequireSessionRejects401WithoutCookie(t *testing.T) {
 
 func TestRequireSessionRejectsUnknownCookie(t *testing.T) {
 	var out bytes.Buffer
-	store, err := newCapabilityStore(newDeterministicReader(), &out)
+	store, err := newCapabilityStore(newDeterministicReader(), &out, DefaultListenAddress)
 	if err != nil {
 		t.Fatalf("newCapabilityStore: %v", err)
 	}

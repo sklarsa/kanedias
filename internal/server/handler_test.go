@@ -7,6 +7,7 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
+	"io"
 	"io/fs"
 	"log/slog"
 	"net/http"
@@ -85,6 +86,57 @@ func serveAuthenticatedRequest(t *testing.T, handler http.Handler, method, path 
 	}
 	handler.ServeHTTP(response, req)
 	return response
+}
+
+func TestHandlerPrintsAdvertisedURLs(t *testing.T) {
+	for _, requireSession := range []bool{false, true} {
+		t.Run(fmt.Sprintf("require_session_%t", requireSession), func(t *testing.T) {
+			var output bytes.Buffer
+			logger := slog.New(slog.NewTextHandler(io.Discard, nil))
+			_, err := newHandlerWithOptions(
+				logger, "steven-desktop:8080", &output, nil, context.Background(), requireSession,
+			)
+			if err != nil {
+				t.Fatal(err)
+			}
+			if !strings.Contains(output.String(), "Web UI: http://steven-desktop:8080/\n") {
+				t.Fatalf("operator output = %q, want advertised Web UI URL", output.String())
+			}
+			hasBootstrap := strings.Contains(output.String(), "Bootstrap URL: http://steven-desktop:8080/bootstrap?capability=")
+			if hasBootstrap != requireSession {
+				t.Fatalf("bootstrap URL present = %t, want %t; output = %q", hasBootstrap, requireSession, output.String())
+			}
+		})
+	}
+}
+
+func TestHandlerTrustedNetworkModeBypassesBrowserSecurity(t *testing.T) {
+	logger := slog.New(slog.NewTextHandler(io.Discard, nil))
+	handler, err := newHandlerWithOptions(
+		logger, "steven-desktop:8080", io.Discard, nil, context.Background(), false,
+	)
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	get := httptest.NewRequest(http.MethodGet, "/", nil)
+	get.Host = "other-private-host:8080"
+	getResult := httptest.NewRecorder()
+	handler.ServeHTTP(getResult, get)
+	if getResult.Code != http.StatusOK {
+		t.Fatalf("trusted-network GET status = %d, want 200", getResult.Code)
+	}
+
+	post := httptest.NewRequest(http.MethodPost, "/ui/sessions", strings.NewReader("not json"))
+	post.Host = "other-private-host:8080"
+	post.Header.Set("Origin", "http://different-private-host:8080")
+	post.Header.Set("Sec-Fetch-Site", "cross-site")
+	post.Header.Set("Content-Type", "text/plain")
+	postResult := httptest.NewRecorder()
+	handler.ServeHTTP(postResult, post)
+	if postResult.Code != http.StatusNotFound {
+		t.Fatalf("trusted-network POST status = %d, want downstream 404", postResult.Code)
+	}
 }
 
 // indexBody returns the body of an authenticated GET /.

@@ -75,15 +75,21 @@ func ValidateListenAddress(address string) error {
 		return nil
 	}
 
-	ip := net.ParseIP(host)
-	if ip == nil {
-		return fmt.Errorf("validate listen address %q: host must be localhost or a loopback IP address", address)
+	if net.ParseIP(host) == nil {
+		return fmt.Errorf("validate listen address %q: host must be localhost or an IP address", address)
 	}
-	if !ip.IsLoopback() {
-		return fmt.Errorf("validate listen address %q: IP address is not loopback", address)
-	}
-
 	return nil
+}
+
+func advertisedAddress(effectiveAddress, configuredHostname string) (string, error) {
+	host, port, err := net.SplitHostPort(effectiveAddress)
+	if err != nil {
+		return "", fmt.Errorf("derive advertised address from %q: %w", effectiveAddress, err)
+	}
+	if configuredHostname != "" {
+		host = configuredHostname
+	}
+	return net.JoinHostPort(host, port), nil
 }
 
 // Run is the public entry point used by cmd/server.go.
@@ -154,7 +160,11 @@ func runApplication(
 		bootstrapOutput = io.Discard
 	}
 	handlerFn := func(effectiveAddress string, streamCtx context.Context) (http.Handler, error) {
-		return newHandlerWithOptions(normalizedOptions.Logger, effectiveAddress, bootstrapOutput, fleet, streamCtx, resolved.RequireSession)
+		advertised, addressErr := advertisedAddress(effectiveAddress, resolved.Hostname)
+		if addressErr != nil {
+			return nil, fmt.Errorf("construct advertised address: %w", addressErr)
+		}
+		return newHandlerWithOptions(normalizedOptions.Logger, advertised, bootstrapOutput, fleet, streamCtx, resolved.RequireSession)
 	}
 
 	return runWithManager(ctx, normalizedOptions, fleet, handlerFn, listen, defaultShutdownTimeout)

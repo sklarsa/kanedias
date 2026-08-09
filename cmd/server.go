@@ -43,6 +43,6 @@ func newServerCommand(service services, getConfigPath func() string) *cobra.Comm
 			)
 		},
 	}
-	command.Flags().StringVar(&listenAddress, "listen", listenAddress, "local address for the Kanedias web UI")
+	command.Flags().StringVar(&listenAddress, "listen", listenAddress, "bind address for the Kanedias web UI")
 	return command
 }

@@ -3,8 +3,9 @@ ipv4 = "10.76.111.1/24"
 ipv6 = "fd42:28e2:2375:7000::1/64"
 
 [server]
-# Single-user local console: skip the /bootstrap session token. The same-origin
-# write boundary is still enforced. Set true (default) to re-enable auth.
+hostname = "steven-desktop"
+# Trusted private-network console: skip bootstrap/session auth and the browser
+# write boundary. Set true to require both layers.
 require_session = false
 
 [base_image]
