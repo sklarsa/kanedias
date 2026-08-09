@@ -247,6 +247,13 @@ func TestHandlerRoutes(t *testing.T) {
 			contentType: "text/javascript; charset=utf-8",
 		},
 		{
+			name:        "session modal controller",
+			path:        "/assets/session-modal.js",
+			method:      http.MethodGet,
+			status:      http.StatusOK,
+			contentType: "text/javascript; charset=utf-8",
+		},
+		{
 			name:   "unknown",
 			path:   "/unknown",
 			method: http.MethodGet,
@@ -306,6 +313,7 @@ func TestHandlerRejectsUnsupportedMethods(t *testing.T) {
 		{"/assets/terminal.css", false},
 		{"/assets/app.css", false},
 		{"/assets/datastar.js", false},
+		{"/assets/session-modal.js", false},
 		{"/", true},
 		{"/ui/status", true},
 	}
@@ -341,8 +349,8 @@ func TestInitialPageRendersSessionModalFromLaunchOptions(t *testing.T) {
 	required := []string{
 		`<dialog id="new-session-modal"`, `id="new-session-form"`, `aria-labelledby="new-session-title"`,
 		`id="new-session-title"`, `New session`, `aria-label="Close"`,
-		`id="root-model"`, `id="root-thinking"`, `value="deep-model" selected`, `value="xhigh" selected`,
-		`data-thinking-levels="off,medium"`, `data-default-thinking-level="off"`,
+		`id="root-model"`, `data-root-model`, `id="root-thinking"`, `data-root-thinking`, `value="deep-model" selected`, `value="xhigh" selected`,
+		`data-thinking-levels="off,medium"`, `data-default-thinking="off"`, `data-worker-row`, `data-worker-model`, `data-worker-thinking`, `data-modal-close`,
 		`Fast &amp; safe`, `Deep model`, `<summary>Subagent model profiles</summary>`,
 		`id="new-session-cancel"`, `id="new-session-launch"`, `id="new-session-status"`, `aria-live="polite"`,
 	}
@@ -459,16 +467,16 @@ func TestAstrolabeConsoleIsInteractive(t *testing.T) {
 	body := response.Body.String()
 
 	// The console is wired by local asset modules (Datastar, Marked, Highlight,
-	// the Markdown renderer, and app.js delegated behavior). No external scripts
-	// and no inline controller.
+	// the Markdown renderer, terminal decisions, the session modal, and app.js).
+	// There are no external scripts and no inline controller.
 	scriptRE := regexp.MustCompile(`(?s)<script\b([^>]*)>(.*?)</script>`)
 	scripts := scriptRE.FindAllStringSubmatch(body, -1)
-	wantScripts := 6 // Datastar + 3 Markdown assets + terminal decisions + app.js
+	wantScripts := 7 // Datastar + 3 Markdown assets + terminal decisions + session modal + app.js
 	if len(scripts) != wantScripts {
-		t.Fatalf("script count = %d, want %d (Datastar + 3 Markdown assets + terminal-ui.js + app.js)", len(scripts), wantScripts)
+		t.Fatalf("script count = %d, want %d (Datastar + 3 Markdown assets + terminal-ui.js + session-modal.js + app.js)", len(scripts), wantScripts)
 	}
 
-	var sawDatastar, sawTerminalUI, sawAppJS bool
+	var sawDatastar, sawTerminalUI, sawSessionModal, sawAppJS bool
 	markdownAssets := []string{
 		`src="/assets/marked.min.js"`,
 		`src="/assets/highlight.min.js"`,
@@ -495,6 +503,12 @@ func TestAstrolabeConsoleIsInteractive(t *testing.T) {
 			}
 			sawTerminalUI = true
 		}
+		if strings.Contains(attrs, `src="/assets/session-modal.js"`) {
+			if inner != "" {
+				t.Errorf("session-modal.js script has unexpected inline body %q", inner)
+			}
+			sawSessionModal = true
+		}
 		if strings.Contains(attrs, `src="/assets/app.js"`) {
 			if inner != "" {
 				t.Errorf("app.js script has unexpected inline body %q", inner)
@@ -512,6 +526,9 @@ func TestAstrolabeConsoleIsInteractive(t *testing.T) {
 	}
 	if !sawTerminalUI {
 		t.Error("page is missing the local terminal-ui.js script")
+	}
+	if !sawSessionModal {
+		t.Error("page is missing the local session-modal.js script")
 	}
 	if !sawAppJS {
 		t.Error("page is missing the app.js script")
@@ -1281,7 +1298,7 @@ func TestAssetsAreEmbedded(t *testing.T) {
 	})
 
 	// Unauthenticated paths.
-	for _, path := range []string{"/healthz", "/assets/terminal.css", "/assets/app.css", "/assets/datastar.js", "/assets/terminal-ui.js", "/assets/app.js"} {
+	for _, path := range []string{"/healthz", "/assets/terminal.css", "/assets/app.css", "/assets/datastar.js", "/assets/terminal-ui.js", "/assets/session-modal.js", "/assets/app.js"} {
 		if response := serveRequest(handler, http.MethodGet, path); response.Code != http.StatusOK {
 			t.Errorf("GET %s status = %d, want %d", path, response.Code, http.StatusOK)
 		}
@@ -1339,6 +1356,7 @@ func TestRenderedPageHasOnlyOrderedLocalRuntimeAssets(t *testing.T) {
 		"/assets/highlight.min.js",
 		"/assets/markdown-renderer.js",
 		"/assets/terminal-ui.js",
+		"/assets/session-modal.js",
 		"/assets/app.js",
 	}
 	if len(matches) != len(want) {
@@ -1383,6 +1401,13 @@ func TestProjectStylesDefineAstrolabeVisualSystem(t *testing.T) {
 		// responsive: sidebar collapses to a slide-over on narrow screens
 		"@media (max-width:820px)",
 		".sidebar.open",
+		// native modal has its own backdrop, visible focus, scroll, pending,
+		// and 44px mobile targets without reusing the sidebar scrim.
+		"#new-session-modal::backdrop",
+		"#new-session-modal details{",
+		"#new-session-modal[aria-busy=\"true\"]",
+		"#new-session-modal select:focus-visible",
+		"min-height:44px",
 	}
 	for _, want := range required {
 		if !strings.Contains(styles, want) {

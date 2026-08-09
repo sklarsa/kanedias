@@ -1,0 +1,369 @@
+"use strict";
+
+const test = require("node:test");
+const assert = require("node:assert/strict");
+const modalUI = require("./session-modal.js");
+
+class FakeTarget {
+  constructor() {
+    this.listeners = new Map();
+    this.disabled = false;
+    this.attributes = new Map();
+  }
+  addEventListener(type, listener, options) {
+    const listeners = this.listeners.get(type) || [];
+    listeners.push({ listener, capture: options === true || Boolean(options && options.capture) });
+    this.listeners.set(type, listeners);
+  }
+  removeEventListener(type, listener, options) {
+    const capture = options === true || Boolean(options && options.capture);
+    const listeners = this.listeners.get(type) || [];
+    this.listeners.set(type, listeners.filter((item) => item.listener !== listener || item.capture !== capture));
+  }
+  dispatch(type, init = {}) {
+    const event = Object.assign({
+      type,
+      target: this,
+      defaultPrevented: false,
+      propagationStopped: false,
+      immediatePropagationStopped: false,
+      preventDefault() { this.defaultPrevented = true; },
+      stopPropagation() { this.propagationStopped = true; },
+      stopImmediatePropagation() {
+        this.immediatePropagationStopped = true;
+        this.propagationStopped = true;
+      }
+    }, init);
+    for (const phase of [true, false]) {
+      for (const item of this.listeners.get(type) || []) {
+        if (item.capture !== phase || event.immediatePropagationStopped) continue;
+        item.listener(event);
+      }
+    }
+    return event;
+  }
+  getAttribute(name) { return this.attributes.has(name) ? this.attributes.get(name) : null; }
+  setAttribute(name, value) { this.attributes.set(name, String(value)); }
+  removeAttribute(name) { this.attributes.delete(name); }
+}
+
+class FakeOption extends FakeTarget {
+  constructor(value, levels, defaultThinking) {
+    super();
+    this.value = value;
+    this.textContent = value;
+    if (levels !== undefined) this.setAttribute("data-thinking-levels", levels);
+    if (defaultThinking !== undefined) this.setAttribute("data-default-thinking", defaultThinking);
+  }
+}
+
+class FakeSelect extends FakeTarget {
+  constructor(options, selectedValue, defaultValue) {
+    super();
+    this.options = options;
+    this.defaultValue = defaultValue;
+    this._value = selectedValue;
+  }
+  get selectedIndex() { return this.options.findIndex((option) => option.value === this._value); }
+  get value() { return this._value; }
+  set value(value) { this._value = String(value); }
+  replaceChildren(...options) {
+    this.options = options;
+    if (!options.some((option) => option.value === this._value)) this._value = options.length ? options[0].value : "";
+  }
+}
+
+class FakeDialog extends FakeTarget {
+  constructor() {
+    super();
+    this.open = false;
+    this.returnValue = "";
+  }
+  showModal() { this.open = true; }
+  close() { this.open = false; this.dispatch("close"); }
+}
+
+function option(value, levels, defaultThinking) {
+  return new FakeOption(value, levels, defaultThinking);
+}
+
+function fixture() {
+  const document = new FakeTarget();
+  document.createElement = function (tag) {
+    if (tag !== "option") throw new Error("unexpected element: " + tag);
+    return new FakeOption("");
+  };
+
+  const dialog = new FakeDialog();
+  const trigger = new FakeTarget();
+  const form = new FakeTarget();
+  form.resetCalls = 0;
+  form.reset = function () {
+    this.resetCalls++;
+    for (const select of [rootModel, rootThinking, workerModelA, workerThinkingA, workerModelB, workerThinkingB]) {
+      select.value = select.defaultValue;
+    }
+  };
+  const close = new FakeTarget();
+  const cancel = new FakeTarget();
+  const launch = new FakeTarget();
+  const status = new FakeTarget();
+  status.textContent = "";
+  const fieldset = new FakeTarget();
+  const details = new FakeTarget();
+  details.open = true;
+
+  const rootModel = new FakeSelect([
+    option("deep", "high,xhigh", "high"),
+    option("fast", "off,medium", "off")
+  ], "fast", "deep");
+  rootModel.focusCalls = 0;
+  rootModel.focus = function () { this.focusCalls++; };
+  const rootThinking = new FakeSelect([option("off"), option("medium")], "medium", "xhigh");
+
+  const workerModelA = new FakeSelect([
+    option("deep", "high,xhigh", "high"),
+    option("fast", "off,medium", "off")
+  ], "fast", "deep");
+  const workerThinkingA = new FakeSelect([option("off"), option("medium")], "off", "high");
+  const workerA = new FakeTarget();
+  workerA.setAttribute("data-worker-type", "oracle");
+  workerA.querySelector = (selector) => selector === "[data-worker-model]" ? workerModelA : workerThinkingA;
+
+  const workerModelB = new FakeSelect([
+    option("deep", "high,xhigh", "high"),
+    option("solo", "off", "off")
+  ], "deep", "solo");
+  const workerThinkingB = new FakeSelect([option("high"), option("xhigh")], "xhigh", "off");
+  const workerB = new FakeTarget();
+  workerB.setAttribute("data-worker-type", "worker");
+  workerB.querySelector = (selector) => selector === "[data-worker-model]" ? workerModelB : workerThinkingB;
+
+  const controls = [close, cancel, launch, rootModel, rootThinking, workerModelA, workerThinkingA, workerModelB, workerThinkingB];
+  const query = new Map([
+    ["#new-session-modal", dialog],
+    ["#new-session-button", trigger],
+    ["#new-session-form", form],
+    ["[data-modal-close]", close],
+    ["#new-session-cancel", cancel],
+    ["#new-session-launch", launch],
+    ["#new-session-status", status],
+    ["[data-root-model]", rootModel],
+    ["[data-root-thinking]", rootThinking]
+  ]);
+  document.querySelector = (selector) => query.get(selector) || null;
+  dialog.querySelector = (selector) => query.get(selector) || null;
+  dialog.querySelectorAll = (selector) => {
+    if (selector === "[data-worker-row]") return [workerA, workerB];
+    if (selector === "button, select, input, textarea") return controls;
+    if (selector === "fieldset") return [fieldset, workerA, workerB];
+    return [];
+  };
+
+  return {
+    document, dialog, trigger, form, close, cancel, launch, status, fieldset, details,
+    rootModel, rootThinking, workerModelA, workerThinkingA, workerModelB, workerThinkingB,
+    workerA, workerB, controls
+  };
+}
+
+function response(status, body, contentLength) {
+  return {
+    status,
+    ok: status >= 200 && status < 300,
+    headers: { get(name) { return name.toLowerCase() === "content-length" ? contentLength || null : null; } },
+    text: async () => JSON.stringify(body)
+  };
+}
+
+async function settle() {
+  await new Promise((resolve) => setImmediate(resolve));
+  await new Promise((resolve) => setImmediate(resolve));
+}
+
+test("open resets configured defaults, rebuilds thinking, and focuses the root model", () => {
+  const f = fixture();
+  const controller = modalUI.bind(f.document, async () => response(201, { sessionId: "new" }));
+  f.trigger.dispatch("click");
+  assert.equal(f.form.resetCalls, 1);
+  assert.equal(f.dialog.open, true);
+  assert.equal(f.rootModel.value, "deep");
+  assert.deepEqual(f.rootThinking.options.map((item) => item.value), ["high", "xhigh"]);
+  assert.equal(f.rootThinking.value, "xhigh");
+  assert.equal(f.rootModel.focusCalls, 1);
+  assert.equal(f.status.textContent, "");
+  controller.destroy();
+});
+
+test("model changes replace thinking choices and clamp unsupported values to model default", () => {
+  const f = fixture();
+  f.rootModel.value = "deep";
+  f.rootThinking.value = "medium";
+  modalUI.rebuildThinking(f.document, f.rootModel, f.rootThinking);
+  assert.deepEqual(f.rootThinking.options.map((item) => item.value), ["high", "xhigh"]);
+  assert.equal(f.rootThinking.value, "high");
+
+  f.rootThinking.value = "xhigh";
+  modalUI.rebuildThinking(f.document, f.rootModel, f.rootThinking);
+  assert.equal(f.rootThinking.value, "xhigh", "supported current selection is preserved");
+});
+
+test("one-level model displays but disables its thinking selector", () => {
+  const f = fixture();
+  f.workerModelB.value = "solo";
+  modalUI.rebuildThinking(f.document, f.workerModelB, f.workerThinkingB);
+  assert.deepEqual(f.workerThinkingB.options.map((item) => item.value), ["off"]);
+  assert.equal(f.workerThinkingB.value, "off");
+  assert.equal(f.workerThinkingB.disabled, true);
+});
+
+test("buildRequest returns the root and every worker exactly once", () => {
+  const f = fixture();
+  const got = modalUI.buildRequest(f.dialog);
+  assert.deepEqual(got, {
+    root: { modelType: "fast", thinkingLevel: "medium" },
+    workers: [
+      { workerType: "oracle", modelType: "fast", thinkingLevel: "off" },
+      { workerType: "worker", modelType: "deep", thinkingLevel: "xhigh" }
+    ]
+  });
+});
+
+test("Launch posts the exact complete request and disables controls while pending", async () => {
+  const f = fixture();
+  let resolveFetch;
+  const calls = [];
+  modalUI.bind(f.document, (url, options) => {
+    calls.push({ url, options });
+    return new Promise((resolve) => { resolveFetch = resolve; });
+  });
+  f.trigger.dispatch("click");
+  const expected = modalUI.buildRequest(f.dialog);
+  f.form.dispatch("submit");
+  assert.equal(calls.length, 1);
+  assert.equal(calls[0].url, "/ui/sessions");
+  assert.deepEqual(calls[0].options, {
+    method: "POST",
+    headers: { "Content-Type": "application/json" },
+    body: JSON.stringify(expected),
+    credentials: "same-origin"
+  });
+  assert.equal(f.dialog.getAttribute("aria-busy"), "true");
+  assert.equal(f.launch.textContent, "Launching…");
+  assert.ok(f.controls.every((control) => control.disabled));
+
+  resolveFetch(response(201, { sessionId: "created" }));
+  await settle();
+});
+
+test("failed HTTP keeps modal open, restores controls, and shows bounded sanitized text", async () => {
+  const f = fixture();
+  const unsafe = " <b>not allowed</b> " + "x".repeat(700);
+  modalUI.bind(f.document, async () => response(400, { error: unsafe }));
+  f.trigger.dispatch("click");
+  f.form.dispatch("submit");
+  await settle();
+
+  assert.equal(f.dialog.open, true);
+  assert.equal(f.dialog.getAttribute("aria-busy"), null);
+  assert.equal(f.launch.disabled, false);
+  assert.equal(f.cancel.disabled, false);
+  assert.equal(f.rootModel.disabled, false);
+  assert.equal(f.workerThinkingB.disabled, true, "configured one-level selector remains disabled");
+  assert.equal(f.launch.textContent, "Launch");
+  assert.ok(f.status.textContent.startsWith("<b>not allowed</b>"));
+  assert.ok(f.status.textContent.length <= 300);
+  assert.equal(Object.prototype.hasOwnProperty.call(f.status, "innerHTML"), false);
+});
+
+test("oversized and malformed failure responses use a safe generic message", async () => {
+  for (const reply of [
+    response(500, { error: "secret" }, "70000"),
+    { status: 500, ok: false, headers: { get() { return null; } }, text: async () => "{" }
+  ]) {
+    const f = fixture();
+    modalUI.bind(f.document, async () => reply);
+    f.trigger.dispatch("click");
+    f.form.dispatch("submit");
+    await settle();
+    assert.equal(f.dialog.open, true);
+    assert.equal(f.status.textContent, "The session could not be launched. Please try again.");
+  }
+});
+
+test("synchronous fetch failure restores controls and keeps the modal open", async () => {
+  const f = fixture();
+  modalUI.bind(f.document, () => { throw new Error("offline"); });
+  f.trigger.dispatch("click");
+  f.form.dispatch("submit");
+  await settle();
+  assert.equal(f.dialog.open, true);
+  assert.equal(f.launch.disabled, false);
+  assert.equal(f.status.textContent, "The session could not be launched. Please try again.");
+});
+
+test("201 closes and resets the modal", async () => {
+  const f = fixture();
+  modalUI.bind(f.document, async () => response(201, { sessionId: "created" }));
+  f.trigger.dispatch("click");
+  f.rootModel.value = "fast";
+  f.form.dispatch("submit");
+  await settle();
+  assert.equal(f.dialog.open, false);
+  assert.equal(f.form.resetCalls, 2);
+  assert.equal(f.rootModel.value, "deep");
+  assert.equal(f.status.textContent, "");
+});
+
+test("Cancel, close, backdrop, and native cancel close without fetch", () => {
+  const f = fixture();
+  let fetchCalls = 0;
+  modalUI.bind(f.document, async () => { fetchCalls++; return response(201, {}); });
+  for (const closeAction of [
+    () => f.cancel.dispatch("click"),
+    () => f.close.dispatch("click"),
+    () => f.dialog.dispatch("click", { target: f.dialog }),
+    () => f.dialog.dispatch("cancel")
+  ]) {
+    f.trigger.dispatch("click");
+    const before = f.form.resetCalls;
+    const event = closeAction();
+    assert.equal(f.dialog.open, false);
+    assert.equal(f.form.resetCalls, before + 1);
+    if (event) assert.equal(event.defaultPrevented, true);
+  }
+  assert.equal(fetchCalls, 0);
+});
+
+test("Escape is capture-consumed while open before terminal interrupt but unchanged outside", () => {
+  const f = fixture();
+  let interrupts = 0;
+  modalUI.bind(f.document, async () => response(201, {}));
+  f.document.addEventListener("keydown", (event) => {
+    if (event.key === "Escape") interrupts++;
+  });
+
+  f.trigger.dispatch("click");
+  const guarded = f.document.dispatch("keydown", { key: "Escape" });
+  assert.equal(guarded.defaultPrevented, true);
+  assert.equal(guarded.immediatePropagationStopped, true);
+  assert.equal(f.dialog.open, false);
+  assert.equal(interrupts, 0);
+
+  const outside = f.document.dispatch("keydown", { key: "Escape" });
+  assert.equal(outside.defaultPrevented, false);
+  assert.equal(interrupts, 1);
+});
+
+test("bind is idempotent and destroy removes listeners", () => {
+  const f = fixture();
+  const first = modalUI.bind(f.document, async () => response(201, {}));
+  const second = modalUI.bind(f.document, async () => response(201, {}));
+  assert.equal(first, second);
+  f.trigger.dispatch("click");
+  assert.equal(f.form.resetCalls, 1);
+  second.destroy();
+  f.dialog.close();
+  f.trigger.dispatch("click");
+  assert.equal(f.dialog.open, false);
+});

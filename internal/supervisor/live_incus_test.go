@@ -32,6 +32,7 @@ import (
 	"github.com/pelletier/go-toml/v2"
 	"github.com/sklarsa/kanedias/internal/config"
 	"github.com/sklarsa/kanedias/internal/incusclient"
+	"github.com/sklarsa/kanedias/internal/manager"
 	"github.com/sklarsa/kanedias/internal/supervisor"
 	"github.com/sklarsa/kanedias/internal/supervisor/contract"
 )
@@ -1826,6 +1827,15 @@ func (h *liveAcceptance) runServerManaged() {
 	}
 
 	managedConfig := h.writeManagedConfig(rootSocketDir, sessionLogDir)
+	managedCfg, err := config.Load(managedConfig)
+	if err != nil {
+		h.t.Fatalf("load managed server configuration: %v", err)
+	}
+	launchConfiguration, err := manager.NewLaunchConfiguration(managedCfg)
+	if err != nil {
+		h.t.Fatalf("build managed server launch configuration: %v", err)
+	}
+	defaultLaunchRequest := launchConfiguration.DefaultRequest()
 
 	// Start the server. It spawns roots via SpawnRoot on POST /ui/sessions.
 	server := h.startProcess("managed-server", h.binary, "--config", managedConfig, "server", "--listen", "127.0.0.1:0")
@@ -1834,9 +1844,9 @@ func (h *liveAcceptance) runServerManaged() {
 	// and "Bootstrap URL:" to stderr). Bootstrap the HTTP client with a cookie jar.
 	serverOrigin, client := h.bootstrapManagedServer(server)
 
-	// POST New Session twice to spawn two server-managed roots.
+	// POST New Session twice with the complete configured default launch request.
 	for range 2 {
-		h.postDatastar(client, serverOrigin+"/ui/sessions", map[string]any{})
+		h.postDatastar(client, serverOrigin+"/ui/sessions", defaultLaunchRequest)
 	}
 
 	// Discover both roots by scanning the socket directory.
@@ -2144,7 +2154,7 @@ func (h *liveAcceptance) bootstrapManagedServer(server *acceptanceProcess) (stri
 
 // postDatastar sends a write-boundary-compliant POST to a server action URL.
 // It sets Origin, Sec-Fetch-Site, and Content-Type exactly as the browser would.
-func (h *liveAcceptance) postDatastar(client *http.Client, fullURL string, body map[string]any) {
+func (h *liveAcceptance) postDatastar(client *http.Client, fullURL string, body any) {
 	encoded, err := json.Marshal(body)
 	if err != nil {
 		h.t.Fatalf("postDatastar: marshal body: %v", err)

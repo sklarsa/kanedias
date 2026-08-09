@@ -696,6 +696,172 @@ details[open] > summary .twisty{ transform:rotate(90deg); }
 .tab:active{ color:var(--brass-bright); }
 
 /* ============================================================
+   NEW SESSION DIALOG
+   ============================================================ */
+#new-session-modal{
+  width:min(760px, calc(100vw - 32px));
+  max-width:760px;
+  max-height:min(88vh, 760px);
+  padding:0;
+  overflow:hidden;
+  color:var(--ink);
+  background:linear-gradient(180deg, var(--bg-panel-2), var(--bg-panel));
+  border:1px solid var(--brass);
+  border-radius:3px;
+  box-shadow:0 0 0 1px var(--brass-line-2), 0 24px 70px rgba(0,0,0,.76);
+}
+#new-session-modal::backdrop{
+  background:rgba(2,7,12,.78);
+  backdrop-filter:blur(2px);
+}
+#new-session-modal form{
+  display:flex;
+  flex-direction:column;
+  gap:14px;
+  max-height:min(88vh, 760px);
+  padding:20px;
+}
+#new-session-modal .modal-header{
+  display:flex;
+  align-items:center;
+  gap:16px;
+  padding-bottom:10px;
+  border-bottom:3px double var(--brass-line);
+}
+#new-session-modal h2{
+  flex:1;
+  margin:0;
+  color:var(--brass-bright);
+  font:600 21px/1.2 var(--serif);
+  letter-spacing:.09em;
+  text-transform:uppercase;
+}
+#new-session-modal .modal-close{
+  display:inline-flex;
+  align-items:center;
+  justify-content:center;
+  flex:0 0 auto;
+}
+#new-session-help,
+#new-session-modal fieldset p{
+  margin:0;
+  color:var(--ink-dim);
+}
+#new-session-modal fieldset{
+  display:grid;
+  grid-template-columns:minmax(110px, .45fr) minmax(180px, 1fr);
+  gap:9px 14px;
+  min-width:0;
+  margin:0;
+  padding:12px 14px 14px;
+  border:1px solid var(--brass-line);
+}
+#new-session-modal legend{
+  padding:0 7px;
+  color:var(--brass-bright);
+  font-size:11px;
+  font-weight:700;
+  letter-spacing:.12em;
+  text-transform:uppercase;
+}
+#new-session-modal label{
+  align-self:center;
+  color:var(--ink-dim);
+  font-size:11px;
+  letter-spacing:.08em;
+  text-transform:uppercase;
+}
+#new-session-modal select{
+  min-width:0;
+  width:100%;
+  padding:9px 34px 9px 10px;
+  border:1px solid var(--brass-line);
+  border-radius:2px;
+  color:var(--ink);
+  background:var(--bg-sunk);
+  font:13px var(--mono);
+}
+#new-session-modal select:disabled{
+  opacity:.68;
+  color:var(--ink-dim);
+  cursor:not-allowed;
+}
+#new-session-modal details{
+  min-height:0;
+  overflow:auto;
+  padding:0 4px 2px 0;
+}
+#new-session-modal summary{
+  position:sticky;
+  top:0;
+  z-index:1;
+  padding:8px 4px;
+  color:var(--cyan);
+  background:var(--bg-panel-2);
+  cursor:pointer;
+  font-size:12px;
+  font-weight:700;
+  letter-spacing:.08em;
+  text-transform:uppercase;
+}
+#new-session-modal .worker-model-profile{
+  margin-top:10px;
+}
+#new-session-modal .worker-model-profile p{
+  grid-column:1 / -1;
+}
+#new-session-status{
+  min-height:1.45em;
+  color:var(--ink-dim);
+  font-size:12px;
+}
+#new-session-status:not(:empty){
+  padding:8px 10px;
+  color:var(--amber);
+  border-left:3px solid var(--amber);
+  background:var(--amber-glow);
+}
+#new-session-modal .modal-actions{
+  display:flex;
+  justify-content:flex-end;
+  gap:10px;
+  padding-top:12px;
+  border-top:1px solid var(--brass-line);
+}
+#new-session-modal .modal-actions button{
+  min-width:104px;
+  padding:10px 16px;
+  border:1px solid var(--brass);
+  border-radius:2px;
+  color:var(--brass-bright);
+  background:var(--bg-sunk);
+  font-size:11px;
+  font-weight:700;
+  letter-spacing:.1em;
+  text-transform:uppercase;
+  cursor:pointer;
+}
+#new-session-modal #new-session-launch{
+  color:var(--cyan);
+  border-color:var(--cyan);
+}
+#new-session-modal[aria-busy="true"] #new-session-launch{
+  color:var(--amber);
+  border-color:var(--amber);
+  background:var(--amber-glow);
+}
+#new-session-modal button:disabled,
+#new-session-modal select:disabled{
+  cursor:not-allowed;
+}
+#new-session-modal button:focus-visible,
+#new-session-modal select:focus-visible,
+#new-session-modal summary:focus-visible{
+  outline:2px solid var(--brass-bright);
+  outline-offset:2px;
+}
+
+/* ============================================================
    MOBILE / SLIDE-OVER
    ============================================================ */
 .scrim{
@@ -743,6 +909,22 @@ details[open] > summary .twisty{ transform:rotate(90deg); }
   .deck .deck-lbl{ display:none; }
   .deck-input{ min-width:120px; }
   .dbtn{ padding:9px 11px; font-size:10px; }
+  #new-session-modal{
+    width:calc(100vw - 16px);
+    max-height:calc(100dvh - 16px);
+  }
+  #new-session-modal form{
+    max-height:calc(100dvh - 16px);
+    gap:11px;
+    padding:14px;
+  }
+  #new-session-modal fieldset{ grid-template-columns:1fr; gap:7px; }
+  #new-session-modal select,
+  #new-session-modal button,
+  #new-session-modal summary{ min-height:44px; }
+  #new-session-modal .modal-close{ min-width:44px; }
+  #new-session-modal .modal-actions{ flex:0 0 auto; }
+  #new-session-modal .modal-actions button{ flex:1; min-width:0; }
 }
 
 @media (max-width:420px){

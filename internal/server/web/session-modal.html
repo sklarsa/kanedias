@@ -3,18 +3,18 @@
   <form id="new-session-form">
     <div class="modal-header">
       <h2 id="new-session-title">New session</h2>
-      <button type="button" class="icon-btn" aria-label="Close"{{if not .Enabled}} disabled{{end}}>×</button>
+      <button type="button" class="icon-btn modal-close" data-modal-close aria-label="Close"{{if not .Enabled}} disabled{{end}}>×</button>
     </div>
     <p id="new-session-help">Choose the root model profile and defaults for every subagent role.</p>
 
     <fieldset{{if not .Enabled}} disabled{{end}}>
       <legend>Root model profile</legend>
       <label for="root-model">Model</label>
-      <select id="root-model" name="root-model">
-        {{range .RootModels}}<option value="{{.ID}}"{{if .Selected}} selected{{end}} data-thinking-levels="{{.ThinkingLevelsCSV}}" data-default-thinking-level="{{.DefaultThinkingLevel}}">{{.Label}}</option>{{end}}
+      <select id="root-model" name="root-model" data-root-model>
+        {{range .RootModels}}<option value="{{.ID}}"{{if .Selected}} selected{{end}} data-thinking-levels="{{.ThinkingLevelsCSV}}" data-default-thinking="{{.DefaultThinkingLevel}}">{{.Label}}</option>{{end}}
       </select>
       <label for="root-thinking">Thinking level</label>
-      <select id="root-thinking" name="root-thinking">
+      <select id="root-thinking" name="root-thinking" data-root-thinking>
         {{range .RootThinking}}<option value="{{.Level}}"{{if .Selected}} selected{{end}}>{{.Level}}</option>{{end}}
       </select>
     </fieldset>
@@ -22,15 +22,15 @@
     <details>
       <summary>Subagent model profiles</summary>
       {{range .Workers}}
-      <fieldset class="worker-model-profile" data-worker-type="{{.Role}}"{{if not $.Enabled}} disabled{{end}}>
+      <fieldset class="worker-model-profile" data-worker-row data-worker-type="{{.Role}}"{{if not $.Enabled}} disabled{{end}}>
         <legend>{{.Role}}</legend>
         <p>{{.Description}}</p>
         <label for="worker-model-{{.Index}}">Model</label>
-        <select id="worker-model-{{.Index}}" name="worker-model-{{.Index}}">
-          {{range .Models}}<option value="{{.ID}}"{{if .Selected}} selected{{end}} data-thinking-levels="{{.ThinkingLevelsCSV}}" data-default-thinking-level="{{.DefaultThinkingLevel}}">{{.Label}}</option>{{end}}
+        <select id="worker-model-{{.Index}}" name="worker-model-{{.Index}}" data-worker-model>
+          {{range .Models}}<option value="{{.ID}}"{{if .Selected}} selected{{end}} data-thinking-levels="{{.ThinkingLevelsCSV}}" data-default-thinking="{{.DefaultThinkingLevel}}">{{.Label}}</option>{{end}}
         </select>
         <label for="worker-thinking-{{.Index}}">Thinking level</label>
-        <select id="worker-thinking-{{.Index}}" name="worker-thinking-{{.Index}}">
+        <select id="worker-thinking-{{.Index}}" name="worker-thinking-{{.Index}}" data-worker-thinking>
           {{range .Thinking}}<option value="{{.Level}}"{{if .Selected}} selected{{end}}>{{.Level}}</option>{{end}}
         </select>
       </fieldset>
