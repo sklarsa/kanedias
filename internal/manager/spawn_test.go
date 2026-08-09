@@ -408,6 +408,11 @@ func TestSpawnRootCancellationJoinsBlockedBootstrapWriter(t *testing.T) {
 		time.Sleep(time.Millisecond)
 	}
 	select {
+	case <-writerUnblocked:
+		t.Fatal("real encoded bootstrap write returned before cancellation")
+	default:
+	}
+	select {
 	case spawnErr := <-result:
 		t.Fatalf("SpawnRoot returned before cancellation while bootstrap remained incomplete: %v", spawnErr)
 	default:
