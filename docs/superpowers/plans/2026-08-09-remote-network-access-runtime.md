@@ -711,15 +711,16 @@ Do not terminate an unrelated process. If a known previous Kanedias `make run` o
 ```bash
 runtime_dir="${XDG_RUNTIME_DIR:-/tmp}/kanedias-make-run"
 for attempt in 1 2 3 4 5 6 7 8 9 10; do
-  if ss -ltn '( sport = :8080 )' | grep -Fq '0.0.0.0:8080'; then
+  if curl --fail --show-error --silent http://127.0.0.1:8080/ >/dev/null 2>&1; then
     break
   fi
   sleep 1
 done
-ss -ltn '( sport = :8080 )' | grep -F -- '0.0.0.0:8080'
+ss -ltn '( sport = :8080 )' | grep -F -- ':8080'
+grep -F -- 'requested_address=0.0.0.0:8080' "$runtime_dir/run.log"
 grep -F -- 'Web UI: http://steven-desktop:8080/' "$runtime_dir/run.log"
 curl --fail --show-error --silent http://127.0.0.1:8080/ >/dev/null
 curl --fail --show-error --silent --resolve steven-desktop:8080:127.0.0.1 http://steven-desktop:8080/ >/dev/null
 ```
 
-Expected: the listener is `0.0.0.0:8080`, the log advertises `http://steven-desktop:8080/`, and both direct and configured-hostname HTTP checks succeed without bootstrap authentication. Report the PR URL, merge commit, runtime log, PID file, and any hostname-resolution caveat for other machines.
+Expected: the requested listener is `0.0.0.0:8080`, the socket is present (Linux/Go may display the dual-stack wildcard as `*:8080` with effective address `[::]:8080`), the log advertises `http://steven-desktop:8080/`, and both direct and configured-hostname HTTP checks succeed without bootstrap authentication. Report the PR URL, merge commit, runtime log, PID file, and any hostname-resolution caveat for other machines.
