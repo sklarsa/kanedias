@@ -18,13 +18,17 @@ import (
 	"github.com/sklarsa/kanedias/internal/manager"
 )
 
-func TestValidateListenAddressAcceptsLocalOnlyAddresses(t *testing.T) {
+func TestValidateListenAddressAcceptsLiteralIPAddresses(t *testing.T) {
 	cases := []string{
 		"127.0.0.1:8080",
 		"127.0.0.1:0",
 		"LOCALHOST:8080",
 		"[::1]:8080",
 		"[0:0:0:0:0:0:0:1]:0",
+		"0.0.0.0:8080",
+		"[::]:8080",
+		"192.168.1.2:8080",
+		"8.8.8.8:8080",
 	}
 
 	for _, address := range cases {
@@ -36,14 +40,10 @@ func TestValidateListenAddressAcceptsLocalOnlyAddresses(t *testing.T) {
 	}
 }
 
-func TestValidateListenAddressRejectsNonLocalAddresses(t *testing.T) {
+func TestValidateListenAddressRejectsMalformedOrUnsupportedAddresses(t *testing.T) {
 	cases := []string{
 		"",
 		":8080",
-		"0.0.0.0:8080",
-		"[::]:8080",
-		"192.168.1.2:8080",
-		"8.8.8.8:8080",
 		"example.com:8080",
 		"127.0.0.1",
 		"127.0.0.1:http",
@@ -61,6 +61,24 @@ func TestValidateListenAddressRejectsNonLocalAddresses(t *testing.T) {
 				t.Fatalf("ValidateListenAddress(%q) error %q does not contain address", address, err)
 			}
 		})
+	}
+}
+
+func TestAdvertisedAddressUsesConfiguredHostnameAndEffectivePort(t *testing.T) {
+	tests := []struct {
+		effective string
+		hostname  string
+		want      string
+	}{
+		{"0.0.0.0:8080", "steven-desktop", "steven-desktop:8080"},
+		{"127.0.0.1:9090", "", "127.0.0.1:9090"},
+		{"[::]:8080", "steven-desktop", "steven-desktop:8080"},
+	}
+	for _, tt := range tests {
+		got, err := advertisedAddress(tt.effective, tt.hostname)
+		if err != nil || got != tt.want {
+			t.Errorf("advertisedAddress(%q, %q) = %q, %v; want %q", tt.effective, tt.hostname, got, err, tt.want)
+		}
 	}
 }
 
@@ -131,20 +149,27 @@ func TestPrepareOptionsDefaultsEmptyListenAddress(t *testing.T) {
 	}
 }
 
-func TestRunRejectsUnsafeListenAddressBeforeListening(t *testing.T) {
+func TestRunAcceptsNetworkListenAddressBeforeListening(t *testing.T) {
+	listenErr := errors.New("listen sentinel")
+	called := false
+	listen := func(network, address string) (net.Listener, error) {
+		called = true
+		if network != "tcp" || address != "0.0.0.0:8080" {
+			t.Fatalf("listen(%q, %q), want tcp, 0.0.0.0:8080", network, address)
+		}
+		return nil, listenErr
+	}
 	logger := slog.New(slog.NewTextHandler(io.Discard, nil))
-	listenCalled := false
-	listen := func(string, string) (net.Listener, error) {
-		listenCalled = true
-		return nil, errors.New("unexpected listen")
+	err := run(
+		context.Background(),
+		Options{ListenAddress: "0.0.0.0:8080", Logger: logger},
+		http.NotFoundHandler(), listen, time.Millisecond,
+	)
+	if !called {
+		t.Fatal("network listener was not called")
 	}
-
-	err := run(context.Background(), Options{ListenAddress: "0.0.0.0:8080", Logger: logger}, http.NotFoundHandler(), listen, time.Millisecond)
-	if err == nil || !strings.Contains(err.Error(), "0.0.0.0:8080") {
-		t.Fatalf("run with unsafe address error = %v, want address validation error", err)
-	}
-	if listenCalled {
-		t.Fatal("run with unsafe address called listen")
+	if !errors.Is(err, listenErr) {
+		t.Fatalf("run error = %v, want listen sentinel", err)
 	}
 }
 

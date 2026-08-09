@@ -199,7 +199,7 @@ func (bc *bootstrapCapture) Write(p []byte) (int, error) {
 type runningTestServer struct {
 	cancel       context.CancelFunc
 	result       chan error
-	bootstrapURL string // relative path like /bootstrap?capability=<token>
+	bootstrapURL string // absolute advertised bootstrap URL
 }
 
 // serverWithAddress wraps a running server instance together with its base URL.
@@ -304,8 +304,17 @@ func bootstrapClient(t *testing.T, baseURL, bootstrapPath string) *http.Client {
 		Timeout: 10 * time.Second,
 	}
 
-	// Exchange bootstrap token.
-	bootstrapFull := baseURL + bootstrapPath
+	// Exchange the bootstrap token. ResolveReference supports both the legacy
+	// relative path and the advertised absolute URL.
+	base, err := url.Parse(baseURL)
+	if err != nil {
+		t.Fatalf("parse base URL: %v", err)
+	}
+	bootstrapRef, err := url.Parse(bootstrapPath)
+	if err != nil {
+		t.Fatalf("parse bootstrap URL: %v", err)
+	}
+	bootstrapFull := base.ResolveReference(bootstrapRef).String()
 	resp, err := client.Get(bootstrapFull)
 	if err != nil {
 		t.Fatalf("GET bootstrap: %v", err)
@@ -418,15 +427,19 @@ func minimalTestConfig(t *testing.T, rootSocketDir, sessionLogDir string) (confi
 		t.Fatalf("write config: %v", err)
 	}
 
-	// Build the config struct with short intervals for responsive tests.
+	// Build the config struct with short intervals for responsive tests. This
+	// fixture exercises the bootstrap flow, so session auth must be explicit now
+	// that trusted-network mode is the default.
 	disc := config.Duration{Duration: 200 * time.Millisecond}
 	snap := config.Duration{Duration: 200 * time.Millisecond}
+	requireSession := true
 	cfg := config.Config{
 		Server: config.ServerConfig{
 			RootSocketDir:     rootSocketDir,
 			SessionLogDir:     sessionLogDir,
 			DiscoveryInterval: &disc,
 			SnapshotInterval:  &snap,
+			RequireSession:    &requireSession,
 		},
 	}
 	return cfg, cfgPath
