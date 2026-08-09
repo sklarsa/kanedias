@@ -393,7 +393,7 @@ func runtimePolicyBootstrap(t *testing.T) process.Bootstrap {
 }
 
 func serveRuntimePolicyState(peer net.Conn, worker config.WorkerProfile) {
-	defer peer.Close()
+	defer func() { _ = peer.Close() }()
 	line, err := bufio.NewReader(peer).ReadBytes('\n')
 	if err != nil {
 		return
