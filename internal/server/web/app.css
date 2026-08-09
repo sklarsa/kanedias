@@ -1034,4 +1034,3 @@ a:focus-visible, button:focus-visible, input:focus-visible, summary:focus-visibl
 .transcript .tool-card ::selection{
   background:rgba(94,198,216,.35); color:var(--ink);
 }
-
