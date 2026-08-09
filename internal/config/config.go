@@ -38,6 +38,7 @@ type BaseImage struct {
 	Source          string   `toml:"source"`
 	Image           string   `toml:"image"`
 	AuthorizedHosts []string `toml:"authorized_hosts"`
+	BuildScriptsDir string   `toml:"build_scripts_dir"`
 }
 
 type Workspace struct {
@@ -147,6 +148,16 @@ func (cfg Config) ValidateLifecycle() error {
 
 func (cfg Config) AssetPath(name string) string {
 	return filepath.Join(cfg.Dir, "assets", name)
+}
+
+func (cfg Config) BuildScriptsPath() string {
+	if cfg.BaseImage.BuildScriptsDir == "" {
+		return ""
+	}
+	if filepath.IsAbs(cfg.BaseImage.BuildScriptsDir) {
+		return filepath.Clean(cfg.BaseImage.BuildScriptsDir)
+	}
+	return filepath.Join(cfg.Dir, cfg.BaseImage.BuildScriptsDir)
 }
 
 func (network Network) IPv4Prefix() (netip.Prefix, error) {
