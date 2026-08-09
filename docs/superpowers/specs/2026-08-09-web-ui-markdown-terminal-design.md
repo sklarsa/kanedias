@@ -58,7 +58,7 @@ behavioral match than introducing a separate Go Markdown implementation, keeps
 streamed partial responses responsive, and preserves the existing no-build,
 embedded-asset architecture.
 
-The vendored libraries are served only from Kanedias's authenticated loopback
+The vendored libraries are served only from Kanedias's embedded loopback web
 server. No CDN or runtime package installation is used.
 
 ## Architecture
