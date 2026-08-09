@@ -445,6 +445,42 @@ func testLogger() (*slog.Logger, *bytes.Buffer) {
 	return slog.New(slog.NewJSONHandler(&logs, nil)), &logs
 }
 
+// modelCatalogFixture returns a config carrying a valid model catalog, session
+// defaults, and worker roles used by tests that build a launch configuration.
+func modelCatalogFixture() config.Config {
+	return config.Config{
+		BaseImage: config.BaseImage{Name: "sandbox", Source: "https://images.linuxcontainers.org", Image: "debian/13"},
+		Models: map[string]config.ModelDefinition{
+			"local-qwen": {
+				Label: "Local Qwen", Provider: "local-executor", Model: "Qwen3.6-27B-GGUF",
+				ThinkingLevels: []string{"off"}, DefaultThinkingLevel: "off",
+			},
+			"gpt-5-6-sol": {
+				Label: "GPT-5.6 Solver", Provider: "openai-codex", Model: "gpt-5.6-sol",
+				ThinkingLevels:       []string{"minimal", "low", "medium", "high", "xhigh", "max"},
+				DefaultThinkingLevel: "high",
+			},
+		},
+		Session: config.SessionDefaults{ModelType: "local-qwen", ThinkingLevel: "off"},
+		Workers: map[string]config.WorkerDefaults{
+			"reviewer": {Description: "Review code and designs without modifying files.", ModelType: "gpt-5-6-sol", ThinkingLevel: "xhigh"},
+			"worker":   {Description: "Implement changes and hand off pushed Git refs.", ModelType: "gpt-5-6-sol", ThinkingLevel: "high"},
+		},
+	}
+}
+
+func TestRunApplicationRejectsMissingModelLaunchConfig(t *testing.T) {
+	logger, _ := testLogger()
+	cfg := config.Config{} // no model catalog -> launch construction fails
+	err := runApplication(context.Background(), cfg, Options{
+		ListenAddress: "127.0.0.1:0",
+		Logger:        logger,
+	}, productionManagerFactory, net.Listen)
+	if err == nil || !strings.Contains(err.Error(), "model launch configuration") {
+		t.Fatalf("runApplication error = %v, want model launch configuration error", err)
+	}
+}
+
 func requireStructuredLog(t *testing.T, logs *bytes.Buffer, parts ...string) {
 	t.Helper()
 	got := logs.String()

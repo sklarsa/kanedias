@@ -130,6 +130,11 @@ func runApplication(
 		return fmt.Errorf("run server: resolve event limits: %w", err)
 	}
 
+	launch, err := manager.NewLaunchConfiguration(cfg)
+	if err != nil {
+		return fmt.Errorf("run server: model launch configuration: %w", err)
+	}
+
 	fleet, err := newManager(manager.Options{
 		ConfigPath:        normalizedOptions.ConfigPath,
 		RootSocketDir:     resolved.RootSocketDir,
@@ -142,6 +147,7 @@ func runApplication(
 			MaxEvents: limits.MaxEvents,
 			MaxBytes:  limits.MaxBytes,
 		},
+		Launch: launch,
 		Logger: normalizedOptions.Logger,
 	})
 	if err != nil {

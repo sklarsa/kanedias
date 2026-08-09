@@ -10,6 +10,7 @@ import (
 	"testing"
 	"time"
 
+	"github.com/sklarsa/kanedias/internal/config"
 	"github.com/sklarsa/kanedias/internal/supervisor"
 	"github.com/sklarsa/kanedias/internal/supervisor/contract"
 )
@@ -136,6 +137,7 @@ func fakeManager(factory clientFactory) *Manager {
 			Logger:           discardLogger(),
 			SnapshotInterval: time.Hour, // long: monitoring loops must not fire during unit tests
 		},
+		launch:         managerTestLaunch(),
 		roots:          make(map[string]*rootHandle),
 		routes:         make(map[string]string),
 		factory:        factory,
@@ -150,6 +152,40 @@ func fakeManager(factory clientFactory) *Manager {
 
 func discardLogger() *slog.Logger {
 	return slog.New(slog.DiscardHandler)
+}
+
+// modelConfigFixture builds a valid model/worker/session config used by launch
+// and manager tests.
+func modelConfigFixture() config.Config {
+	return config.Config{
+		BaseImage: config.BaseImage{Name: "sandbox", Source: "https://images.linuxcontainers.org", Image: "debian/13"},
+		Models: map[string]config.ModelDefinition{
+			"local-qwen": {
+				Label: "Local Qwen", Provider: "local-executor", Model: "Qwen3.6-27B-GGUF",
+				ThinkingLevels: []string{"off"}, DefaultThinkingLevel: "off",
+			},
+			"gpt-5-6-sol": {
+				Label: "GPT-5.6 Solver", Provider: "openai-codex", Model: "gpt-5.6-sol",
+				ThinkingLevels:       []string{"minimal", "low", "medium", "high", "xhigh", "max"},
+				DefaultThinkingLevel: "high",
+			},
+		},
+		Session: config.SessionDefaults{ModelType: "local-qwen", ThinkingLevel: "off"},
+		Workers: map[string]config.WorkerDefaults{
+			"reviewer": {Description: "Review code and designs without modifying files.", ModelType: "gpt-5-6-sol", ThinkingLevel: "xhigh"},
+			"worker":   {Description: "Implement changes and hand off pushed Git refs.", ModelType: "gpt-5-6-sol", ThinkingLevel: "high"},
+		},
+	}
+}
+
+// managerTestLaunch builds the launch catalog used by manager fakes and tests.
+// It must not fail for the valid fixture.
+func managerTestLaunch() LaunchConfiguration {
+	lc, err := NewLaunchConfiguration(modelConfigFixture())
+	if err != nil {
+		panic(err)
+	}
+	return lc
 }
 
 // shortTempDirs creates two short-path temporary directories suitable for
