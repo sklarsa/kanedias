@@ -2,9 +2,12 @@ package manager
 
 import (
 	"context"
+	"encoding/base64"
 	"encoding/json"
+	"errors"
 	"testing"
 
+	"github.com/sklarsa/kanedias/internal/attachments"
 	"github.com/sklarsa/kanedias/internal/supervisor"
 )
 
@@ -102,6 +105,185 @@ func piManagerWithSession(sessionID string, client *piControlClient, tree superv
 	m.roots[handle.socketPath] = handle
 	m.routes[sessionID] = handle.rootID
 	return m
+}
+
+func imageCapablePIControlClient(streaming bool) *piControlClient {
+	client := &piControlClient{}
+	client.response = func(idx int, _ string, _ json.RawMessage) (json.RawMessage, error) {
+		if idx == 0 {
+			if streaming {
+				return json.RawMessage(`{"type":"response","command":"get_state","success":true,"data":{"isStreaming":true,"model":{"input":["text","image"]}}}`), nil
+			}
+			return json.RawMessage(`{"type":"response","command":"get_state","success":true,"data":{"isStreaming":false,"model":{"input":["text","image"]}}}`), nil
+		}
+		if streaming {
+			return json.RawMessage(`{"type":"response","command":"steer","success":true}`), nil
+		}
+		return json.RawMessage(`{"type":"response","command":"prompt","success":true}`), nil
+	}
+	return client
+}
+
+func testPNG(t *testing.T, marker byte) attachments.Image {
+	t.Helper()
+	data := append([]byte("\x89PNG\r\n\x1a\n"), make([]byte, 32)...)
+	data[len(data)-1] = marker
+	image, err := attachments.NewImage(data)
+	if err != nil {
+		t.Fatal(err)
+	}
+	return image
+}
+
+func TestSendMessageIdleIncludesNativeImages(t *testing.T) {
+	image := testPNG(t, 1)
+	client := imageCapablePIControlClient(false)
+	m := piManagerWithSession("root", client, rootTree("root"))
+
+	if err := m.SendMessage(context.Background(), "root", "inspect", []attachments.Image{image}); err != nil {
+		t.Fatal(err)
+	}
+	var command struct {
+		Type, Message string
+		Images        []struct{ Type, Data, MIMEType string }
+	}
+	if err := json.Unmarshal(client.callLog[1].payload, &command); err != nil {
+		t.Fatal(err)
+	}
+	if command.Type != "prompt" || command.Message != "inspect" {
+		t.Fatalf("command = %#v", command)
+	}
+	if len(command.Images) != 1 || command.Images[0].Type != "image" || command.Images[0].MIMEType != "image/png" {
+		t.Fatalf("images = %#v", command.Images)
+	}
+	if got := command.Images[0].Data; got != base64.StdEncoding.EncodeToString(image.Data) {
+		t.Fatal("data mismatch")
+	}
+}
+
+func TestSendMessageStreamingIncludesNativeImages(t *testing.T) {
+	image := testPNG(t, 2)
+	client := imageCapablePIControlClient(true)
+	m := piManagerWithSession("root", client, rootTree("root"))
+
+	if err := m.SendMessage(context.Background(), "root", "redirect", []attachments.Image{image}); err != nil {
+		t.Fatal(err)
+	}
+	var command struct {
+		Type   string
+		Images []struct{ Data string }
+	}
+	if err := json.Unmarshal(client.callLog[1].payload, &command); err != nil {
+		t.Fatal(err)
+	}
+	if command.Type != "steer" || len(command.Images) != 1 {
+		t.Fatalf("command = %#v", command)
+	}
+}
+
+func TestSendMessagePreservesImageOrder(t *testing.T) {
+	first := testPNG(t, 1)
+	second := testPNG(t, 2)
+	client := imageCapablePIControlClient(false)
+	m := piManagerWithSession("root", client, rootTree("root"))
+
+	if err := m.SendMessage(context.Background(), "root", "compare", []attachments.Image{first, second}); err != nil {
+		t.Fatal(err)
+	}
+	var command struct {
+		Images []struct{ Data string }
+	}
+	if err := json.Unmarshal(client.callLog[1].payload, &command); err != nil {
+		t.Fatal(err)
+	}
+	want := []string{base64.StdEncoding.EncodeToString(first.Data), base64.StdEncoding.EncodeToString(second.Data)}
+	if len(command.Images) != len(want) {
+		t.Fatalf("got %d images, want %d", len(command.Images), len(want))
+	}
+	for i := range want {
+		if command.Images[i].Data != want[i] {
+			t.Fatalf("image %d data mismatch", i)
+		}
+	}
+}
+
+func TestSteerOmitsImagesField(t *testing.T) {
+	client := imageCapablePIControlClient(false)
+	m := piManagerWithSession("root", client, rootTree("root"))
+
+	if err := m.Steer(context.Background(), "root", "text only"); err != nil {
+		t.Fatal(err)
+	}
+	var command map[string]json.RawMessage
+	if err := json.Unmarshal(client.callLog[1].payload, &command); err != nil {
+		t.Fatal(err)
+	}
+	if _, found := command["images"]; found {
+		t.Fatalf("Steer payload contains images: %s", client.callLog[1].payload)
+	}
+}
+
+func TestSendMessageRejectsModelsWithoutImageInput(t *testing.T) {
+	tests := []struct {
+		name      string
+		modelJSON string
+	}{
+		{"nil_model", ""},
+		{"text_only", `,"model":{"input":["text"]}`},
+	}
+	for _, test := range tests {
+		t.Run(test.name, func(t *testing.T) {
+			client := &piControlClient{response: func(_ int, _ string, _ json.RawMessage) (json.RawMessage, error) {
+				return json.RawMessage(`{"type":"response","command":"get_state","success":true,"data":{"isStreaming":false` + test.modelJSON + `}}`), nil
+			}}
+			m := piManagerWithSession("root", client, rootTree("root"))
+			err := m.SendMessage(context.Background(), "root", "inspect", []attachments.Image{testPNG(t, 1)})
+			if !errors.Is(err, ErrImageInputUnsupported) {
+				t.Fatalf("SendMessage() error = %v, want %v", err, ErrImageInputUnsupported)
+			}
+			if len(client.callLog) != 1 {
+				t.Fatalf("RPC calls = %d, want 1", len(client.callLog))
+			}
+		})
+	}
+}
+
+func TestSendMessageAcceptsTextAndImageModelInput(t *testing.T) {
+	client := imageCapablePIControlClient(false)
+	m := piManagerWithSession("root", client, rootTree("root"))
+	if err := m.SendMessage(context.Background(), "root", "inspect", []attachments.Image{testPNG(t, 1)}); err != nil {
+		t.Fatalf("SendMessage() error: %v", err)
+	}
+}
+
+func TestSendMessageValidatesImagesBeforeNetworkIO(t *testing.T) {
+	client := imageCapablePIControlClient(false)
+	m := piManagerWithSession("root", client, rootTree("root"))
+	invalid := attachments.Image{MIMEType: "image/png", Data: []byte("not an image")}
+
+	err := m.SendMessage(context.Background(), "root", "inspect", []attachments.Image{invalid})
+	if !errors.Is(err, attachments.ErrUnsupportedFormat) {
+		t.Fatalf("SendMessage() error = %v, want %v", err, attachments.ErrUnsupportedFormat)
+	}
+	if len(client.callLog) != 0 {
+		t.Fatalf("invalid images caused %d RPC calls", len(client.callLog))
+	}
+}
+
+func TestSendMessageReturnsExactPiRejection(t *testing.T) {
+	client := imageCapablePIControlClient(false)
+	client.response = func(idx int, _ string, _ json.RawMessage) (json.RawMessage, error) {
+		if idx == 0 {
+			return json.RawMessage(`{"type":"response","command":"get_state","success":true,"data":{"isStreaming":false,"model":{"input":["text","image"]}}}`), nil
+		}
+		return json.RawMessage(`{"type":"response","command":"prompt","success":false,"error":"image rejected"}`), nil
+	}
+	m := piManagerWithSession("root", client, rootTree("root"))
+
+	err := m.SendMessage(context.Background(), "root", "inspect", []attachments.Image{testPNG(t, 1)})
+	if err == nil || err.Error() != "pi command failed: image rejected" {
+		t.Fatalf("SendMessage() error = %v", err)
+	}
 }
 
 func TestSteerStreamingUsesSteerCommand(t *testing.T) {

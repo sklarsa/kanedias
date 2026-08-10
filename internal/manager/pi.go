@@ -2,10 +2,12 @@ package manager
 
 import (
 	"context"
+	"encoding/base64"
 	"encoding/json"
 	"errors"
 	"fmt"
 
+	"github.com/sklarsa/kanedias/internal/attachments"
 	"github.com/sklarsa/kanedias/internal/supervisor"
 )
 
@@ -108,15 +110,41 @@ func (m *Manager) actionableClientAndNode(sessionID string) (rootClient, supervi
 type piStateData struct {
 	IsStreaming bool   `json:"isStreaming"`
 	SessionID   string `json:"sessionId,omitempty"`
+	Model       *struct {
+		Input []string `json:"input"`
+	} `json:"model,omitempty"`
 }
 
-// Steer sends a streaming steer or idle prompt to a session.
+var ErrImageInputUnsupported = errors.New("manager: selected model does not support image input")
+
+type piMessageImage struct {
+	Type     string `json:"type"`
+	Data     string `json:"data"`
+	MIMEType string `json:"mimeType"`
+}
+
+type piMessageCommand struct {
+	Type    string           `json:"type"`
+	Message string           `json:"message"`
+	Images  []piMessageImage `json:"images,omitempty"`
+}
+
+// Steer sends a streaming steer or idle prompt to a session without images.
 func (m *Manager) Steer(ctx context.Context, sessionID string, message string) error {
+	return m.SendMessage(ctx, sessionID, message, nil)
+}
+
+// SendMessage sends a streaming steer or idle prompt, including native Pi
+// image content when the selected model supports image input.
+func (m *Manager) SendMessage(ctx context.Context, sessionID, message string, images []attachments.Image) error {
+	if err := attachments.Validate(images); err != nil {
+		return err
+	}
+
 	client, err := m.actionableClient(sessionID)
 	if err != nil {
 		return err
 	}
-	// get_state first.
 	rawState, err := client.CallRPC(ctx, sessionID, mustJSON(map[string]any{"type": "get_state"}))
 	if err != nil {
 		return fmt.Errorf("get_state: %w", err)
@@ -126,22 +154,43 @@ func (m *Manager) Steer(ctx context.Context, sessionID string, message string) e
 		return fmt.Errorf("get_state: %w", err)
 	}
 
-	var cmd json.RawMessage
-	if state.IsStreaming {
-		cmd = mustJSON(map[string]any{"type": "steer", "message": message})
-	} else {
-		cmd = mustJSON(map[string]any{"type": "prompt", "message": message})
+	if len(images) > 0 && !supportsImageInput(state.Model) {
+		return ErrImageInputUnsupported
 	}
-	rawResp, err := client.CallRPC(ctx, sessionID, cmd)
+
+	commandType := "prompt"
+	if state.IsStreaming {
+		commandType = "steer"
+	}
+	command := piMessageCommand{Type: commandType, Message: message}
+	for _, image := range images {
+		command.Images = append(command.Images, piMessageImage{
+			Type:     "image",
+			Data:     base64.StdEncoding.EncodeToString(image.Data),
+			MIMEType: image.MIMEType,
+		})
+	}
+
+	rawResp, err := client.CallRPC(ctx, sessionID, mustJSON(command))
 	if err != nil {
 		return err
 	}
-	if state.IsStreaming {
-		_, err = decodePiResponse[any](rawResp, "steer")
-	} else {
-		_, err = decodePiResponse[any](rawResp, "prompt")
-	}
+	_, err = decodePiResponse[any](rawResp, commandType)
 	return err
+}
+
+func supportsImageInput(model *struct {
+	Input []string `json:"input"`
+}) bool {
+	if model == nil {
+		return false
+	}
+	for _, input := range model.Input {
+		if input == "image" {
+			return true
+		}
+	}
+	return false
 }
 
 // Interrupt aborts the current turn of a session.
