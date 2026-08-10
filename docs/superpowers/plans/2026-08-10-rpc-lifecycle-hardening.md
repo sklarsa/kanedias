@@ -1807,6 +1807,84 @@ Then rerun Task 6H rapid control and Task 6I deterministic children on the final
 
 ---
 
+### Task 6M: Prove post-interrupt root control with a deterministic Pi extension command
+
+**Failed invariant and evidence:**
+
+- Task 6K's stronger model-facing prompt did not resolve the boundary. `/home/steven/.cache/kanedias/e2e/e2e-3569567-1786402419014244115/` proves root abort completed with exact `message_end(aborted) -> agent_end -> agent_settled`; a fresh generation then received the 198-byte prompt explicitly stating that the prior request was aborted, must not be resumed, no tools may be called, and only the marker may be returned.
+- The local model again resumed the old twelve-file task, emitted an assistant tool-use message, at least seventeen tool-result messages, and had not produced `agent_end`/`agent_settled` when the observable four-minute settlement gate expired. Exact teardown restored baseline and the proxy log remained quiet.
+- Two real local-model runs therefore establish a reproducible instruction-priority limitation after aborted history. This is not a missing prompt, stale event replay, supervisor disconnect, tool-call transport failure, or insufficient timeout. Retrying, strengthening the wording again, accepting tool output, or extending the wait would hide the failure rather than test supervisor lifecycle.
+- The interrupt scenario's required post-abort invariant is that the same root Pi/supervisor control plane remains addressable and usable. Prove that deterministically with the installed `/present_e2e_question` extension command: exact prompt acknowledgement, root question projection, exact answer routing/removal, and idle/zero state. The scenario still uses the real local model for the active root task, root abort, active deep-child task, and deep-child abort.
+
+**Files and scope:**
+
+- Modify/Test only: `internal/supervisor/live_rpc_lifecycle_test.go`, `internal/supervisor/live_rpc_lifecycle_support_test.go`
+- Reuse test-only extension fixture: `present_e2e_question` registered in `internal/image/pi-extension/src/index.ts`
+- Do not modify the extension, Pi, provider/model, production routing, abort, timeouts, or generic non-interrupt root-usability probes.
+- Remove the superseded Task 6K model-facing helper/test/wrapper rather than leaving dead acceptance code.
+
+Independent review of this Task 6M amendment is required before implementation.
+
+- [ ] **Step 1: Add RED pure prompt/question-selection regressions**
+
+Add `TestLifecycleInterruptControlProbeRequiresExactQuestion`. Require missing pure helpers that:
+
+1. construct exactly `/present_e2e_question MARKER`, retain the complete marker exactly once, and reject/avoid empty marker construction; and
+2. select exactly one pending question for the target session whose title equals the supplied marker, returning its nonempty ID; reject no match, wrong session/title, empty ID, or duplicate exact matches.
+
+Use in-memory `NodeSnapshot` trees only. Prove compile RED for the missing helpers before adding them.
+
+- [ ] **Step 2: Replace post-interrupt model prompts with the controlled question probe**
+
+Add `assertLifecycleRootControlAfterInterrupt(root, marker)` in the lifecycle support test:
+
+1. Send exactly one `prompt` RPC containing the extension command from Step 1 through `lifecycleRPCCommand`; require its exact successful acknowledgement.
+2. Poll the direct root `/v1/tree` until Step 1's selector finds exactly one matching pending root question. No sleep or action retry.
+3. Answer it exactly once through the direct supervisor question-response route and require HTTP 204.
+4. Poll until that exact question disappears.
+5. Read typed `get_state` and require `IsStreaming == false` and `PendingMessageCount == 0`. Do not wait for or manufacture `agent_settled`; extension commands are handled without a model generation.
+
+Use distinct exact run markers for the root-after-root-abort and root-after-child-abort probes. Replace both interrupt scenario calls to `assertRootUsable`/Task-6K wrapper with this deterministic probe. Remove `lifecyclePostAbortProbe`, `TestLifecyclePostAbortProbeExplicitlySupersedesPriorTask`, and the specialized model wrapper; preserve generic `assertRootUsable` byte-for-byte for every non-interrupt scenario.
+
+Update the interrupt root's exact settlement total from the aborted root generation plus two model probes to only the aborted root generation. Keep the child aborted settlement total exact. The accepted extension prompt, projected question, answer, removal, and idle state replace—not waive—the two usability boundaries.
+
+- [ ] **Step 3: Prove focused GREEN/race and tagged compilation**
+
+```bash
+gofmt -w internal/supervisor/live_rpc_lifecycle_test.go internal/supervisor/live_rpc_lifecycle_support_test.go
+go test -v -count=1 -tags=incus ./internal/supervisor \
+  -run '^TestLifecycleInterruptControlProbeRequiresExactQuestion$'
+go test -race -v -count=1 -tags=incus ./internal/supervisor \
+  -run '^TestLifecycleInterruptControlProbeRequiresExactQuestion$'
+go test -count=1 -tags=incus ./internal/supervisor -run '^$'
+git diff --check
+```
+
+Expected: exact command/selector cases pass normally and under race; no production file changes; tagged compilation and diff check pass.
+
+- [ ] **Step 4: Rerun interrupt once on Task 6L**
+
+```bash
+set -a; . /home/steven/source/github/kanedias/.env; set +a
+go test -v -count=1 -tags=incus ./internal/supervisor \
+  -run '^TestLiveRPCInterruptLifecycle$' -timeout 90m
+```
+
+Expected: deterministic root control passes after root abort; routed child abort response returns success before child terminal 409; deterministic root control passes again after child abort; exact root/child event/action/resource invariants and baseline restoration pass.
+
+- [ ] **Step 5: Review, commit, and resume remaining live gates**
+
+After independent implementation review:
+
+```bash
+git add internal/supervisor/live_rpc_lifecycle_test.go internal/supervisor/live_rpc_lifecycle_support_test.go
+git commit -m "test: use deterministic post-interrupt probe"
+```
+
+Then rerun Task 6H rapid control and Task 6I deterministic children on the final code, followed by all eight scenarios once. Any new failure receives another evidence-gated amendment.
+
+---
+
 ### Task 7: Prove five consecutive clean runs and complete verification
 
 **Files:**
