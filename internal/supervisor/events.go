@@ -357,25 +357,30 @@ func (mailbox *eventMailbox) close() {
 // byte count) and closes the channel promptly without requiring a consumer read.
 func (mailbox *eventMailbox) abort() {
 	mailbox.mu.Lock()
-	if !mailbox.closed {
-		mailbox.closed = true
-		for {
-			select {
-			case <-mailbox.events:
-				if len(mailbox.sizes) > 0 {
-					mailbox.totalBytes -= mailbox.sizes[0]
-					mailbox.sizes = mailbox.sizes[1:]
-				}
-			default:
-				mailbox.totalBytes = 0
-				mailbox.sizes = nil
-				close(mailbox.events)
-				mailbox.mu.Unlock()
-				return
+	wasClosed := mailbox.closed
+	mailbox.closed = true
+	for {
+		select {
+		case _, open := <-mailbox.events:
+			if open {
+				continue
 			}
+			// A graceful broker close won the race. Its closed channel can still
+			// contain buffered events, all of which have now been discarded.
+			mailbox.totalBytes = 0
+			mailbox.sizes = nil
+			mailbox.mu.Unlock()
+			return
+		default:
+			mailbox.totalBytes = 0
+			mailbox.sizes = nil
+			if !wasClosed {
+				close(mailbox.events)
+			}
+			mailbox.mu.Unlock()
+			return
 		}
 	}
-	mailbox.mu.Unlock()
 }
 
 func cloneEnvelopes(events []EventEnvelope) []EventEnvelope {

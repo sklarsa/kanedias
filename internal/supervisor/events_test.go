@@ -221,6 +221,53 @@ func TestEventBrokerGracefulCloseKeepsBufferedEventsReadable(t *testing.T) {
 	}
 }
 
+func TestEventBrokerSubscriptionCloseAfterGracefulCloseDiscardsUnreadEvents(t *testing.T) {
+	broker := newEventBroker(4, 2)
+	subscription := broker.Subscribe()
+	mailbox := onlyEventMailbox(t, broker)
+
+	broker.PublishLocal("root", "pi", json.RawMessage(`{"n":1}`))
+	waitForMailboxDelivery(t, mailbox)
+	broker.Close()
+	subscription.Close()
+
+	assertMailboxReleased(t, mailbox)
+	if _, open := <-subscription.Events; open {
+		t.Fatal("subscription close delivered an unread event after graceful close")
+	}
+}
+
+func TestEventBrokerSubscriptionCloseRacingGracefulCloseReleasesMailbox(t *testing.T) {
+	for range 100 {
+		broker := newEventBroker(4, 2)
+		subscription := broker.Subscribe()
+		mailbox := onlyEventMailbox(t, broker)
+		broker.PublishLocal("root", "pi", json.RawMessage(`{"n":1}`))
+		waitForMailboxDelivery(t, mailbox)
+
+		start := make(chan struct{})
+		var group sync.WaitGroup
+		group.Add(2)
+		go func() {
+			defer group.Done()
+			<-start
+			broker.Close()
+		}()
+		go func() {
+			defer group.Done()
+			<-start
+			subscription.Close()
+		}()
+		close(start)
+		group.Wait()
+
+		assertMailboxReleased(t, mailbox)
+		if _, open := <-subscription.Events; open {
+			t.Fatal("racing close retained an unread event")
+		}
+	}
+}
+
 func onlyEventMailbox(t *testing.T, broker *EventBroker) *eventMailbox {
 	t.Helper()
 	broker.mu.Lock()
