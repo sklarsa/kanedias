@@ -1251,6 +1251,109 @@ Update Task 6B/6C/6D/6E reports with the shared commit and evidence, then resume
 
 ---
 
+### Task 6F: Separate queued descendant steer from active root interrupt in managed acceptance
+
+**Failed invariant and evidence:**
+
+- Required invariant: the existing managed acceptance must prove server-routed descendant steer/question/stop and an active-session interrupt without accidentally turning the interrupt into an unbounded wait for a previously queued steer.
+- The Task 6E live rerun proved exact local/off child binding and manager projection, then failed on the descendant interrupt after 26.22 seconds. Retained artifacts are at `/home/steven/.cache/kanedias/e2e/e2e-3387564-1786396592070742202/`.
+- `managed-server-restart.log` proves the descendant fleet barrier completed, descendant steer succeeded in 1.07 milliseconds, and the immediately following interrupt failed exactly ten seconds later with `child_unavailable ... /rpc: context deadline exceeded`. The descendant POST later returned child failure during teardown; exact resource cleanup restored baseline.
+- Pi 0.83's documented `steer` contract queues the message for delivery after the current assistant turn/tool batch. Its RPC implementation handles `abort` by awaiting `AgentSession.abort()`, which calls `agent.abort()` and then `waitForIdle()` without clearing pending steering/follow-up queues. A real standalone Pi/local-model probe matching the managed workload observed the acknowledged steer start another agent run and received no abort response within 90 seconds. The comparison probe with no queued steer observed streaming and received the abort response in 2 milliseconds with one `agent_end`/`agent_settled` pair.
+- Earliest divergent boundary: `runServerManaged` sends steer and then abort back-to-back to the same transient child, conflating ordinary managed-control coverage with the dedicated `TestLiveRPCRapidControlLifecycle` contract. Raising the descendant unary timeout would only wait longer for queued work and would not test interruption isolation. This task must not weaken the ten-second availability bound or patch Pi semantics preemptively; the dedicated rapid-control scenario remains the evidence gate for that later behavior.
+
+**Files and scope:**
+
+- Modify/Test only: `internal/supervisor/live_incus_test.go`
+- Read comparison only: Pi `docs/rpc.md`, Pi `dist/modes/rpc/rpc-mode.js`, Pi `dist/core/agent-session.js`, `internal/supervisorapi/client.go`, and `internal/manager/pi.go`
+- Read artifacts: `/home/steven/.cache/kanedias/e2e/e2e-3387564-1786396592070742202/`
+- Do not modify `DescendantClient` timeouts, production manager controls, Pi, the image, supervisor routing, or any production file.
+
+**Interfaces:**
+
+- Consumes: direct supervisor `get_state`, the existing restarted managed connection, `lifecycleActiveReadTask`, root persistence across server restart, and the server's steer/interrupt/question/stop routes.
+- Produces: observable empty-queue/streaming barriers around an active interrupt of `roots[1]`, while the `roots[0]` descendant independently proves steer, controlled-question routing, and stop. Deep descendant interrupt remains covered by `TestLiveRPCInterruptLifecycle`; queued steer-to-abort behavior remains covered by `TestLiveRPCRapidControlLifecycle`.
+
+Independent review of this Task 6F amendment is required before Step 1 edits `internal/supervisor/live_incus_test.go`.
+
+- [ ] **Step 1: Add hermetic exact-state regressions for managed control barriers**
+
+Add a pure helper and test:
+
+```go
+func managedSessionControlState(response map[string]any) (streaming bool, pending int, ok bool)
+func TestManagedSessionControlStateRequiresExactSuccessfulState(t *testing.T)
+```
+
+Require a valid `get_state` response with `success=true`, object `data`, boolean `isStreaming`, and a finite nonnegative integral `pendingMessageCount`. Test both idle/zero and streaming/zero valid cases. Reject `success=false`, missing/non-object data, missing or non-boolean streaming, missing/fractional/negative/non-numeric pending count, and unrelated response shapes. The helper must not stringify or retain private response content.
+
+- [ ] **Step 2: Prove RED for the missing state parser**
+
+Run:
+
+```bash
+go test -v -count=1 -tags=incus ./internal/supervisor \
+  -run '^TestManagedSessionControlStateRequiresExactSuccessfulState$'
+```
+
+Expected: FAIL to compile because `managedSessionControlState` does not exist.
+
+- [ ] **Step 3: Add observable idle/streaming barriers without sleeps or action retries**
+
+Modify only `internal/supervisor/live_incus_test.go`:
+
+1. Implement `managedSessionControlState` with exact dynamic-type checks for the JSON-decoded response. Convert `pendingMessageCount` only when it is a finite nonnegative integer representable as `int`.
+2. Add `waitManagedSessionControlState(client, sessionID string, wantStreaming bool, wantPending int, description string)`. Use the existing bounded `h.poll` and direct supervisor `get_state`; accept only an exact parsed state matching both requested values. Do not log raw responses.
+3. Add `exerciseManagedRootInterrupt(connection managedServerConnection, root managedRoot)`. First wait for the persistent root to be idle with zero pending messages. Send exactly one server steer action while idle with `lifecycleActiveReadTask("KANEDIAS_E2E_MANAGED_ROOT_INTERRUPT")`; `Manager.SendMessage` therefore emits a Pi `prompt`, not a queued `steer`. Wait for direct `get_state` to report streaming with zero pending messages. Send the server interrupt exactly once, then wait for idle with zero pending messages. This proves an active interrupt through the restarted server without queued work.
+4. Keep all polls bounded and state-based; do not add time sleeps and do not retry steer/interrupt POSTs.
+
+- [ ] **Step 4: Assign independent controls to stable sessions**
+
+In `runServerManaged`, after restarted root fleet rediscovery and before descendant creation, call `exerciseManagedRootInterrupt` for `roots[1]`; `roots[0]` remains the separate descendant owner. Then retain the descendant creation, direct running-child barrier, manager fleet projection barrier, descendant steer, controlled-question answer, and descendant stop. Remove only the immediately-following descendant interrupt call and update comments to describe the split coverage. Root stop and exact cleanup remain unchanged. `exerciseManagedRootInterrupt` ends at an idle/zero-pending barrier before the test proceeds.
+
+The descendant's controlled question is triggered by an extension command; Pi's RPC contract executes extension commands immediately even during streaming, so it remains independent of the queued steer and can be answered before descendant stop.
+
+- [ ] **Step 5: Prove focused GREEN and race safety**
+
+Run:
+
+```bash
+gofmt -w internal/supervisor/live_incus_test.go
+go test -v -count=1 -tags=incus ./internal/supervisor \
+  -run '^Test(ManagedSessionControlStateRequiresExactSuccessfulState|WriteManagedConfigWorkerOverride|ValidateLifecycleModelPolicyRequiresLocalRootAndWorkers|ManagedDescendantFromTreeRequiresOneRunningBoundReadChild|FleetStreamContainsSessionEvaluatesIndividualPatches|FleetStreamContainsExactlyEvaluatesIndividualPatches|ParseManagedServerStartupModes|NormalizeManagedBootstrapURLToEffectiveOrigin|ManagedServerConnection(AuthenticatedAuthority|TrustedNoBootstrap))$'
+go test -race -v -count=1 -tags=incus ./internal/supervisor \
+  -run '^Test(ManagedSessionControlStateRequiresExactSuccessfulState|WriteManagedConfigWorkerOverride|ValidateLifecycleModelPolicyRequiresLocalRootAndWorkers|ManagedDescendantFromTreeRequiresOneRunningBoundReadChild|FleetStreamContainsSessionEvaluatesIndividualPatches|FleetStreamContainsExactlyEvaluatesIndividualPatches|ParseManagedServerStartupModes|NormalizeManagedBootstrapURLToEffectiveOrigin|ManagedServerConnection(AuthenticatedAuthority|TrustedNoBootstrap))$'
+go test -count=1 -tags=incus ./internal/supervisor -run '^$'
+git diff --check
+```
+
+Expected: exact state parsing and both barriers pass; all Task 6B–6E tests remain green normally and under the race detector; tagged compilation succeeds; no production file changes; `git diff --check` is silent.
+
+- [ ] **Step 6: Rerun only the failed managed live acceptance**
+
+Run:
+
+```bash
+set -a; . /home/steven/source/github/kanedias/.env; set +a
+go test -v -count=1 -tags=incus ./internal/supervisor \
+  -run '^TestLiveServerManagedSupervisorAcceptance$' \
+  -timeout 90m
+```
+
+Expected: active root interrupt acknowledges with an empty queue; descendant steer/question/stop all succeed independently; roots stop; exact process/socket/Incus baseline is restored. Preserve and diagnose any later boundary rather than broadening this change.
+
+- [ ] **Step 7: Commit jointly verified managed-acceptance hardening only after live GREEN**
+
+After focused/live GREEN and implementation review:
+
+```bash
+git add internal/supervisor/live_incus_test.go internal/supervisor/live_rpc_lifecycle_support_test.go
+git commit -m "test: harden managed server acceptance"
+```
+
+Update Task 6B through 6F reports with the shared commit and evidence, then resume Task 6 Step 2. Both the dedicated descendant-interrupt and rapid-control scenarios must still run in Task 6 Step 3 and may not borrow this test-only separation as evidence of their correctness.
+
+---
+
 ### Task 7: Prove five consecutive clean runs and complete verification
 
 **Files:**
