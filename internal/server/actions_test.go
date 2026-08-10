@@ -47,6 +47,42 @@ func TestSteerActionPatchesDeckStatus(t *testing.T) {
 	}
 }
 
+// TestSteerActionPatchesCompleteDeckStatusWrapperWithOuterMode verifies the
+// deck-status patch carries the complete #deck-status root element in outer
+// mode. renderTemplate returns the full wrapper, so inner mode would nest that
+// wrapper under its own same-ID root and throw a HierarchyRequestError (no
+// status renders). Pinning the exact payload+mode pairing catches that
+// regression end to end.
+func TestSteerActionPatchesCompleteDeckStatusWrapperWithOuterMode(t *testing.T) {
+	fleet := newStreamFakeFleet()
+	handler, cookie := mustNewHandlerWithFleetAuth(t, fleet)
+
+	resp := serveActionRequest(t, handler, "/ui/sessions/sess-1/steer", `{}`, cookie)
+	if resp.Code != http.StatusOK {
+		t.Fatalf("steer status = %d, want %d; body = %q", resp.Code, http.StatusOK, resp.Body.String())
+	}
+	body := resp.Body.String()
+
+	// The payload must target #deck-status and carry the complete wrapper root,
+	// not just an inner fragment.
+	if !strings.Contains(body, "selector #deck-status") {
+		t.Errorf("steer patch does not select #deck-status:\n%s", body)
+	}
+	if !strings.Contains(body, `<div id="deck-status"`) {
+		t.Errorf("steer patch does not carry the complete #deck-status wrapper:\n%s", body)
+	}
+	// The successful acknowledgment must be present.
+	if !strings.Contains(body, "Command sent.") {
+		t.Errorf("steer patch missing success copy:\n%s", body)
+	}
+	// Outer mode is Datastar's default. Inner mode must NOT be requested,
+	// because inner mode nests the complete wrapper under its own same-ID root
+	// (HierarchyRequestError on the client).
+	if strings.Contains(body, "mode inner") {
+		t.Errorf("steer patch uses inner mode, which would nest the #deck-status wrapper under itself (HierarchyRequestError):\n%s", body)
+	}
+}
+
 // TestInterruptActionPatchesDeckStatus verifies that an interrupt action
 // patches #deck-status.
 func TestInterruptActionPatchesDeckStatus(t *testing.T) {

@@ -228,6 +228,160 @@ test("clear dispatches a bubbling input event and focuses the deck", () => {
   assert.equal(fixture.dispatched[0].bubbles, true);
 });
 
+function makeFakeTimer() {
+  let nextId = 0;
+  const scheduled = new Map();
+  return {
+    setTimeout(fn, delay) {
+      const id = ++nextId;
+      scheduled.set(id, { fn, delay });
+      return id;
+    },
+    clearTimeout(id) { scheduled.delete(id); },
+    fire(id) {
+      const task = scheduled.get(id);
+      if (!task) return false;
+      scheduled.delete(id);
+      task.fn();
+      return true;
+    },
+    pending() { return Array.from(scheduled.entries()); },
+    count() { return scheduled.size; }
+  };
+}
+
+// A minimal stand-in for #deck-status. The transient success span (.deck-ok)
+// carries data-success-id and is removable by the controller; the error node
+// (.deck-error) lives outside that span and is never removed, so errors persist.
+function makeDeckStatusDoc() {
+  const data = { id: null, present: false, errorPresent: false };
+  const span = {
+    getAttribute(name) { return name === "data-success-id" ? data.id : null; }
+  };
+  span.parentNode = {
+    removeChild(child) { if (child === span) data.present = false; }
+  };
+  const errorNode = { getAttribute() { return null; } };
+  return {
+    setSuccess(id) { data.id = id; data.present = true; data.errorPresent = false; },
+    setError() { data.id = null; data.present = false; data.errorPresent = true; },
+    present() { return data.present; },
+    errorPresent() { return data.errorPresent; },
+    querySelector(sel) {
+      if (sel === "#deck-status .deck-ok") return data.present ? span : null;
+      if (sel === "#deck-status .deck-error") return data.errorPresent ? errorNode : null;
+      return null;
+    }
+  };
+}
+
+function makeDeckCtrl(timer) {
+  return ui.createDeckStatusController({
+    delay: 2000,
+    setTimeout: timer.setTimeout,
+    clearTimeout: timer.clearTimeout
+  });
+}
+
+test("deck status success auto-clears after exactly the delay (2000ms)", () => {
+  const timer = makeFakeTimer();
+  const ctrl = makeDeckCtrl(timer);
+  const doc = makeDeckStatusDoc();
+  doc.setSuccess("ack-1");
+  ctrl.schedule(doc);
+  assert.equal(timer.count(), 1);
+  const [id, task] = timer.pending()[0];
+  assert.equal(task.delay, 2000);
+  assert.equal(doc.present(), true);
+  timer.fire(id);
+  assert.equal(doc.present(), false);
+  assert.equal(timer.count(), 0);
+});
+
+test("deck status error is never auto-cleared", () => {
+  const timer = makeFakeTimer();
+  const ctrl = makeDeckCtrl(timer);
+  const doc = makeDeckStatusDoc();
+  // Error-only state: no .deck-ok is present, so nothing is scheduled or
+  // removed and the transient error content stays in place.
+  ctrl.schedule(doc);
+  assert.equal(timer.count(), 0);
+  assert.equal(ctrl.successID(doc), null);
+});
+
+test("repeated identical success restarts the lifetime", () => {
+  const timer = makeFakeTimer();
+  const ctrl = makeDeckCtrl(timer);
+  const doc = makeDeckStatusDoc();
+  doc.setSuccess("ack-1");
+  ctrl.schedule(doc);
+  const [firstId] = timer.pending()[0];
+  // The same marker reappears (morph): it must restart, not accumulate.
+  ctrl.schedule(doc);
+  assert.equal(timer.count(), 1);
+  timer.fire(firstId); // cancelled first timer is a no-op
+  assert.equal(doc.present(), true);
+  const [secondId] = timer.pending()[0];
+  timer.fire(secondId);
+  assert.equal(doc.present(), false);
+});
+
+test("a stale success callback never clears a newer success", () => {
+  const timer = makeFakeTimer();
+  const ctrl = makeDeckCtrl(timer);
+  const doc = makeDeckStatusDoc();
+  doc.setSuccess("ack-1");
+  ctrl.schedule(doc);
+  const [, firstTask] = timer.pending()[0];
+  // A newer success with a distinct marker supersedes the prior one.
+  doc.setSuccess("ack-2");
+  ctrl.schedule(doc);
+  assert.equal(timer.count(), 1);
+  // Even if the older callback fires after cancellation it must not clear
+  // the newer success.
+  firstTask.fn();
+  assert.equal(doc.present(), true);
+  const [secondId] = timer.pending()[0];
+  timer.fire(secondId);
+  assert.equal(doc.present(), false);
+});
+
+test("deck status error never auto-clears an actual .deck-error node", () => {
+  const timer = makeFakeTimer();
+  const ctrl = makeDeckCtrl(timer);
+  const doc = makeDeckStatusDoc();
+  // A real error node with transient success content absent: nothing is
+  // scheduled or removed, and the error persists.
+  doc.setError();
+  ctrl.schedule(doc);
+  assert.equal(timer.count(), 0);
+  assert.equal(ctrl.successID(doc), null);
+  assert.equal(doc.present(), false);
+  assert.equal(doc.errorPresent(), true);
+});
+
+test("deck status error cancels a pending success timer and persists", () => {
+  const timer = makeFakeTimer();
+  const ctrl = makeDeckCtrl(timer);
+  const doc = makeDeckStatusDoc();
+  // Begin as a pending success (auto-clear scheduled).
+  doc.setSuccess("ack-1");
+  ctrl.schedule(doc);
+  assert.equal(timer.count(), 1);
+  const [, firstTask] = timer.pending()[0];
+  assert.equal(doc.present(), true);
+  // Transition to an actual .deck-error: the pending success timer must be
+  // canceled so the error is never auto-cleared.
+  doc.setError();
+  ctrl.schedule(doc);
+  assert.equal(timer.count(), 0);
+  // Even if the stale captured callback fires after cancellation, it is a
+  // no-op and must not remove the error node.
+  firstTask.fn();
+  assert.equal(doc.errorPresent(), true);
+  assert.equal(doc.present(), false);
+});
+
 test("Ctrl-O with no cards primes a fresh patched card", () => {
   let cards = [];
   const root = {querySelectorAll: selector => selector === "[data-tool-card]" ? cards : []};

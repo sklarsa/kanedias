@@ -4,7 +4,9 @@ import (
 	"errors"
 	"fmt"
 	"sort"
+	"strconv"
 	"strings"
+	"sync/atomic"
 
 	"github.com/sklarsa/kanedias/internal/manager"
 	"github.com/sklarsa/kanedias/internal/supervisor"
@@ -258,6 +260,11 @@ type activityView struct {
 type deckStatusView struct {
 	Error   string
 	Success bool
+	// SuccessID is a per-acknowledgment marker rendered only on the transient
+	// success span. Datastar morphs identical DOM, so the client needs a fresh
+	// marker to distinguish every "Command sent." acknowledgment and restart
+	// its 2000ms auto-clear lifetime.
+	SuccessID string
 }
 
 // contextView holds nullable context metrics for the Astrolabe dial.
@@ -534,10 +541,19 @@ func emptySessionState() manager.SessionState {
 	return manager.SessionState{}
 }
 
+// deckStatusCounter serializes per-success markers so two rapid
+// acknowledgments never collide even when the browser sees identical DOM.
+var deckStatusCounter atomic.Uint64
+
+// genDeckSuccessID returns a fresh, monotonically increasing success marker.
+func genDeckSuccessID() string {
+	return "ack-" + strconv.FormatUint(deckStatusCounter.Add(1), 10)
+}
+
 // newDeckStatusView converts an operation error into a deck status view.
 func newDeckStatusView(err error) deckStatusView {
 	if err == nil {
-		return deckStatusView{Success: true}
+		return deckStatusView{Success: true, SuccessID: genDeckSuccessID()}
 	}
 	return deckStatusView{Error: operatorMessage(err)}
 }
