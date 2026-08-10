@@ -1,6 +1,6 @@
 {{define "deck-status.html"}}
 <div id="deck-status" role="status">
   {{if .Error}}<span class="deck-error">{{.Error}}</span>{{end}}
-  {{if .Success}}<span class="deck-ok">Command sent.</span>{{end}}
+  {{if .Success}}<span class="deck-ok" data-success-id="{{.SuccessID}}">Command sent.</span>{{end}}
 </div>
 {{end}}

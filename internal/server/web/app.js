@@ -247,6 +247,24 @@
 
   terminalUI.observeDeckCapabilities(document, MutationObserver);
 
+  /* -------- Deck status success auto-clears after 2000ms; errors persist -------- */
+  (function () {
+    var deckStatus = document.getElementById("deck-status");
+    if (!deckStatus) return;
+    var deckStatusController = terminalUI.createDeckStatusController({ delay: 2000 });
+    var observer = new MutationObserver(function () {
+      deckStatusController.schedule(document);
+    });
+    observer.observe(deckStatus, {
+      childList: true,
+      subtree: true,
+      attributes: true,
+      attributeFilter: ["data-success-id"]
+    });
+    // Handle a success already present before the observer was installed.
+    deckStatusController.schedule(document);
+  })();
+
   /* -------- Alert banner jumps to first question (delegated) -------- */
   document.addEventListener("click", function (e) {
     if (!e.target.closest("#alertBanner")) return;

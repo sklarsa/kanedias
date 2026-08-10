@@ -32,6 +32,11 @@ func patchDeckStatusAction(w http.ResponseWriter, r *http.Request, templates *te
 		return
 	}
 	sse := datastar.NewSSE(w, r)
+	// Outer mode morphs the complete rendered #deck-status wrapper onto the
+	// existing same-ID root, keeping that stable root in place while the client
+	// clears the transient success span (and its marker). Inner mode would nest
+	// the returned wrapper under its own same-ID root and throw a
+	// HierarchyRequestError, so it must not be used here.
 	if sseErr := sse.PatchElements(html, datastar.WithSelectorID("deck-status"), datastar.WithModeOuter()); sseErr != nil {
 		logger.Error("patch deck-status", "error", sseErr)
 	}

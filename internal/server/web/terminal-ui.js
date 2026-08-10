@@ -124,6 +124,69 @@
     };
   }
 
+  // createDeckStatusController schedules the transient auto-clear for success
+  // acknowledgments rendered in #deck-status ("Command sent."). Errors are
+  // never auto-cleared. A newer success cancels/supersedes the older timeout,
+  // and a stale callback that fires after cancellation is a no-op so it can
+  // never clear a newer success. Each success carries a unique data-success-id
+  // marker from the server so even identical acknowledgments (which Datastar
+  // morphs to the same DOM shape) restart the 2000ms lifetime.
+  function createDeckStatusController(options) {
+    options = options || {};
+    var delay = options.delay == null ? 2000 : options.delay;
+    var setTimeoutFn = options.setTimeout || (typeof setTimeout === "function" ? setTimeout.bind(null) : null);
+    var clearTimeoutFn = options.clearTimeout || (typeof clearTimeout === "function" ? clearTimeout.bind(null) : null);
+
+    var state = { pendingID: null, timer: null };
+
+    function successSpan(documentObject) {
+      return documentObject && typeof documentObject.querySelector === "function"
+        ? documentObject.querySelector("#deck-status .deck-ok")
+        : null;
+    }
+
+    function successID(documentObject) {
+      var span = successSpan(documentObject);
+      if (!span || typeof span.getAttribute !== "function") return null;
+      return span.getAttribute("data-success-id") || null;
+    }
+
+    function clearCurrent(documentObject, id) {
+      // Stale callback (superseded by a newer success): never clear newer state.
+      if (id !== state.pendingID) return;
+      var span = successSpan(documentObject);
+      if (span && span.parentNode) span.parentNode.removeChild(span);
+      state.pendingID = null;
+      state.timer = null;
+    }
+
+    // schedule reads the current success marker and (re)starts the lifetime.
+    // Called on every #deck-status mutation. Errors (no .deck-ok) cancel any
+    // pending success timer and leave the transient error content untouched.
+    function schedule(documentObject) {
+      var id = successID(documentObject);
+      if (id === null) {
+        if (state.timer !== null && clearTimeoutFn) clearTimeoutFn(state.timer);
+        state.pendingID = null;
+        state.timer = null;
+        return;
+      }
+      // Newer success cancels the older timeout; identical (re-morphed) markers
+      // also restart from here.
+      if (state.timer !== null && clearTimeoutFn) clearTimeoutFn(state.timer);
+      state.pendingID = id;
+      var capturedID = id;
+      state.timer = setTimeoutFn(function () {
+        clearCurrent(documentObject, capturedID);
+      }, delay);
+    }
+
+    return {
+      schedule: schedule,
+      successID: successID
+    };
+  }
+
   function performAction(action, context) {
     if (!action) return false;
     var event = context.event;
@@ -172,6 +235,7 @@
     syncDeckState: syncDeckState,
     observeDeckCapabilities: observeDeckCapabilities,
     createToolExpansionController: createToolExpansionController,
+    createDeckStatusController: createDeckStatusController,
     performAction: performAction
   };
 });
