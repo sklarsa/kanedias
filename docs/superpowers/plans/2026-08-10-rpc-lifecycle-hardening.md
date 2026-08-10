@@ -1702,6 +1702,111 @@ After Tasks 6J and 6K pass live, rerun Task 6H rapid control and Task 6I determi
 
 ---
 
+### Task 6L: Quiesce admitted child RPC handlers before terminal report acknowledgement
+
+**Failed invariant and evidence:**
+
+- After Tasks 6G/6K, `/home/steven/.cache/kanedias/e2e/e2e-3539447-1786400920601429667/` proves the root post-abort probe succeeded and the deep child reached streaming. Pi then emitted exact child `message_end(stopReason=aborted) -> agent_end -> agent_settled`, and the asynchronous child-create call returned exact 409 `child_aborted` with message `read child was aborted`.
+- The routed child `abort` request itself still returned normalized 502 `child_unavailable ... internal supervisor error`. The child root log contains the typed aborted result followed by process exit 1; cleanup restored the exact Incus baseline.
+- Task 6G correctly moved typed failure publication before deferred `node.Stop`, but `reporter.Failure` may be acknowledged by the direct parent before the child supervisor's already-admitted `Node.CallRPC(abort)` handler has received and returned Pi's response. The child runtime then leaves `reporter.Failure`, runs deferred `node.Stop`, and closes Pi RPC underneath that handler. Which path wins is timing-dependent: the mixed-sibling abort passed on the same code while this isolated deep abort failed.
+- Earliest divergence is therefore terminal publication versus completion of an already-admitted child RPC handler, not Pi abort, terminal classification, descendant routing, model compliance, timeout length, or cleanup. Do not retry abort, delay acknowledgement, inflate the ten-second descendant timeout, or special-case a 502 as success.
+
+**Files:**
+
+- Modify/Test: `internal/supervisor/node.go`, `internal/supervisor/node_test.go`
+- Modify/Test: `cmd/session_runtime.go`, `cmd/session_runtime_test.go`
+- Read comparison only: `internal/supervisorapi/handler.go`, `internal/supervisorapi/client.go`, `internal/supervisor/process/protocol.go`
+
+**Interfaces and ordering:**
+
+- `Node.CallRPC` admits or rejects each routed RPC under a private gate, counts admitted calls until their exact return, and preserves all existing binding/command/error behavior.
+- Child terminal quiescence atomically closes new RPC admission and waits for every already-admitted call to return. It is used only by the read-child terminal path, not explicit parent cancellation.
+- For abort, the already-admitted handler returns its exact successful Pi response before the child publishes `MessageFailure(child_aborted)`. The direct parent can then acknowledge, after which normal child teardown begins.
+- Inherited-context cancellation skips terminal quiescence/publication and retains Task 6G's ack/liveness cancellation path.
+
+Independent review of this Task 6L amendment is required before Step 1 edits production.
+
+- [ ] **Step 1: Add channel-coordinated RED RPC-quiescence regressions**
+
+In `internal/supervisor/node_test.go`, add a test with a bound fake local RPC peer and explicit channels:
+
+1. Start one admitted `Node.CallRPC` and hold its matching Pi response.
+2. Begin terminal quiescence in another goroutine and prove it does not return while that call is active.
+3. Prove a new RPC after quiescence admission closes is rejected with exact `session_stopping` without reaching the fake peer.
+4. Release the original response; require that call to return exact success and quiescence to return nil.
+5. Repeated/concurrent quiescence callers observe the same closed admission and completed drain without panic or reopen.
+
+In `cmd/session_runtime_test.go`, extend the Task 6G read-failure ordering regression so an admitted abort-like `Node.CallRPC` remains blocked when `RunReadTask` observes aborted settlement. Require no terminal failure report until that RPC response is released; then require exact RPC success, one typed `MessageFailure(child_aborted)`, parent acknowledgement, and only afterward listener/runtime teardown. Add the success-result comparison if needed to prove natural read results use the same quiescence boundary. Use channels, never sleeps, as the ordering seam.
+
+- [ ] **Step 2: Prove RED before implementation**
+
+Run the exact new focused tests. Expected RED: compile failure for the missing quiescence seam or an ordering assertion showing the terminal failure report appears while the admitted RPC remains blocked. Record the exact command/output before production edits.
+
+- [ ] **Step 3: Add a monotonic per-node RPC admission/drain gate**
+
+In `Node`, add a private mutex-protected RPC gate with:
+
+1. a boolean permanently closing new admission for terminal teardown;
+2. an exact active-call count; and
+3. an idle notification channel created on the zero-to-one transition and closed on the one-to-zero transition.
+
+`Node.CallRPC` must preserve its current lifecycle/local checks, then atomically reject closed admission with `contract.ErrorSessionStopping` or increment the count, and always decrement in a defer after `local.CallRPC` returns. No `sync.WaitGroup` Add/Wait race is permitted.
+
+Add an exported child-runtime method with a narrow name such as `QuiesceRPC(ctx) error`. It atomically closes admission, returns immediately when no call is active, or snapshots the current idle channel, releases the gate mutex, and only then waits for idle/context so the in-flight call's deferred decrement can reacquire the mutex and close the channel. Repeated callers are idempotent. It must not stop Pi, close the Unix listener, mutate binding/model identity, or reopen admission.
+
+- [ ] **Step 4: Quiesce before publishing any read-child terminal report**
+
+In `productionChildRunnerWithRuntime` read handling:
+
+1. If inherited context cancellation won, retain Task 6G behavior: publish nothing and return for parent-owned cancellation.
+2. Otherwise create a bounded cleanup context from `context.WithoutCancel(ctx)` using the existing child runtime cleanup bound and call `node.QuiesceRPC` before `reporter.Read` or `publishReadFailure`.
+3. On a normal read result, a quiescence failure must not publish success; publish one fixed privacy-safe internal failure instead and return the joined diagnostics.
+4. On an existing typed read failure such as `child_aborted`, quiesce first, then publish that same typed code/message; retain any quiescence error only in joined local diagnostics.
+5. The existing deferred `node.Stop` remains after terminal report acknowledgement. `Reporter.TerminalSent` still prevents duplicate outer publication.
+
+Do not change top-level root RPC semantics, explicit cancellation, reporter acknowledgement bytes, supervisor API timeout, or error normalization.
+
+- [ ] **Step 5: Prove focused/full GREEN and race safety**
+
+```bash
+gofmt -w internal/supervisor/node.go internal/supervisor/node_test.go \
+  cmd/session_runtime.go cmd/session_runtime_test.go
+go test -v -count=1 ./internal/supervisor ./cmd \
+  -run '<exact Task 6L RPC quiescence regression alternation>'
+go test -race -v -count=1 ./internal/supervisor ./cmd \
+  -run '<exact Task 6L RPC quiescence regression alternation>'
+go test -count=1 ./internal/supervisor ./cmd
+go test -race -count=1 ./internal/supervisor ./cmd
+go vet ./internal/supervisor ./cmd
+git diff --check
+```
+
+Expected: admitted-call response precedes terminal report, new calls fail closed, repeated drains are safe, Task 6G cancellation/failure tests remain green, full packages pass normally and under race, and diff check is silent.
+
+- [ ] **Step 6: Rerun interrupt and mixed abort once**
+
+```bash
+set -a; . /home/steven/source/github/kanedias/.env; set +a
+go test -v -count=1 -tags=incus ./internal/supervisor \
+  -run '^TestLiveRPC(Interrupt|MixedSibling)Lifecycle$' -timeout 2h
+```
+
+Expected: both root/child abort acknowledgements return exact success before child terminal 409; mixed natural/delete/abort outcomes stay independent; all terminal/action/event/resource invariants pass; exact baseline is restored.
+
+- [ ] **Step 7: Review, commit, and resume remaining live gates**
+
+After independent implementation review:
+
+```bash
+git add internal/supervisor/node.go internal/supervisor/node_test.go \
+  cmd/session_runtime.go cmd/session_runtime_test.go
+git commit -m "fix: drain child RPC before terminal teardown"
+```
+
+Then rerun Task 6H rapid control and Task 6I deterministic children on the final code, followed by all eight scenarios once. Any failure receives another evidence-gated amendment.
+
+---
+
 ### Task 7: Prove five consecutive clean runs and complete verification
 
 **Files:**
