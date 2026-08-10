@@ -39,6 +39,7 @@
     <div class="row st-{{.Lifecycle}}"
          data-session-id="{{.RootSessionID}}"
          data-lifecycle="{{.Lifecycle}}"
+         data-class:sel="$selectedSessionId === el.dataset.sessionId"
          data-on:click="$selectedSessionId = el.dataset.sessionId; @get('/ui/session', {payload:{selectedSessionId:el.dataset.sessionId}, requestCancellation:'auto'})"
     >
       <span class="twisty">▸</span>
@@ -75,6 +76,7 @@
     <div class="row st-{{.Lifecycle}}"
          data-session-id="{{.SessionID}}"
          data-lifecycle="{{.Lifecycle}}"
+         data-class:sel="$selectedSessionId === el.dataset.sessionId"
          data-on:click="$selectedSessionId = el.dataset.sessionId; @get('/ui/session', {payload:{selectedSessionId:el.dataset.sessionId}, requestCancellation:'auto'})"
     >
       <span class="twisty">▸</span>
@@ -99,6 +101,7 @@
 <div class="row leaf st-{{.Lifecycle}}"
      data-session-id="{{.SessionID}}"
      data-lifecycle="{{.Lifecycle}}"
+     data-class:sel="$selectedSessionId === el.dataset.sessionId"
      data-on:click="$selectedSessionId = el.dataset.sessionId; @get('/ui/session', {payload:{selectedSessionId:el.dataset.sessionId}, requestCancellation:'auto'})"
 >
   <span class="twisty">·</span>
