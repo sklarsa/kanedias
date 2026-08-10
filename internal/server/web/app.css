@@ -27,6 +27,7 @@
   --cyan-glow:     rgba(94,198,216,.14);
 
   --topbar-h: 52px;
+  --fleet-width:340px;
 
   --mono: ui-monospace, "SF Mono", "Cascadia Mono", "Consolas", "Roboto Mono", monospace;
   --serif: "Iowan Old Style", "Palatino Linotype", Palatino, "URW Palladio L", Georgia, serif;
@@ -70,11 +71,11 @@ body{
 .app{
   display:grid;
   grid-template-rows:var(--topbar-h) minmax(0,1fr) auto;
-  grid-template-columns: 340px 1fr;
+  grid-template-columns:var(--fleet-width) 8px minmax(0,1fr);
   grid-template-areas:
-    "top  top"
-    "side main"
-    "deck deck";
+    "top  top    top"
+    "side resize main"
+    "deck deck   deck";
   height:100vh;
   width:100vw;
 }
@@ -161,10 +162,17 @@ body{
 }
 
 .icon-btn{
-  display:none; /* hamburger, shown on mobile */
+  display:none; /* hamburger, shown on mobile or when the desktop Fleet is collapsed */
+  align-items:center; justify-content:center;
   background:var(--bg-sunk); color:var(--brass); border:1px solid var(--brass-line);
   border-radius:2px; width:34px;height:32px; font-size:16px; cursor:pointer;
 }
+.app.fleet-collapsed #menuBtn{ display:inline-flex; }
+.app.fleet-collapsed{
+  grid-template-columns:0 0 minmax(0,1fr);
+}
+.app.fleet-collapsed #fleet-panel,
+.app.fleet-collapsed #fleet-resizer{ display:none; }
 
 /* ============================================================
    SIDEBAR — nested agent tree
@@ -174,6 +182,35 @@ body{
   min-width:0; min-height:0;
   display:flex;
 }
+#fleet-resizer{
+  grid-area:resize;
+  position:relative;
+  z-index:12;
+  cursor:col-resize;
+  touch-action:none;
+  background:var(--bg-sunk);
+  border-left:1px solid var(--brass-line-2);
+  border-right:1px solid var(--brass-line-2);
+  outline:none;
+}
+#fleet-resizer::after{
+  content:"";
+  position:absolute;
+  top:50%; left:50%;
+  width:2px; height:42px;
+  transform:translate(-50%,-50%);
+  background:var(--brass-line);
+  box-shadow:0 0 8px rgba(216,169,74,.15);
+}
+#fleet-resizer:hover,
+#fleet-resizer:focus-visible,
+.app.fleet-resizing #fleet-resizer{
+  background:rgba(216,169,74,.13);
+  border-color:var(--brass);
+}
+#fleet-resizer:focus-visible{ box-shadow:inset 0 0 0 1px var(--brass-bright); }
+.app.fleet-resizing{ cursor:col-resize; user-select:none; }
+.app.fleet-resizing *{ cursor:col-resize!important; }
 .sidebar{
   width:100%;
   background:linear-gradient(180deg,#0a1521,#081221);
@@ -205,7 +242,20 @@ body{
   font-family:var(--serif); color:var(--brass-bright);
   letter-spacing:.2em; text-transform:uppercase; font-size:11px;
 }
-.side-head .htitle .cnt{ color:var(--ink-faint); font-size:10px; letter-spacing:.1em; }
+.side-head .htitle .cnt{ color:var(--ink-faint); font-size:10px; letter-spacing:.1em; margin-left:auto; }
+.fleet-collapse{
+  flex:0 0 auto;
+  width:25px; height:23px;
+  display:inline-flex; align-items:center; justify-content:center;
+  padding:0;
+  border:1px solid var(--brass-line);
+  border-radius:2px;
+  background:var(--bg-sunk);
+  color:var(--brass-bright);
+  font-family:var(--mono); font-size:18px; line-height:1;
+  cursor:pointer;
+}
+.fleet-collapse:hover{ border-color:var(--brass); background:rgba(216,169,74,.1); }
 
 .search-wrap{ position:relative; }
 .search-wrap svg, .search-wrap .mag{
@@ -962,19 +1012,24 @@ details[open] > summary .twisty{ transform:rotate(90deg); }
 .scrim.show{ display:block; }
 
 @media (max-width:1100px){
-  .app{ grid-template-columns:300px 1fr; }
+  .app{ --fleet-width:300px; }
   .deck-hint{ display:none; }
 }
 
 @media (max-width:820px){
   :root{ --topbar-h:50px; }
-  .app{
+  .app,
+  .app.fleet-collapsed{
     grid-template-columns:1fr;
     grid-template-areas:
       "top"
       "main"
       "deck";
   }
+  .app.fleet-collapsed #fleet-panel,
+  #fleet-panel{ display:contents; }
+  #fleet-resizer,
+  .fleet-collapse{ display:none; }
   /* sidebar becomes a top slide-over sheet */
   .sidebar{
     position:fixed; top:var(--topbar-h); left:0; right:0;
@@ -986,7 +1041,8 @@ details[open] > summary .twisty{ transform:rotate(90deg); }
     box-shadow:0 12px 40px rgba(0,0,0,.6);
   }
   .sidebar.open{ transform:translateY(0); }
-  .icon-btn{ display:inline-flex; align-items:center; justify-content:center; }
+  .icon-btn,
+  .app.fleet-collapsed #menuBtn{ display:inline-flex; align-items:center; justify-content:center; }
   .brand-txt .t2{ display:none; }
   .session-pill{ display:none; }
   .alert-banner{ font-size:10px; padding:5px 10px 5px 8px; }

@@ -194,6 +194,8 @@ func TestHandlerRoutes(t *testing.T) {
 				"<title>Kanedias — Circle of the Fleet</title>",
 				`id="alertBanner"`,
 				`id="fleet-panel"`,
+				`id="fleet-resizer"`,
+				`src="/assets/fleet-layout.js"`,
 				`id="detail-panel"`,
 				`id="question-panel"`,
 				`id="activity-panel"`,
@@ -266,6 +268,13 @@ func TestHandlerRoutes(t *testing.T) {
 			contentType: "text/javascript; charset=utf-8",
 		},
 		{
+			name:        "Fleet layout controller",
+			path:        "/assets/fleet-layout.js",
+			method:      http.MethodGet,
+			status:      http.StatusOK,
+			contentType: "text/javascript; charset=utf-8",
+		},
+		{
 			name:   "unknown",
 			path:   "/unknown",
 			method: http.MethodGet,
@@ -326,6 +335,7 @@ func TestHandlerRejectsUnsupportedMethods(t *testing.T) {
 		{"/assets/app.css", false},
 		{"/assets/datastar.js", false},
 		{"/assets/session-modal.js", false},
+		{"/assets/fleet-layout.js", false},
 		{"/", true},
 		{"/ui/status", true},
 	}
@@ -439,6 +449,9 @@ func TestInitialPageContainsAstrolabeConsole(t *testing.T) {
 		`<html lang="en" data-theme="dark">`,
 		// shell stable Datastar patch roots
 		`id="fleet-panel"`,
+		`id="fleet-resizer"`, `role="separator"`, `aria-orientation="vertical"`,
+		`aria-controls="fleet-panel main-stack"`, `tabindex="0"`,
+		`src="/assets/fleet-layout.js"`,
 		`id="detail-panel"`,
 		`data-can-steer="false"`,
 		`data-can-interrupt="false"`,
@@ -516,17 +529,17 @@ func TestAstrolabeConsoleIsInteractive(t *testing.T) {
 	body := response.Body.String()
 
 	// The console is wired by local asset modules (Datastar, Marked, Highlight,
-	// the Markdown renderer, terminal decisions, the session modal, and app.js).
-	// There are no external scripts and no inline controller.
+	// the Markdown renderer, terminal decisions, Fleet layout, the session modal,
+	// attachments, and app.js). There are no external scripts or inline controller.
 	scriptRE := regexp.MustCompile(`(?s)<script\b([^>]*)>(.*?)</script>`)
 	scripts := scriptRE.FindAllStringSubmatch(body, -1)
-	wantScripts := 8 // Datastar + 3 Markdown assets + terminal decisions + session modal + attachments + app.js
+	wantScripts := 9 // Datastar + 3 Markdown assets + terminal decisions + Fleet layout + session modal + attachments + app.js
 	if len(scripts) != wantScripts {
-		t.Fatalf("script count = %d, want %d (Datastar + 3 Markdown assets + terminal-ui.js + session-modal.js + image-attachments.js + app.js)", len(scripts), wantScripts)
+		t.Fatalf("script count = %d, want %d", len(scripts), wantScripts)
 	}
 
-	var sawDatastar, sawTerminalUI, sawSessionModal, sawAttachments, sawAppJS bool
-	attachmentIndex, appIndex := -1, -1
+	var sawDatastar, sawTerminalUI, sawFleetLayout, sawSessionModal, sawAttachments, sawAppJS bool
+	fleetLayoutIndex, attachmentIndex, appIndex := -1, -1, -1
 	markdownAssets := []string{
 		`src="/assets/marked.min.js"`,
 		`src="/assets/highlight.min.js"`,
@@ -552,6 +565,13 @@ func TestAstrolabeConsoleIsInteractive(t *testing.T) {
 				t.Errorf("terminal-ui.js script has unexpected inline body %q", inner)
 			}
 			sawTerminalUI = true
+		}
+		if strings.Contains(attrs, `src="/assets/fleet-layout.js"`) {
+			if inner != "" {
+				t.Errorf("fleet-layout.js script has unexpected inline body %q", inner)
+			}
+			sawFleetLayout = true
+			fleetLayoutIndex = scriptIndex
 		}
 		if strings.Contains(attrs, `src="/assets/session-modal.js"`) {
 			if inner != "" {
@@ -585,6 +605,9 @@ func TestAstrolabeConsoleIsInteractive(t *testing.T) {
 	if !sawTerminalUI {
 		t.Error("page is missing the local terminal-ui.js script")
 	}
+	if !sawFleetLayout {
+		t.Error("page is missing the local fleet-layout.js script")
+	}
 	if !sawSessionModal {
 		t.Error("page is missing the local session-modal.js script")
 	}
@@ -593,6 +616,9 @@ func TestAstrolabeConsoleIsInteractive(t *testing.T) {
 	}
 	if !sawAppJS {
 		t.Error("page is missing the app.js script")
+	}
+	if fleetLayoutIndex < 0 || appIndex < 0 || fleetLayoutIndex >= appIndex {
+		t.Error("fleet-layout.js must load before app.js")
 	}
 	if attachmentIndex < 0 || appIndex < 0 || attachmentIndex >= appIndex {
 		t.Error("image-attachments.js must load before app.js")
@@ -817,6 +843,11 @@ func TestTemplatesDefineStableRoots(t *testing.T) {
 	}
 	if !strings.Contains(fleetHTML, `id="fleet-panel"`) {
 		t.Errorf("fleet.html does not contain #fleet-panel root")
+	}
+	for _, want := range []string{`data-fleet-collapse`, `aria-label="Hide Fleet"`} {
+		if !strings.Contains(fleetHTML, want) {
+			t.Errorf("fleet.html does not contain %q", want)
+		}
 	}
 
 	// Render the detail template with an empty state.
@@ -1610,7 +1641,7 @@ func TestAssetsAreEmbedded(t *testing.T) {
 	})
 
 	// Unauthenticated paths.
-	for _, path := range []string{"/healthz", "/assets/terminal.css", "/assets/app.css", "/assets/datastar.js", "/assets/terminal-ui.js", "/assets/session-modal.js", "/assets/image-attachments.js", "/assets/app.js"} {
+	for _, path := range []string{"/healthz", "/assets/terminal.css", "/assets/app.css", "/assets/datastar.js", "/assets/terminal-ui.js", "/assets/fleet-layout.js", "/assets/session-modal.js", "/assets/image-attachments.js", "/assets/app.js"} {
 		if response := serveRequest(handler, http.MethodGet, path); response.Code != http.StatusOK {
 			t.Errorf("GET %s status = %d, want %d", path, response.Code, http.StatusOK)
 		}
@@ -1688,6 +1719,7 @@ func TestRenderedPageHasOnlyOrderedLocalRuntimeAssets(t *testing.T) {
 		"/assets/highlight.min.js",
 		"/assets/markdown-renderer.js",
 		"/assets/terminal-ui.js",
+		"/assets/fleet-layout.js",
 		"/assets/session-modal.js",
 		"/assets/image-attachments.js",
 		"/assets/app.js",
@@ -1751,6 +1783,13 @@ func TestProjectStylesDefineAstrolabeVisualSystem(t *testing.T) {
 		"#new-session-modal[aria-busy=\"true\"]",
 		"#new-session-modal select:focus-visible",
 		"min-height:44px",
+		// persistent desktop Fleet layout and controls
+		`--fleet-width:`,
+		`grid-template-columns:var(--fleet-width)`,
+		`#fleet-resizer{`,
+		`.app.fleet-collapsed`,
+		`.fleet-collapse`,
+		`cursor:col-resize`,
 	}
 	for _, want := range required {
 		if !strings.Contains(styles, want) {
