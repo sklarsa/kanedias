@@ -75,13 +75,13 @@ func newSessionCommand(service services, configPath func() string) *cobra.Comman
 			if inheritedBootstrap {
 				bootstrapFile = own(bootstrapFD, "root-bootstrap")
 				if bootstrapFile != nil {
-					defer bootstrapFile.Close()
+					defer func() { _ = bootstrapFile.Close() }()
 				}
 			}
 			if inheritedStatus {
 				rootStatus = own(statusFD, "root-status")
 				if rootStatus != nil {
-					defer rootStatus.Close()
+					defer func() { _ = rootStatus.Close() }()
 				}
 			}
 

@@ -402,8 +402,8 @@ func TestSessionInheritedFDsAreMarkedCloseOnExec(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	defer bootstrapWrite.Close()
-	defer statusRead.Close()
+	defer func() { _ = bootstrapWrite.Close() }()
+	defer func() { _ = statusRead.Close() }()
 	command := exec.Command(os.Args[0], "-test.run=TestSessionInheritedFDsAreMarkedCloseOnExec", "--")
 	command.Env = append(os.Environ(), "KANEDIAS_SESSION_CLOEXEC_HELPER=1")
 	command.ExtraFiles = []*os.File{bootstrapRead, statusWrite}
