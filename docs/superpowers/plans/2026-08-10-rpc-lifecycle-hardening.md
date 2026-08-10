@@ -525,7 +525,7 @@ Before each scenario marks success, write:
 - pre-control, post-control, and final tree snapshots; and
 - exact resource snapshots.
 
-Assert monotonic broker sequence, monotonic per-session source sequence, no duplicate `(sessionID, sourceSeq)`, and one non-overlapping `agent_start`/`agent_end` pair per observed generation. Treat `agent_settled` as an optional post-end confirmation in the shared validator because Pi may omit it for an aborted generation when queued work starts immediately; retain exact `agent_settled` totals in each scenario whose control contract requires them. Also require no remaining descendant socket, no owned process, and no proxy warning.
+Assert monotonic broker sequence, monotonic per-session source sequence, no duplicate `(sessionID, sourceSeq)`, and one non-overlapping `agent_start`/`agent_end` pair per observed generation unless that session is explicitly recorded as externally cancelled before final validation. External cancellation may truncate event forwarding after `agent_start`; an unclosed generation without exact cancellation evidence remains invalid. Treat `agent_settled` as an optional post-end confirmation in the shared validator because Pi may omit it for an aborted generation when queued work starts immediately; retain exact `agent_settled` totals in each scenario whose control contract requires them. Also require no remaining descendant socket, no owned process, and no proxy warning.
 
 - [ ] **Step 5: Format, compile, race support tests, and commit**
 
@@ -1503,7 +1503,7 @@ Change only `validateLifecycleFinalEvents`:
 1. `agent_start` opens a generation and clears any unconsumed settlement eligibility from an earlier ended generation.
 2. `agent_end` requires one open generation, closes it, and makes that ended generation eligible for at most one `agent_settled` confirmation.
 3. `agent_settled` is allowed only with no open generation and one current eligible ended generation, then consumes eligibility.
-4. Final validation requires no open generation but does not require every ended generation to settle.
+4. Final validation requires no open generation unless a later evidence-gated amendment supplies exact external-cancellation identity for that session; it does not require every ended generation to settle.
 5. Preserve strict broker sequence, source sequence, source identity, and JSON parsing behavior.
 
 Do not weaken `validateLifecycleSettlementTotals`, `waitLifecycleSettlement`, or scenario-specific exact settlement counts.
@@ -1582,6 +1582,123 @@ git commit -m "test: shorten lifecycle provenance markers"
 ```
 
 After Tasks 6G–6I are independently live GREEN, rerun all eight scenarios once. Only a complete clean matrix may proceed to Task 7; any code change or failure resets the affected scenario's five-run count.
+
+---
+
+### Task 6J: Admit truncated generations only for explicitly cancelled sessions
+
+**Failed invariant and evidence:**
+
+- After Task 6G, `/home/steven/.cache/kanedias/e2e/e2e-3496270-1786399903873442764/` returns exact 409 `child_aborted`, removes the child, proves the root usable, exits cleanly, and restores baseline; only final validation rejects the cancelled child's `agent_start` without `agent_end`.
+- `/home/steven/.cache/kanedias/e2e/e2e-3496270-1786399926571384197/` likewise returns exact 409 `child_aborted` for all three root-cascade children and reaches final validation; each cancelled child ends its forwarded stream after the user message.
+- In both corresponding pre-Task-6G artifacts, externally stopped children already lacked `agent_end`/`agent_settled`; Task 6G did not remove those events. `cleanupChild` marks descendant stream closure expected and cancels forwarding as part of parent-owned cancellation, so a forced cancellation intentionally does not promise a complete Pi terminal stream.
+- `/home/steven/.cache/kanedias/e2e/e2e-3496270-1786400019776431893/` proves outcome separation: abort child has `message_end(aborted) -> agent_end -> agent_settled` and returns 409; natural child has `message_end(stop) -> agent_end -> agent_settled` and returns 200; external DELETE child returns 409 but has no settlement. The timeout waiting for one DELETE settlement and the shared no-open-generation rule are test-contract defects.
+- Do not globally accept unclosed generations. Only a session recorded from an accepted external `DELETE` (including descendants present in the root tree immediately before root DELETE) may end with an open generation.
+
+**Files and scope:**
+
+- Modify/Test only: `internal/supervisor/live_rpc_lifecycle_support_test.go`, `internal/supervisor/live_rpc_lifecycle_test.go`
+- Do not modify Task 6G production cancellation, event forwarding, Pi, or settlement behavior.
+
+Independent review of this Task 6J amendment is required before implementation.
+
+- [ ] **Step 1: Add RED cancellation-evidence regressions**
+
+Change the pure validator contract to accept an explicit set of externally cancelled session IDs. Extend `TestValidateLifecycleFinalEventsRequiresOrderedPairedGenerations` with the same unclosed `agent_start` sequence twice: it must remain invalid with an empty allowed set and become valid only when that exact session ID is in the allowed set. A different allowed ID must not help. Keep every existing ordering/end/settlement invalid case.
+
+Add a pure test for recording a cancellation tree: recording a direct child includes only that target; recording a root from a current tree includes the root and every currently projected descendant; empty/unknown IDs are not added accidentally. The RED must be a compile failure for the missing explicit-cancellation seams or a focused assertion failure against the unchanged validator.
+
+- [ ] **Step 2: Record exact external cancellation identity at the action boundary**
+
+In `lifecycleRoot`, add a mutex-protected set of externally cancelled session IDs and initialize it with the other root evidence state. Immediately before `deleteLifecycleSession` sends a request:
+
+1. For a non-root target, record exactly that session ID.
+2. For root DELETE, read the current root tree and record the root plus every descendant present in that snapshot. A failed snapshot records only the root; any unrecorded open descendant still fails final validation rather than being broadly excused.
+3. A rejected/transport-failed DELETE still fails its scenario at the existing status assertion, so the evidence cannot mask an unsuccessful control.
+4. Do not record Pi `abort`, natural completion, steer, or root-usability prompts as external cancellation.
+
+Pass an immutable copy of this set to `validateLifecycleFinalEvents` at the fully drained final boundary. The validator still closes generations on `agent_end`; at EOF it permits an open generation only when that exact session is externally cancelled. Ordering, uniqueness, end-without-start, overlap, and settled-state validation remain strict for all sessions.
+
+- [ ] **Step 3: Remove the nonexistent mixed-DELETE settlement promise without weakening siblings**
+
+In `exerciseMixedSiblingOutcomes`, retain exact 409 `child_aborted`, identity-specific disappearance, process/socket/resource cleanup, and final cancellation evidence for the DELETE child. Remove only `waitLifecycleSettlementTotal(...deleteChild..., 1)` and omit the DELETE child from `assertLifecycleSettlementTotals`. Continue requiring exactly one settlement for the abort child and natural child, exact natural output, immutable natural events after sibling controls, and root settlement.
+
+- [ ] **Step 4: Prove focused GREEN/race and rerun affected live scenarios**
+
+```bash
+gofmt -w internal/supervisor/live_rpc_lifecycle_support_test.go internal/supervisor/live_rpc_lifecycle_test.go
+go test -v -count=1 -tags=incus ./internal/supervisor \
+  -run '^Test(ValidateLifecycleFinalEventsRequiresOrderedPairedGenerations|LifecycleExternalCancellationEvidence)$'
+go test -race -v -count=1 -tags=incus ./internal/supervisor \
+  -run '^Test(ValidateLifecycleFinalEventsRequiresOrderedPairedGenerations|LifecycleExternalCancellationEvidence)$'
+go test -count=1 -tags=incus ./internal/supervisor -run '^$'
+set -a; . /home/steven/source/github/kanedias/.env; set +a
+go test -v -count=1 -tags=incus ./internal/supervisor \
+  -run '^TestLiveRPC(ChildStop|RootEnd|MixedSibling)Lifecycle$' -timeout 2h
+git diff --check
+```
+
+Expected: externally cancelled open generations are admitted only by exact identity; unmarked truncation remains invalid; mixed abort/natural settlement contracts remain exact; all three live scenarios pass with baseline restoration.
+
+- [ ] **Step 5: Review and commit**
+
+After independent implementation review:
+
+```bash
+git add internal/supervisor/live_rpc_lifecycle_support_test.go internal/supervisor/live_rpc_lifecycle_test.go
+git commit -m "test: identify externally cancelled generations"
+```
+
+---
+
+### Task 6K: Make post-abort root usability explicitly supersede the aborted task
+
+**Failed invariant and evidence:**
+
+- `/home/steven/.cache/kanedias/e2e/e2e-3496270-1786399939127754928/` proves root abort itself succeeded with `message_end(aborted) -> agent_end -> agent_settled`. The following user message containing the exact root-usability marker was delivered in a new `agent_start` generation.
+- Instead of obeying the short `Reply with exactly ...` message, the local model resumed the earlier aborted twelve-file analysis, issued repository tool calls, and produced a long response without the marker. This is a real local-model instruction-priority failure after abort, not a transport, binding, or tool-execution failure and not stale event replay.
+- The usability probe must explicitly state that the prior task was aborted and must not be resumed, prohibit tools, and retain a byte-exact run marker. Do not retry, fuzzy-match, hide the failure, or weaken the existing final-text assertion.
+
+**Files and scope:**
+
+- Modify/Test only: `internal/supervisor/live_rpc_lifecycle_test.go`
+- Do not modify Pi, provider/model, abort behavior, RPC routing, timeouts, or generic non-abort usability probes.
+
+Independent review of this Task 6K amendment is required before implementation.
+
+- [ ] **Step 1: Add a RED pure prompt regression**
+
+Add `TestLifecyclePostAbortProbeExplicitlySupersedesPriorTask` for a missing pure helper. Require the prompt to contain the exact supplied marker exactly once and explicit fixed instructions that the previous request was aborted, must not be resumed, no tools may be called, and the response must contain only the marker. Reject marker omission/duplication in the constructed string. The focused test must fail to compile before the helper exists.
+
+- [ ] **Step 2: Use the specialized strict probe only after root abort**
+
+Extract the common settlement/final-text/state logic from `assertRootUsable` into a private helper that accepts the prompt while retaining the expected marker. Preserve the generic `Reply with exactly MARKER.` wrapper for every existing non-abort caller. Add a post-abort wrapper using the new pure prompt and call it only after the root interrupt settlement in `exerciseLifecycleInterrupt`. Keep one prompt, one bounded settlement wait, exact `strings.Contains` final-text check, and typed idle-state check. Do not add retries, sleeps, alternative markers, or tool-output acceptance.
+
+- [ ] **Step 3: Prove focused GREEN/race and rerun interrupt once**
+
+```bash
+gofmt -w internal/supervisor/live_rpc_lifecycle_test.go
+go test -v -count=1 -tags=incus ./internal/supervisor \
+  -run '^TestLifecyclePostAbortProbeExplicitlySupersedesPriorTask$'
+go test -race -v -count=1 -tags=incus ./internal/supervisor \
+  -run '^TestLifecyclePostAbortProbeExplicitlySupersedesPriorTask$'
+go test -count=1 -tags=incus ./internal/supervisor -run '^$'
+set -a; . /home/steven/source/github/kanedias/.env; set +a
+go test -v -count=1 -tags=incus ./internal/supervisor \
+  -run '^TestLiveRPCInterruptLifecycle$' -timeout 90m
+git diff --check
+```
+
+Expected: root and child abort each retain exact aborted/end/settled semantics; the specialized fresh generation returns the exact marker without resuming the old task; child create returns 409 `child_aborted`; root remains usable; exact baseline is restored.
+
+- [ ] **Step 4: Review, commit, and resume the one-pass matrix**
+
+```bash
+git add internal/supervisor/live_rpc_lifecycle_test.go
+git commit -m "test: clarify post-abort usability probe"
+```
+
+After Tasks 6J and 6K pass live, rerun Task 6H rapid control and Task 6I deterministic children if they have not yet passed on the final code, then rerun all eight scenarios once. Any later failure receives another evidence-gated amendment.
 
 ---
 
