@@ -129,6 +129,31 @@ func TestPostNewSessionJSONRejectsInvalidResponses(t *testing.T) {
 	}
 }
 
+func TestRecursiveAcceptanceUsesShortSocketPaths(t *testing.T) {
+	t.Setenv("XDG_RUNTIME_DIR", "/tmp")
+	h := &liveAcceptance{t: t, runDir: filepath.Join(t.TempDir(), strings.Repeat("deep-artifact-directory-", 4))}
+	rootPath := h.recursiveRootSocketPath("main")
+	childPath := h.recursiveDescendantSocketPath("session-" + strings.Repeat("a", 32))
+	if filepath.Dir(rootPath) == h.runDir {
+		t.Fatalf("recursive root socket remained under deep artifact directory %q", h.runDir)
+	}
+	for _, path := range []string{rootPath, childPath} {
+		if !filepath.IsAbs(path) {
+			t.Fatalf("socket path is not absolute: %q", path)
+		}
+		if len(path) >= len(syscall.RawSockaddrUnix{}.Path) {
+			t.Fatalf("socket path length = %d, want below platform bound %d: %q", len(path), len(syscall.RawSockaddrUnix{}.Path), path)
+		}
+	}
+	info, err := os.Stat(filepath.Dir(rootPath))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if info.Mode().Perm() != 0o700 {
+		t.Fatalf("recursive socket directory mode = %o, want 0700", info.Mode().Perm())
+	}
+}
+
 func TestWriteManagedConfigMergesExistingTables(t *testing.T) {
 	dir := t.TempDir()
 	source := filepath.Join(dir, "source.toml")
@@ -351,6 +376,10 @@ type liveAcceptance struct {
 	roots     []*acceptanceProcess
 	processes []*acceptanceProcess
 	streams   []*sseCapture
+
+	// recursiveSocketDir keeps manual root and descendant socket paths below
+	// the platform Unix-address bound while artifacts remain under runDir.
+	recursiveSocketDir string
 
 	// managedSocketDir is the short root-socket directory used by the
 	// server-managed lifecycle test (kept short to stay under UNIX_PATH_MAX).
@@ -589,9 +618,11 @@ func (h *liveAcceptance) close() {
 	}
 	h.cancel()
 	if h.success && !h.t.Failed() {
-		for _, id := range h.sessionIDs() {
-			if _, err := os.Lstat(filepath.Join(h.runDir, id+".sock")); !errors.Is(err, os.ErrNotExist) {
-				h.t.Fatalf("session socket %s remains before artifact cleanup: %v", id, err)
+		if h.recursiveSocketDir != "" {
+			for _, id := range h.sessionIDs() {
+				if _, err := os.Lstat(h.recursiveDescendantSocketPath(id)); !errors.Is(err, os.ErrNotExist) {
+					h.t.Fatalf("session socket %s remains before artifact cleanup: %v", id, err)
+				}
 			}
 		}
 		if err := os.RemoveAll(h.runDir); err != nil {
@@ -697,7 +728,7 @@ func (h *liveAcceptance) stopProxy() {
 }
 
 func (h *liveAcceptance) startRoot(label string) (*acceptanceProcess, string, supervisor.NodeSnapshot, *sseCapture, net.Conn) {
-	socket := filepath.Join(h.runDir, label+"-root.sock")
+	socket := h.recursiveRootSocketPath(label)
 	root := h.startProcess(label+"-root", h.binary, "--config", h.configPath, "session", "--socket", socket)
 	h.roots = append(h.roots, root)
 	client := unixHTTPClient(socket)
@@ -810,7 +841,7 @@ func (h *liveAcceptance) exerciseFreshRead(root supervisor.NodeSnapshot, socket 
 		h.t.Fatalf("delegate_session read answer missing marker: %q", text)
 	}
 	h.assertSessionAbsent(child.SessionID)
-	if _, err := os.Stat(filepath.Join(h.runDir, child.SessionID+".sock")); !errors.Is(err, os.ErrNotExist) {
+	if _, err := os.Stat(h.recursiveDescendantSocketPath(child.SessionID)); !errors.Is(err, os.ErrNotExist) {
 		h.t.Fatalf("fresh child socket remains: %v", err)
 	}
 	h.snapshotTree("fresh-read-complete", client)
@@ -1631,7 +1662,7 @@ func (h *liveAcceptance) assertDescendantSocketsAbsent(tree supervisor.NodeSnaps
 		ids = ids[1:]
 	}
 	for _, id := range ids {
-		if _, err := os.Lstat(filepath.Join(h.runDir, id+".sock")); !errors.Is(err, os.ErrNotExist) {
+		if _, err := os.Lstat(h.recursiveDescendantSocketPath(id)); !errors.Is(err, os.ErrNotExist) {
 			h.t.Fatalf("descendant socket %s remains before artifact cleanup: %v", id, err)
 		}
 	}
@@ -1858,11 +1889,26 @@ type managedRoot struct {
 	PID        int
 }
 
+func (h *liveAcceptance) recursiveSocketDirectory() string {
+	if h.recursiveSocketDir == "" {
+		h.recursiveSocketDir = h.shortSocketDir()
+	}
+	return h.recursiveSocketDir
+}
+
+func (h *liveAcceptance) recursiveRootSocketPath(label string) string {
+	return filepath.Join(h.recursiveSocketDirectory(), label+"-root.sock")
+}
+
+func (h *liveAcceptance) recursiveDescendantSocketPath(sessionID string) string {
+	return filepath.Join(h.recursiveSocketDirectory(), sessionID+".sock")
+}
+
 // shortSocketDir returns a short, private, EUID-owned mode-0700 directory for
-// managed root sockets. A root socket path is <base>/<32-hex>.root.sock and must
-// stay under UNIX_PATH_MAX (107 bytes); the deep e2e artifact runDir would
-// overflow it, so anchor sockets under XDG_RUNTIME_DIR (or /tmp) with a short
-// unique suffix. The directory is removed when the test finishes.
+// supervisor sockets. A root or child socket path must stay under UNIX_PATH_MAX
+// (107 bytes); the deep e2e artifact runDir can overflow it, so anchor sockets
+// under XDG_RUNTIME_DIR (or /tmp) with a short unique suffix. The directory is
+// removed when the test finishes.
 func (h *liveAcceptance) shortSocketDir() string {
 	base := strings.TrimSpace(os.Getenv("XDG_RUNTIME_DIR"))
 	if base == "" {

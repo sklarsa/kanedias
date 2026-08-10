@@ -316,6 +316,41 @@ git add cmd/session.go cmd/session_test.go docs/superpowers/specs/2026-08-10-chi
 git commit -m "fix: preserve optional root startup status"
 ```
 
+### Task 4: Keep Recursive Live-Acceptance Sockets Within the Unix Path Bound
+
+**Files:**
+- Modify: `internal/supervisor/live_incus_test.go`
+- Modify: `docs/superpowers/specs/2026-08-10-child-liveness-shutdown-design.md`
+
+**Interfaces:**
+- Consumes: the existing private `shortSocketDir` acceptance helper and fixed child socket basename.
+- Produces: short paths for manual recursive root and descendant sockets; unchanged long-lived artifact locations.
+
+- [ ] **Step 1: Add a non-destructive path-bound regression and verify RED**
+
+Require manual recursive root and maximum-length child socket paths to be absolute, outside the deep artifact directory, below `syscall.RawSockaddrUnix`'s path bound, and beneath a mode-0700 directory. Run:
+
+```bash
+go test -tags incus ./internal/supervisor -run '^TestRecursiveAcceptanceUsesShortSocketPaths$' -count=1 -v
+```
+
+Expected: FAIL until the recursive socket-path helpers exist. The live predecessor failed with a 110-byte path and `exceeds the platform address bound for the Unix listener`.
+
+- [ ] **Step 2: Reuse the private short socket directory**
+
+Track one recursive socket directory per harness. Start manual roots there so deterministic descendant sockets are siblings in the same short directory. Keep executable, event, process, and Incus snapshots under `runDir`. Point all recursive descendant-removal assertions at the actual socket directory. Do not change production naming.
+
+- [ ] **Step 3: Verify focused GREEN and rerun live acceptance**
+
+Run the focused path test, the hermetic supervisor package with the `incus` tag, and then the exact authorized live recursive acceptance command. Require exact baseline cleanup on both pass and failure.
+
+- [ ] **Step 4: Commit Task 4**
+
+```bash
+git add internal/supervisor/live_incus_test.go docs/superpowers/specs/2026-08-10-child-liveness-shutdown-design.md docs/superpowers/plans/2026-08-10-child-liveness-shutdown.md
+git commit -m "test: keep recursive acceptance sockets short"
+```
+
 ## Final Verification
 
 After all task reviews are clean, run from the final branch state:

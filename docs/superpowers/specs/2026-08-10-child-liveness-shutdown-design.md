@@ -126,6 +126,8 @@ Live validation against the rebased branch exposed a root-startup regression int
 
 Normalize the optional writer at the command boundary: assign `SessionOptions.RootStatus` only when the concrete `*onceFile` is non-nil. Preserve the interface type and the existing idempotent descriptor ownership for real status descriptors. Add a command-level regression proving a direct `session` invocation without `--status-fd` forwards a genuinely nil `RootStatus`, while existing descriptor-forwarding and closure tests preserve the inherited-manager path. This adjacent correction is approved because it is necessary to execute the required live lifecycle validation and prevents a real root-startup resource leak.
 
+After that correction allowed live validation to reach child creation, the recursive acceptance harness exposed a second deterministic validation blocker: its deep artifact directory produced a 110-byte child socket path, exceeding Linux's Unix-address bound. The server-managed acceptance already avoids the same constraint with a private mode-0700 directory under `XDG_RUNTIME_DIR` or `/tmp`. Reuse that short-directory strategy for manually started recursive roots and their descendants, while retaining binaries, logs, and diagnostics in the artifact directory. Update socket-removal assertions to inspect the actual short directory and add a non-destructive path-bound regression. This is test-harness scope only; production socket naming and lifecycle semantics do not change.
+
 ## Alternatives Rejected
 
 ### Only close the parent liveness writer after acknowledgement
