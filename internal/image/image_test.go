@@ -3,7 +3,9 @@ package image
 import (
 	"bytes"
 	"context"
+	"crypto/x509"
 	"encoding/json"
+	"encoding/pem"
 	"errors"
 	"io"
 	"net"
@@ -18,6 +20,7 @@ import (
 	"github.com/lxc/incus/v7/shared/api"
 	"github.com/sklarsa/kanedias/internal/config"
 	"github.com/sklarsa/kanedias/internal/incusclient"
+	"github.com/sklarsa/kanedias/internal/proxy"
 	"golang.org/x/sys/unix"
 )
 
@@ -50,6 +53,37 @@ func TestInstallerActivatesOnlyKanediasDelegationExtensionAndSkills(t *testing.T
 	}
 	if strings.Contains(script, "pi-subagents") || strings.Contains(string(settings), "pi-subagents") {
 		t.Error("pi-subagents remains installed or configured")
+	}
+}
+
+func TestInstallerInstallsProxyCAIntoSystemTrust(t *testing.T) {
+	script := string(installer)
+	for _, want := range []string{
+		`proxy_ca_file="$assets_dir/kanedias-proxy.crt"`,
+		`"$proxy_ca_file"`,
+		`/usr/local/share/ca-certificates/kanedias-proxy.crt`,
+		`update-ca-certificates`,
+	} {
+		if !strings.Contains(script, want) {
+			t.Errorf("installer missing proxy CA trust behavior %q", want)
+		}
+	}
+
+	// The install and registration steps must come after the initial
+	// apt-get install so that update-ca-certificates is available on PATH.
+	aptIdx := strings.Index(script, "apt-get install -y --no-install-recommends")
+	// Anchor on the install destination, not the early asset-var definition.
+	caCertDest := "/usr/local/share/ca-certificates/kanedias-proxy.crt"
+	caIdx := strings.Index(script, caCertDest)
+	updateIdx := strings.Index(script, "update-ca-certificates")
+	if aptIdx < 0 {
+		t.Fatal("installer missing apt-get install command")
+	}
+	if caIdx < 0 || updateIdx < 0 {
+		t.Fatal("installer missing proxy CA install or update step")
+	}
+	if caIdx < aptIdx || updateIdx < caIdx {
+		t.Error("proxy CA install/update must occur after apt-get install so update-ca-certificates is available")
 	}
 }
 
@@ -860,6 +894,7 @@ func TestCreateRunsImageWorkflowInOrder(t *testing.T) {
 		"push /root/assets/pi-settings.json",
 		"push /root/assets/pi-auth.json",
 		"push /root/assets/pi-models.json",
+		"push /root/assets/kanedias-proxy.crt",
 		"push /root/assets/kanedias-pi.socket",
 		"push /root/assets/kanedias-pi@.service",
 		"push /root/assets/kanedias-pi-env",
@@ -967,6 +1002,24 @@ func TestCreateRunsImageWorkflowInOrder(t *testing.T) {
 	}
 	if auth.mode != 0o600 {
 		t.Errorf("pi auth mode = %#o, want 0600", auth.mode)
+	}
+	proxyCA := client.files["/root/assets/kanedias-proxy.crt"]
+	if proxyCA.mode != 0o644 {
+		t.Errorf("proxy CA mode = %#o, want 0644", proxyCA.mode)
+	}
+	block, _ := pem.Decode(proxyCA.content)
+	if block == nil || block.Type != "CERTIFICATE" {
+		t.Errorf("proxy CA upload is not a PEM certificate: %q", proxyCA.content)
+	} else if _, err := x509.ParseCertificate(block.Bytes); err != nil {
+		t.Errorf("proxy CA upload is not a valid certificate: %v", err)
+	}
+	if strings.Contains(string(proxyCA.content), "PRIVATE KEY") {
+		t.Errorf("proxy CA upload contains private key material")
+	}
+	for path := range client.files {
+		if strings.HasSuffix(path, "ca.key") {
+			t.Errorf("uploaded path %q contains the proxy CA private key", path)
+		}
 	}
 	bridge := client.files["/root/assets/kanedias-pi-env"]
 	if bridge.mode != 0o700 {
@@ -1223,8 +1276,56 @@ func TestCreateValidatesBeforeConnecting(t *testing.T) {
 	}
 }
 
+func TestLoadBuildInputsInitializesAndReadsPublicCA(t *testing.T) {
+	cfg := imageConfig(t, nil)
+	options, err := proxy.DefaultOptions()
+	if err != nil {
+		t.Fatal(err)
+	}
+	inputs, err := loadBuildInputs(cfg, openBuildScriptsDirectory)
+	if err != nil {
+		t.Fatal(err)
+	}
+	block, _ := pem.Decode(inputs.proxyCA)
+	if block == nil || block.Type != "CERTIFICATE" {
+		t.Fatalf("proxy CA input is not a PEM certificate: %q", inputs.proxyCA)
+	}
+	if _, err := x509.ParseCertificate(block.Bytes); err != nil {
+		t.Fatalf("proxy CA input is not a valid certificate: %v", err)
+	}
+	if strings.Contains(string(inputs.proxyCA), "PRIVATE KEY") {
+		t.Fatal("proxy CA build input contains private key material")
+	}
+	if _, err := os.Stat(options.CAKeyPath); err != nil {
+		t.Fatalf("proxy CA key was not initialized: %v", err)
+	}
+}
+
+func TestCreateReturnsProxyCAInitializationErrorBeforeConnecting(t *testing.T) {
+	cfg := imageConfig(t, nil)
+	blockingFile := filepath.Join(t.TempDir(), "config-file")
+	if err := os.WriteFile(blockingFile, []byte("block"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	t.Setenv("XDG_CONFIG_HOME", blockingFile)
+	connected := false
+
+	err := create(context.Background(), cfg, io.Discard, io.Discard, func(context.Context) (imageClient, error) {
+		connected = true
+		return &recordingClient{}, nil
+	})
+	if err == nil || !strings.Contains(err.Error(), "initialize proxy CA") {
+		t.Fatalf("create() error = %v, want initialize proxy CA error", err)
+	}
+	if connected {
+		t.Fatal("connected to Incus before proxy CA initialization")
+	}
+}
+
 func imageConfig(t *testing.T, hosts []string) config.Config {
 	t.Helper()
+	configHome := filepath.Join(t.TempDir(), "config")
+	t.Setenv("XDG_CONFIG_HOME", configHome)
 	dir := t.TempDir()
 	assetDir := filepath.Join(dir, "assets")
 	if err := os.Mkdir(assetDir, 0o700); err != nil {

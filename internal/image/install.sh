@@ -26,11 +26,13 @@ pi_rpc_service_file="$assets_dir/kanedias-pi@.service"
 pi_environment_bridge_file="$assets_dir/kanedias-pi-env"
 pi_rpc_launcher_file="$assets_dir/kanedias-pi-rpc"
 pi_extension_dir="$assets_dir/pi-extension"
+proxy_ca_file="$assets_dir/kanedias-proxy.crt"
 
 for required_file in \
     "$authorized_hosts_file" "$pi_settings_file" "$pi_auth_file" "$pi_models_file" \
     "$pi_rpc_socket_file" "$pi_rpc_service_file" \
-    "$pi_environment_bridge_file" "$pi_rpc_launcher_file"; do
+    "$pi_environment_bridge_file" "$pi_rpc_launcher_file" \
+    "$proxy_ca_file"; do
     if [[ ! -f $required_file ]]; then
         echo "missing install input: $required_file" >&2
         exit 1
@@ -92,6 +94,14 @@ apt-get install -y --no-install-recommends \
     wget \
     zip \
     zsh
+
+# Bake the public proxy CA into the image trust store so sandbox processes can
+# trust the shared credential proxy without a host disk mount. This runs after
+# the apt-get block because the trust-bundle refresh tool ships with
+# ca-certificates.
+install -m 0644 "$proxy_ca_file" \
+    /usr/local/share/ca-certificates/kanedias-proxy.crt
+update-ca-certificates
 
 run_as_managed_user() (
     cd "$managed_home"
