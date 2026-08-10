@@ -623,6 +623,150 @@ After each fix, rerun focused tests, the failed scenario, then the complete one-
 
 ---
 
+### Task 6A: Bound stalled supervisor SSE writes so root shutdown stays clean
+
+**Failed invariant and evidence:**
+
+- Required invariant: after an accepted root `DELETE`, a successfully settled root and child must exit zero, unlink the supervisor socket, and restore the exact Incus baseline even when a connected SSE client does not read.
+- The required Task 6 Step 2 command failed first at `internal/supervisor/live_incus_test.go:625` with `liveness root exited after DELETE: exit status 1`; `/home/steven/.cache/kanedias/e2e/e2e-3244740-1786390399344309628/liveness-root.log` ends with `Error: context deadline exceeded`.
+- The focused reproduction failed identically at `/home/steven/.cache/kanedias/e2e/e2e-3253771-1786390774846879783/`. Its `liveness-events.sse` and `fresh-read-complete-tree.json` prove successful child output, root settlement, and child disappearance before DELETE. Its `incus-operation-monitor.log` proves root stop/delete completed by `2026-08-10T15:40:45.906434293-04:00`, while `liveness-root.log` did not finish until `2026-08-10 15:41:10.831269249 -0400` with the 30-second deadline error; `teardown-final-incus.json` matches baseline.
+- Earliest divergent boundary: `internal/supervisorapi/events.go:33-43` can block indefinitely in synchronous SSE write/flush to the deliberately non-reading raw Unix client retained by `internal/supervisor/live_incus_test.go:616-625`. Broker closure cannot release a handler already blocked in the response write, so `internal/supervisorapi/unix.go:121-135` reaches its shutdown deadline and downgrades otherwise successful cleanup to process exit 1.
+
+**Files:**
+
+- Modify/Test: `internal/supervisorapi/handler_test.go`
+- Modify: `internal/supervisorapi/events.go`
+- Live verification only: `internal/supervisor/live_incus_test.go`
+- Read artifacts: `/home/steven/.cache/kanedias/e2e/e2e-3244740-1786390399344309628/` and `/home/steven/.cache/kanedias/e2e/e2e-3253771-1786390774846879783/`
+
+**Interfaces:**
+
+- Consumes: `supervisor.NewEventBroker`, `StartUnix`, `NewHandler`, `http.NewResponseController`, and the existing consuming-stream shutdown test.
+- Produces: bounded supervisor SSE response writes that disconnect a non-reading client without changing event retention or subscriber mailbox limits.
+
+- [ ] **Step 1: Add the raw non-reading Unix SSE regression**
+
+In `internal/supervisorapi/handler_test.go`, add a `subscribeCalled chan struct{}` field to `fakeService`. In `fakeService.Subscribe`, close it when non-nil immediately before returning `service.sub`. Then add this test beside `TestActiveParentToChildSSEBrokerCloseAllowsPromptCleanUnixShutdown`:
+
+```go
+func TestStalledSupervisorSSEClientDoesNotBlockUnixShutdown(t *testing.T) {
+    path := filepath.Join(t.TempDir(), "stalled-supervisor.sock")
+    broker := supervisor.NewEventBroker()
+    defer broker.Close()
+
+    payload := json.RawMessage(`{"chunk":"` + strings.Repeat("x", 96<<10) + `"}`)
+    for range 96 {
+        broker.PublishLocal("root", "pi", payload)
+    }
+    subscribed := make(chan struct{})
+    service := &fakeService{sub: broker.Subscribe(), subscribeCalled: subscribed}
+    server, err := StartUnix(path, NewHandler(service))
+    if err != nil {
+        t.Fatal(err)
+    }
+
+    stalled, err := net.Dial("unix", path)
+    if err != nil {
+        t.Fatal(err)
+    }
+    defer stalled.Close()
+    if _, err := io.WriteString(stalled, "GET /v1/events HTTP/1.1\r\nHost: unix\r\nAccept: text/event-stream\r\n\r\n"); err != nil {
+        t.Fatal(err)
+    }
+    select {
+    case <-subscribed:
+    case <-time.After(time.Second):
+        t.Fatal("stalled SSE request did not subscribe")
+    }
+
+    broker.Close()
+    shutdownCtx, cancel := context.WithTimeout(context.Background(), 3*time.Second)
+    defer cancel()
+    started := time.Now()
+    if err := server.Close(shutdownCtx); err != nil {
+        t.Fatalf("stalled SSE shutdown error = %v", err)
+    }
+    if elapsed := time.Since(started); elapsed >= 2*time.Second {
+        t.Fatalf("stalled SSE shutdown took %s, want under 2s", elapsed)
+    }
+    if _, err := os.Lstat(path); !errors.Is(err, os.ErrNotExist) {
+        t.Fatalf("Unix socket remains after stalled SSE shutdown: %v", err)
+    }
+}
+```
+
+The 96 events contain approximately 9 MiB of valid bounded JSON: enough to fill a Unix socket whose peer never reads, while remaining below the existing 4,096-event and 16-MiB broker limits. Do not add sleeps; the `subscribeCalled` seam is the observable request-admission boundary.
+
+- [ ] **Step 2: Run the focused regression and prove RED**
+
+Run:
+
+```bash
+go test -v -count=1 ./internal/supervisorapi \
+  -run '^TestStalledSupervisorSSEClientDoesNotBlockUnixShutdown$'
+```
+
+Expected: FAIL after the three-second shutdown context expires. The failure must contain:
+
+```text
+stalled SSE shutdown error = context deadline exceeded
+```
+
+This proves the raw non-reading client, not broker admission, Pi settlement, or Incus cleanup, pins the active HTTP handler.
+
+- [ ] **Step 3: Bound each supervisor SSE response write and flush**
+
+Modify only `internal/supervisorapi/events.go` in production:
+
+1. Add the named private constant `const supervisorSSEWriteTimeout = time.Second`.
+2. Construct one `controller := http.NewResponseController(w)` after preserving the existing streaming-support check.
+3. Add a private helper that sets `controller.SetWriteDeadline(time.Now().Add(supervisorSSEWriteTimeout))` immediately before each response operation, executes one header/event write and `controller.Flush()`, and clears the deadline with `controller.SetWriteDeadline(time.Time{})` on every return path after a successful deadline set. Join a clear failure to the operation error rather than hiding either error. Treat `http.ErrNotSupported` from setting a deadline as an unsupported optional capability so existing recorder-based handler tests continue through the existing `http.Flusher` seam; real Unix HTTP connections must use the deadline.
+4. Use that helper for the initial `WriteHeader(http.StatusOK)` plus flush and for every complete SSE frame `fmt.Fprintf` plus flush. Return from `serveEvents` on any write, flush, deadline-set, or deadline-clear error.
+5. Reset to a fresh absolute deadline for every frame; never carry one frame's deadline into the wait for the next broker event, and never leave a nonzero deadline on the connection after a successful flush.
+6. Do not change `supervisor.EventBroker`, `eventmailbox`, `DefaultEventRingCapacity`, `DefaultEventRingByteCapacity`, configured `max_events`/`max_bytes`, replay behavior, or subscriber mailbox capacity. Normal consuming streams retain the same ordering and payloads.
+
+- [ ] **Step 4: Prove focused GREEN under normal and race execution**
+
+Run:
+
+```bash
+gofmt -w internal/supervisorapi/events.go internal/supervisorapi/handler_test.go
+go test -v -count=1 ./internal/supervisorapi \
+  -run '^Test(StalledSupervisorSSEClientDoesNotBlockUnixShutdown|ActiveParentToChildSSEBrokerCloseAllowsPromptCleanUnixShutdown)$'
+go test -race -v -count=1 ./internal/supervisorapi \
+  -run '^Test(StalledSupervisorSSEClientDoesNotBlockUnixShutdown|ActiveParentToChildSSEBrokerCloseAllowsPromptCleanUnixShutdown)$'
+go test -count=1 ./internal/supervisorapi
+git diff --check
+```
+
+Expected: both the stalled-client regression and existing consuming-client comparison PASS normally and with the race detector; the complete `internal/supervisorapi` package passes; `git diff --check` is silent.
+
+- [ ] **Step 5: Rerun the failed live acceptance once**
+
+Run only the confirmed failed scenario first:
+
+```bash
+set -a; . /home/steven/source/github/kanedias/.env; set +a
+go test -v -count=1 -tags=incus ./internal/supervisor \
+  -run '^TestLiveChildLivenessShutdownAcceptance$' \
+  -timeout 90m
+```
+
+Expected: PASS with zero process exit status, root and child sockets absent, no test-owned process, exact Incus baseline restoration, and no proxy warning. Preserve a new artifact path if it fails; do not broaden the fix.
+
+- [ ] **Step 6: Commit the bounded SSE fix**
+
+```bash
+git add internal/supervisorapi/events.go internal/supervisorapi/handler_test.go
+git commit -m "fix: bound stalled supervisor SSE writes"
+```
+
+- [ ] **Step 7: Resume Task 6 in failure priority order**
+
+After GREEN, restart Task 6 at Step 2. Run both existing isolated acceptances once. Diagnose the separate `TestLiveServerManagedSupervisorAcceptance` missing-bootstrap failure next with its retained `/home/steven/.cache/kanedias/e2e/e2e-3244740-1786390502809184281/managed-server.log` evidence and another plan amendment before any additional production edit. Only after both existing acceptances pass may Task 6 Step 3 run the eight new `TestLiveRPC.*Lifecycle` scenarios.
+
+---
+
 ### Task 7: Prove five consecutive clean runs and complete verification
 
 **Files:**
