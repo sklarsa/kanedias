@@ -579,7 +579,6 @@ func (h *liveAcceptance) exerciseMixedSiblingOutcomes() {
 	h.lifecycleRPCCommand(root, abortChild.SessionID, map[string]any{"type": "abort"})
 
 	h.assertLifecycleStoppedResult(calls["delete"].wait(h.t, 2*time.Minute))
-	h.waitLifecycleSettlementTotal(root, deleteChild.SessionID, 1, "mixed DELETE child exact drained settlement")
 	h.waitForLifecycleChildGone(root, deleteChild.SessionID, "mixed DELETE child independent disappearance")
 	h.assertLifecycleStoppedResult(calls["abort"].wait(h.t, 2*time.Minute))
 	h.waitLifecycleSettlementTotal(root, abortChild.SessionID, 1, "mixed abort child exact drained settlement")
@@ -604,9 +603,8 @@ func (h *liveAcceptance) exerciseMixedSiblingOutcomes() {
 	h.assertLifecycleSettlementTotals(root, map[string]int{
 		root.tree.SessionID:    1,
 		naturalChild.SessionID: 1,
-		deleteChild.SessionID:  1,
 		abortChild.SessionID:   1,
-	}, "mixed sibling exact one-generation settlement totals")
+	}, "mixed sibling abort/natural exact one-generation settlement totals")
 }
 
 func (h *liveAcceptance) identifyLifecycleChildrenByMarker(root *lifecycleRoot, children []supervisor.NodeSnapshot, markers map[string]string) map[string]supervisor.NodeSnapshot {

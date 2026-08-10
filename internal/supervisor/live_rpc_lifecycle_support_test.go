@@ -12,6 +12,7 @@ import (
 	"net/url"
 	"os"
 	"path/filepath"
+	"reflect"
 	"strings"
 	"sync"
 	"testing"
@@ -73,7 +74,7 @@ func TestValidateLifecycleFinalEventsRequiresOrderedPairedGenerations(t *testing
 		lifecyclePiEnvelope(6, "root", `{"type":"agent_start"}`),
 		lifecyclePiEnvelope(7, "root", `{"type":"agent_end"}`),
 	}
-	if err := validateLifecycleFinalEvents(events); err != nil {
+	if err := validateLifecycleFinalEvents(events, nil); err != nil {
 		t.Fatalf("valid final events: %v", err)
 	}
 
@@ -118,10 +119,62 @@ func TestValidateLifecycleFinalEventsRequiresOrderedPairedGenerations(t *testing
 			for index, event := range events {
 				cloned[index] = cloneLifecycleEnvelope(event)
 			}
-			if err := validateLifecycleFinalEvents(test.edit(cloned)); err == nil {
+			if err := validateLifecycleFinalEvents(test.edit(cloned), nil); err == nil {
 				t.Fatal("invalid final events were accepted")
 			}
 		})
+	}
+}
+
+func TestValidateLifecycleFinalEventsAdmitsOnlyExplicitExternalCancellation(t *testing.T) {
+	// A session whose external cancellation truncated its Pi stream after
+	// agent_start must be rejected unless its exact session ID is recorded as
+	// externally cancelled. A different allowed ID must not excuse it.
+	events := []supervisor.EventEnvelope{
+		lifecyclePiEnvelope(1, "cancelled-child", `{"type":"agent_start"}`),
+	}
+	if err := validateLifecycleFinalEvents(events, nil); err == nil {
+		t.Fatal("unclosed generation without cancellation evidence was accepted")
+	}
+	if err := validateLifecycleFinalEvents(events, map[string]struct{}{"other-session": {}}); err == nil {
+		t.Fatal("unclosed generation accepted under a different allowed session")
+	}
+	if err := validateLifecycleFinalEvents(events, map[string]struct{}{"cancelled-child": {}}); err != nil {
+		t.Fatalf("explicitly cancelled unclosed generation was rejected: %v", err)
+	}
+
+	// An externally cancelled ID must never excuse an ordering/end/settled
+	// violation; only an unclosed generation at EOF is eligible.
+	invalid := []supervisor.EventEnvelope{
+		lifecyclePiEnvelope(1, "cancelled-child", `{"type":"agent_end"}`),
+	}
+	if err := validateLifecycleFinalEvents(invalid, map[string]struct{}{"cancelled-child": {}}); err == nil {
+		t.Fatal("end-without-start was excused by cancellation evidence")
+	}
+}
+
+func TestLifecycleExternalCancellationEvidence(t *testing.T) {
+	tree := supervisor.NodeSnapshot{SessionID: "root"}
+	tree.Children = []supervisor.NodeSnapshot{
+		{SessionID: "child-1"},
+		{SessionID: "child-2"},
+	}
+
+	// Non-root direct DELETE records exactly the target, never its tree.
+	if got := lifecycleExternalCancellationIDs("child-1", tree, true); !reflect.DeepEqual(got, []string{"child-1"}) {
+		t.Fatalf("direct child cancellation ids = %v, want exactly child-1", got)
+	}
+	// Root DELETE records the root and every currently projected descendant.
+	if got := lifecycleExternalCancellationIDs("root", tree, true); !reflect.DeepEqual(got, []string{"root", "child-1", "child-2"}) {
+		t.Fatalf("root cancellation ids = %v, want root plus descendants", got)
+	}
+	// Root DELETE with a failed snapshot records only the root (fails closed).
+	if got := lifecycleExternalCancellationIDs("root", tree, false); !reflect.DeepEqual(got, []string{"root"}) {
+		t.Fatalf("root cancellation ids with failed tree = %v, want only root", got)
+	}
+	// Empty target adds nothing.
+	if got := lifecycleExternalCancellationIDs("", tree, true); len(got) != 0 {
+		t.Fatalf("empty cancellation target added ids: %v", got)
 	}
 }
 
@@ -453,13 +506,14 @@ type lifecycleRoot struct {
 	stalled   net.Conn
 	eventPath string
 
-	mu              sync.Mutex
-	actions         []lifecycleAction
-	childPIDs       map[int]struct{}
-	preControl      *lifecycleBoundaryEvidence
-	postControl     *lifecycleBoundaryEvidence
-	final           *lifecycleBoundaryEvidence
-	immutableEvents map[string][]supervisor.EventEnvelope
+	mu                sync.Mutex
+	actions           []lifecycleAction
+	childPIDs         map[int]struct{}
+	preControl        *lifecycleBoundaryEvidence
+	postControl       *lifecycleBoundaryEvidence
+	final             *lifecycleBoundaryEvidence
+	immutableEvents   map[string][]supervisor.EventEnvelope
+	externalCancelled map[string]struct{}
 }
 
 // newLifecycleEventJournal starts a goroutine that drains stream.events as its
@@ -512,8 +566,12 @@ func (journal *lifecycleEventJournal) countPi(sessionID, eventType, toolName str
 // per-session source ordering, unique source identities, and non-overlapping
 // agent_start/agent_end generation boundaries. agent_settled is an optional
 // post-end confirmation: at most one is accepted per ended generation, and only
-// when no generation is open.
-func validateLifecycleFinalEvents(events []supervisor.EventEnvelope) error {
+// when no generation is open. A session recorded in externallyCancelled is the
+// only case permitted to end the stream with an unclosed generation, because an
+// external DELETE cancels descendant event forwarding after agent_start. All
+// ordering, uniqueness, end-without-start, overlap, and settled-state checks
+// remain strict even for externally cancelled sessions.
+func validateLifecycleFinalEvents(events []supervisor.EventEnvelope, externallyCancelled map[string]struct{}) error {
 	var brokerSeq uint64
 	sourceSeq := make(map[string]uint64)
 	seenSources := make(map[string]struct{}, len(events))
@@ -572,6 +630,9 @@ func validateLifecycleFinalEvents(events []supervisor.EventEnvelope) error {
 	}
 	for sessionID, open := range openGeneration {
 		if open {
+			if _, allowed := externallyCancelled[sessionID]; allowed {
+				continue
+			}
 			return fmt.Errorf("session %q has an unclosed started generation", sessionID)
 		}
 	}
@@ -987,16 +1048,17 @@ func (call *lifecycleChildCall) wait(t *testing.T, timeout time.Duration) lifecy
 func (h *liveAcceptance) startLifecycleRoot(label string) *lifecycleRoot {
 	process, socket, tree, stream, stalled := h.startRoot(label)
 	root := &lifecycleRoot{
-		process:         process,
-		socket:          socket,
-		tree:            tree,
-		client:          unixHTTPClient(socket),
-		stream:          stream,
-		journal:         newLifecycleEventJournal(stream),
-		stalled:         stalled,
-		eventPath:       filepath.Join(h.runDir, label+"-events.sse"),
-		childPIDs:       make(map[int]struct{}),
-		immutableEvents: make(map[string][]supervisor.EventEnvelope),
+		process:           process,
+		socket:            socket,
+		tree:              tree,
+		client:            unixHTTPClient(socket),
+		stream:            stream,
+		journal:           newLifecycleEventJournal(stream),
+		stalled:           stalled,
+		eventPath:         filepath.Join(h.runDir, label+"-events.sse"),
+		childPIDs:         make(map[int]struct{}),
+		immutableEvents:   make(map[string][]supervisor.EventEnvelope),
+		externalCancelled: make(map[string]struct{}),
 	}
 	h.recordLifecycleDescendantPIDs(root, "root-start")
 	h.captureLifecycleBoundary(root, "pre-control")
@@ -1056,7 +1118,45 @@ func (h *liveAcceptance) finishStoppedLifecycleRoot(root *lifecycleRoot, descrip
 	})
 }
 
+// lifecycleExternalCancellationIDs returns the session identities to record as
+// externally cancelled for a DELETE. A non-root target records exactly that
+// target; a root DELETE records the root plus every currently projected
+// descendant from the supplied tree, or only the root when the tree snapshot
+// failed (fails closed so an unrecorded open descendant is not broadly excused).
+// An empty target records nothing.
+func lifecycleExternalCancellationIDs(target string, tree supervisor.NodeSnapshot, treeOK bool) []string {
+	target = strings.TrimSpace(target)
+	if target == "" {
+		return nil
+	}
+	if target != tree.SessionID {
+		return []string{target}
+	}
+	if !treeOK {
+		return []string{target}
+	}
+	return treeSessionIDs(tree)
+}
+
+func (root *lifecycleRoot) recordExternalCancellation(ids []string) {
+	root.mu.Lock()
+	defer root.mu.Unlock()
+	for _, id := range ids {
+		if trimmed := strings.TrimSpace(id); trimmed != "" {
+			root.externalCancelled[trimmed] = struct{}{}
+		}
+	}
+}
+
 func (h *liveAcceptance) deleteLifecycleSession(root *lifecycleRoot, sessionID string) (int, error) {
+	// Record the exact external cancellation identity at the action boundary
+	// before the request so a truncated descendant stream can be admitted only
+	// for an accepted DELETE. Request/status validation still fails the scenario
+	// on any rejected or transport-failed DELETE before final validation.
+	var current supervisor.NodeSnapshot
+	treeOK := unixJSON(root.client, http.MethodGet, "/v1/tree", nil, &current) == nil
+	root.recordExternalCancellation(lifecycleExternalCancellationIDs(sessionID, current, treeOK))
+
 	status, _, err := unixRequest(root.client, http.MethodDelete, "/v1/sessions/"+url.PathEscape(sessionID), nil)
 	outcome := "accepted"
 	if err != nil {
@@ -1291,9 +1391,6 @@ func (h *liveAcceptance) captureLifecycleBoundary(root *lifecycleRoot, boundary 
 
 func (h *liveAcceptance) assertLifecycleFinalInvariants(root *lifecycleRoot) {
 	events := root.journal.snapshot()
-	if err := validateLifecycleFinalEvents(events); err != nil {
-		h.t.Fatalf("final lifecycle event invariants: %v", err)
-	}
 	root.mu.Lock()
 	preControl := root.preControl
 	postControl := root.postControl
@@ -1307,7 +1404,14 @@ func (h *liveAcceptance) assertLifecycleFinalInvariants(root *lifecycleRoot) {
 	for sessionID, frozen := range root.immutableEvents {
 		immutable[sessionID] = append([]supervisor.EventEnvelope(nil), frozen...)
 	}
+	externallyCancelled := make(map[string]struct{}, len(root.externalCancelled))
+	for sessionID := range root.externalCancelled {
+		externallyCancelled[sessionID] = struct{}{}
+	}
 	root.mu.Unlock()
+	if err := validateLifecycleFinalEvents(events, externallyCancelled); err != nil {
+		h.t.Fatalf("final lifecycle event invariants: %v", err)
+	}
 	if preControl == nil || postControl == nil || final == nil {
 		h.t.Fatalf("lifecycle boundary evidence incomplete: pre=%t post=%t final=%t", preControl != nil, postControl != nil, final != nil)
 	}
