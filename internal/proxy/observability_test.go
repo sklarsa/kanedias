@@ -1,14 +1,81 @@
 package proxy
 
 import (
+	"bytes"
+	"context"
+	"errors"
+	"fmt"
+	"io"
+	"log/slog"
+	"net"
 	"net/http"
 	"net/http/httptest"
 	"strings"
+	"syscall"
 	"testing"
 	"time"
 
 	"github.com/prometheus/client_golang/prometheus/testutil"
 )
+
+func TestPrivacySafeProxyLoggerClassifiesWithoutRenderingArguments(t *testing.T) {
+	tests := []struct {
+		name   string
+		format string
+		want   string
+	}{
+		{name: "connect", format: "[%03d] WARN: Error dialing to %s: %s", want: "connect_dial"},
+		{name: "TLS", format: "[%03d] WARN: Cannot handshake client %v %v", want: "tls_handshake"},
+		{name: "client read", format: "[%03d] WARN: Cannot read request from mitm'd client %v %v", want: "client_read"},
+		{name: "upstream read", format: "[%03d] WARN: Cannot read response from mitm'd server %v", want: "upstream_read"},
+		{name: "client write", format: "[%03d] WARN: Cannot write response from mitm'd client: %v", want: "client_write"},
+		{name: "copy", format: "[%03d] WARN: Error copying to client: %s", want: "tunnel_copy"},
+		{name: "websocket", format: "[%03d] WARN: Unable to use Websocket connection", want: "websocket"},
+		{name: "certificate", format: "[%03d] WARN: Cannot sign host certificate with provided CA: %s", want: "certificate"},
+		{name: "protocol", format: "[%03d] WARN: HTTP2 connection failed: %v", want: "protocol"},
+		{name: "unknown", format: "unknown %s", want: "internal"},
+	}
+	for _, test := range tests {
+		t.Run(test.name, func(t *testing.T) {
+			var logs bytes.Buffer
+			logger := privacySafeProxyLogger{logger: slog.New(slog.NewJSONHandler(&logs, nil))}
+			logger.Printf(test.format, 7, "private.example", errors.New("secret-error-token"))
+			output := logs.String()
+			if !strings.Contains(output, `"error_class":"`+test.want+`"`) {
+				t.Fatalf("classified log = %s, want %s", output, test.want)
+			}
+			for _, secret := range []string{"private.example", "secret-error-token"} {
+				if strings.Contains(output, secret) {
+					t.Fatalf("secret %q leaked in %s", secret, output)
+				}
+			}
+		})
+	}
+}
+
+func TestPrivacySafeProxyLoggerSuppressesExpectedTeardown(t *testing.T) {
+	tests := []struct {
+		name string
+		err  error
+	}{
+		{name: "context canceled", err: context.Canceled},
+		{name: "EOF", err: io.EOF},
+		{name: "unexpected EOF", err: io.ErrUnexpectedEOF},
+		{name: "closed connection", err: net.ErrClosed},
+		{name: "broken pipe", err: syscall.EPIPE},
+		{name: "connection reset", err: syscall.ECONNRESET},
+	}
+	for _, test := range tests {
+		t.Run(test.name, func(t *testing.T) {
+			var logs bytes.Buffer
+			logger := privacySafeProxyLogger{logger: slog.New(slog.NewJSONHandler(&logs, nil))}
+			logger.Printf("proxy warning: %v", fmt.Errorf("wrapped teardown: %w", test.err))
+			if logs.Len() != 0 {
+				t.Fatalf("expected teardown produced log: %s", logs.String())
+			}
+		})
+	}
+}
 
 func TestProxyRouteForHostIsBounded(t *testing.T) {
 	tests := []struct {

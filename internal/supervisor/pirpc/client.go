@@ -13,6 +13,9 @@ import (
 	"sync"
 	"sync/atomic"
 	"time"
+
+	"github.com/sklarsa/kanedias/internal/config"
+	"github.com/sklarsa/kanedias/internal/eventmailbox"
 )
 
 // 8 MiB raw images expand to about 10.7 MiB; 12 MiB leaves JSON/text headroom
@@ -41,7 +44,7 @@ type callResult struct {
 
 type Client struct {
 	conn     io.ReadWriteCloser
-	events   chan Event
+	events   *eventmailbox.Mailbox[Event]
 	done     chan struct{}
 	readDone chan struct{}
 
@@ -53,9 +56,20 @@ type Client struct {
 }
 
 func NewClient(conn io.ReadWriteCloser) *Client {
+	return newClientWithEventLimits(conn, eventmailbox.Limits{
+		MaxEvents: config.DefaultSupervisorEventMaxEvents,
+		MaxBytes:  config.DefaultSupervisorEventMaxBytes,
+	})
+}
+
+func newClientWithEventLimits(conn io.ReadWriteCloser, limits eventmailbox.Limits) *Client {
+	events, err := eventmailbox.New[Event](limits)
+	if err != nil {
+		panic(err)
+	}
 	client := &Client{
 		conn:      conn,
-		events:    make(chan Event, 1),
+		events:    events,
 		done:      make(chan struct{}),
 		readDone:  make(chan struct{}),
 		writeGate: make(chan struct{}, 1),
@@ -151,7 +165,7 @@ func (client *Client) Send(ctx context.Context, command json.RawMessage) error {
 	return nil
 }
 
-func (client *Client) Events() <-chan Event { return client.events }
+func (client *Client) Events() <-chan Event { return client.events.Events() }
 
 func (client *Client) Done() <-chan struct{} { return client.done }
 
@@ -163,12 +177,13 @@ func (client *Client) Err() error {
 
 func (client *Client) Close() error {
 	err := client.terminate(io.ErrClosedPipe)
+	client.events.Abort()
 	<-client.readDone
 	return err
 }
 
 func (client *Client) readLoop() {
-	defer close(client.events)
+	defer client.events.Close()
 	defer close(client.readDone)
 	reader := bufio.NewReaderSize(client.conn, MaxRecordBytes+1)
 	var sequence uint64
@@ -204,12 +219,16 @@ func (client *Client) readLoop() {
 		if envelope.Type == "response" && client.dispatchResponse(envelope.ID, sequence, raw) {
 			continue
 		}
-		select {
-		case client.events <- Event{Seq: sequence, Type: envelope.Type, Raw: raw}:
-		case <-client.done:
+		err = client.events.Send(Event{Seq: sequence, Type: envelope.Type, Raw: raw}, len(raw))
+		if errors.Is(err, eventmailbox.ErrClosed) {
 			return
-		default:
+		}
+		if errors.Is(err, eventmailbox.ErrFull) {
 			_ = client.terminate(errors.New("pi RPC event consumer exceeded bounded capacity"))
+			return
+		}
+		if err != nil {
+			_ = client.terminate(fmt.Errorf("queue Pi RPC event: %w", err))
 			return
 		}
 	}

@@ -2,10 +2,13 @@ package proxy
 
 import (
 	"context"
+	"errors"
+	"io"
 	"log/slog"
 	"net"
 	"net/http"
 	"strings"
+	"syscall"
 	"time"
 
 	"github.com/elazarl/goproxy"
@@ -18,9 +21,59 @@ type privacySafeProxyLogger struct {
 	logger *slog.Logger
 }
 
-func (l privacySafeProxyLogger) Printf(string, ...any) {
+func (l privacySafeProxyLogger) Printf(format string, args ...any) {
+	if isExpectedProxyTeardown(args) {
+		return
+	}
 	l.logger.LogAttrs(context.Background(), slog.LevelWarn, "proxy internal warning",
-		slog.String("error_class", "internal"))
+		slog.String("error_class", proxyDiagnosticClass(format)))
+}
+
+func proxyDiagnosticClass(format string) string {
+	switch {
+	case strings.Contains(format, "Error dialing to"):
+		return "connect_dial"
+	case strings.Contains(format, "Cannot handshake client"):
+		return "tls_handshake"
+	case strings.Contains(format, "Cannot read request from mitm'd client"):
+		return "client_read"
+	case strings.Contains(format, "Cannot read response from mitm'd server"):
+		return "upstream_read"
+	case strings.Contains(format, "Cannot write response from mitm'd client"):
+		return "client_write"
+	case strings.Contains(format, "Error copying to client"):
+		return "tunnel_copy"
+	case strings.Contains(format, "Unable to use Websocket connection"):
+		return "websocket"
+	case strings.Contains(format, "Cannot sign host certificate with provided CA"):
+		return "certificate"
+	case strings.Contains(format, "HTTP2 connection failed"):
+		return "protocol"
+	default:
+		return "internal"
+	}
+}
+
+func isExpectedProxyTeardown(args []any) bool {
+	for _, arg := range args {
+		err, ok := arg.(error)
+		if !ok {
+			continue
+		}
+		for _, expected := range []error{
+			context.Canceled,
+			io.EOF,
+			io.ErrUnexpectedEOF,
+			net.ErrClosed,
+			syscall.EPIPE,
+			syscall.ECONNRESET,
+		} {
+			if errors.Is(err, expected) {
+				return true
+			}
+		}
+	}
+	return false
 }
 
 type proxyObserver struct {
