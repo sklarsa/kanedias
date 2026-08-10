@@ -375,7 +375,23 @@ func productionChildRunnerWithRuntime(ctx context.Context, bootstrap process.Boo
 	case contract.ChildKindRead:
 		readResult, err := node.RunReadTask(ctx, bootstrap.Request.Task)
 		if err != nil {
-			return publishReadFailure(ctx, reporter, err)
+			return publishReadFailureAfterDrain(ctx, node, reporter, err)
+		}
+		// A natural read result still quiesces already-admitted routed RPC
+		// handlers before the terminal success is acknowledged. When the
+		// inherited context already won, publish nothing (Task 6G parent-owned
+		// cancellation path).
+		if ctx.Err() != nil {
+			return ctx.Err()
+		}
+		drainCtx, cancelDrain := context.WithTimeout(context.WithoutCancel(ctx), supervisorCleanupTimeout)
+		drainErr := node.QuiesceRPC(drainCtx)
+		cancelDrain()
+		if drainErr != nil {
+			// A quiescence failure must never publish success; report one fixed
+			// privacy-safe internal failure and join the drain diagnostics.
+			return errors.Join(drainErr, publishReadFailure(context.WithoutCancel(ctx), reporter,
+				contract.NewError(contract.ErrorInternal, "read child RPC did not drain")))
 		}
 		return reporter.Read(readResult)
 	case contract.ChildKindWrite:
@@ -391,6 +407,25 @@ func productionChildRunnerWithRuntime(ctx context.Context, bootstrap process.Boo
 	default:
 		return contract.NewError(contract.ErrorConflict, "unsupported child kind")
 	}
+}
+
+// publishReadFailureAfterDrain quiesces every already-admitted Node.CallRPC
+// handler before publishing a read-child terminal failure, so the admitted
+// handler can return its exact response to the direct parent before the terminal
+// report is published and the child teardown starts. Inherited-context
+// cancellation skips terminal publication entirely (Task 6G parent-owned
+// cancellation path). An existing typed failure keeps its exact type after the
+// drain; a quiescence error is retained only in the joined local diagnostics and
+// never changes the published code/message.
+func publishReadFailureAfterDrain(ctx context.Context, node *supervisor.Node, reporter *process.Reporter, runErr error) error {
+	if ctx.Err() != nil {
+		return ctx.Err()
+	}
+	drainCtx, cancel := context.WithTimeout(context.WithoutCancel(ctx), supervisorCleanupTimeout)
+	defer cancel()
+	drainErr := node.QuiesceRPC(drainCtx)
+	reportErr := publishReadFailure(ctx, reporter, runErr)
+	return errors.Join(drainErr, reportErr)
 }
 
 // publishReadFailure publishes a typed privacy-safe terminal failure over the

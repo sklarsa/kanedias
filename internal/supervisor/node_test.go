@@ -830,6 +830,86 @@ func TestRootNodeChangedPiIdentityIsTerminalAndCleansResources(t *testing.T) {
 	}
 }
 
+// TestNodeQuiesceRPCWaitsForAdmittedCallRejectsNewAndIsIdempotent proves the
+// channel-coordinated per-node RPC admission/drain gate used by child terminal
+// quiescence: an already-admitted CallRPC is drained exactly, admission closes
+// atomically (new calls rejected with session_stopping without reaching the fake
+// peer), and repeated/concurrent quiescence callers are all safe and idempotent.
+func TestNodeQuiesceRPCWaitsForAdmittedCallRejectsNewAndIsIdempotent(t *testing.T) {
+	node, peer := boundReadNode(t)
+	defer func() { _ = peer.Close() }()
+
+	admitted := make(chan struct{})
+	releaseResponse := make(chan struct{})
+	go func() {
+		reader := bufio.NewReader(peer)
+		command := readRPCCommand(t, reader)
+		if command.Type != "get_messages" {
+			t.Errorf("admitted command type = %q, want get_messages", command.Type)
+		}
+		close(admitted)
+		<-releaseResponse
+		writeRPCResponse(t, peer, command.ID, command.Type, true, map[string]any{"ok": true})
+	}()
+
+	// 1. Start one admitted CallRPC and hold its matching Pi response.
+	callResult := make(chan error, 1)
+	go func() {
+		_, err := node.CallRPC(context.Background(), json.RawMessage(`{"type":"get_messages"}`))
+		callResult <- err
+	}()
+	<-admitted
+
+	// 2. Begin terminal quiescence and prove it does not return while that call
+	// is active.
+	quiesceResult := make(chan error, 1)
+	go func() { quiesceResult <- node.QuiesceRPC(context.Background()) }()
+	select {
+	case err := <-quiesceResult:
+		t.Fatalf("QuiesceRPC returned while an admitted call was active: %v", err)
+	case <-time.After(30 * time.Millisecond):
+	}
+
+	// 3. A new RPC after admission closes is rejected with exact session_stopping
+	// without reaching the fake peer.
+	_, rejectErr := node.CallRPC(context.Background(), json.RawMessage(`{"type":"get_state"}`))
+	var typed *contract.Error
+	if !errors.As(rejectErr, &typed) || typed.Code != contract.ErrorSessionStopping {
+		t.Fatalf("rejected RPC error = %v, want session_stopping", rejectErr)
+	}
+	_ = peer.SetReadDeadline(time.Now().Add(30 * time.Millisecond))
+	if line, err := bufio.NewReader(peer).ReadBytes('\n'); err == nil {
+		t.Fatalf("rejected RPC reached the fake peer: %q", line)
+	}
+
+	// 4. Release the original response; the admitted call returns exact success
+	// and quiescence returns nil.
+	close(releaseResponse)
+	if err := <-callResult; err != nil {
+		t.Fatalf("admitted call error = %v, want success", err)
+	}
+	if err := <-quiesceResult; err != nil {
+		t.Fatalf("QuiesceRPC error = %v, want nil", err)
+	}
+
+	// 5. Repeated/concurrent quiescence callers observe the same closed admission
+	// and completed drain without panic or reopen.
+	var gateWG sync.WaitGroup
+	for i := 0; i < 8; i++ {
+		gateWG.Add(1)
+		go func() {
+			defer gateWG.Done()
+			if err := node.QuiesceRPC(context.Background()); err != nil {
+				t.Errorf("concurrent QuiesceRPC error = %v", err)
+			}
+		}()
+	}
+	gateWG.Wait()
+	if _, err := node.CallRPC(context.Background(), json.RawMessage(`{"type":"get_messages"}`)); !errors.As(err, &typed) || typed.Code != contract.ErrorSessionStopping {
+		t.Fatalf("post-quiesce RPC error = %v, want admission to stay closed", err)
+	}
+}
+
 func TestNodeWorkspaceStartInheritance(t *testing.T) {
 	workspace := config.WorkspaceStart{Repository: "owner/repo", Checkout: "repo"}
 
