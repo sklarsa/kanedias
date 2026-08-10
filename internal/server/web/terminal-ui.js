@@ -90,19 +90,30 @@
 
   function createToolExpansionController() {
     var expansionMode = null;
+    var seenCards = new WeakSet();
+
+    function cardsIn(root) {
+      return Array.prototype.slice.call(root.querySelectorAll("[data-tool-card]"));
+    }
+
+    function apply(card) {
+      seenCards.add(card);
+      if (card.open !== expansionMode) card.open = expansionMode;
+    }
 
     function refresh(root) {
-      if (expansionMode === null) return;
-      var cards = root.querySelectorAll("[data-tool-card]");
+      var cards = cardsIn(root);
       for (var i = 0; i < cards.length; i++) {
-        if (cards[i].open !== expansionMode) cards[i].open = expansionMode;
+        if (seenCards.has(cards[i])) continue;
+        seenCards.add(cards[i]);
+        if (expansionMode !== null) apply(cards[i]);
       }
     }
 
     function toggle(root) {
-      var cards = Array.prototype.slice.call(root.querySelectorAll("[data-tool-card]"));
+      var cards = cardsIn(root);
       expansionMode = nextToolExpansion(cards.map(function (card) { return card.open; }));
-      refresh(root);
+      for (var i = 0; i < cards.length; i++) apply(cards[i]);
       return expansionMode;
     }
 
