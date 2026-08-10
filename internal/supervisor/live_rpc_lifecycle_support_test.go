@@ -19,6 +19,7 @@ import (
 	"github.com/sklarsa/kanedias/internal/config"
 	"github.com/sklarsa/kanedias/internal/supervisor"
 	"github.com/sklarsa/kanedias/internal/supervisor/contract"
+	"github.com/sklarsa/kanedias/internal/supervisor/pirpc"
 )
 
 func TestValidateLifecycleModelPolicyRequiresLocalRootAndWorkers(t *testing.T) {
@@ -593,26 +594,117 @@ func (h *liveAcceptance) stopLifecycleRoot(root *lifecycleRoot) {
 	})
 }
 
-// assertRootUsable sends a short prompt containing the marker, waits for a new
-// root agent_settled in the journal, requires the marker in the final assistant
-// text, and requires a successful non-streaming get_state.
+// lifecycleRPCCommand routes one command through the root socket and requires
+// Pi's exact successful response envelope for that same command.
+func (h *liveAcceptance) lifecycleRPCCommand(root *lifecycleRoot, sessionID string, command map[string]any) map[string]any {
+	commandType, _ := command["type"].(string)
+	if strings.TrimSpace(commandType) == "" {
+		h.t.Fatalf("lifecycle RPC command has no nonempty type: %#v", command)
+	}
+	response := h.rpc(root.client, sessionID, command)
+	responseType, _ := response["type"].(string)
+	responseCommand, _ := response["command"].(string)
+	if responseType != "response" || responseCommand != commandType || response["success"] != true {
+		h.t.Fatalf("lifecycle RPC %q acknowledgement for %s was not exact: %#v", commandType, sessionID, response)
+	}
+	return response
+}
+
+// lifecycleGetState decodes the full typed get_state response and validates
+// the response envelope instead of relying on map assertions for control gates.
+func (h *liveAcceptance) lifecycleGetState(root *lifecycleRoot, sessionID string) pirpc.GetStateData {
+	response := h.lifecycleRPCCommand(root, sessionID, map[string]any{"type": "get_state"})
+	data, ok := response["data"].(map[string]any)
+	if !ok {
+		h.t.Fatalf("get_state response for %s has no object data: %#v", sessionID, response)
+	}
+	streaming, streamingOK := data["isStreaming"].(bool)
+	pending, pendingOK := data["pendingMessageCount"].(float64)
+	if !streamingOK || !pendingOK || pending < 0 || pending != float64(int(pending)) {
+		h.t.Fatalf("get_state response for %s lacks exact streaming/pending state: %#v", sessionID, response)
+	}
+	encoded, err := json.Marshal(response)
+	if err != nil {
+		h.t.Fatalf("encode typed get_state response for %s: %v", sessionID, err)
+	}
+	var state pirpc.GetStateResponse
+	if err := json.Unmarshal(encoded, &state); err != nil {
+		h.t.Fatalf("decode typed get_state response for %s: %v", sessionID, err)
+	}
+	if state.Type != "response" || state.Command != "get_state" || !state.Success ||
+		state.Data.IsStreaming != streaming || state.Data.PendingMessageCount != int(pending) {
+		h.t.Fatalf("typed get_state response for %s was not exact: %#v", sessionID, state)
+	}
+	return state.Data
+}
+
+// waitLifecycleStreaming admits a control command only after one tree snapshot
+// reports the target running and typed get_state reports active streaming.
+func (h *liveAcceptance) waitLifecycleStreaming(root *lifecycleRoot, sessionID, description string) pirpc.GetStateData {
+	var observed pirpc.GetStateData
+	h.poll(4*time.Minute, description, func() bool {
+		var tree supervisor.NodeSnapshot
+		if unixJSON(root.client, http.MethodGet, "/v1/tree", nil, &tree) != nil {
+			return false
+		}
+		node, ok := lifecycleSnapshotByID(tree, sessionID)
+		if !ok || node.Lifecycle != string(supervisor.LifecycleRunning) {
+			return false
+		}
+		state := h.lifecycleGetState(root, sessionID)
+		if !state.IsStreaming {
+			return false
+		}
+		observed = state
+		return true
+	})
+	return observed
+}
+
+func lifecycleSnapshotByID(tree supervisor.NodeSnapshot, sessionID string) (supervisor.NodeSnapshot, bool) {
+	if tree.SessionID == sessionID {
+		return tree, true
+	}
+	for _, child := range tree.Children {
+		if matched, ok := lifecycleSnapshotByID(child, sessionID); ok {
+			return matched, true
+		}
+	}
+	return supervisor.NodeSnapshot{}, false
+}
+
+// waitLifecycleSettlement requires exactly one new terminal settlement and
+// observes typed non-streaming state while the target transport remains open.
+func (h *liveAcceptance) waitLifecycleSettlement(root *lifecycleRoot, sessionID string, settledBefore int, requireEmptyPending bool, description string) pirpc.GetStateData {
+	var observed pirpc.GetStateData
+	stateObserved := false
+	h.poll(4*time.Minute, description, func() bool {
+		settled := root.journal.countPi(sessionID, "agent_settled", "")
+		if settled > settledBefore+1 {
+			h.t.Fatalf("%s emitted %d new agent_settled events, want exactly 1", description, settled-settledBefore)
+		}
+		if !stateObserved {
+			state := h.lifecycleGetState(root, sessionID)
+			if !state.IsStreaming && (!requireEmptyPending || state.PendingMessageCount == 0) {
+				observed = state
+				stateObserved = true
+			}
+		}
+		return stateObserved && settled == settledBefore+1
+	})
+	return observed
+}
+
+// assertRootUsable sends a short prompt containing the marker, requires its
+// exact acknowledgement and exactly one new settlement, then checks the final
+// text and typed non-streaming state over the still-open transport.
 func (h *liveAcceptance) assertRootUsable(root *lifecycleRoot, marker string) {
 	before := root.journal.countPi(root.tree.SessionID, "agent_settled", "")
-	h.rpc(root.client, root.tree.SessionID, map[string]any{"type": "prompt", "message": "Reply with exactly " + marker + "."})
-	h.poll(4*time.Minute, "new root settlement after marker prompt", func() bool {
-		return root.journal.countPi(root.tree.SessionID, "agent_settled", "") > before
-	})
+	h.lifecycleRPCCommand(root, root.tree.SessionID, map[string]any{"type": "prompt", "message": "Reply with exactly " + marker + "."})
+	h.waitLifecycleSettlement(root, root.tree.SessionID, before, false, "new root settlement after marker prompt")
 	text := h.lastAssistantText(root.client, root.tree.SessionID)
 	if !strings.Contains(text, marker) {
 		h.t.Fatalf("root final text %q does not contain marker %q", text, marker)
-	}
-	state := h.rpc(root.client, root.tree.SessionID, map[string]any{"type": "get_state"})
-	if state["success"] != true {
-		h.t.Fatalf("get_state failed on usable root: %#v", state)
-	}
-	data, _ := state["data"].(map[string]any)
-	if streaming, _ := data["isStreaming"].(bool); streaming {
-		h.t.Fatalf("get_state isStreaming still true on usable root: %#v", state)
 	}
 }
 

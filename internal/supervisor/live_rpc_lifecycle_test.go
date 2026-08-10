@@ -42,6 +42,24 @@ func TestLiveRPCRootEndLifecycle(t *testing.T) {
 	})
 }
 
+func TestLiveRPCInterruptLifecycle(t *testing.T) {
+	runLifecycleScenario(t, "interrupt", func(h *liveAcceptance) {
+		h.exerciseLifecycleInterrupt()
+	})
+}
+
+func TestLiveRPCSteerLifecycle(t *testing.T) {
+	runLifecycleScenario(t, "steer", func(h *liveAcceptance) {
+		h.exerciseLifecycleSteer()
+	})
+}
+
+func TestLiveRPCRapidControlLifecycle(t *testing.T) {
+	runLifecycleScenario(t, "rapid-control", func(h *liveAcceptance) {
+		h.exerciseLifecycleRapidControl()
+	})
+}
+
 func TestValidateLifecycleStoppedResultRequiresExactChildAborted(t *testing.T) {
 	valid := lifecycleHTTPResult{
 		Status: contract.ErrorChildAborted.HTTPStatus(),
@@ -359,6 +377,122 @@ func (h *liveAcceptance) exerciseLifecycleRootEnd() {
 	if status, body, err := unixRequest(root.client, http.MethodGet, "/v1/tree", nil); err == nil {
 		h.t.Fatalf("request through ended root socket unexpectedly succeeded: status=%d body=%q", status, body)
 	}
+}
+
+func (h *liveAcceptance) exerciseLifecycleInterrupt() {
+	root := h.startLifecycleRoot("interrupt")
+	h.lifecycleRPCCommand(root, root.tree.SessionID, map[string]any{
+		"type": "prompt", "message": lifecycleActiveReadTask("KANEDIAS_LIFECYCLE_INTERRUPT_ROOT_UNEXPECTED_" + h.prefix),
+	})
+	h.waitLifecycleStreaming(root, root.tree.SessionID, "root running and streaming before interrupt")
+	rootSettledBefore := root.journal.countPi(root.tree.SessionID, "agent_settled", "")
+	h.lifecycleRPCCommand(root, root.tree.SessionID, map[string]any{"type": "abort"})
+	h.waitLifecycleSettlement(root, root.tree.SessionID, rootSettledBefore, false, "root interrupt settlement and open transport")
+	h.assertRootUsable(root, "KANEDIAS_LIFECYCLE_INTERRUPT_ROOT_USABLE_"+h.prefix)
+	if got := root.journal.countPi(root.tree.SessionID, "agent_settled", ""); got != rootSettledBefore+2 {
+		h.t.Fatalf("root interrupt plus follow-up settlements = %d, want exactly 2", got-rootSettledBefore)
+	}
+
+	childCall := h.startLifecycleChildCall(root.client, root.tree.SessionID, "interrupt-child",
+		lifecycleActiveReadTask("KANEDIAS_LIFECYCLE_INTERRUPT_CHILD_UNEXPECTED_"+h.prefix))
+	childTree := h.waitForLifecycleChildren(root, 1, true, "running child before interrupt")
+	child := childTree.Children[0]
+	h.assertLifecycleChildren(root.tree, childTree.Children)
+	childPIDs := h.captureLifecycleChildPIDs(root, 1, "interrupt-child")
+	h.waitLifecycleStreaming(root, child.SessionID, "child running and streaming before interrupt")
+	childSettledBefore := root.journal.countPi(child.SessionID, "agent_settled", "")
+	h.lifecycleRPCCommand(root, child.SessionID, map[string]any{"type": "abort"})
+	h.waitLifecycleSettlement(root, child.SessionID, childSettledBefore, false, "child interrupt settlement and open transport")
+	h.assertLifecycleStoppedResult(childCall.wait(h.t, 2*time.Minute))
+	if got := root.journal.countPi(child.SessionID, "agent_settled", ""); got != childSettledBefore+1 {
+		h.t.Fatalf("interrupted child settlements = %d, want exactly 1", got-childSettledBefore)
+	}
+	h.waitForLifecycleChildrenGone(root, []supervisor.NodeSnapshot{child}, childPIDs, "interrupted child cleanup")
+	h.assertRootUsable(root, "KANEDIAS_LIFECYCLE_INTERRUPT_CHILD_ROOT_USABLE_"+h.prefix)
+	if got := root.journal.countPi(root.tree.SessionID, "agent_settled", ""); got != rootSettledBefore+3 {
+		h.t.Fatalf("interrupt scenario root settlements = %d, want exactly 3", got-rootSettledBefore)
+	}
+	h.stopLifecycleRoot(root)
+}
+
+func (h *liveAcceptance) exerciseLifecycleSteer() {
+	root := h.startLifecycleRoot("steer")
+	rootSteerMarker := "KANEDIAS_LIFECYCLE_STEER_ROOT_" + h.prefix
+	h.lifecycleRPCCommand(root, root.tree.SessionID, map[string]any{
+		"type": "prompt", "message": lifecycleActiveReadTask("KANEDIAS_LIFECYCLE_STEER_ROOT_ORIGINAL_" + h.prefix),
+	})
+	h.waitLifecycleStreaming(root, root.tree.SessionID, "root running and streaming before steer")
+	rootSettledBefore := root.journal.countPi(root.tree.SessionID, "agent_settled", "")
+	h.lifecycleRPCCommand(root, root.tree.SessionID, map[string]any{
+		"type": "steer", "message": "Stop the prior response and include exactly " + rootSteerMarker + ".",
+	})
+	h.waitLifecycleSettlement(root, root.tree.SessionID, rootSettledBefore, false, "steered root settlement and open transport")
+	if text := h.lastAssistantText(root.client, root.tree.SessionID); !strings.Contains(text, rootSteerMarker) {
+		h.t.Fatalf("steered root final text %q lacks marker %q", text, rootSteerMarker)
+	}
+	h.assertRootUsable(root, "KANEDIAS_LIFECYCLE_STEER_ROOT_USABLE_"+h.prefix)
+	if got := root.journal.countPi(root.tree.SessionID, "agent_settled", ""); got != rootSettledBefore+2 {
+		h.t.Fatalf("root steer plus follow-up settlements = %d, want exactly 2", got-rootSettledBefore)
+	}
+
+	childSteerMarker := "KANEDIAS_LIFECYCLE_STEER_CHILD_" + h.prefix
+	childCall := h.startLifecycleChildCall(root.client, root.tree.SessionID, "steer-child",
+		lifecycleActiveReadTask("KANEDIAS_LIFECYCLE_STEER_CHILD_ORIGINAL_"+h.prefix))
+	childTree := h.waitForLifecycleChildren(root, 1, true, "running child before steer")
+	child := childTree.Children[0]
+	h.assertLifecycleChildren(root.tree, childTree.Children)
+	childPIDs := h.captureLifecycleChildPIDs(root, 1, "steer-child")
+	h.waitLifecycleStreaming(root, child.SessionID, "child running and streaming before steer")
+	childSettledBefore := root.journal.countPi(child.SessionID, "agent_settled", "")
+	h.lifecycleRPCCommand(root, child.SessionID, map[string]any{
+		"type": "steer", "message": "Stop the prior response and include exactly " + childSteerMarker + ".",
+	})
+	h.waitLifecycleSettlement(root, child.SessionID, childSettledBefore, false, "steered child settlement and open transport")
+	result := childCall.wait(h.t, 2*time.Minute)
+	h.assertLifecycleReadResult(result, child.SessionID, childSteerMarker)
+	h.waitForLifecycleNaturalChildEvents(root, []supervisor.NodeSnapshot{child}, "steered child exact terminal events")
+	h.waitForLifecycleChildrenGone(root, []supervisor.NodeSnapshot{child}, childPIDs, "steered child cleanup")
+	h.assertRootUsable(root, "KANEDIAS_LIFECYCLE_STEER_CHILD_ROOT_USABLE_"+h.prefix)
+	if got := root.journal.countPi(root.tree.SessionID, "agent_settled", ""); got != rootSettledBefore+3 {
+		h.t.Fatalf("steer scenario root settlements = %d, want exactly 3", got-rootSettledBefore)
+	}
+	h.stopLifecycleRoot(root)
+}
+
+func (h *liveAcceptance) exerciseLifecycleRapidControl() {
+	root := h.startLifecycleRoot("rapid-control")
+	priorSteerMarker := "KANEDIAS_LIFECYCLE_RAPID_STEER_" + h.prefix
+	h.lifecycleRPCCommand(root, root.tree.SessionID, map[string]any{
+		"type": "prompt", "message": lifecycleActiveReadTask("KANEDIAS_LIFECYCLE_RAPID_ORIGINAL_" + h.prefix),
+	})
+	h.waitLifecycleStreaming(root, root.tree.SessionID, "root running and streaming before rapid control")
+	settledBefore := root.journal.countPi(root.tree.SessionID, "agent_settled", "")
+	h.lifecycleRPCCommand(root, root.tree.SessionID, map[string]any{
+		"type": "steer", "message": "Stop the prior response and include exactly " + priorSteerMarker + ".",
+	})
+	h.lifecycleRPCCommand(root, root.tree.SessionID, map[string]any{"type": "abort"})
+	h.waitLifecycleSettlement(root, root.tree.SessionID, settledBefore, true, "rapid steer-abort settlement with empty pending queue")
+	settledAtFollowUp := root.journal.countPi(root.tree.SessionID, "agent_settled", "")
+	if settledAtFollowUp != settledBefore+1 {
+		h.t.Fatalf("rapid steer-abort settlements = %d, want exactly 1", settledAtFollowUp-settledBefore)
+	}
+
+	followUpMarker := "KANEDIAS_LIFECYCLE_RAPID_FOLLOW_UP_" + h.prefix
+	h.lifecycleRPCCommand(root, root.tree.SessionID, map[string]any{
+		"type": "prompt", "message": "Reply with exactly " + followUpMarker + ".",
+	})
+	h.waitLifecycleSettlement(root, root.tree.SessionID, settledAtFollowUp, false, "rapid-control isolated follow-up settlement")
+	if got := root.journal.countPi(root.tree.SessionID, "agent_settled", ""); got != settledBefore+2 {
+		h.t.Fatalf("rapid-control total settlements = %d, want exactly 2", got-settledBefore)
+	}
+	text := h.lastAssistantText(root.client, root.tree.SessionID)
+	if !strings.Contains(text, followUpMarker) {
+		h.t.Fatalf("rapid-control follow-up text %q lacks marker %q", text, followUpMarker)
+	}
+	if strings.Contains(text, priorSteerMarker) {
+		h.t.Fatalf("rapid-control follow-up text %q retained prior steer marker %q", text, priorSteerMarker)
+	}
+	h.stopLifecycleRoot(root)
 }
 
 func (h *liveAcceptance) sendLifecycleModelPrompt(root *lifecycleRoot, prompt string) {
