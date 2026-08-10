@@ -14,10 +14,24 @@ test("matches terminal editor and interrupt keys without stealing copy", () => {
   assert.equal(ui.keyAction(event("o", {ctrlKey:true}), {target:"body", hasSelection:false, canInterrupt:false}), "toggle-tools");
 });
 
-test("ignores composition, conflicting modifiers, and unrelated editors", () => {
+test("bare Enter submits while Shift-Enter remains a textarea newline", () => {
   const deck = {target:"deck", hasSelection:false, canInterrupt:true};
   assert.equal(ui.keyAction(event("Enter"), deck), "submit");
+  assert.equal(ui.keyAction(event("Enter", {shiftKey:true}), deck), null);
+  assert.equal(ui.keyAction(event("Enter", {isComposing:true}), deck), null);
   assert.equal(ui.keyAction(event("Enter"), {...deck, target:"body"}), null);
+});
+
+test("IME keyCode 229 Enter is ignored without changing the following normal Enter", () => {
+  const deck = {target:"deck", hasSelection:false, canInterrupt:true};
+  const compositionEnter = event("Enter", {keyCode: 229});
+  assert.equal(compositionEnter.isComposing, false);
+  assert.equal(ui.keyAction(compositionEnter, deck), null);
+  assert.equal(ui.keyAction(event("Enter", {keyCode: 13}), deck), "submit");
+});
+
+test("ignores composition, conflicting modifiers, and unrelated editors", () => {
+  const deck = {target:"deck", hasSelection:false, canInterrupt:true};
   assert.equal(ui.keyAction(event("a", {ctrlKey:true, isComposing:true}), deck), null);
   assert.equal(ui.keyAction(event("a", {ctrlKey:true, shiftKey:true}), deck), null);
   assert.equal(ui.keyAction(event("a", {ctrlKey:true, altKey:true}), deck), null);

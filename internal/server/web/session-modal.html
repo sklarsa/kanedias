@@ -12,10 +12,25 @@
       <label for="session-name">Session name <span class="optional">optional</span></label>
       <input id="session-name" type="text" maxlength="80" autocomplete="off" data-session-name>
       <label for="start-repository">Starting repository</label>
-      <select id="start-repository" data-start-repository>
-        <option value="" selected>/workspace</option>
-        {{range .Repositories}}<option value="{{.Slug}}">{{.Slug}}</option>{{end}}
-      </select>
+      <div class="repository-combobox" data-repository-combobox>
+        <input id="start-repository" type="text" autocomplete="off"
+          role="combobox" aria-autocomplete="list" aria-expanded="false"
+          aria-controls="start-repository-list" aria-describedby="start-repository-results"
+          placeholder="/workspace" data-repository-query>
+        <input type="hidden" value="" data-start-repository>
+        <div id="start-repository-list" class="repository-listbox" role="listbox"
+          aria-label="Configured repositories" data-repository-listbox hidden>
+          <div id="repository-option-workspace" role="option" aria-selected="true"
+            data-repository-option data-value="">/workspace</div>
+          {{range $index, $repository := .Repositories}}
+          <div id="repository-option-{{$index}}" role="option" aria-selected="false"
+            data-repository-option data-value="{{$repository.Slug}}">{{$repository.Slug}}</div>
+          {{end}}
+          <div class="repository-empty" role="presentation" data-repository-empty hidden>No configured repositories match.</div>
+        </div>
+        <div id="start-repository-results" class="repository-results" role="status"
+          aria-live="polite" data-repository-results></div>
+      </div>
     </fieldset>
 
     <fieldset{{if not .Enabled}} disabled{{end}}>

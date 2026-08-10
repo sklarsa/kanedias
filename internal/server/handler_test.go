@@ -166,6 +166,7 @@ func launchOptionsFixture() manager.SessionLaunchOptions {
 		Repositories: []manager.RepositoryLaunchOption{
 			{Slug: "two/beta"},
 			{Slug: "one/alpha"},
+			{Slug: "special/<escape>&"},
 		},
 	}
 }
@@ -194,6 +195,8 @@ func TestHandlerRoutes(t *testing.T) {
 				"<title>Kanedias — Circle of the Fleet</title>",
 				`id="alertBanner"`,
 				`id="fleet-panel"`,
+				`id="fleet-resizer"`,
+				`src="/assets/fleet-layout.js"`,
 				`id="detail-panel"`,
 				`id="question-panel"`,
 				`id="activity-panel"`,
@@ -252,6 +255,13 @@ func TestHandlerRoutes(t *testing.T) {
 			contentType: "text/javascript; charset=utf-8",
 		},
 		{
+			name:        "repository combobox controller",
+			path:        "/assets/repository-combobox.js",
+			method:      http.MethodGet,
+			status:      http.StatusOK,
+			contentType: "text/javascript; charset=utf-8",
+		},
+		{
 			name:        "session modal controller",
 			path:        "/assets/session-modal.js",
 			method:      http.MethodGet,
@@ -261,6 +271,13 @@ func TestHandlerRoutes(t *testing.T) {
 		{
 			name:        "image attachment controller",
 			path:        "/assets/image-attachments.js",
+			method:      http.MethodGet,
+			status:      http.StatusOK,
+			contentType: "text/javascript; charset=utf-8",
+		},
+		{
+			name:        "Fleet layout controller",
+			path:        "/assets/fleet-layout.js",
 			method:      http.MethodGet,
 			status:      http.StatusOK,
 			contentType: "text/javascript; charset=utf-8",
@@ -325,7 +342,9 @@ func TestHandlerRejectsUnsupportedMethods(t *testing.T) {
 		{"/assets/terminal.css", false},
 		{"/assets/app.css", false},
 		{"/assets/datastar.js", false},
+		{"/assets/repository-combobox.js", false},
 		{"/assets/session-modal.js", false},
+		{"/assets/fleet-layout.js", false},
 		{"/", true},
 		{"/ui/status", true},
 	}
@@ -362,7 +381,12 @@ func TestInitialPageRendersSessionModalFromLaunchOptions(t *testing.T) {
 		`<dialog id="new-session-modal"`, `id="new-session-form"`, `aria-labelledby="new-session-title"`,
 		`id="new-session-title"`, `New session`, `aria-label="Close"`,
 		`id="session-name"`, `type="text"`, `maxlength="80"`, `autocomplete="off"`, `data-session-name`, `Session name`, `optional`,
-		`id="start-repository"`, `data-start-repository`, `<option value="" selected>/workspace</option>`,
+		`data-repository-combobox`, `id="start-repository"`, `type="text"`, `role="combobox"`, `aria-autocomplete="list"`,
+		`aria-controls="start-repository-list"`, `aria-describedby="start-repository-results"`, `data-repository-query`,
+		`type="hidden"`, `data-start-repository`, `id="start-repository-list"`, `role="listbox"`, `aria-label="Configured repositories"`,
+		`data-repository-listbox hidden`, `id="repository-option-workspace"`, `role="option"`, `data-repository-option data-value=""`, `>/workspace</div>`,
+		`class="repository-empty"`, `role="presentation"`, `data-repository-empty hidden`, `No configured repositories match.`,
+		`id="start-repository-results"`, `role="status"`, `aria-live="polite"`, `data-repository-results`,
 		`id="root-model"`, `data-root-model`, `id="root-thinking"`, `data-root-thinking`, `value="deep-model" selected`, `value="xhigh" selected`,
 		`data-thinking-levels="off,medium"`, `data-default-thinking="off"`, `data-worker-row`, `data-worker-model`, `data-worker-thinking`, `data-modal-close`,
 		`Fast &amp; safe`, `Deep model`, `<summary>Subagent model profiles</summary>`,
@@ -379,14 +403,21 @@ func TestInitialPageRendersSessionModalFromLaunchOptions(t *testing.T) {
 	if got := strings.Count(body, `data-session-name`); got != 1 {
 		t.Errorf("session name input count = %d, want 1", got)
 	}
-	workspace := strings.Index(body, `<option value="" selected>/workspace</option>`)
+	if strings.Contains(body, `<select id="start-repository"`) {
+		t.Error("repository chooser still renders the retired native select")
+	}
+	workspace := strings.Index(body, `id="repository-option-workspace"`)
 	lastRepository := workspace
-	for _, slug := range []string{"one/alpha", "two/beta"} {
-		marker := `<option value="` + slug + `">` + slug + `</option>`
-		if got := strings.Count(body, marker); got != 1 {
+	for index, slug := range []string{"one/alpha", "special/&lt;escape&gt;&amp;", "two/beta"} {
+		idMarker := fmt.Sprintf(`id="repository-option-%d"`, index)
+		valueMarker := `data-repository-option data-value="` + slug + `">` + slug + `</div>`
+		if got := strings.Count(body, idMarker); got != 1 {
+			t.Errorf("repository %q stable ID count = %d, want 1", slug, got)
+		}
+		if got := strings.Count(body, valueMarker); got != 1 {
 			t.Errorf("repository %q option count = %d, want 1", slug, got)
 		}
-		position := strings.Index(body, marker)
+		position := strings.Index(body, valueMarker)
 		if workspace < 0 || position <= lastRepository {
 			t.Errorf("repository %q is not after /workspace in deterministic slug order", slug)
 		}
@@ -439,6 +470,9 @@ func TestInitialPageContainsAstrolabeConsole(t *testing.T) {
 		`<html lang="en" data-theme="dark">`,
 		// shell stable Datastar patch roots
 		`id="fleet-panel"`,
+		`id="fleet-resizer"`, `role="separator"`, `aria-orientation="vertical"`,
+		`aria-controls="fleet-panel main-stack"`, `tabindex="0"`,
+		`src="/assets/fleet-layout.js"`,
 		`id="detail-panel"`,
 		`data-can-steer="false"`,
 		`data-can-interrupt="false"`,
@@ -467,6 +501,18 @@ func TestInitialPageContainsAstrolabeConsole(t *testing.T) {
 		if !strings.Contains(body, want) {
 			t.Errorf("initial page does not contain %q", want)
 		}
+	}
+	for _, want := range []string{
+		`<textarea class="deck-input" rows="2"`,
+		`aria-keyshortcuts="Control+A Control+C Enter Shift+Enter"`,
+		`Enter: steer · Shift+Enter: newline`,
+	} {
+		if !strings.Contains(body, want) {
+			t.Errorf("composer shell does not contain %q", want)
+		}
+	}
+	if strings.Contains(body, `<input class="deck-input" type="text"`) {
+		t.Error("composer still renders the retired single-line input")
 	}
 
 	obsolete := []string{
@@ -504,17 +550,17 @@ func TestAstrolabeConsoleIsInteractive(t *testing.T) {
 	body := response.Body.String()
 
 	// The console is wired by local asset modules (Datastar, Marked, Highlight,
-	// the Markdown renderer, terminal decisions, the session modal, and app.js).
-	// There are no external scripts and no inline controller.
+	// the Markdown renderer, terminal decisions, Fleet layout, repository combobox,
+	// the session modal, attachments, and app.js). There are no external scripts or inline controller.
 	scriptRE := regexp.MustCompile(`(?s)<script\b([^>]*)>(.*?)</script>`)
 	scripts := scriptRE.FindAllStringSubmatch(body, -1)
-	wantScripts := 8 // Datastar + 3 Markdown assets + terminal decisions + session modal + attachments + app.js
+	wantScripts := 10 // Datastar + 3 Markdown assets + terminal decisions + Fleet layout + repository combobox + session modal + attachments + app.js
 	if len(scripts) != wantScripts {
-		t.Fatalf("script count = %d, want %d (Datastar + 3 Markdown assets + terminal-ui.js + session-modal.js + image-attachments.js + app.js)", len(scripts), wantScripts)
+		t.Fatalf("script count = %d, want %d", len(scripts), wantScripts)
 	}
 
-	var sawDatastar, sawTerminalUI, sawSessionModal, sawAttachments, sawAppJS bool
-	attachmentIndex, appIndex := -1, -1
+	var sawDatastar, sawTerminalUI, sawFleetLayout, sawRepositoryCombobox, sawSessionModal, sawAttachments, sawAppJS bool
+	fleetLayoutIndex, repositoryComboboxIndex, sessionModalIndex, attachmentIndex, appIndex := -1, -1, -1, -1, -1
 	markdownAssets := []string{
 		`src="/assets/marked.min.js"`,
 		`src="/assets/highlight.min.js"`,
@@ -541,11 +587,26 @@ func TestAstrolabeConsoleIsInteractive(t *testing.T) {
 			}
 			sawTerminalUI = true
 		}
+		if strings.Contains(attrs, `src="/assets/fleet-layout.js"`) {
+			if inner != "" {
+				t.Errorf("fleet-layout.js script has unexpected inline body %q", inner)
+			}
+			sawFleetLayout = true
+			fleetLayoutIndex = scriptIndex
+		}
+		if strings.Contains(attrs, `src="/assets/repository-combobox.js"`) {
+			if inner != "" {
+				t.Errorf("repository-combobox.js script has unexpected inline body %q", inner)
+			}
+			sawRepositoryCombobox = true
+			repositoryComboboxIndex = scriptIndex
+		}
 		if strings.Contains(attrs, `src="/assets/session-modal.js"`) {
 			if inner != "" {
 				t.Errorf("session-modal.js script has unexpected inline body %q", inner)
 			}
 			sawSessionModal = true
+			sessionModalIndex = scriptIndex
 		}
 		if strings.Contains(attrs, `src="/assets/image-attachments.js"`) {
 			if inner != "" {
@@ -573,6 +634,12 @@ func TestAstrolabeConsoleIsInteractive(t *testing.T) {
 	if !sawTerminalUI {
 		t.Error("page is missing the local terminal-ui.js script")
 	}
+	if !sawFleetLayout {
+		t.Error("page is missing the local fleet-layout.js script")
+	}
+	if !sawRepositoryCombobox {
+		t.Error("page is missing the local repository-combobox.js script")
+	}
 	if !sawSessionModal {
 		t.Error("page is missing the local session-modal.js script")
 	}
@@ -581,6 +648,12 @@ func TestAstrolabeConsoleIsInteractive(t *testing.T) {
 	}
 	if !sawAppJS {
 		t.Error("page is missing the app.js script")
+	}
+	if fleetLayoutIndex < 0 || appIndex < 0 || fleetLayoutIndex >= appIndex {
+		t.Error("fleet-layout.js must load before app.js")
+	}
+	if repositoryComboboxIndex < 0 || sessionModalIndex < 0 || repositoryComboboxIndex+1 != sessionModalIndex {
+		t.Error("repository-combobox.js must load immediately before session-modal.js")
 	}
 	if attachmentIndex < 0 || appIndex < 0 || attachmentIndex >= appIndex {
 		t.Error("image-attachments.js must load before app.js")
@@ -594,13 +667,24 @@ func TestAstrolabeConsoleIsInteractive(t *testing.T) {
 	// The console is a working control surface with delegated Datastar wiring.
 	for _, want := range []string{
 		`class="deck-input"`, `data-on:click=`,
-		`aria-keyshortcuts="Control+A Control+C Enter"`,
 		`aria-keyshortcuts="Escape"`,
-		`^A select all · ^C clear/copy · esc abort · ^O tools`,
+		`^A select all · ^C clear/copy · ↵ send · ⇧↵ newline · esc abort · ^O tools`,
 	} {
 		if !strings.Contains(body, want) {
 			t.Errorf("interactive console is missing wiring %q", want)
 		}
+	}
+	for _, want := range []string{
+		`<textarea class="deck-input" rows="2"`,
+		`aria-keyshortcuts="Control+A Control+C Enter Shift+Enter"`,
+		`Enter: steer · Shift+Enter: newline`,
+	} {
+		if !strings.Contains(body, want) {
+			t.Errorf("composer shell does not contain %q", want)
+		}
+	}
+	if strings.Contains(body, `<input class="deck-input" type="text"`) {
+		t.Error("composer still renders the retired single-line input")
 	}
 	if strings.Contains(body, " disabled") {
 		t.Error("Astrolabe console must not ship disabled placeholder controls")
@@ -794,6 +878,11 @@ func TestTemplatesDefineStableRoots(t *testing.T) {
 	}
 	if !strings.Contains(fleetHTML, `id="fleet-panel"`) {
 		t.Errorf("fleet.html does not contain #fleet-panel root")
+	}
+	for _, want := range []string{`data-fleet-collapse`, `aria-label="Hide Fleet"`, `aria-expanded="true"`} {
+		if !strings.Contains(fleetHTML, want) {
+			t.Errorf("fleet.html does not contain %q", want)
+		}
 	}
 
 	// Render the detail template with an empty state.
@@ -1587,7 +1676,7 @@ func TestAssetsAreEmbedded(t *testing.T) {
 	})
 
 	// Unauthenticated paths.
-	for _, path := range []string{"/healthz", "/assets/terminal.css", "/assets/app.css", "/assets/datastar.js", "/assets/terminal-ui.js", "/assets/session-modal.js", "/assets/image-attachments.js", "/assets/app.js"} {
+	for _, path := range []string{"/healthz", "/assets/terminal.css", "/assets/app.css", "/assets/datastar.js", "/assets/terminal-ui.js", "/assets/fleet-layout.js", "/assets/repository-combobox.js", "/assets/session-modal.js", "/assets/image-attachments.js", "/assets/app.js"} {
 		if response := serveRequest(handler, http.MethodGet, path); response.Code != http.StatusOK {
 			t.Errorf("GET %s status = %d, want %d", path, response.Code, http.StatusOK)
 		}
@@ -1665,6 +1754,8 @@ func TestRenderedPageHasOnlyOrderedLocalRuntimeAssets(t *testing.T) {
 		"/assets/highlight.min.js",
 		"/assets/markdown-renderer.js",
 		"/assets/terminal-ui.js",
+		"/assets/fleet-layout.js",
+		"/assets/repository-combobox.js",
 		"/assets/session-modal.js",
 		"/assets/image-attachments.js",
 		"/assets/app.js",
@@ -1708,6 +1799,10 @@ func TestProjectStylesDefineAstrolabeVisualSystem(t *testing.T) {
 		".alidade{",
 		".alert-banner{",
 		".deck{",
+		"grid-template-rows:var(--topbar-h) minmax(0,1fr) auto;",
+		"resize:none",
+		"font-size:15px",
+		"line-height:1.45",
 		// responsive: sidebar collapses to a slide-over on narrow screens
 		"@media (max-width:820px)",
 		".sidebar.open",
@@ -1723,7 +1818,18 @@ func TestProjectStylesDefineAstrolabeVisualSystem(t *testing.T) {
 		"flex:0 0 auto",
 		"#new-session-modal[aria-busy=\"true\"]",
 		"#new-session-modal select:focus-visible",
+		".repository-combobox{",
+		".repository-listbox[hidden]",
+		"[data-repository-option][aria-selected=\"true\"]",
+		".repository-empty{",
 		"min-height:44px",
+		// persistent desktop Fleet layout and controls
+		`--fleet-width:`,
+		`grid-template-columns:var(--fleet-width)`,
+		`#fleet-resizer{`,
+		`.app.fleet-collapsed`,
+		`.fleet-collapse`,
+		`cursor:col-resize`,
 	}
 	for _, want := range required {
 		if !strings.Contains(styles, want) {
@@ -1731,6 +1837,10 @@ func TestProjectStylesDefineAstrolabeVisualSystem(t *testing.T) {
 		}
 	}
 	for description, pattern := range map[string]string{
+		"app deck row sizes to composer content": `(?s)\.app\{[^}]*grid-template-rows:var\(--topbar-h\) minmax\(0,1fr\) auto;`,
+		"composer disables manual resizing":      `(?s)\.deck-input\{[^}]*resize:none`,
+		"composer uses a readable font size":     `(?s)\.deck-input\{[^}]*font-size:15px`,
+		"composer uses multiline line height":    `(?s)\.deck-input\{[^}]*line-height:1\.45`,
 		"full modal form scrolls within its cap": `(?s)#new-session-modal form\{[^}]*overflow-y:auto`,
 		"modal actions stay reachable":           `(?s)#new-session-modal \.modal-actions\{[^}]*position:sticky[^}]*bottom:0[^}]*flex:0 0 auto`,
 	} {

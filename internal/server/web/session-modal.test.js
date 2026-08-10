@@ -9,6 +9,8 @@ class FakeTarget {
     this.listeners = new Map();
     this.disabled = false;
     this.attributes = new Map();
+    this.hidden = false;
+    this.parent = null;
   }
   addEventListener(type, listener, options) {
     const listeners = this.listeners.get(type) || [];
@@ -45,6 +47,12 @@ class FakeTarget {
   getAttribute(name) { return this.attributes.has(name) ? this.attributes.get(name) : null; }
   setAttribute(name, value) { this.attributes.set(name, String(value)); }
   removeAttribute(name) { this.attributes.delete(name); }
+  contains(target) {
+    for (let current = target; current; current = current.parent) {
+      if (current === this) return true;
+    }
+    return false;
+  }
 }
 
 class FakeOption extends FakeTarget {
@@ -109,15 +117,9 @@ function fixture() {
   };
 
   const dialog = new FakeDialog();
+  dialog.parent = document;
   const trigger = new FakeTarget();
   const form = new FakeTarget();
-  form.resetCalls = 0;
-  form.reset = function () {
-    this.resetCalls++;
-    for (const control of [sessionName, startRepository, rootModel, rootThinking, workerModelA, workerThinkingA, workerModelB, workerThinkingB]) {
-      control.reset();
-    }
-  };
   const close = new FakeTarget();
   const cancel = new FakeTarget();
   const launch = new FakeTarget();
@@ -128,11 +130,50 @@ function fixture() {
   details.open = true;
 
   const sessionName = new FakeInput();
-  const startRepository = new FakeSelect([
-    option("", undefined, undefined, true),
-    option("one/alpha"),
-    option("owner/repo")
+  const repositoryRoot = new FakeTarget();
+  repositoryRoot.parent = dialog;
+  const repositoryQuery = new FakeInput();
+  repositoryQuery.parent = repositoryRoot;
+  repositoryQuery.setAttribute("aria-expanded", "false");
+  const startRepository = new FakeInput();
+  startRepository.parent = repositoryRoot;
+  const repositoryListbox = new FakeTarget();
+  repositoryListbox.parent = repositoryRoot;
+  repositoryListbox.hidden = true;
+  const repositoryResults = new FakeTarget();
+  repositoryResults.parent = repositoryRoot;
+  repositoryResults.textContent = "";
+  const repositoryEmpty = new FakeTarget();
+  repositoryEmpty.parent = repositoryListbox;
+  repositoryEmpty.hidden = true;
+  repositoryEmpty.textContent = "No configured repositories match.";
+  repositoryEmpty.setAttribute("role", "presentation");
+  const repositoryOptions = ["", "one/alpha", "owner/repo"].map((value, index) => {
+    const repositoryOption = new FakeTarget();
+    repositoryOption.parent = repositoryListbox;
+    repositoryOption.textContent = value || "/workspace";
+    repositoryOption.setAttribute("id", "repository-option-" + index);
+    repositoryOption.setAttribute("data-value", value);
+    repositoryOption.setAttribute("aria-selected", value === "" ? "true" : "false");
+    return repositoryOption;
+  });
+  const repositorySelectors = new Map([
+    ["[data-repository-query]", repositoryQuery],
+    ["[data-start-repository]", startRepository],
+    ["[data-repository-listbox]", repositoryListbox],
+    ["[data-repository-results]", repositoryResults],
+    ["[data-repository-empty]", repositoryEmpty]
   ]);
+  repositoryRoot.querySelector = (selector) => repositorySelectors.get(selector) || null;
+  repositoryRoot.querySelectorAll = (selector) => selector === "[data-repository-option]" ? repositoryOptions : [];
+
+  form.resetCalls = 0;
+  form.reset = function () {
+    this.resetCalls++;
+    for (const control of [sessionName, repositoryQuery, startRepository, rootModel, rootThinking, workerModelA, workerThinkingA, workerModelB, workerThinkingB]) {
+      control.reset();
+    }
+  };
   const rootModel = new FakeSelect([
     option("deep", "high,xhigh", "high", true),
     option("fast", "off,medium", "off")
@@ -159,7 +200,7 @@ function fixture() {
   workerB.setAttribute("data-worker-type", "worker");
   workerB.querySelector = (selector) => selector === "[data-worker-model]" ? workerModelB : workerThinkingB;
 
-  const controls = [close, cancel, launch, sessionName, startRepository, rootModel, rootThinking, workerModelA, workerThinkingA, workerModelB, workerThinkingB];
+  const controls = [close, cancel, launch, sessionName, repositoryQuery, startRepository, rootModel, rootThinking, workerModelA, workerThinkingA, workerModelB, workerThinkingB];
   const query = new Map([
     ["#new-session-modal", dialog],
     ["#new-session-button", trigger],
@@ -169,6 +210,7 @@ function fixture() {
     ["#new-session-launch", launch],
     ["#new-session-status", status],
     ["[data-session-name]", sessionName],
+    ["[data-repository-combobox]", repositoryRoot],
     ["[data-start-repository]", startRepository],
     ["[data-root-model]", rootModel],
     ["[data-root-thinking]", rootThinking]
@@ -182,10 +224,19 @@ function fixture() {
     return [];
   };
 
+  function chooseRepository(value) {
+    const repositoryOption = repositoryOptions.find((item) => item.getAttribute("data-value") === value);
+    if (!repositoryOption) throw new Error("unknown repository: " + value);
+    repositoryQuery.value = value;
+    repositoryQuery.dispatch("input");
+    repositoryOption.dispatch("pointerdown");
+  }
+
   return {
     document, dialog, trigger, form, close, cancel, launch, status, fieldset, details,
-    sessionName, startRepository, rootModel, rootThinking, workerModelA, workerThinkingA, workerModelB, workerThinkingB,
-    workerA, workerB, controls
+    sessionName, repositoryRoot, repositoryQuery, startRepository, repositoryListbox, repositoryResults, repositoryEmpty, repositoryOptions,
+    rootModel, rootThinking, workerModelA, workerThinkingA, workerModelB, workerThinkingB,
+    workerA, workerB, controls, chooseRepository
   };
 }
 
@@ -273,7 +324,7 @@ test("buildRequest returns raw name and repository with the root and every worke
   f.workerModelB.value = "deep";
   f.workerThinkingB.replaceChildren(option("high"), option("xhigh"));
   f.workerThinkingB.value = "xhigh";
-  const got = modalUI.buildRequest(f.dialog);
+  const got = modalUI.buildRequest(f.dialog, "owner/repo");
   assert.deepEqual(got, {
     name: "release triage",
     repository: "owner/repo",
@@ -283,6 +334,35 @@ test("buildRequest returns raw name and repository with the root and every worke
       { workerType: "worker", modelType: "deep", thinkingLevel: "xhigh" }
     ]
   });
+});
+
+test("unmatched repository blocks fetch and preserves the modal", () => {
+  const f = fixture();
+  let fetchCalls = 0;
+  modalUI.bind(f.document, async () => { fetchCalls++; return response(201, { sessionId: "x" }); });
+  f.trigger.dispatch("click");
+  f.repositoryQuery.value = "invented/repo";
+  f.repositoryQuery.dispatch("input");
+  f.form.dispatch("submit");
+  assert.equal(fetchCalls, 0);
+  assert.equal(f.dialog.open, true);
+  assert.equal(f.status.textContent,
+    "Choose a configured repository or clear the field to use /workspace.");
+});
+
+test("selected autocomplete value is the exact launch repository despite hidden mirror drift", async () => {
+  const f = fixture();
+  const calls = [];
+  modalUI.bind(f.document, async (_url, options) => {
+    calls.push(JSON.parse(options.body));
+    return response(201, { sessionId: "created" });
+  });
+  f.trigger.dispatch("click");
+  f.chooseRepository("one/alpha");
+  f.startRepository.value = "owner/repo";
+  f.form.dispatch("submit");
+  await settle();
+  assert.equal(calls[0].repository, "one/alpha");
 });
 
 test("Launch posts the exact complete request and disables controls while pending", async () => {
@@ -295,8 +375,8 @@ test("Launch posts the exact complete request and disables controls while pendin
   });
   f.trigger.dispatch("click");
   f.sessionName.value = "release triage";
-  f.startRepository.value = "owner/repo";
-  const expected = modalUI.buildRequest(f.dialog);
+  f.chooseRepository("owner/repo");
+  const expected = modalUI.buildRequest(f.dialog, "owner/repo");
   f.form.dispatch("submit");
   assert.equal(calls.length, 1);
   assert.equal(calls[0].url, "/ui/sessions");
@@ -354,12 +434,13 @@ test("failed HTTP keeps modal open, restores controls, and shows bounded sanitiz
   modalUI.bind(f.document, async () => response(400, { error: unsafe }));
   f.trigger.dispatch("click");
   f.sessionName.value = "keep this name";
-  f.startRepository.value = "owner/repo";
+  f.chooseRepository("owner/repo");
   f.form.dispatch("submit");
   await settle();
 
   assert.equal(f.dialog.open, true);
   assert.equal(f.sessionName.value, "keep this name");
+  assert.equal(f.repositoryQuery.value, "owner/repo");
   assert.equal(f.startRepository.value, "owner/repo");
   assert.equal(f.dialog.getAttribute("aria-busy"), null);
   assert.equal(f.launch.disabled, false);
@@ -468,7 +549,7 @@ test("201 closes and resets the modal", async () => {
   modalUI.bind(f.document, async () => response(201, { sessionId: "created" }));
   f.trigger.dispatch("click");
   f.sessionName.value = "completed name";
-  f.startRepository.value = "owner/repo";
+  f.chooseRepository("owner/repo");
   f.rootModel.value = "fast";
   f.form.dispatch("submit");
   await settle();
@@ -498,6 +579,73 @@ test("Cancel, close, backdrop, and native cancel close without fetch", () => {
     if (event) assert.equal(event.defaultPrevented, true);
   }
   assert.equal(fetchCalls, 0);
+});
+
+test("composition Escape ordering cannot close or reset the modal", () => {
+  const f = fixture();
+  modalUI.bind(f.document, async () => response(201, { sessionId: "created" }));
+  f.trigger.dispatch("click");
+  const resets = f.form.resetCalls;
+
+  f.document.dispatch("compositionstart", {target: f.sessionName});
+  const legacyIME = f.document.dispatch("keydown", {
+    key: "Escape", keyCode: 229, isComposing: false, target: f.sessionName
+  });
+  assert.equal(legacyIME.defaultPrevented, true);
+  assert.equal(f.dialog.open, true);
+  assert.equal(f.form.resetCalls, resets);
+
+  f.document.dispatch("compositionend", {target: f.sessionName});
+  const trailingEscape = f.document.dispatch("keydown", {
+    key: "Escape", keyCode: 27, isComposing: false, target: f.sessionName
+  });
+  assert.equal(trailingEscape.defaultPrevented, true);
+  assert.equal(f.dialog.open, true);
+  assert.equal(f.form.resetCalls, resets);
+
+  const normalEscape = f.document.dispatch("keydown", {
+    key: "Escape", keyCode: 27, isComposing: false, target: f.sessionName
+  });
+  assert.equal(normalEscape.defaultPrevented, true);
+  assert.equal(f.dialog.open, false);
+  assert.equal(f.form.resetCalls, resets + 1);
+});
+
+test("composition guard expires before a later intentional modal Escape", async () => {
+  const f = fixture();
+  modalUI.bind(f.document, async () => response(201, { sessionId: "created" }));
+  f.trigger.dispatch("click");
+  f.document.dispatch("compositionstart", {target: f.sessionName});
+  f.document.dispatch("compositionend", {target: f.sessionName});
+  await new Promise((resolve) => setTimeout(resolve, 0));
+  f.document.dispatch("keydown", {key: "Escape", target: f.sessionName});
+  assert.equal(f.dialog.open, false);
+});
+
+test("repository composition preserves combobox then modal two-step Escape", () => {
+  const f = fixture();
+  modalUI.bind(f.document, async () => response(201, { sessionId: "created" }));
+  f.trigger.dispatch("click");
+  f.repositoryQuery.value = "one";
+  f.repositoryQuery.dispatch("input");
+  assert.equal(f.repositoryQuery.getAttribute("aria-expanded"), "true");
+
+  f.document.dispatch("compositionstart", {target: f.repositoryQuery});
+  f.repositoryQuery.dispatch("compositionstart");
+  f.document.dispatch("compositionend", {target: f.repositoryQuery});
+  f.repositoryQuery.dispatch("compositionend");
+  f.document.dispatch("keydown", {key: "Escape", target: f.repositoryQuery});
+  f.repositoryQuery.dispatch("keydown", {key: "Escape"});
+  assert.equal(f.repositoryQuery.getAttribute("aria-expanded"), "true");
+  assert.equal(f.dialog.open, true);
+
+  f.document.dispatch("keydown", {key: "Escape", target: f.repositoryQuery});
+  f.repositoryQuery.dispatch("keydown", {key: "Escape"});
+  assert.equal(f.repositoryQuery.getAttribute("aria-expanded"), "false");
+  assert.equal(f.dialog.open, true);
+
+  f.document.dispatch("keydown", {key: "Escape", target: f.repositoryQuery});
+  assert.equal(f.dialog.open, false);
 });
 
 test("Escape is capture-consumed while open before terminal interrupt but unchanged outside", () => {
@@ -562,6 +710,11 @@ test("bind is idempotent and destroy removes every registered interaction listen
   assert.equal(f.form.resetCalls, 1);
   second.destroy();
   f.dialog.close();
+
+  f.repositoryQuery.value = "owner/repo";
+  f.repositoryQuery.dispatch("input");
+  f.repositoryOptions[2].dispatch("pointerdown");
+  assert.equal(f.startRepository.value, "", "repository combobox listener remained");
 
   const resetCalls = f.form.resetCalls;
   f.trigger.dispatch("click");

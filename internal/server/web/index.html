@@ -30,6 +30,9 @@
 
   <!-- Stable Datastar patch roots -->
   <div id="fleet-panel"></div>
+  <div id="fleet-resizer" role="separator" aria-label="Resize Fleet panel"
+    aria-orientation="vertical" aria-controls="fleet-panel main-stack"
+    aria-valuemin="240" aria-valuemax="560" aria-valuenow="340" tabindex="0"></div>
   <div id="main-stack">
     <div id="detail-panel" data-can-steer="false" data-can-interrupt="false" data-can-stop="false"></div>
     <div id="question-panel"></div>
@@ -44,13 +47,14 @@
     </div>
     <div class="deck-row">
       <span class="deck-lbl">alidade ›</span>
-      <input class="deck-input" type="text" placeholder="steer — type a directive…" aria-label="Message to selected session"
-        aria-keyshortcuts="Control+A Control+C Enter" title="Ctrl+A: select all · Ctrl+C: clear or copy · Enter: steer">
+      <textarea class="deck-input" rows="2" placeholder="steer — type a directive…" aria-label="Message to selected session"
+        aria-keyshortcuts="Control+A Control+C Enter Shift+Enter"
+        title="Ctrl+A: select all · Ctrl+C: clear or copy · Enter: steer · Shift+Enter: newline"></textarea>
       <input id="image-file-input" type="file" accept="image/png,image/jpeg,image/gif,image/webp" multiple hidden>
       <button class="dbtn attach-images" id="attach-images-button" type="button" aria-controls="image-attachment-tray">
         <span class="g" aria-hidden="true">＋</span> Attach Images
       </button>
-      <span class="deck-hint" aria-hidden="true">^A select all · ^C clear/copy · esc abort · ^O tools</span>
+      <span class="deck-hint" aria-hidden="true">^A select all · ^C clear/copy · ↵ send · ⇧↵ newline · esc abort · ^O tools</span>
       <button class="dbtn steer" id="steerBtn" type="button">
         <span class="g">→</span> Steer
       </button>
@@ -78,6 +82,8 @@
 <script src="/assets/highlight.min.js"></script>
 <script src="/assets/markdown-renderer.js"></script>
 <script src="/assets/terminal-ui.js"></script>
+<script src="/assets/fleet-layout.js"></script>
+<script src="/assets/repository-combobox.js"></script>
 <script src="/assets/session-modal.js"></script>
 <script src="/assets/image-attachments.js"></script>
 <script type="module" src="/assets/app.js"></script>
