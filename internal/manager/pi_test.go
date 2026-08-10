@@ -170,11 +170,12 @@ func TestSendMessageIdleIncludesNativeImages(t *testing.T) {
 }
 
 func TestSendMessageStreamingIncludesNativeImages(t *testing.T) {
-	image := testPNG(t, 2)
+	first := testPNG(t, 1)
+	second := testPNG(t, 2)
 	client := imageCapablePIControlClient(true)
 	m := piManagerWithSession("root", client, rootTree("root"))
 
-	if err := m.SendMessage(context.Background(), "root", "redirect", []attachments.Image{image}); err != nil {
+	if err := m.SendMessage(context.Background(), "root", "redirect", []attachments.Image{first, second}); err != nil {
 		t.Fatal(err)
 	}
 	var command struct {
@@ -184,10 +185,20 @@ func TestSendMessageStreamingIncludesNativeImages(t *testing.T) {
 	if err := json.Unmarshal(client.callLog[1].payload, &command); err != nil {
 		t.Fatal(err)
 	}
-	if command.Type != "steer" || command.Message != "redirect" || len(command.Images) != 1 ||
-		command.Images[0].Type != "image" || command.Images[0].MIMEType != "image/png" ||
-		command.Images[0].Data != base64.StdEncoding.EncodeToString(image.Data) {
+	if command.Type != "steer" || command.Message != "redirect" {
 		t.Fatalf("command = %#v", command)
+	}
+	want := []struct{ Type, Data, MIMEType string }{
+		{Type: "image", Data: base64.StdEncoding.EncodeToString(first.Data), MIMEType: "image/png"},
+		{Type: "image", Data: base64.StdEncoding.EncodeToString(second.Data), MIMEType: "image/png"},
+	}
+	if len(command.Images) != len(want) {
+		t.Fatalf("streaming images = %#v, want %#v", command.Images, want)
+	}
+	for index := range want {
+		if command.Images[index] != want[index] {
+			t.Fatalf("streaming image %d = %#v, want %#v", index, command.Images[index], want[index])
+		}
 	}
 }
 

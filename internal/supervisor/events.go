@@ -50,14 +50,13 @@ type EventBroker struct {
 }
 
 type eventMailbox struct {
-	mu          sync.Mutex
-	events      chan EventEnvelope
-	wake        chan struct{}
-	queue       []EventEnvelope
-	queuedBytes int
-	maxEvents   int
-	maxBytes    int
-	closed      bool
+	mu         sync.Mutex
+	events     chan EventEnvelope
+	sizes      []int // FIFO of retained byte sizes for events still buffered on events
+	totalBytes int
+	maxEvents  int
+	maxBytes   int
+	closed     bool
 }
 
 type eventSubscriber struct {
@@ -282,7 +281,7 @@ func (broker *EventBroker) deliver(event EventEnvelope, subscribers []eventSubsc
 	}
 	broker.mu.Unlock()
 	for _, subscriber := range overflowed {
-		subscriber.mailbox.close()
+		subscriber.mailbox.abort()
 	}
 }
 
@@ -292,76 +291,91 @@ func (broker *EventBroker) removeSubscriber(id uint64, mailbox *eventMailbox) {
 		delete(broker.subs, id)
 	}
 	broker.mu.Unlock()
-	mailbox.close()
+	mailbox.abort()
 }
 
 func newEventMailbox(maxEvents, maxBytes int) *eventMailbox {
-	mailbox := &eventMailbox{
-		events:    make(chan EventEnvelope),
-		wake:      make(chan struct{}, 1),
+	return &eventMailbox{
+		// events is the single bounded store: channel capacity maxEvents bounds
+		// total retained count, and sizes/totalBytes bound retained bytes. There
+		// is no worker goroutine; sends are nonblocking while holding mu.
+		events:    make(chan EventEnvelope, maxEvents),
+		sizes:     make([]int, 0, maxEvents),
 		maxEvents: maxEvents,
 		maxBytes:  maxBytes,
 	}
-	go mailbox.run()
-	return mailbox
 }
 
 func (mailbox *eventMailbox) send(event EventEnvelope) bool {
 	mailbox.mu.Lock()
 	defer mailbox.mu.Unlock()
+	// Reconcile entries the consumer has already read off the buffered channel.
+	// Events are only removed from the channel by the consumer, so sizes can only
+	// outrun len(events); dropping the leading consumed sizes keeps accounting
+	// conservative and never negative.
+	if consumed := len(mailbox.sizes) - len(mailbox.events); consumed > 0 {
+		for _, size := range mailbox.sizes[:consumed] {
+			mailbox.totalBytes -= size
+		}
+		mailbox.sizes = mailbox.sizes[consumed:]
+	}
 	if mailbox.closed {
+		return false
+	}
+	if mailbox.maxEvents > 0 && len(mailbox.sizes) >= mailbox.maxEvents {
 		return false
 	}
 	eventBytes := retainedEventBytes(event)
-	if (mailbox.maxEvents > 0 && len(mailbox.queue) >= mailbox.maxEvents) ||
-		(mailbox.maxBytes > 0 && mailbox.queuedBytes+eventBytes > mailbox.maxBytes) {
+	if mailbox.maxBytes > 0 && mailbox.totalBytes+eventBytes > mailbox.maxBytes {
 		return false
 	}
-	mailbox.queue = append(mailbox.queue, event)
-	mailbox.queuedBytes += eventBytes
 	select {
-	case mailbox.wake <- struct{}{}:
+	case mailbox.events <- event:
+		mailbox.sizes = append(mailbox.sizes, eventBytes)
+		mailbox.totalBytes += eventBytes
+		return true
 	default:
+		return false
 	}
-	return true
 }
 
-func (mailbox *eventMailbox) run() {
-	defer close(mailbox.events)
-	for {
-		mailbox.mu.Lock()
-		if len(mailbox.queue) == 0 {
-			if mailbox.closed {
+// close gracefully terminates the mailbox for broker shutdown: it stops
+// accepting new events and closes the channel WITHOUT draining, so buffered
+// events already accepted remain readable by the consumer. This preserves the
+// final buffered-event delivery contract required of broker.Close.
+func (mailbox *eventMailbox) close() {
+	mailbox.mu.Lock()
+	if !mailbox.closed {
+		mailbox.closed = true
+		close(mailbox.events)
+	}
+	mailbox.mu.Unlock()
+}
+
+// abort terminates a mailbox for an individual subscription close or overflow
+// detachment: it drains any buffered unread events (releasing their payload and
+// byte count) and closes the channel promptly without requiring a consumer read.
+func (mailbox *eventMailbox) abort() {
+	mailbox.mu.Lock()
+	if !mailbox.closed {
+		mailbox.closed = true
+		for {
+			select {
+			case <-mailbox.events:
+				if len(mailbox.sizes) > 0 {
+					mailbox.totalBytes -= mailbox.sizes[0]
+					mailbox.sizes = mailbox.sizes[1:]
+				}
+			default:
+				mailbox.totalBytes = 0
+				mailbox.sizes = nil
+				close(mailbox.events)
 				mailbox.mu.Unlock()
 				return
 			}
-			mailbox.mu.Unlock()
-			<-mailbox.wake
-			continue
 		}
-		event := mailbox.queue[0]
-		mailbox.mu.Unlock()
-
-		mailbox.events <- event
-		mailbox.mu.Lock()
-		mailbox.queuedBytes -= retainedEventBytes(mailbox.queue[0])
-		mailbox.queue[0] = EventEnvelope{}
-		mailbox.queue = mailbox.queue[1:]
-		mailbox.mu.Unlock()
 	}
-}
-
-func (mailbox *eventMailbox) close() {
-	mailbox.mu.Lock()
-	defer mailbox.mu.Unlock()
-	if mailbox.closed {
-		return
-	}
-	mailbox.closed = true
-	select {
-	case mailbox.wake <- struct{}{}:
-	default:
-	}
+	mailbox.mu.Unlock()
 }
 
 func cloneEnvelopes(events []EventEnvelope) []EventEnvelope {

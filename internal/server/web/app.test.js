@@ -414,6 +414,33 @@ test("selection clears visible status and stale detail capabilities fail closed"
   assert.equal(f.binding.canEditSelectedDraft(), true);
 });
 
+test("fleet reconciliation clears status when it removes the selected session", () => {
+  const f = fixture();
+  const status = f.document.getElementById("deck-status");
+  f.select("A");
+  f.document.getElementById("steerBtn").click();
+  assert.equal(status.textContent, "Enter a message or attach an image.");
+
+  f.document.rows = f.rows.filter((row) => row.dataset.sessionId !== "A");
+  FakeMutationObserver.trigger(f.document.getElementById("fleet-panel"));
+  assert.equal(status.textContent, "");
+});
+
+test("fleet reconciliation prunes status owned by a removed session", () => {
+  const f = fixture();
+  const status = f.document.getElementById("deck-status");
+  f.select("A");
+  f.document.getElementById("steerBtn").click();
+  f.select("B");
+
+  f.document.rows = f.rows.filter((row) => row.dataset.sessionId !== "A");
+  FakeMutationObserver.trigger(f.document.getElementById("fleet-panel"));
+  f.document.rows = f.rows.slice();
+  FakeMutationObserver.trigger(f.document.getElementById("fleet-panel"));
+  f.select("A");
+  assert.equal(status.textContent, "");
+});
+
 test("capability revocation clears active drag affordance", () => {
   const f = fixture();
   f.select("A");

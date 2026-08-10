@@ -253,9 +253,14 @@
     function reconcileFleetSessions() {
       var rows = documentObject.querySelectorAll(".row[data-session-id]");
       var sessionIDs = Array.prototype.map.call(rows, function (row) { return row.dataset.sessionId; });
+      var retainedSessionIDs = new Set(sessionIDs);
+      statuses.forEach(function (_, sessionID) {
+        if (!retainedSessionIDs.has(sessionID)) statuses.delete(sessionID);
+      });
       controller.reconcileSessions(sessionIDs);
-      if (selectedSessionID && sessionIDs.indexOf(selectedSessionID) === -1) {
+      if (selectedSessionID && !retainedSessionIDs.has(selectedSessionID)) {
         selectedSessionID = "";
+        deckStatus.textContent = "";
         renderDraft(controller.draft(""));
       }
     }
