@@ -15,7 +15,9 @@ import (
 	"time"
 )
 
-const MaxRecordBytes = 4 << 20
+// 8 MiB raw images expand to about 10.7 MiB; 12 MiB leaves JSON/text headroom
+// while remaining below the default 16 MiB event-byte budget.
+const MaxRecordBytes = 12 << 20
 
 var ErrForbiddenCommand = errors.New("command would replace the bound Pi RPC session")
 

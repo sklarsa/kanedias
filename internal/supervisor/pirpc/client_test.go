@@ -331,6 +331,34 @@ func TestClientEOFFailsEveryPendingCall(t *testing.T) {
 	}
 }
 
+func TestClientAcceptsImageSizedRecord(t *testing.T) {
+	clientConn, peer := net.Pipe()
+	client := NewClient(clientConn)
+	defer func() { _ = client.Close() }()
+	defer func() { _ = peer.Close() }()
+
+	record := `{"type":"message_update","text":"` + strings.Repeat("x", 11<<20) + `"}`
+	writeDone := make(chan error, 1)
+	go func() {
+		_, err := io.WriteString(peer, record+"\n")
+		writeDone <- err
+	}()
+
+	select {
+	case event := <-client.Events():
+		if event.Type != "message_update" || len(event.Raw) != len(record) {
+			t.Fatalf("event type = %q, bytes = %d; want message_update with %d bytes", event.Type, len(event.Raw), len(record))
+		}
+	case <-client.Done():
+		t.Fatalf("image-sized record terminated client: %v", client.Err())
+	case <-time.After(3 * time.Second):
+		t.Fatal("image-sized record was not published")
+	}
+	if err := <-writeDone; err != nil {
+		t.Fatalf("write image-sized record: %v", err)
+	}
+}
+
 func TestClientRejectsPartialMalformedAndOversizedRecords(t *testing.T) {
 	tests := []struct {
 		name   string

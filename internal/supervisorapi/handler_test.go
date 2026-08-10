@@ -280,6 +280,21 @@ func TestHandlerPreservesArbitraryPiRPCFields(t *testing.T) {
 	}
 }
 
+func TestRPCBodyUsesImageAwareLimit(t *testing.T) {
+	payload := `{"type":"prompt","message":"` + strings.Repeat("x", MaxRequestBodyBytes) + `"}`
+	response := jsonRequest(t, NewHandler(&fakeService{}), http.MethodPost, "/v1/sessions/self/rpc", payload)
+	if response.Code != http.StatusOK {
+		t.Fatalf("status = %d; body = %s", response.Code, response.Body.String())
+	}
+}
+
+func TestRPCBodyRejectsOneByteOverImageAwareLimit(t *testing.T) {
+	response := jsonRequest(t, NewHandler(&fakeService{}), http.MethodPost, "/v1/sessions/self/rpc", strings.Repeat("x", MaxRPCRequestBodyBytes+1))
+	if response.Code != http.StatusRequestEntityTooLarge {
+		t.Fatalf("status = %d; body = %s", response.Code, response.Body.String())
+	}
+}
+
 func TestHandlerRejectsWrongMethodsContentTypeOversizeAndHTML(t *testing.T) {
 	handler := NewHandler(&fakeService{})
 	for _, test := range []struct {
@@ -288,7 +303,7 @@ func TestHandlerRejectsWrongMethodsContentTypeOversizeAndHTML(t *testing.T) {
 	}{
 		{"method", http.MethodPost, "/v1/tree", "application/json", `{}`, http.StatusMethodNotAllowed},
 		{"content-type", http.MethodPost, "/v1/sessions/self/rpc", "text/plain", `{}`, http.StatusUnsupportedMediaType},
-		{"oversize", http.MethodPost, "/v1/sessions/self/rpc", "application/json", strings.Repeat("x", MaxRequestBodyBytes+1), http.StatusRequestEntityTooLarge},
+		{"oversize", http.MethodPost, "/v1/sessions/self/questions/q-1/response", "application/json", strings.Repeat("x", MaxRequestBodyBytes+1), http.StatusRequestEntityTooLarge},
 		{"html", http.MethodGet, "/", "", "", http.StatusNotFound},
 	} {
 		t.Run(test.name, func(t *testing.T) {
@@ -730,6 +745,48 @@ func TestDescendantUnaryOperationsHaveInternalDeadline(t *testing.T) {
 	case <-done:
 	case <-time.After(6 * time.Second):
 		t.Fatal("server did not close")
+	}
+}
+
+func TestDescendantClientRPCResponseUsesImageAwareLimit(t *testing.T) {
+	path := filepath.Join(t.TempDir(), "rpc-response.sock")
+	largeRPC := []byte(`{"type":"response","success":true,"data":{"text":"` + strings.Repeat("x", MaxRequestBodyBytes) + `"}}`)
+	largeSnapshot := []byte(`{"sessionId":"self","rootSessionId":"self","children":[],"padding":"` + strings.Repeat("x", MaxRequestBodyBytes) + `"}`)
+	ctx, cancel := context.WithCancel(context.Background())
+	done := make(chan error, 1)
+	go func() {
+		done <- ServeUnix(ctx, path, http.HandlerFunc(func(w http.ResponseWriter, request *http.Request) {
+			w.Header().Set("Content-Type", "application/json")
+			switch request.URL.Path {
+			case "/v1/sessions/self/rpc":
+				_, _ = w.Write(largeRPC)
+			case "/v1/tree":
+				_, _ = w.Write(largeSnapshot)
+			default:
+				http.NotFound(w, request)
+			}
+		}))
+	}()
+	waitForSocket(t, path)
+	client, err := NewClient(path)
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	response, err := client.CallRPC(context.Background(), "self", json.RawMessage(`{"type":"get_state"}`))
+	if err != nil {
+		t.Fatalf("CallRPC() error = %v", err)
+	}
+	if len(response) != len(largeRPC) {
+		t.Fatalf("CallRPC() response bytes = %d, want %d", len(response), len(largeRPC))
+	}
+	if _, err := client.Snapshot(context.Background()); err == nil || !strings.Contains(err.Error(), "exceeds 1 MiB") {
+		t.Fatalf("Snapshot() error = %v, want 1 MiB response rejection", err)
+	}
+
+	cancel()
+	if err := <-done; err != nil {
+		t.Fatal(err)
 	}
 }
 
