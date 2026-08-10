@@ -196,7 +196,7 @@ func (m *Manager) SpawnRootWithRequest(ctx context.Context, request SessionLaunc
 		return "", err
 	}
 	var encoded bytes.Buffer
-	if err := process.EncodeRootBootstrap(&encoded, process.RootBootstrap{Policy: resolved.Policy}); err != nil {
+	if err := process.EncodeRootBootstrap(&encoded, process.RootBootstrap{Policy: resolved.Policy, Workspace: resolved.Workspace}); err != nil {
 		return "", fmt.Errorf("manager: encode root bootstrap: %w", err)
 	}
 

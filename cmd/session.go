@@ -16,6 +16,7 @@ type SessionOptions struct {
 	SocketPath string
 	ConfigPath string
 	Policy     config.SessionModelPolicy
+	Workspace  config.WorkspaceStart
 }
 
 func newSessionCommand(service services, configPath func() string) *cobra.Command {
@@ -28,6 +29,7 @@ func newSessionCommand(service services, configPath func() string) *cobra.Comman
 		RunE: func(cmd *cobra.Command, _ []string) error {
 			inheritedBootstrap := cmd.Flags().Changed("bootstrap-fd")
 			var policy config.SessionModelPolicy
+			var workspace config.WorkspaceStart
 			if inheritedBootstrap {
 				if bootstrapFD < process.RootBootstrapFD {
 					return fmt.Errorf("--bootstrap-fd must be at least %d", process.RootBootstrapFD)
@@ -43,6 +45,7 @@ func newSessionCommand(service services, configPath func() string) *cobra.Comman
 					return errors.Join(decodeErr, closeErr)
 				}
 				policy = bootstrap.Policy
+				workspace = bootstrap.Workspace
 			}
 			if socketPath == "" {
 				return fmt.Errorf("--socket is required")
@@ -67,6 +70,7 @@ func newSessionCommand(service services, configPath func() string) *cobra.Comman
 				SocketPath: socketPath,
 				ConfigPath: absoluteConfig,
 				Policy:     policy,
+				Workspace:  workspace,
 			}, cmd.OutOrStdout())
 		},
 	}

@@ -12,18 +12,22 @@ import (
 // root-bootstrap endpoint.
 const RootBootstrapFD = 3
 
-// RootBootstrap is the immutable model policy transferred by the manager to a
-// newly started root supervisor through its private inherited descriptor.
+// RootBootstrap is the immutable launch policy transferred by the manager to
+// a newly started root supervisor through its private inherited descriptor.
 type RootBootstrap struct {
-	Policy config.SessionModelPolicy `json:"policy"`
+	Policy    config.SessionModelPolicy `json:"policy"`
+	Workspace config.WorkspaceStart     `json:"workspace"`
 }
 
-// EncodeRootBootstrap validates and clones the policy before encoding exactly
-// one bounded JSON value.
+// EncodeRootBootstrap validates and clones the bootstrap before encoding
+// exactly one bounded JSON value.
 func EncodeRootBootstrap(writer io.Writer, bootstrap RootBootstrap) error {
 	bootstrap.Policy = bootstrap.Policy.Clone()
 	if err := bootstrap.Policy.Validate(); err != nil {
 		return fmt.Errorf("validate root bootstrap policy: %w", err)
+	}
+	if err := bootstrap.Workspace.Validate(); err != nil {
+		return fmt.Errorf("validate root bootstrap workspace: %w", err)
 	}
 	data, err := json.Marshal(bootstrap)
 	if err != nil {
@@ -52,6 +56,9 @@ func DecodeRootBootstrap(reader io.Reader) (RootBootstrap, error) {
 	bootstrap.Policy = bootstrap.Policy.Clone()
 	if err := bootstrap.Policy.Validate(); err != nil {
 		return RootBootstrap{}, fmt.Errorf("validate root bootstrap policy: %w", err)
+	}
+	if err := bootstrap.Workspace.Validate(); err != nil {
+		return RootBootstrap{}, fmt.Errorf("validate root bootstrap workspace: %w", err)
 	}
 	return bootstrap, nil
 }

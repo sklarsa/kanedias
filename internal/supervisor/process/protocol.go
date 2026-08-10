@@ -32,6 +32,7 @@ type Bootstrap struct {
 	SourceInstance string                      `json:"sourceInstance"`
 	SourceVolume   string                      `json:"sourceVolume"`
 	Policy         config.SessionModelPolicy   `json:"policy"`
+	Workspace      config.WorkspaceStart       `json:"workspace"`
 	Request        contract.CreateChildRequest `json:"request"`
 	RunAttribution string                      `json:"runAttribution,omitempty"`
 }
@@ -114,6 +115,9 @@ func (bootstrap Bootstrap) Validate() error {
 	}
 	if err := bootstrap.Policy.Validate(); err != nil {
 		return contract.NewError(contract.ErrorInvalidRequest, "session model policy is invalid: "+err.Error())
+	}
+	if err := bootstrap.Workspace.Validate(); err != nil {
+		return contract.NewError(contract.ErrorInvalidRequest, "workspace start is invalid: "+err.Error())
 	}
 	if err := bootstrap.Request.Validate(); err != nil {
 		return err

@@ -33,6 +33,7 @@ func validBootstrap(t *testing.T) Bootstrap {
 		SessionID: "child-1", ParentID: "parent-1", RootID: "root-1",
 		SocketPath:     filepath.Join(t.TempDir(), "child.sock"),
 		SourceInstance: "session-parent-1", SourceVolume: "workspace-parent-1",
+		Workspace: config.WorkspaceStart{Repository: "owner/repo", Checkout: "repo"},
 		Policy: config.SessionModelPolicy{
 			Root: config.ModelProfile{Provider: "local-executor", Model: "root-model", ThinkingLevel: "off"},
 			Workers: map[string]config.WorkerProfile{
@@ -84,8 +85,12 @@ func TestSpawnerOwnsIndependentPolicyClone(t *testing.T) {
 	mutated := bootstrap.Policy.Workers["reviewer"]
 	mutated.Model = "mutated-after-spawn"
 	bootstrap.Policy.Workers["reviewer"] = mutated
+	bootstrap.Workspace = config.WorkspaceStart{Repository: "other/project", Checkout: "project"}
 	if child.bootstrap.Policy.Workers["reviewer"].Model == mutated.Model {
 		t.Fatal("spawned child state aliases caller policy map")
+	}
+	if child.bootstrap.Workspace != (config.WorkspaceStart{Repository: "owner/repo", Checkout: "repo"}) {
+		t.Fatalf("spawned child workspace = %#v, want original", child.bootstrap.Workspace)
 	}
 }
 
@@ -99,7 +104,7 @@ func TestBootstrapStrictDecodeAndValidation(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	if got.SessionID != bootstrap.SessionID || got.Request.Task != bootstrap.Request.Task || !reflect.DeepEqual(got.Policy, bootstrap.Policy) {
+	if got.SessionID != bootstrap.SessionID || got.Request.Task != bootstrap.Request.Task || got.Workspace != bootstrap.Workspace || !reflect.DeepEqual(got.Policy, bootstrap.Policy) {
 		t.Fatalf("decoded bootstrap = %#v", got)
 	}
 	if len(got.Policy.Workers) != 2 {
@@ -119,6 +124,36 @@ func TestBootstrapStrictDecodeAndValidation(t *testing.T) {
 	}
 	if _, err := DecodeBootstrap(strings.NewReader(strings.Repeat(" ", MaxRecordBytes+1))); !errors.Is(err, ErrRecordTooLarge) {
 		t.Fatalf("oversize error = %v, want ErrRecordTooLarge", err)
+	}
+}
+
+func TestBootstrapWorkspaceDefaultAndValidation(t *testing.T) {
+	zero := validBootstrap(t)
+	zero.Workspace = config.WorkspaceStart{}
+	var wire bytes.Buffer
+	if err := EncodeBootstrap(&wire, zero); err != nil {
+		t.Fatalf("zero workspace encode: %v", err)
+	}
+	got, err := DecodeBootstrap(&wire)
+	if err != nil {
+		t.Fatalf("zero workspace decode: %v", err)
+	}
+	if got.Workspace != (config.WorkspaceStart{}) {
+		t.Fatalf("zero workspace = %#v", got.Workspace)
+	}
+
+	for _, workspace := range []config.WorkspaceStart{
+		{Repository: "owner/repo", Checkout: "other"},
+		{Repository: "owner/repo", Checkout: "../repo"},
+	} {
+		bootstrap := validBootstrap(t)
+		bootstrap.Workspace = workspace
+		if err := EncodeBootstrap(&bytes.Buffer{}, bootstrap); err == nil {
+			t.Fatalf("EncodeBootstrap accepted invalid workspace %#v", workspace)
+		}
+		if _, err := DecodeBootstrap(bytes.NewReader(mustJSON(t, bootstrap))); err == nil {
+			t.Fatalf("DecodeBootstrap accepted invalid workspace %#v", workspace)
+		}
 	}
 }
 

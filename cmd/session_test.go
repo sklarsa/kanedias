@@ -55,6 +55,9 @@ func TestSessionRequiresSocketAndRunsForegroundSupervisor(t *testing.T) {
 	if gotOptions.SocketPath != "./root.sock" || gotOptions.ConfigPath != wantConfig || !reflect.DeepEqual(gotOptions.Policy, wantPolicy) {
 		t.Fatalf("options = %#v", gotOptions)
 	}
+	if gotOptions.Workspace != (config.WorkspaceStart{}) || gotOptions.Workspace.Directory() != config.WorkspaceRoot {
+		t.Fatalf("direct CLI workspace = %#v at %q, want zero value at /workspace", gotOptions.Workspace, gotOptions.Workspace.Directory())
+	}
 }
 
 func TestSessionRejectsMissingSocketBeforeLoadingConfig(t *testing.T) {
@@ -86,14 +89,15 @@ func TestSessionDoesNotReadStdin(t *testing.T) {
 	}
 }
 
-func TestSessionInheritedRootBootstrapUsesExactFDAndKeepsStdinUntouched(t *testing.T) {
+func TestSessionWorkspaceStartInheritanceUsesExactFDAndKeepsStdinUntouched(t *testing.T) {
 	cfg := validSupervisorConfig()
 	policy, err := cfg.DefaultSessionModelPolicy()
 	if err != nil {
 		t.Fatal(err)
 	}
 	policy.Root = config.ModelProfile{Provider: "local-executor", Model: "Qwen3.6-27B-GGUF", ThinkingLevel: "off"}
-	bootstrapFD := rootBootstrapReadFDForPolicy(t, policy)
+	workspace := config.WorkspaceStart{Repository: "owner/repo", Checkout: "repo"}
+	bootstrapFD := rootBootstrapReadFDForPolicy(t, policy, workspace)
 
 	service := stubServices()
 	service.loadConfig = func(string) (config.Config, error) { return cfg, nil }
@@ -112,6 +116,9 @@ func TestSessionInheritedRootBootstrapUsesExactFDAndKeepsStdinUntouched(t *testi
 	}
 	if !reflect.DeepEqual(got.Policy, policy) {
 		t.Fatalf("policy = %#v, want %#v", got.Policy, policy)
+	}
+	if got.Workspace != workspace {
+		t.Fatalf("workspace = %#v, want %#v", got.Workspace, workspace)
 	}
 	assertDescriptorClosed(t, bootstrapFD)
 }
@@ -233,17 +240,17 @@ func rootBootstrapReadFD(t *testing.T) int {
 	if err != nil {
 		t.Fatal(err)
 	}
-	return rootBootstrapReadFDForPolicy(t, policy)
+	return rootBootstrapReadFDForPolicy(t, policy, config.WorkspaceStart{})
 }
 
-func rootBootstrapReadFDForPolicy(t *testing.T, policy config.SessionModelPolicy) int {
+func rootBootstrapReadFDForPolicy(t *testing.T, policy config.SessionModelPolicy, workspace config.WorkspaceStart) int {
 	t.Helper()
 	var descriptors [2]int
 	if err := unix.Pipe2(descriptors[:], unix.O_CLOEXEC); err != nil {
 		t.Fatal(err)
 	}
 	writeEnd := os.NewFile(uintptr(descriptors[1]), "test-root-bootstrap-write")
-	if err := process.EncodeRootBootstrap(writeEnd, process.RootBootstrap{Policy: policy}); err != nil {
+	if err := process.EncodeRootBootstrap(writeEnd, process.RootBootstrap{Policy: policy, Workspace: workspace}); err != nil {
 		_ = unix.Close(descriptors[0])
 		_ = writeEnd.Close()
 		t.Fatal(err)

@@ -245,7 +245,7 @@ func TestSpawnRootWithRequestValidatesBeforeSideEffects(t *testing.T) {
 	}
 }
 
-func TestSpawnRootWithRequestTransfersResolvedPolicyOnlyThroughFD3(t *testing.T) {
+func TestSpawnRootWithRequestTransfersResolvedPolicyAndWorkspaceOnlyThroughFD3(t *testing.T) {
 	fs := &fakeStarter{process: newFakeProcess(1236), rootBootstraps: make(chan rootBootstrapResult, 1)}
 	m := fakeManager(nil)
 	m.starter = fs
@@ -264,6 +264,7 @@ func TestSpawnRootWithRequestTransfersResolvedPolicyOnlyThroughFD3(t *testing.T)
 	}
 
 	request := m.launch.DefaultRequest()
+	request.Repository = "owner/repo"
 	request.Root = ModelSelection{ModelType: "local-qwen", ThinkingLevel: "off"}
 	for index := range request.Workers {
 		request.Workers[index].ModelType = "local-qwen"
@@ -274,6 +275,7 @@ func TestSpawnRootWithRequestTransfersResolvedPolicyOnlyThroughFD3(t *testing.T)
 		t.Fatal(err)
 	}
 	wantPolicy := resolved.Policy
+	wantWorkspace := resolved.Workspace
 	go func() {
 		time.Sleep(20 * time.Millisecond)
 		fs.process.exit(nil)
@@ -287,6 +289,9 @@ func TestSpawnRootWithRequestTransfersResolvedPolicyOnlyThroughFD3(t *testing.T)
 		}
 		if !reflect.DeepEqual(result.bootstrap.Policy, wantPolicy) {
 			t.Fatalf("bootstrap policy = %#v, want %#v", result.bootstrap.Policy, wantPolicy)
+		}
+		if result.bootstrap.Workspace != wantWorkspace {
+			t.Fatalf("bootstrap workspace = %#v, want %#v", result.bootstrap.Workspace, wantWorkspace)
 		}
 	case <-time.After(time.Second):
 		t.Fatal("timed out decoding inherited root bootstrap")
@@ -303,7 +308,7 @@ func TestSpawnRootWithRequestTransfersResolvedPolicyOnlyThroughFD3(t *testing.T)
 		t.Fatalf("ExtraFiles = %d, want 1", len(spec.ExtraFiles))
 	}
 	argv := strings.Join(spec.Args, "\x00")
-	for _, value := range []string{wantPolicy.Root.Provider, wantPolicy.Root.Model, `"provider"`, `"workers"`} {
+	for _, value := range []string{wantPolicy.Root.Provider, wantPolicy.Root.Model, wantWorkspace.Repository, wantWorkspace.Checkout, `"provider"`, `"workers"`, `"workspace"`} {
 		if strings.Contains(argv, value) {
 			t.Fatalf("private policy value %q leaked into argv", value)
 		}
