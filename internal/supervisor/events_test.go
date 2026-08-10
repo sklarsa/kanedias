@@ -92,6 +92,224 @@ func TestEventBrokerReplayIsImmutableCopy(t *testing.T) {
 	}
 }
 
+func TestEventBrokerMailboxDisconnectsBeforeByteBudgetOverflow(t *testing.T) {
+	broker := newEventBrokerWithByteCapacity(8, 128, 120)
+	slow := broker.Subscribe()
+	defer slow.Close()
+
+	first := broker.PublishLocal("root", "pi", json.RawMessage(`{"payload":"`+strings.Repeat("x", 48)+`"}`))
+	if retainedEventBytes(first) > 120 {
+		t.Fatal("test event unexpectedly exceeds mailbox budget")
+	}
+	broker.mu.Lock()
+	var mailbox *eventMailbox
+	for _, candidate := range broker.subs {
+		mailbox = candidate
+	}
+	broker.mu.Unlock()
+	if mailbox == nil {
+		t.Fatal("slow subscriber was not registered")
+	}
+	mailbox.mu.Lock()
+	if mailbox.totalBytes > 120 {
+		t.Fatalf("queued bytes = %d, want <= 120", mailbox.totalBytes)
+	}
+	mailbox.mu.Unlock()
+
+	broker.PublishLocal("root", "pi", json.RawMessage(`{"payload":"`+strings.Repeat("y", 48)+`"}`))
+	broker.mu.Lock()
+	remaining := len(broker.subs)
+	broker.mu.Unlock()
+	if remaining != 0 {
+		t.Fatalf("slow subscribers = %d, want detached", remaining)
+	}
+	delivered := 0
+	for {
+		select {
+		case _, open := <-slow.Events:
+			if !open {
+				if delivered > 1 {
+					t.Fatalf("delivered %d queued events beyond byte budget", delivered)
+				}
+				return
+			}
+			delivered++
+		case <-time.After(time.Second):
+			t.Fatal("slow subscriber did not close after byte overflow")
+		}
+	}
+}
+
+func TestEventBrokerSubscriptionCloseDiscardsUnreadQueuedEvent(t *testing.T) {
+	broker := newEventBroker(4, 1)
+	subscription := broker.Subscribe()
+	mailbox := onlyEventMailbox(t, broker)
+
+	broker.PublishLocal("root", "pi", json.RawMessage(`{"n":1}`))
+	waitForMailboxDelivery(t, mailbox)
+	subscription.Close()
+
+	assertMailboxReleased(t, mailbox)
+	select {
+	case _, open := <-subscription.Events:
+		if open {
+			t.Fatal("subscription close delivered an event that was unread at close")
+		}
+	case <-time.After(time.Second):
+		t.Fatal("subscription close did not terminate the mailbox promptly")
+	}
+}
+
+func TestEventBrokerOverflowDiscardsUnreadQueuedEvent(t *testing.T) {
+	broker := newEventBroker(4, 1)
+	subscription := broker.Subscribe()
+	defer subscription.Close()
+	mailbox := onlyEventMailbox(t, broker)
+
+	broker.PublishLocal("root", "pi", json.RawMessage(`{"n":1}`))
+	waitForMailboxDelivery(t, mailbox)
+	broker.PublishLocal("root", "pi", json.RawMessage(`{"n":2}`))
+
+	broker.mu.Lock()
+	remaining := len(broker.subs)
+	broker.mu.Unlock()
+	if remaining != 0 {
+		t.Fatalf("subscribers after overflow = %d, want 0", remaining)
+	}
+	assertMailboxReleased(t, mailbox)
+	select {
+	case _, open := <-subscription.Events:
+		if open {
+			t.Fatal("overflow delivered an event that was unread at detachment")
+		}
+	case <-time.After(time.Second):
+		t.Fatal("overflow detachment did not terminate the mailbox promptly")
+	}
+}
+
+func TestEventBrokerGracefulCloseKeepsBufferedEventsReadable(t *testing.T) {
+	broker := newEventBroker(4, 2)
+	subscription := broker.Subscribe()
+	mailbox := onlyEventMailbox(t, broker)
+	defer subscription.Close()
+
+	broker.PublishLocal("root", "pi", json.RawMessage(`{"n":1}`))
+	waitForMailboxDelivery(t, mailbox)
+	broker.PublishLocal("root", "pi", json.RawMessage(`{"n":2}`))
+	waitForMailboxDeliveryCount(t, mailbox, 2)
+
+	broker.Close()
+	// Graceful broker close keeps already-accepted buffered events readable.
+	select {
+	case event := <-subscription.Events:
+		if string(event.Payload) != `{"n":1}` {
+			t.Fatalf("first buffered event = %q, want n:1", event.Payload)
+		}
+	case <-time.After(time.Second):
+		t.Fatal("graceful close discarded the first buffered event")
+	}
+	select {
+	case event := <-subscription.Events:
+		if string(event.Payload) != `{"n":2}` {
+			t.Fatalf("second buffered event = %q, want n:2", event.Payload)
+		}
+	case <-time.After(time.Second):
+		t.Fatal("graceful close discarded the second buffered event")
+	}
+	if _, open := <-subscription.Events; open {
+		t.Fatal("subscription events channel still open after graceful close drain")
+	}
+}
+
+func TestEventBrokerSubscriptionCloseAfterGracefulCloseDiscardsUnreadEvents(t *testing.T) {
+	broker := newEventBroker(4, 2)
+	subscription := broker.Subscribe()
+	mailbox := onlyEventMailbox(t, broker)
+
+	broker.PublishLocal("root", "pi", json.RawMessage(`{"n":1}`))
+	waitForMailboxDelivery(t, mailbox)
+	broker.Close()
+	subscription.Close()
+
+	assertMailboxReleased(t, mailbox)
+	if _, open := <-subscription.Events; open {
+		t.Fatal("subscription close delivered an unread event after graceful close")
+	}
+}
+
+func TestEventBrokerSubscriptionCloseRacingGracefulCloseReleasesMailbox(t *testing.T) {
+	for range 100 {
+		broker := newEventBroker(4, 2)
+		subscription := broker.Subscribe()
+		mailbox := onlyEventMailbox(t, broker)
+		broker.PublishLocal("root", "pi", json.RawMessage(`{"n":1}`))
+		waitForMailboxDelivery(t, mailbox)
+
+		start := make(chan struct{})
+		var group sync.WaitGroup
+		group.Add(2)
+		go func() {
+			defer group.Done()
+			<-start
+			broker.Close()
+		}()
+		go func() {
+			defer group.Done()
+			<-start
+			subscription.Close()
+		}()
+		close(start)
+		group.Wait()
+
+		assertMailboxReleased(t, mailbox)
+		if _, open := <-subscription.Events; open {
+			t.Fatal("racing close retained an unread event")
+		}
+	}
+}
+
+func onlyEventMailbox(t *testing.T, broker *EventBroker) *eventMailbox {
+	t.Helper()
+	broker.mu.Lock()
+	defer broker.mu.Unlock()
+	if len(broker.subs) != 1 {
+		t.Fatalf("subscribers = %d, want 1", len(broker.subs))
+	}
+	for _, mailbox := range broker.subs {
+		return mailbox
+	}
+	return nil
+}
+
+func waitForMailboxDelivery(t *testing.T, mailbox *eventMailbox) {
+	t.Helper()
+	waitForMailboxDeliveryCount(t, mailbox, 1)
+}
+
+func waitForMailboxDeliveryCount(t *testing.T, mailbox *eventMailbox, want int) {
+	t.Helper()
+	deadline := time.Now().Add(time.Second)
+	for time.Now().Before(deadline) {
+		mailbox.mu.Lock()
+		buffered := len(mailbox.events)
+		mailbox.mu.Unlock()
+		if buffered >= want {
+			return
+		}
+		runtime.Gosched()
+	}
+	t.Fatalf("mailbox buffered %d events, want %d", len(mailbox.events), want)
+}
+
+func assertMailboxReleased(t *testing.T, mailbox *eventMailbox) {
+	t.Helper()
+	mailbox.mu.Lock()
+	defer mailbox.mu.Unlock()
+	if len(mailbox.events) != 0 || len(mailbox.sizes) != 0 || mailbox.totalBytes != 0 {
+		t.Fatalf("closed mailbox retained %d buffered events, %d sizes, %d bytes", len(mailbox.events), len(mailbox.sizes), mailbox.totalBytes)
+	}
+}
+
 func TestEventBrokerOverflowDisconnectsOnlySlowSubscriber(t *testing.T) {
 	broker := newEventBroker(4, 1)
 	slow := broker.Subscribe()
@@ -435,9 +653,7 @@ func TestEventBrokerWithOptionsRejectsNegative(t *testing.T) {
 	}
 }
 
-func TestEventBrokerOversizedEventIsDeliveredLiveNotRetained(t *testing.T) {
-	// byte cap of 10 — any real payload exceeds it; event must still get a sequence
-	// and arrive live, but the ring must stay within budget.
+func TestEventBrokerOversizedEventIsNotRetainedAndDisconnectsStalledSubscriber(t *testing.T) {
 	broker, err := NewEventBrokerWithOptions(EventBrokerOptions{MaxBytes: 10})
 	if err != nil {
 		t.Fatal(err)
@@ -449,14 +665,13 @@ func TestEventBrokerOversizedEventIsDeliveredLiveNotRetained(t *testing.T) {
 	if envelope.Seq == 0 {
 		t.Fatalf("oversized event has no sequence number")
 	}
-
 	select {
-	case event := <-sub.Events:
-		if event.Seq != envelope.Seq {
-			t.Fatalf("live event Seq = %d, want %d", event.Seq, envelope.Seq)
+	case _, open := <-sub.Events:
+		if open {
+			t.Fatal("oversized event was queued beyond the subscriber byte budget")
 		}
 	case <-time.After(time.Second):
-		t.Fatal("oversized event was not delivered live")
+		t.Fatal("stalled subscriber was not disconnected")
 	}
 
 	replay := broker.Subscribe()

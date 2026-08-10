@@ -481,6 +481,61 @@ func TestRequestBoundaryRejectsNonJSONContentType(t *testing.T) {
 	}
 }
 
+func TestWriteBoundaryAllowsOnlyConfiguredBaseMediaTypes(t *testing.T) {
+	boundary := newRequestBoundary("127.0.0.1:43127")
+	handler := boundary.requireWriteBoundaryFor("multipart/form-data")(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
+		w.WriteHeader(http.StatusOK)
+	}))
+
+	for _, test := range []struct {
+		name        string
+		contentType string
+		want        int
+	}{
+		{name: "multipart with boundary", contentType: "multipart/form-data; boundary=abc123", want: http.StatusOK},
+		{name: "multipart mixed case parameter", contentType: `multipart/form-data; boundary="quoted"`, want: http.StatusOK},
+		{name: "JSON not configured", contentType: "application/json", want: http.StatusUnsupportedMediaType},
+		{name: "multipart subtype not configured", contentType: "multipart/mixed; boundary=abc123", want: http.StatusUnsupportedMediaType},
+		{name: "malformed", contentType: "multipart/form-data; boundary", want: http.StatusUnsupportedMediaType},
+	} {
+		t.Run(test.name, func(t *testing.T) {
+			req := httptest.NewRequest(http.MethodPost, "/ui/sessions/s/messages", nil)
+			req.Host = "127.0.0.1:43127"
+			req.Header.Set("Origin", "http://127.0.0.1:43127")
+			req.Header.Set("Sec-Fetch-Site", "same-origin")
+			req.Header.Set("Content-Type", test.contentType)
+			w := httptest.NewRecorder()
+			handler.ServeHTTP(w, req)
+			if w.Code != test.want {
+				t.Fatalf("status = %d, want %d", w.Code, test.want)
+			}
+		})
+	}
+}
+
+func TestRequestBoundaryDefaultRemainsJSONOnly(t *testing.T) {
+	boundary := newRequestBoundary("127.0.0.1:43127")
+	handler := boundary.requireWriteBoundary(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
+		w.WriteHeader(http.StatusOK)
+	}))
+	for _, test := range []struct {
+		contentType string
+		want        int
+	}{
+		{contentType: "application/json; charset=utf-8", want: http.StatusOK},
+		{contentType: "multipart/form-data; boundary=abc123", want: http.StatusUnsupportedMediaType},
+	} {
+		req := httptest.NewRequest(http.MethodPost, "/ui/sessions/s/steer", nil)
+		req.Host = "127.0.0.1:43127"
+		req.Header.Set("Content-Type", test.contentType)
+		w := httptest.NewRecorder()
+		handler.ServeHTTP(w, req)
+		if w.Code != test.want {
+			t.Fatalf("Content-Type %q: status = %d, want %d", test.contentType, w.Code, test.want)
+		}
+	}
+}
+
 func TestRequestBoundaryAcceptsSameOriginRequest(t *testing.T) {
 	boundary := newRequestBoundary("127.0.0.1:43127")
 	handler := boundary.requireWriteBoundary(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {

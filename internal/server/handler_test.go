@@ -20,6 +20,7 @@ import (
 	"testing/fstest"
 	"time"
 
+	"github.com/sklarsa/kanedias/internal/attachments"
 	"github.com/sklarsa/kanedias/internal/manager"
 	"github.com/sklarsa/kanedias/internal/supervisor"
 )
@@ -258,6 +259,13 @@ func TestHandlerRoutes(t *testing.T) {
 			contentType: "text/javascript; charset=utf-8",
 		},
 		{
+			name:        "image attachment controller",
+			path:        "/assets/image-attachments.js",
+			method:      http.MethodGet,
+			status:      http.StatusOK,
+			contentType: "text/javascript; charset=utf-8",
+		},
+		{
 			name:   "unknown",
 			path:   "/unknown",
 			method: http.MethodGet,
@@ -445,13 +453,15 @@ func TestInitialPageContainsAstrolabeConsole(t *testing.T) {
 		// Datastar wiring: signals and init
 		`data-signals=`,
 		`selectedSessionId`,
-		`commandMessage`,
 		`data-init=`,
-		// command deck actions
+		// command deck and accessible attachment controls
 		`Steer`,
 		`Interrupt`,
 		`Stop Session`,
 		`New Session`,
+		`id="image-attachment-tray" aria-live="polite" hidden`,
+		`id="image-file-input" type="file" accept="image/png,image/jpeg,image/gif,image/webp" multiple hidden`,
+		`id="attach-images-button" type="button"`,
 	}
 	for _, want := range required {
 		if !strings.Contains(body, want) {
@@ -498,19 +508,20 @@ func TestAstrolabeConsoleIsInteractive(t *testing.T) {
 	// There are no external scripts and no inline controller.
 	scriptRE := regexp.MustCompile(`(?s)<script\b([^>]*)>(.*?)</script>`)
 	scripts := scriptRE.FindAllStringSubmatch(body, -1)
-	wantScripts := 7 // Datastar + 3 Markdown assets + terminal decisions + session modal + app.js
+	wantScripts := 8 // Datastar + 3 Markdown assets + terminal decisions + session modal + attachments + app.js
 	if len(scripts) != wantScripts {
-		t.Fatalf("script count = %d, want %d (Datastar + 3 Markdown assets + terminal-ui.js + session-modal.js + app.js)", len(scripts), wantScripts)
+		t.Fatalf("script count = %d, want %d (Datastar + 3 Markdown assets + terminal-ui.js + session-modal.js + image-attachments.js + app.js)", len(scripts), wantScripts)
 	}
 
-	var sawDatastar, sawTerminalUI, sawSessionModal, sawAppJS bool
+	var sawDatastar, sawTerminalUI, sawSessionModal, sawAttachments, sawAppJS bool
+	attachmentIndex, appIndex := -1, -1
 	markdownAssets := []string{
 		`src="/assets/marked.min.js"`,
 		`src="/assets/highlight.min.js"`,
 		`src="/assets/markdown-renderer.js"`,
 	}
 	sawMarkdown := make(map[string]bool)
-	for _, script := range scripts {
+	for scriptIndex, script := range scripts {
 		attrs, inner := script[1], strings.TrimSpace(script[2])
 		if strings.Contains(attrs, `src="http://`) || strings.Contains(attrs, `src="https://`) {
 			t.Errorf("script references a remote origin: %s", script[0])
@@ -536,11 +547,19 @@ func TestAstrolabeConsoleIsInteractive(t *testing.T) {
 			}
 			sawSessionModal = true
 		}
+		if strings.Contains(attrs, `src="/assets/image-attachments.js"`) {
+			if inner != "" {
+				t.Errorf("image-attachments.js script has unexpected inline body %q", inner)
+			}
+			sawAttachments = true
+			attachmentIndex = scriptIndex
+		}
 		if strings.Contains(attrs, `src="/assets/app.js"`) {
 			if inner != "" {
 				t.Errorf("app.js script has unexpected inline body %q", inner)
 			}
 			sawAppJS = true
+			appIndex = scriptIndex
 		}
 		for _, asset := range markdownAssets {
 			if strings.Contains(attrs, asset) {
@@ -557,8 +576,14 @@ func TestAstrolabeConsoleIsInteractive(t *testing.T) {
 	if !sawSessionModal {
 		t.Error("page is missing the local session-modal.js script")
 	}
+	if !sawAttachments {
+		t.Error("page is missing the local image-attachments.js script")
+	}
 	if !sawAppJS {
 		t.Error("page is missing the app.js script")
+	}
+	if attachmentIndex < 0 || appIndex < 0 || attachmentIndex >= appIndex {
+		t.Error("image-attachments.js must load before app.js")
 	}
 	for _, asset := range markdownAssets {
 		if !sawMarkdown[asset] {
@@ -568,7 +593,7 @@ func TestAstrolabeConsoleIsInteractive(t *testing.T) {
 
 	// The console is a working control surface with delegated Datastar wiring.
 	for _, want := range []string{
-		`class="deck-input"`, `data-bind="commandMessage"`, `data-on:click=`,
+		`class="deck-input"`, `data-on:click=`,
 		`aria-keyshortcuts="Control+A Control+C Enter"`,
 		`aria-keyshortcuts="Escape"`,
 		`^A select all · ^C clear/copy · esc abort · ^O tools`,
@@ -580,8 +605,20 @@ func TestAstrolabeConsoleIsInteractive(t *testing.T) {
 	if strings.Contains(body, " disabled") {
 		t.Error("Astrolabe console must not ship disabled placeholder controls")
 	}
-	if strings.Contains(strings.ToLower(body), "onkeydown=") || strings.Contains(strings.ToLower(body), "onkeyup=") {
-		t.Error("Astrolabe console must use delegated keyboard handling, not inline key handlers")
+	if strings.Contains(body, `data-bind="commandMessage"`) {
+		t.Error("directive input must be owned by the image draft controller, not a Datastar signal")
+	}
+	steerRE := regexp.MustCompile(`(?s)<button\b[^>]*id="steerBtn"[^>]*>`)
+	steer := steerRE.FindString(body)
+	if steer == "" || !strings.Contains(steer, `type="button"`) {
+		t.Error("Steer must be a stable type=button control")
+	}
+	if strings.Contains(steer, `data-on:click`) {
+		t.Error("Steer must delegate browser submission to the image draft controller")
+	}
+	inlineHandlerRE := regexp.MustCompile(`(?i)\s(onclick|onchange|oninput|onpaste|ondragenter|ondragover|ondragleave|ondrop|onkeydown|onkeyup)\s*=`)
+	if inlineHandlerRE.MatchString(body) {
+		t.Error("Astrolabe console must use delegated browser handling, not inline event handlers")
 	}
 }
 
@@ -632,6 +669,74 @@ func TestActivityUsesMarkdownClassification(t *testing.T) {
 	}
 	if got := strings.Count(html, `data-markdown`); got != 2 {
 		t.Fatalf("markdown markers = %d, want 2\n%s", got, html)
+	}
+}
+
+func TestImageAttachmentLabelBoundaries(t *testing.T) {
+	for _, test := range []struct {
+		count int
+		want  string
+	}{
+		{count: -1, want: ""}, {count: 0, want: ""}, {count: 1, want: "1 image attached"}, {count: 2, want: "2 images attached"},
+	} {
+		if got := imageAttachmentLabel(test.count); got != test.want {
+			t.Fatalf("imageAttachmentLabel(%d) = %q, want %q", test.count, got, test.want)
+		}
+	}
+}
+
+func TestActivityAttachmentLabelsAreSafe(t *testing.T) {
+	const (
+		secretA = "SECRET_BASE64_A"
+		secretB = "SECRET_BASE64_B"
+	)
+	state := manager.SessionState{RecentActivity: []manager.ActivityItem{
+		{
+			Seq: 1, Kind: "user_message", Label: "You", Text: "inspect", ImageCount: 1, Complete: true,
+			ToolArgs: secretA,
+		},
+		{
+			Seq: 2, Kind: "user_message", Label: "You", ImageCount: 2, Complete: true,
+			ToolOutput: "data:image/png;base64," + secretB, ToolLanguage: "image/jpeg",
+		},
+	}}
+	view := newActivityView(state)
+	if len(view.Items) != 2 {
+		t.Fatalf("items = %d, want 2", len(view.Items))
+	}
+	if got := view.Items[0].AttachmentLabel; got != "1 image attached" {
+		t.Errorf("singular attachment label = %q", got)
+	}
+	if got := view.Items[1].AttachmentLabel; got != "2 images attached" {
+		t.Errorf("plural attachment label = %q", got)
+	}
+	projectedView := fmt.Sprintf("%#v", view)
+	for _, leaked := range []string{secretA, secretB, "image/png", "image/jpeg", "data:image"} {
+		if strings.Contains(projectedView, leaked) {
+			t.Errorf("activity view retained image payload %q: %s", leaked, projectedView)
+		}
+	}
+
+	templates, err := parseTemplates(webFiles)
+	if err != nil {
+		t.Fatal(err)
+	}
+	html, err := renderTemplate(templates, templateActivity, view)
+	if err != nil {
+		t.Fatal(err)
+	}
+	for _, want := range []string{"1 image attached", "2 images attached"} {
+		if !strings.Contains(html, want) {
+			t.Errorf("rendered activity is missing %q:\n%s", want, html)
+		}
+	}
+	for _, leaked := range []string{secretA, secretB, "image/png", "image/jpeg", "data:image"} {
+		if strings.Contains(html, leaked) {
+			t.Errorf("rendered activity leaked image payload %q:\n%s", leaked, html)
+		}
+	}
+	if strings.Contains(strings.ToLower(html), "<img") {
+		t.Errorf("attachment metadata must not render an image element:\n%s", html)
 	}
 }
 
@@ -957,6 +1062,20 @@ func TestFleetRowsBindSelectedSessionClass(t *testing.T) {
 	}
 }
 
+type sentMessage struct {
+	sessionID string
+	message   string
+	images    []attachments.Image
+}
+
+func cloneImages(images []attachments.Image) []attachments.Image {
+	cloned := make([]attachments.Image, len(images))
+	for i, image := range images {
+		cloned[i] = attachments.Image{MIMEType: image.MIMEType, Data: append([]byte(nil), image.Data...)}
+	}
+	return cloned
+}
+
 // streamFakeFleet is a controllable fake fleet manager for SSE stream tests.
 type streamFakeFleet struct {
 	mu              sync.Mutex
@@ -974,6 +1093,8 @@ type streamFakeFleet struct {
 	renameSessionID string
 	renameName      string
 	renameErr       error
+	sentMessage     sentMessage
+	messageErr      error
 }
 
 func newStreamFakeFleet() *streamFakeFleet {
@@ -1032,8 +1153,14 @@ func (f *streamFakeFleet) RenameRoot(sessionID, name string) error {
 	return f.renameErr
 }
 func (f *streamFakeFleet) Steer(context.Context, string, string) error { return nil }
-func (f *streamFakeFleet) Interrupt(context.Context, string) error     { return nil }
-func (f *streamFakeFleet) StopSession(context.Context, string) error   { return nil }
+func (f *streamFakeFleet) SendMessage(_ context.Context, sessionID, message string, images []attachments.Image) error {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	f.sentMessage = sentMessage{sessionID: sessionID, message: message, images: cloneImages(images)}
+	return f.messageErr
+}
+func (f *streamFakeFleet) Interrupt(context.Context, string) error   { return nil }
+func (f *streamFakeFleet) StopSession(context.Context, string) error { return nil }
 func (f *streamFakeFleet) AnswerQuestion(context.Context, string, string, json.RawMessage) error {
 	return nil
 }
@@ -1460,7 +1587,7 @@ func TestAssetsAreEmbedded(t *testing.T) {
 	})
 
 	// Unauthenticated paths.
-	for _, path := range []string{"/healthz", "/assets/terminal.css", "/assets/app.css", "/assets/datastar.js", "/assets/terminal-ui.js", "/assets/session-modal.js", "/assets/app.js"} {
+	for _, path := range []string{"/healthz", "/assets/terminal.css", "/assets/app.css", "/assets/datastar.js", "/assets/terminal-ui.js", "/assets/session-modal.js", "/assets/image-attachments.js", "/assets/app.js"} {
 		if response := serveRequest(handler, http.MethodGet, path); response.Code != http.StatusOK {
 			t.Errorf("GET %s status = %d, want %d", path, response.Code, http.StatusOK)
 		}
@@ -1468,6 +1595,26 @@ func TestAssetsAreEmbedded(t *testing.T) {
 	// Authenticated paths.
 	if response := serveAuthenticatedRequest(t, handler, http.MethodGet, "/", cookie); response.Code != http.StatusOK {
 		t.Errorf("GET / status = %d, want %d", response.Code, http.StatusOK)
+	}
+}
+
+func TestImageAttachmentsAssetIsDormantLocalJavaScript(t *testing.T) {
+	handler, _ := mustNewHandlerWithAuth(t, slog.New(slog.NewTextHandler(&bytes.Buffer{}, nil)))
+	response := serveRequest(handler, http.MethodGet, "/assets/image-attachments.js")
+	if response.Code != http.StatusOK {
+		t.Fatalf("GET image attachment asset without session cookie = %d, want %d", response.Code, http.StatusOK)
+	}
+	if got := response.Header().Get("Content-Type"); got != "text/javascript; charset=utf-8" {
+		t.Errorf("Content-Type = %q, want JavaScript", got)
+	}
+	body := response.Body.String()
+	if !strings.Contains(body, "KanediasImageAttachments") {
+		t.Error("image attachment asset does not publish KanediasImageAttachments")
+	}
+	for _, external := range []string{"http://", "https://", "src=\"//", "src='//"} {
+		if strings.Contains(strings.ToLower(body), external) {
+			t.Errorf("image attachment asset contains external URL marker %q", external)
+		}
 	}
 }
 
@@ -1519,6 +1666,7 @@ func TestRenderedPageHasOnlyOrderedLocalRuntimeAssets(t *testing.T) {
 		"/assets/markdown-renderer.js",
 		"/assets/terminal-ui.js",
 		"/assets/session-modal.js",
+		"/assets/image-attachments.js",
 		"/assets/app.js",
 	}
 	if len(matches) != len(want) {

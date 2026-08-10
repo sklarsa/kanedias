@@ -23,6 +23,7 @@ import (
 const (
 	maxDescendantResponseBytes = 1 << 20
 	maxDescendantSSELineBytes  = pirpc.MaxRecordBytes + (1 << 20)
+	maxDescendantSSEEventBytes = maxDescendantSSELineBytes
 	defaultUnaryTimeout        = 10 * time.Second
 )
 
@@ -78,18 +79,21 @@ func (client *DescendantClient) request(ctx context.Context, method, path string
 	return response, nil
 }
 
-func readDescendantJSON(response *http.Response, target any) error {
+func readDescendantJSON(response *http.Response, target any, maxBytes int64) error {
 	defer func() { _ = response.Body.Close() }()
 	mediaType, _, err := mime.ParseMediaType(response.Header.Get("Content-Type"))
 	if err != nil || mediaType != "application/json" {
 		return contract.NewError(contract.ErrorChildUnavailable, "child response is not JSON")
 	}
-	body, err := io.ReadAll(io.LimitReader(response.Body, maxDescendantResponseBytes+1))
+	body, err := io.ReadAll(io.LimitReader(response.Body, maxBytes+1))
 	if err != nil {
 		return contract.NewError(contract.ErrorChildUnavailable, "read child response: "+err.Error())
 	}
-	if len(body) > maxDescendantResponseBytes {
-		return contract.NewError(contract.ErrorChildUnavailable, "child response exceeds 1 MiB")
+	if int64(len(body)) > maxBytes {
+		if maxBytes == maxDescendantResponseBytes {
+			return contract.NewError(contract.ErrorChildUnavailable, "child response exceeds 1 MiB")
+		}
+		return contract.NewError(contract.ErrorChildUnavailable, fmt.Sprintf("child response exceeds %d bytes", maxBytes))
 	}
 	if response.StatusCode < 200 || response.StatusCode >= 300 {
 		var typed contract.Error
@@ -116,7 +120,7 @@ func (client *DescendantClient) Snapshot(ctx context.Context) (supervisor.NodeSn
 		return supervisor.NodeSnapshot{}, err
 	}
 	var snapshot supervisor.NodeSnapshot
-	if err := readDescendantJSON(response, &snapshot); err != nil {
+	if err := readDescendantJSON(response, &snapshot, maxDescendantResponseBytes); err != nil {
 		return supervisor.NodeSnapshot{}, err
 	}
 	return snapshot, nil
@@ -135,7 +139,7 @@ func (client *DescendantClient) CallRPC(ctx context.Context, sessionID string, c
 		return nil, err
 	}
 	var raw json.RawMessage
-	if err := readDescendantJSON(response, &raw); err != nil {
+	if err := readDescendantJSON(response, &raw, pirpc.MaxRecordBytes); err != nil {
 		return nil, err
 	}
 	return raw, nil
@@ -152,7 +156,7 @@ func (client *DescendantClient) AnswerQuestion(ctx context.Context, sessionID, q
 	if response.StatusCode == http.StatusNoContent {
 		return nil
 	}
-	return readDescendantJSON(response, &struct{}{})
+	return readDescendantJSON(response, &struct{}{}, maxDescendantResponseBytes)
 }
 
 func (client *DescendantClient) Stop(ctx context.Context, sessionID string) error {
@@ -165,12 +169,27 @@ func (client *DescendantClient) Stop(ctx context.Context, sessionID string) erro
 	var accepted struct {
 		Status string `json:"status"`
 	}
-	if err := readDescendantJSON(response, &accepted); err != nil {
+	if err := readDescendantJSON(response, &accepted, maxDescendantResponseBytes); err != nil {
 		return err
 	}
 	if accepted.Status != "stopping" {
 		return contract.NewError(contract.ErrorChildUnavailable, "child returned an invalid stop acknowledgement")
 	}
+	return nil
+}
+
+func appendDescendantSSEData(data *strings.Builder, value string, maxBytes int) error {
+	additional := len(value)
+	if data.Len() > 0 {
+		additional++
+	}
+	if additional > maxBytes-data.Len() {
+		return fmt.Errorf("child event data exceeds %d bytes", maxBytes)
+	}
+	if data.Len() > 0 {
+		data.WriteByte('\n')
+	}
+	data.WriteString(value)
 	return nil
 }
 
@@ -188,7 +207,7 @@ func (client *DescendantClient) Subscribe(ctx context.Context) (supervisor.Subsc
 		return supervisor.Subscription{}, contract.NewError(contract.ErrorChildUnavailable, "child event stream is unavailable")
 	}
 
-	events := make(chan supervisor.EventEnvelope, supervisor.DefaultSubscriberMailboxCapacity)
+	events := make(chan supervisor.EventEnvelope, 1)
 	var closeOnce sync.Once
 	var errMu sync.Mutex
 	var streamErr error
@@ -220,14 +239,18 @@ func (client *DescendantClient) Subscribe(ctx context.Context) (supervisor.Subsc
 				case events <- event:
 				case <-streamCtx.Done():
 					return
+				default:
+					setStreamErr(contract.NewError(contract.ErrorChildUnavailable, "child event consumer exceeded bounded capacity"))
+					return
 				}
 				continue
 			}
 			if strings.HasPrefix(line, "data:") {
-				if data.Len() > 0 {
-					data.WriteByte('\n')
+				value := strings.TrimSpace(strings.TrimPrefix(line, "data:"))
+				if err := appendDescendantSSEData(&data, value, maxDescendantSSEEventBytes); err != nil {
+					setStreamErr(contract.NewError(contract.ErrorChildUnavailable, err.Error()))
+					return
 				}
-				data.WriteString(strings.TrimSpace(strings.TrimPrefix(line, "data:")))
 			}
 		}
 		if streamCtx.Err() != nil {

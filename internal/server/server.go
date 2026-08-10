@@ -13,6 +13,7 @@ import (
 	"strings"
 	"time"
 
+	"github.com/sklarsa/kanedias/internal/attachments"
 	"github.com/sklarsa/kanedias/internal/config"
 	"github.com/sklarsa/kanedias/internal/manager"
 	"github.com/sklarsa/kanedias/internal/supervisor"
@@ -43,6 +44,7 @@ type fleetManager interface {
 	SpawnRootWithRequest(ctx context.Context, request manager.SessionLaunchRequest) (string, error)
 	RenameRoot(sessionID, name string) error
 	Steer(ctx context.Context, sessionID string, message string) error
+	SendMessage(ctx context.Context, sessionID, message string, images []attachments.Image) error
 	Interrupt(ctx context.Context, sessionID string) error
 	StopSession(ctx context.Context, sessionID string) error
 	AnswerQuestion(ctx context.Context, sessionID string, questionID string, answer json.RawMessage) error

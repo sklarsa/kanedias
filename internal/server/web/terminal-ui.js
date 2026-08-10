@@ -60,7 +60,13 @@
   }
 
   function syncDeckState(documentObject) {
-    setActionControlState(documentObject.getElementById("steerBtn"), detailCapability(documentObject, "steer"));
+    var deck = documentObject.querySelector(".deck");
+    var busy = !!deck && deck.getAttribute("aria-busy") === "true";
+    var canSteer = detailCapability(documentObject, "steer") && !busy;
+    setActionControlState(documentObject.getElementById("steerBtn"), canSteer);
+    setActionControlState(documentObject.querySelector(".deck-input"), canSteer);
+    setActionControlState(documentObject.getElementById("attach-images-button"), canSteer);
+    setActionControlState(documentObject.getElementById("image-file-input"), canSteer);
     setActionControlState(documentObject.getElementById("interruptBtn"), detailCapability(documentObject, "interrupt"));
     setActionControlState(documentObject.querySelector(".dbtn.stop"), detailCapability(documentObject, "stop"));
   }
@@ -194,10 +200,10 @@
     event.preventDefault();
 
     if (action === "submit") {
-      var steer = documentObject.getElementById("steerBtn");
-      if (steer && !steer.disabled) {
-        steer.click();
-        clearDeck(documentObject.querySelector(".deck-input"), context.Event);
+      if (typeof context.submit === "function") context.submit();
+      else {
+        var steer = documentObject.getElementById("steerBtn");
+        if (steer && !steer.disabled) steer.click();
       }
       return true;
     }

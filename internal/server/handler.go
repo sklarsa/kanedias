@@ -65,9 +65,12 @@ func newHandlerWithOptions(logger *slog.Logger, advertisedAddress string, bootst
 	// Both browser security middlewares are no-ops in trusted-network mode.
 	sessionRequired := func(next http.Handler) http.Handler { return next }
 	writeRequired := func(next http.Handler) http.Handler { return next }
+	messageWriteRequired := func(next http.Handler) http.Handler { return next }
 	if auth != nil {
 		sessionRequired = auth.requireSession
-		writeRequired = newRequestBoundary(advertisedAddress).requireWriteBoundary
+		boundary := newRequestBoundary(advertisedAddress)
+		writeRequired = boundary.requireWriteBoundary
+		messageWriteRequired = boundary.requireWriteBoundaryFor("multipart/form-data")
 	}
 
 	serveIndex := func(w http.ResponseWriter, _ *http.Request) {
@@ -102,6 +105,7 @@ func newHandlerWithOptions(logger *slog.Logger, advertisedAddress string, bootst
 	serveMarkdownRenderer := serveEmbeddedAsset(logger, "web/markdown-renderer.js", "text/javascript; charset=utf-8")
 	serveTerminalUI := serveEmbeddedAsset(logger, "web/terminal-ui.js", "text/javascript; charset=utf-8")
 	serveSessionModal := serveEmbeddedAsset(logger, "web/session-modal.js", "text/javascript; charset=utf-8")
+	serveImageAttachments := serveEmbeddedAsset(logger, "web/image-attachments.js", "text/javascript; charset=utf-8")
 
 	router := chi.NewRouter()
 	router.Use(requestLogger(logger), recoverPanics(logger))
@@ -119,6 +123,7 @@ func newHandlerWithOptions(logger *slog.Logger, advertisedAddress string, bootst
 	router.Get("/assets/markdown-renderer.js", serveMarkdownRenderer)
 	router.Get("/assets/terminal-ui.js", serveTerminalUI)
 	router.Get("/assets/session-modal.js", serveSessionModal)
+	router.Get("/assets/image-attachments.js", serveImageAttachments)
 	router.Get("/assets/app.js", serveAppJS)
 
 	var serveFleet, serveSession http.HandlerFunc
@@ -142,6 +147,7 @@ func newHandlerWithOptions(logger *slog.Logger, advertisedAddress string, bootst
 	})
 
 	// Browser security is applied to action POSTs only when session auth is enabled.
+	// Existing action routes remain JSON-only.
 	router.Group(func(write chi.Router) {
 		write.Use(sessionRequired)
 		write.Use(writeRequired)
@@ -159,6 +165,18 @@ func newHandlerWithOptions(logger *slog.Logger, advertisedAddress string, bootst
 			write.Post("/ui/sessions/{sessionID}/interrupt", http.NotFoundHandler().ServeHTTP)
 			write.Post("/ui/sessions/{sessionID}/stop", http.NotFoundHandler().ServeHTTP)
 			write.Post("/ui/sessions/{sessionID}/questions/{questionID}", http.NotFoundHandler().ServeHTTP)
+		}
+	})
+
+	// Multipart is allowed only for the dedicated message route. In trusted-
+	// network mode decodeMessageRequest still validates the multipart media type.
+	router.Group(func(write chi.Router) {
+		write.Use(sessionRequired)
+		write.Use(messageWriteRequired)
+		if fleet != nil {
+			write.Post("/ui/sessions/{sessionID}/messages", makeMessageHandler(fleet, logger))
+		} else {
+			write.Post("/ui/sessions/{sessionID}/messages", http.NotFoundHandler().ServeHTTP)
 		}
 	})
 

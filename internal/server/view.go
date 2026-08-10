@@ -233,13 +233,14 @@ type questionPanelView struct {
 // <pre><code> blocks; the browser highlights them via
 // KanediasMarkdown.highlight.
 type activityItemView struct {
-	Seq        uint64
-	Kind       string
-	Label      string
-	Text       string
-	ToolName   string
-	IsError    bool
-	IsMarkdown bool
+	Seq             uint64
+	Kind            string
+	Label           string
+	Text            string
+	AttachmentLabel string
+	ToolName        string
+	IsError         bool
+	IsMarkdown      bool
 	// Complete allows the template to leave finalized browser-rendered content
 	// untouched while the surrounding activity panel continues to morph.
 	Complete bool
@@ -265,6 +266,16 @@ type activityItemView struct {
 // and tool activity remain plain escaped text.
 func activityUsesMarkdown(kind string) bool {
 	return kind == "message_update" || kind == "user_message"
+}
+
+func imageAttachmentLabel(count int) string {
+	if count == 1 {
+		return "1 image attached"
+	}
+	if count > 1 {
+		return fmt.Sprintf("%d images attached", count)
+	}
+	return ""
 }
 
 // activityView is the template data for activity.html.
@@ -504,14 +515,15 @@ func newActivityView(state manager.SessionState) activityView {
 	items := make([]activityItemView, 0, len(state.RecentActivity))
 	for _, a := range state.RecentActivity {
 		view := activityItemView{
-			Seq:        a.Seq,
-			Kind:       a.Kind,
-			Label:      a.Label,
-			Text:       a.Text,
-			ToolName:   a.ToolName,
-			IsError:    a.IsError,
-			IsMarkdown: activityUsesMarkdown(a.Kind),
-			Complete:   a.Complete,
+			Seq:             a.Seq,
+			Kind:            a.Kind,
+			Label:           a.Label,
+			Text:            a.Text,
+			AttachmentLabel: imageAttachmentLabel(a.ImageCount),
+			ToolName:        a.ToolName,
+			IsError:         a.IsError,
+			IsMarkdown:      activityUsesMarkdown(a.Kind),
+			Complete:        a.Complete,
 		}
 		if a.IsTool {
 			view.IsTool = true

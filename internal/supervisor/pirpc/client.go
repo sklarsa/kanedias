@@ -15,7 +15,9 @@ import (
 	"time"
 )
 
-const MaxRecordBytes = 4 << 20
+// 8 MiB raw images expand to about 10.7 MiB; 12 MiB leaves JSON/text headroom
+// while remaining below the default 16 MiB event-byte budget.
+const MaxRecordBytes = 12 << 20
 
 var ErrForbiddenCommand = errors.New("command would replace the bound Pi RPC session")
 
@@ -53,7 +55,7 @@ type Client struct {
 func NewClient(conn io.ReadWriteCloser) *Client {
 	client := &Client{
 		conn:      conn,
-		events:    make(chan Event, 128),
+		events:    make(chan Event, 1),
 		done:      make(chan struct{}),
 		readDone:  make(chan struct{}),
 		writeGate: make(chan struct{}, 1),
@@ -91,6 +93,9 @@ func (client *Client) CallWithSequence(ctx context.Context, command json.RawMess
 	id := fmt.Sprintf("kanedias-%s-%d", processIDPrefix, requestCounter.Add(1))
 	wire, err := commandWithID(command, id)
 	if err != nil {
+		return nil, 0, err
+	}
+	if err := checkRecordSize(wire); err != nil {
 		return nil, 0, err
 	}
 	result := make(chan callResult, 1)
@@ -132,6 +137,9 @@ func (client *Client) Send(ctx context.Context, command json.RawMessage) error {
 	var compact bytes.Buffer
 	if err := json.Compact(&compact, command); err != nil {
 		return fmt.Errorf("encode Pi RPC command: %w", err)
+	}
+	if err := checkRecordSize(compact.Bytes()); err != nil {
+		return err
 	}
 	if err := client.write(ctx, compact.Bytes()); err != nil {
 		if ctxErr := ctx.Err(); ctxErr != nil {
@@ -200,6 +208,9 @@ func (client *Client) readLoop() {
 		case client.events <- Event{Seq: sequence, Type: envelope.Type, Raw: raw}:
 		case <-client.done:
 			return
+		default:
+			_ = client.terminate(errors.New("pi RPC event consumer exceeded bounded capacity"))
+			return
 		}
 	}
 }
@@ -221,6 +232,13 @@ func (client *Client) removePending(id string) {
 	client.mu.Lock()
 	delete(client.pending, id)
 	client.mu.Unlock()
+}
+
+func checkRecordSize(record []byte) error {
+	if len(record) > MaxRecordBytes {
+		return fmt.Errorf("record exceeds %d bytes on the Pi RPC transport", MaxRecordBytes)
+	}
+	return nil
 }
 
 func (client *Client) write(ctx context.Context, record []byte) error {

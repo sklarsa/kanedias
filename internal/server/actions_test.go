@@ -12,6 +12,7 @@ import (
 	"strings"
 	"testing"
 
+	"github.com/sklarsa/kanedias/internal/attachments"
 	"github.com/sklarsa/kanedias/internal/manager"
 	"github.com/sklarsa/kanedias/internal/supervisor/contract"
 )
@@ -464,9 +465,12 @@ type errFleet struct {
 
 func (e *errFleet) RenameRoot(string, string) error             { return e.mutationErr }
 func (e *errFleet) Steer(context.Context, string, string) error { return e.mutationErr }
-func (e *errFleet) Interrupt(context.Context, string) error     { return e.mutationErr }
-func (e *errFleet) StopSession(context.Context, string) error   { return e.mutationErr }
-func (e *errFleet) SpawnRoot(context.Context) (string, error)   { return "", e.mutationErr }
+func (e *errFleet) SendMessage(context.Context, string, string, []attachments.Image) error {
+	return e.mutationErr
+}
+func (e *errFleet) Interrupt(context.Context, string) error   { return e.mutationErr }
+func (e *errFleet) StopSession(context.Context, string) error { return e.mutationErr }
+func (e *errFleet) SpawnRoot(context.Context) (string, error) { return "", e.mutationErr }
 func (e *errFleet) SpawnRootWithRequest(context.Context, manager.SessionLaunchRequest) (string, error) {
 	return "", e.mutationErr
 }

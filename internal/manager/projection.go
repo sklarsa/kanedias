@@ -174,14 +174,19 @@ func (p *activityProjector) applyMessageEnd(event supervisor.EventEnvelope) {
 	}
 	if payload.Message.Role == "user" {
 		var text string
+		imageCount := 0
 		for _, content := range payload.Message.Content {
-			if content.Type == "text" {
+			switch content.Type {
+			case "text":
 				text += content.Text
+			case "image":
+				imageCount++
 			}
 		}
-		if text != "" {
+		if text != "" || imageCount > 0 {
 			p.items = append(p.items, ActivityItem{
-				Seq: event.Seq, Kind: "user_message", Label: "You", Text: text, Complete: true,
+				Seq: event.Seq, Kind: "user_message", Label: "You", Text: text,
+				ImageCount: imageCount, Complete: true,
 			})
 		}
 		return

@@ -158,6 +158,90 @@ func assertOpenAssistantItem(t *testing.T, items []ActivityItem, wantText string
 	}
 }
 
+func TestProjectActivityCountsUserMessageImagesWithoutRetainingPayload(t *testing.T) {
+	const (
+		secretA      = "SECRET_BASE64_A"
+		secretB      = "SECRET_BASE64_B"
+		imageDataURL = "data:image/png;base64," + secretA
+	)
+	projector := newActivityProjector()
+	projector.Apply(piEvent(7, "s", "message_end", map[string]any{
+		"message": map[string]any{
+			"role": "user",
+			"content": []any{
+				map[string]any{"type": "text", "text": "inspect"},
+				map[string]any{"type": "image", "mimeType": "image/png", "data": imageDataURL},
+				map[string]any{"type": "image", "mimeType": "image/jpeg", "data": secretB},
+			},
+		},
+	}))
+
+	items := projector.Items()
+	if len(items) != 1 {
+		t.Fatalf("items = %d, want 1: %#v", len(items), items)
+	}
+	item := items[0]
+	if item.Kind != "user_message" || item.Text != "inspect" || item.ImageCount != 2 {
+		t.Fatalf("user message = %#v, want text with two image attachments", item)
+	}
+	projected, err := json.Marshal(item)
+	if err != nil {
+		t.Fatal(err)
+	}
+	for _, leaked := range []string{imageDataURL, "data:image", secretA, secretB, "image/png", "image/jpeg"} {
+		if strings.Contains(string(projected), leaked) {
+			t.Fatalf("projected activity retained image payload %q: %s", leaked, projected)
+		}
+	}
+}
+
+func TestProjectActivityIncludesImageOnlyUserMessage(t *testing.T) {
+	projector := newActivityProjector()
+	projector.Apply(piEvent(8, "s", "message_end", map[string]any{
+		"message": map[string]any{
+			"role": "user",
+			"content": []any{
+				map[string]any{"type": "image", "mimeType": "image/png", "data": "IMAGE_ONLY_SECRET"},
+			},
+		},
+	}))
+
+	items := projector.Items()
+	if len(items) != 1 {
+		t.Fatalf("items = %d, want image-only user activity item: %#v", len(items), items)
+	}
+	if item := items[0]; item.Kind != "user_message" || item.Text != "" || item.ImageCount != 1 || !item.Complete {
+		t.Fatalf("image-only user message = %#v", item)
+	}
+}
+
+func TestProjectActivityUserContentUsesExactTypesAndOrderedText(t *testing.T) {
+	projector := newActivityProjector()
+	projector.Apply(piEvent(9, "s", "message_end", map[string]any{
+		"message": map[string]any{"role": "user", "content": []any{
+			map[string]any{"type": "text", "text": "first"},
+			map[string]any{"type": "image_variant", "text": "ignored"},
+			map[string]any{"type": "image", "data": "SECRET"},
+			map[string]any{"type": "text", "text": "-second"},
+		}},
+	}))
+	items := projector.Items()
+	if len(items) != 1 || items[0].Text != "first-second" || items[0].ImageCount != 1 {
+		t.Fatalf("items = %#v", items)
+	}
+
+	empty := newActivityProjector()
+	empty.Apply(piEvent(10, "s", "message_end", map[string]any{
+		"message": map[string]any{"role": "user", "content": []any{
+			map[string]any{"type": "text_variant", "text": "ignored"},
+			map[string]any{"type": "image_variant", "data": "ignored"},
+		}},
+	}))
+	if got := empty.Items(); len(got) != 0 {
+		t.Fatalf("variant-only message projected = %#v", got)
+	}
+}
+
 func TestProjectActivityShowsPromptAndCoalescesRepeatedProviderError(t *testing.T) {
 	errorMessage := map[string]any{
 		"message": map[string]any{

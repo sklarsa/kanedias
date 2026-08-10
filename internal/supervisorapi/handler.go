@@ -13,9 +13,13 @@ import (
 	"github.com/go-chi/chi/v5"
 	"github.com/sklarsa/kanedias/internal/supervisor"
 	"github.com/sklarsa/kanedias/internal/supervisor/contract"
+	"github.com/sklarsa/kanedias/internal/supervisor/pirpc"
 )
 
-const MaxRequestBodyBytes = 1 << 20
+const (
+	MaxRequestBodyBytes    = 1 << 20
+	MaxRPCRequestBodyBytes = pirpc.MaxRecordBytes
+)
 
 type Service interface {
 	Snapshot(context.Context) (supervisor.NodeSnapshot, error)
@@ -135,7 +139,7 @@ func NewHandler(service Service) http.Handler {
 }
 
 func readRPCBody(w http.ResponseWriter, request *http.Request) (json.RawMessage, error) {
-	body, err := readJSONBody(w, request)
+	body, err := readJSONBodyLimit(w, request, MaxRPCRequestBodyBytes, "request body exceeds 12 MiB")
 	if err != nil {
 		return nil, err
 	}
@@ -152,16 +156,20 @@ func readRPCBody(w http.ResponseWriter, request *http.Request) (json.RawMessage,
 }
 
 func readJSONBody(w http.ResponseWriter, request *http.Request) (json.RawMessage, error) {
+	return readJSONBodyLimit(w, request, MaxRequestBodyBytes, "request body exceeds 1 MiB")
+}
+
+func readJSONBodyLimit(w http.ResponseWriter, request *http.Request, limit int64, overflowMessage string) (json.RawMessage, error) {
 	mediaType, _, err := mime.ParseMediaType(request.Header.Get("Content-Type"))
 	if err != nil || mediaType != "application/json" {
 		return nil, &httpBoundaryError{status: http.StatusUnsupportedMediaType, err: contract.NewError(contract.ErrorInvalidRequest, "Content-Type must be application/json")}
 	}
-	request.Body = http.MaxBytesReader(w, request.Body, MaxRequestBodyBytes)
+	request.Body = http.MaxBytesReader(w, request.Body, limit)
 	body, err := io.ReadAll(request.Body)
 	if err != nil {
 		var tooLarge *http.MaxBytesError
 		if errors.As(err, &tooLarge) {
-			return nil, &httpBoundaryError{status: http.StatusRequestEntityTooLarge, err: contract.NewError(contract.ErrorInvalidRequest, "request body exceeds 1 MiB")}
+			return nil, &httpBoundaryError{status: http.StatusRequestEntityTooLarge, err: contract.NewError(contract.ErrorInvalidRequest, overflowMessage)}
 		}
 		return nil, contract.NewError(contract.ErrorInvalidRequest, "read request body: "+err.Error())
 	}
@@ -228,7 +236,4 @@ func writeRawJSON(w http.ResponseWriter, status int, raw json.RawMessage) {
 	w.Header().Set("Content-Type", "application/json")
 	w.WriteHeader(status)
 	_, _ = w.Write(raw)
-	if !strings.HasSuffix(string(raw), "\n") {
-		_, _ = w.Write([]byte("\n"))
-	}
 }
