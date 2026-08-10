@@ -6,6 +6,27 @@
 })(typeof globalThis !== "undefined" ? globalThis : this, function () {
   "use strict";
 
+  function numericStyle(style, name) {
+    var value = parseFloat(style && style[name]);
+    return Number.isFinite(value) ? value : 0;
+  }
+
+  function autoSizeComposer(input, windowObject) {
+    var style = windowObject.getComputedStyle(input);
+    var lineHeight = numericStyle(style, "lineHeight") || 21.75;
+    var chrome = numericStyle(style, "paddingTop") + numericStyle(style, "paddingBottom") +
+      numericStyle(style, "borderTopWidth") + numericStyle(style, "borderBottomWidth");
+    var minHeight = Math.ceil(lineHeight * 2 + chrome);
+    var maxHeight = Math.ceil(lineHeight * 6 + chrome);
+    input.style.height = "auto";
+    var desired = Math.ceil(input.scrollHeight + numericStyle(style, "borderTopWidth") + numericStyle(style, "borderBottomWidth"));
+    var height = Math.max(minHeight, Math.min(maxHeight, desired));
+    var overflowing = desired > maxHeight;
+    input.style.height = height + "px";
+    input.style.overflowY = overflowing ? "auto" : "hidden";
+    return {height: height, minHeight: minHeight, maxHeight: maxHeight, overflowing: overflowing};
+  }
+
   function bindComposer(documentObject, windowObject) {
     var terminalUI = windowObject.KanediasTerminalUI;
     var appShell = documentObject.querySelector(".app");
@@ -74,6 +95,7 @@
       }
       if (snapshot.sessionID !== selectedSessionID) return;
       if (input.value !== snapshot.text) input.value = snapshot.text;
+      autoSizeComposer(input, windowObject);
 
       var nextPreviewKey = snapshot.images.map(function (image) { return image.id; }).join(",");
       if (nextPreviewKey !== previewKey) {
@@ -166,8 +188,17 @@
     }
 
     listen(input, "input", function () {
+      autoSizeComposer(input, windowObject);
       if (canEditSelectedDraft()) controller.setText(input.value);
     });
+    listen(windowObject, "resize", function () {
+      autoSizeComposer(input, windowObject);
+    });
+    if (documentObject.fonts && documentObject.fonts.ready) {
+      documentObject.fonts.ready.then(function () {
+        if (!destroyed) autoSizeComposer(input, windowObject);
+      });
+    }
 
     listen(attachButton, "click", function () {
       if (canEditSelectedDraft()) fileInput.click();
@@ -304,7 +335,7 @@
     };
   }
 
-  return {bindComposer: bindComposer};
+  return {autoSizeComposer: autoSizeComposer, bindComposer: bindComposer};
 });
 
 if (typeof module === "undefined" && typeof window !== "undefined" && typeof document !== "undefined") (function () {

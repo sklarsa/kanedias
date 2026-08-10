@@ -31,6 +31,8 @@ class FakeElement {
     this.classList = new FakeClassList(this);
     this.disabled = false;
     this.hidden = false;
+    this.style = {};
+    this.scrollHeight = 30;
     this.value = "";
     this.files = [];
     this.textContent = "";
@@ -39,6 +41,11 @@ class FakeElement {
     this.classList.names = new Set(String(value).split(/\s+/).filter(Boolean));
   }
   get className() { return Array.from(this.classList.names).join(" "); }
+  set value(value) {
+    this._value = String(value);
+    this.scrollHeight = this._value.split("\n").length * 30;
+  }
+  get value() { return this._value; }
   get firstChild() { return this.children[0] || null; }
   appendChild(child) { child.parentNode = this; child.ownerDocument = this.ownerDocument; this.children.push(child); return child; }
   removeChild(child) {
@@ -188,11 +195,12 @@ function jsonResponse(status, body) {
 function image(name) { return {name, type: "image/png", size: 10, lastModified: 1}; }
 function clipboardFile(file) { return {kind: "file", type: file.type, getAsFile: () => file}; }
 
-function fixture(fetchImpl = async () => jsonResponse(202, {accepted: true})) {
+function fixture(fetchImpl = async () => jsonResponse(202, {accepted: true}), options = {}) {
   FakeMutationObserver.instances = [];
   const document = new FakeDocument();
+  if (options.fonts) document.fonts = options.fonts;
   const ids = [
-    ["app", "div"], ["deck", "footer"], ["deck-input", "input"],
+    ["app", "div"], ["deck", "footer"], ["deck-input", "textarea"],
     ["image-attachment-tray", "div"], ["attach-images-button", "button"],
     ["image-file-input", "input"], ["steerBtn", "button"], ["deck-status", "div"],
     ["detail-panel", "div"], ["main-stack", "div"], ["fleet-panel", "div"],
@@ -230,6 +238,13 @@ function fixture(fetchImpl = async () => jsonResponse(202, {accepted: true})) {
     },
     removeEventListener(type, listener) {
       windowListeners.set(type, (windowListeners.get(type) || []).filter((candidate) => candidate !== listener));
+    },
+    getComputedStyle() {
+      if (options.onGetComputedStyle) options.onGetComputedStyle();
+      return {
+        lineHeight: "20px", paddingTop: "5px", paddingBottom: "5px",
+        borderTopWidth: "1px", borderBottomWidth: "1px"
+      };
     }
   };
   const binding = app.bindComposer(document, windowObject);
@@ -245,6 +260,28 @@ function fixture(fetchImpl = async () => jsonResponse(202, {accepted: true})) {
   };
   return {document, windowObject, windowListeners, binding, rows, select, setCanSteer, revoked};
 }
+
+test("autoSizeComposer clamps a textarea from two through six lines", () => {
+  const input = new FakeElement("textarea");
+  input.style = {};
+  input.scrollHeight = 30;
+  const windowObject = {
+    getComputedStyle: () => ({
+      lineHeight: "20px", paddingTop: "5px", paddingBottom: "5px",
+      borderTopWidth: "1px", borderBottomWidth: "1px"
+    })
+  };
+
+  assert.deepEqual(app.autoSizeComposer(input, windowObject), {
+    height: 52, minHeight: 52, maxHeight: 132, overflowing: false
+  });
+  input.scrollHeight = 220;
+  assert.deepEqual(app.autoSizeComposer(input, windowObject), {
+    height: 132, minHeight: 52, maxHeight: 132, overflowing: true
+  });
+  assert.equal(input.style.height, "132px");
+  assert.equal(input.style.overflowY, "auto");
+});
 
 function changePicker(f, files) {
   const picker = f.document.getElementById("image-file-input");
@@ -280,6 +317,23 @@ test("bound composer resets same-file picker and restores independent A/B drafts
   f.select("B");
   assert.equal(input.value, "beta");
   assert.equal(f.document.getElementById("image-attachment-tray").children.length, 1);
+});
+
+test("multiline drafts resize independently when the selected session changes", () => {
+  const f = fixture();
+  const input = f.document.getElementById("deck-input");
+  f.select("A");
+  input.value = "alpha\nsecond line\nthird line";
+  input.scrollHeight = 90;
+  input.dispatchEvent(browserEvent("input"));
+  const alphaHeight = input.style.height;
+
+  f.select("B");
+  assert.equal(input.value, "");
+  assert.notEqual(input.style.height, alphaHeight);
+  f.select("A");
+  assert.equal(input.value, "alpha\nsecond line\nthird line");
+  assert.equal(input.style.height, alphaHeight);
 });
 
 test("capability transitions disable remove and guard drop plus late picker change", () => {
@@ -465,14 +519,43 @@ test("clipboard image candidates with blank or case-varied declarations reach sh
   assert.deepEqual(f.binding.controller.draft("A").images.map((entry) => entry.name), ["blank.png", "case.png"]);
 });
 
+test("font readiness recalculates unless the composer binding was destroyed", async () => {
+  const ready = deferred();
+  const f = fixture(undefined, {fonts: {ready: ready.promise}});
+  const input = f.document.getElementById("deck-input");
+  f.select("A");
+  input.scrollHeight = 220;
+  ready.resolve();
+  await flush();
+  assert.equal(input.style.height, "132px");
+
+  const lateReady = deferred();
+  let recalculations = 0;
+  const destroyed = fixture(undefined, {
+    fonts: {ready: lateReady.promise},
+    onGetComputedStyle() { recalculations++; }
+  });
+  destroyed.binding.destroy();
+  const before = recalculations;
+  lateReady.resolve();
+  await flush();
+  assert.equal(recalculations, before);
+});
+
 test("destroy removes binding listeners and permits a clean rebind", () => {
   const f = fixture();
   assert.equal((f.document.getElementById("steerBtn").listeners.get("click") || []).length, 1);
   assert.equal((f.windowListeners.get("beforeunload") || []).length, 1);
+  assert.equal((f.windowListeners.get("resize") || []).length, 1);
+  const input = f.document.getElementById("deck-input");
+  input.scrollHeight = 220;
+  for (const listener of f.windowListeners.get("resize") || []) listener();
+  assert.equal(input.style.height, "132px");
   f.binding.destroy();
   f.binding.destroy();
   assert.equal((f.document.getElementById("steerBtn").listeners.get("click") || []).length, 0);
   assert.equal((f.windowListeners.get("beforeunload") || []).length, 0);
+  assert.equal((f.windowListeners.get("resize") || []).length, 0);
   const rebound = app.bindComposer(f.document, f.windowObject);
   assert.equal((f.document.getElementById("steerBtn").listeners.get("click") || []).length, 1);
   rebound.destroy();

@@ -44,13 +44,14 @@
     </div>
     <div class="deck-row">
       <span class="deck-lbl">alidade ›</span>
-      <input class="deck-input" type="text" placeholder="steer — type a directive…" aria-label="Message to selected session"
-        aria-keyshortcuts="Control+A Control+C Enter" title="Ctrl+A: select all · Ctrl+C: clear or copy · Enter: steer">
+      <textarea class="deck-input" rows="2" placeholder="steer — type a directive…" aria-label="Message to selected session"
+        aria-keyshortcuts="Control+A Control+C Enter Shift+Enter"
+        title="Ctrl+A: select all · Ctrl+C: clear or copy · Enter: steer · Shift+Enter: newline"></textarea>
       <input id="image-file-input" type="file" accept="image/png,image/jpeg,image/gif,image/webp" multiple hidden>
       <button class="dbtn attach-images" id="attach-images-button" type="button" aria-controls="image-attachment-tray">
         <span class="g" aria-hidden="true">＋</span> Attach Images
       </button>
-      <span class="deck-hint" aria-hidden="true">^A select all · ^C clear/copy · esc abort · ^O tools</span>
+      <span class="deck-hint" aria-hidden="true">^A select all · ^C clear/copy · ↵ send · ⇧↵ newline · esc abort · ^O tools</span>
       <button class="dbtn steer" id="steerBtn" type="button">
         <span class="g">→</span> Steer
       </button>

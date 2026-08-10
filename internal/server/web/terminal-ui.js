@@ -10,13 +10,16 @@
 
   function keyAction(event, context) {
     context = context || {};
-    if (!event || event.isComposing || event.altKey || event.metaKey || event.shiftKey) return null;
+    if (!event || event.isComposing || event.altKey || event.metaKey) return null;
+    if (event.key === "Enter" && context.target === "deck") {
+      return !event.ctrlKey && !event.shiftKey ? "submit" : null;
+    }
+    if (event.shiftKey) return null;
     if (context.target === "other-editable") return null;
 
     var key = typeof event.key === "string" ? event.key.toLowerCase() : "";
     var inConsole = context.target === "deck" || context.target === "body";
 
-    if (!event.ctrlKey && event.key === "Enter" && context.target === "deck") return "submit";
     if (!event.ctrlKey && event.key === "Escape" && inConsole && context.canInterrupt) return "interrupt";
     if (!event.ctrlKey || !inConsole) return null;
     if (key === "a") return context.target === "deck" ? "select-all" : null;

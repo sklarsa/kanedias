@@ -468,6 +468,18 @@ func TestInitialPageContainsAstrolabeConsole(t *testing.T) {
 			t.Errorf("initial page does not contain %q", want)
 		}
 	}
+	for _, want := range []string{
+		`<textarea class="deck-input" rows="2"`,
+		`aria-keyshortcuts="Control+A Control+C Enter Shift+Enter"`,
+		`Enter: steer · Shift+Enter: newline`,
+	} {
+		if !strings.Contains(body, want) {
+			t.Errorf("composer shell does not contain %q", want)
+		}
+	}
+	if strings.Contains(body, `<input class="deck-input" type="text"`) {
+		t.Error("composer still renders the retired single-line input")
+	}
 
 	obsolete := []string{
 		// the retired orrery mockup
@@ -594,13 +606,24 @@ func TestAstrolabeConsoleIsInteractive(t *testing.T) {
 	// The console is a working control surface with delegated Datastar wiring.
 	for _, want := range []string{
 		`class="deck-input"`, `data-on:click=`,
-		`aria-keyshortcuts="Control+A Control+C Enter"`,
 		`aria-keyshortcuts="Escape"`,
-		`^A select all · ^C clear/copy · esc abort · ^O tools`,
+		`^A select all · ^C clear/copy · ↵ send · ⇧↵ newline · esc abort · ^O tools`,
 	} {
 		if !strings.Contains(body, want) {
 			t.Errorf("interactive console is missing wiring %q", want)
 		}
+	}
+	for _, want := range []string{
+		`<textarea class="deck-input" rows="2"`,
+		`aria-keyshortcuts="Control+A Control+C Enter Shift+Enter"`,
+		`Enter: steer · Shift+Enter: newline`,
+	} {
+		if !strings.Contains(body, want) {
+			t.Errorf("composer shell does not contain %q", want)
+		}
+	}
+	if strings.Contains(body, `<input class="deck-input" type="text"`) {
+		t.Error("composer still renders the retired single-line input")
 	}
 	if strings.Contains(body, " disabled") {
 		t.Error("Astrolabe console must not ship disabled placeholder controls")
@@ -1708,6 +1731,10 @@ func TestProjectStylesDefineAstrolabeVisualSystem(t *testing.T) {
 		".alidade{",
 		".alert-banner{",
 		".deck{",
+		"grid-template-rows:var(--topbar-h) minmax(0,1fr) auto;",
+		"resize:none",
+		"font-size:15px",
+		"line-height:1.45",
 		// responsive: sidebar collapses to a slide-over on narrow screens
 		"@media (max-width:820px)",
 		".sidebar.open",
@@ -1731,6 +1758,10 @@ func TestProjectStylesDefineAstrolabeVisualSystem(t *testing.T) {
 		}
 	}
 	for description, pattern := range map[string]string{
+		"app deck row sizes to composer content": `(?s)\.app\{[^}]*grid-template-rows:var\(--topbar-h\) minmax\(0,1fr\) auto;`,
+		"composer disables manual resizing":      `(?s)\.deck-input\{[^}]*resize:none`,
+		"composer uses a readable font size":     `(?s)\.deck-input\{[^}]*font-size:15px`,
+		"composer uses multiline line height":    `(?s)\.deck-input\{[^}]*line-height:1\.45`,
 		"full modal form scrolls within its cap": `(?s)#new-session-modal form\{[^}]*overflow-y:auto`,
 		"modal actions stay reachable":           `(?s)#new-session-modal \.modal-actions\{[^}]*position:sticky[^}]*bottom:0[^}]*flex:0 0 auto`,
 	} {

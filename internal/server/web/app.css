@@ -27,7 +27,6 @@
   --cyan-glow:     rgba(94,198,216,.14);
 
   --topbar-h: 52px;
-  --deck-h: 64px;
 
   --mono: ui-monospace, "SF Mono", "Cascadia Mono", "Consolas", "Roboto Mono", monospace;
   --serif: "Iowan Old Style", "Palatino Linotype", Palatino, "URW Palladio L", Georgia, serif;
@@ -70,7 +69,7 @@ body{
 /* ---------- App shell ---------- */
 .app{
   display:grid;
-  grid-template-rows: var(--topbar-h) 1fr var(--deck-h);
+  grid-template-rows:var(--topbar-h) minmax(0,1fr) auto;
   grid-template-columns: 340px 1fr;
   grid-template-areas:
     "top  top"
@@ -79,7 +78,6 @@ body{
   height:100vh;
   width:100vw;
 }
-.app.has-image-draft{ --deck-h:132px; }
 
 /* ============================================================
    TOP BAR
@@ -718,9 +716,9 @@ details[open] > summary .twisty{ transform:rotate(90deg); }
   letter-spacing:.02em; white-space:nowrap; flex:0 0 auto;
 }
 .deck-input{
-  flex:1 1 auto; background:var(--bg-sunk); border:1px solid var(--brass-line);
+  flex:1 1 auto; min-height:0; background:var(--bg-sunk); border:1px solid var(--brass-line);
   color:var(--ink); padding:10px 14px; border-radius:2px; font-family:var(--mono);
-  font-size:13px; outline:none;
+  resize:none; overflow-y:hidden; font-size:15px; line-height:1.45; white-space:pre-wrap; outline:none;
 }
 .deck-input:focus{ border-color:var(--brass); box-shadow:0 0 0 1px rgba(216,169,74,.25); }
 .deck-input:focus-visible, .dbtn:focus-visible{
@@ -980,7 +978,7 @@ details[open] > summary .twisty{ transform:rotate(90deg); }
   /* sidebar becomes a top slide-over sheet */
   .sidebar{
     position:fixed; top:var(--topbar-h); left:0; right:0;
-    bottom:var(--deck-h);
+    bottom:0;
     z-index:45; width:100%;
     transform:translateY(-105%);
     transition:transform .28s cubic-bezier(.4,0,.2,1);
@@ -1000,7 +998,6 @@ details[open] > summary .twisty{ transform:rotate(90deg); }
   .deck{ gap:6px; padding:7px 10px; overflow:hidden; }
   .deck-row{ overflow-x:auto; gap:8px; padding:2px; }
   .deck .deck-lbl{ display:none; }
-  .deck-input{ min-width:160px; }
   .image-attachment-card{ flex-basis:200px; }
   .dbtn{ padding:9px 11px; font-size:10px; }
   #new-session-modal{

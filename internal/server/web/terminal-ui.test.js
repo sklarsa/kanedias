@@ -14,10 +14,16 @@ test("matches terminal editor and interrupt keys without stealing copy", () => {
   assert.equal(ui.keyAction(event("o", {ctrlKey:true}), {target:"body", hasSelection:false, canInterrupt:false}), "toggle-tools");
 });
 
-test("ignores composition, conflicting modifiers, and unrelated editors", () => {
+test("bare Enter submits while Shift-Enter remains a textarea newline", () => {
   const deck = {target:"deck", hasSelection:false, canInterrupt:true};
   assert.equal(ui.keyAction(event("Enter"), deck), "submit");
+  assert.equal(ui.keyAction(event("Enter", {shiftKey:true}), deck), null);
+  assert.equal(ui.keyAction(event("Enter", {isComposing:true}), deck), null);
   assert.equal(ui.keyAction(event("Enter"), {...deck, target:"body"}), null);
+});
+
+test("ignores composition, conflicting modifiers, and unrelated editors", () => {
+  const deck = {target:"deck", hasSelection:false, canInterrupt:true};
   assert.equal(ui.keyAction(event("a", {ctrlKey:true, isComposing:true}), deck), null);
   assert.equal(ui.keyAction(event("a", {ctrlKey:true, shiftKey:true}), deck), null);
   assert.equal(ui.keyAction(event("a", {ctrlKey:true, altKey:true}), deck), null);
