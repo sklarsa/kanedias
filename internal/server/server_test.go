@@ -14,6 +14,7 @@ import (
 	"testing"
 	"time"
 
+	"github.com/sklarsa/kanedias/internal/attachments"
 	"github.com/sklarsa/kanedias/internal/config"
 	"github.com/sklarsa/kanedias/internal/manager"
 )
@@ -602,6 +603,9 @@ func (f *fakeFleetManager) RenameRoot(string, string) error {
 	return errors.New("not implemented")
 }
 func (f *fakeFleetManager) Steer(context.Context, string, string) error {
+	return errors.New("not implemented")
+}
+func (f *fakeFleetManager) SendMessage(context.Context, string, string, []attachments.Image) error {
 	return errors.New("not implemented")
 }
 func (f *fakeFleetManager) Interrupt(context.Context, string) error {

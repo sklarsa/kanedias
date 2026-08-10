@@ -215,31 +215,50 @@ func boundaryOriginMatches(origin, requestHost, expected string) bool {
 	return strings.EqualFold(u.Host, requestHost) && boundaryHostMatches(u.Host, expected)
 }
 
-// requireWriteBoundary is a middleware that enforces same-origin write constraints.
-// It checks Host, Origin, Sec-Fetch-Site, and Content-Type: application/json.
+// requireWriteBoundary is a middleware that enforces the existing JSON-only
+// same-origin write constraints.
 func (b requestBoundary) requireWriteBoundary(next http.Handler) http.Handler {
-	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-		if !boundaryHostMatches(r.Host, b.Host) {
-			http.Error(w, "Forbidden", http.StatusForbidden)
-			return
-		}
-		origin := r.Header.Get("Origin")
-		if origin != "" && !boundaryOriginMatches(origin, r.Host, b.Host) {
-			http.Error(w, "Forbidden", http.StatusForbidden)
-			return
-		}
-		sfs := r.Header.Get("Sec-Fetch-Site")
-		if sfs != "" && sfs != "same-origin" {
-			http.Error(w, "Forbidden", http.StatusForbidden)
-			return
-		}
-		mediaType, _, err := mime.ParseMediaType(r.Header.Get("Content-Type"))
-		if err != nil || mediaType != "application/json" {
-			http.Error(w, "Unsupported Media Type", http.StatusUnsupportedMediaType)
-			return
-		}
-		next.ServeHTTP(w, r)
-	})
+	return b.requireWriteBoundaryFor("application/json")(next)
+}
+
+// requireWriteBoundaryFor enforces same-origin write constraints and allows
+// only the explicitly configured base media types. Content-Type parameters are
+// parsed rather than compared as raw strings, which permits multipart boundary
+// parameters without widening any JSON route.
+func (b requestBoundary) requireWriteBoundaryFor(allowed ...string) func(http.Handler) http.Handler {
+	return func(next http.Handler) http.Handler {
+		return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+			if !boundaryHostMatches(r.Host, b.Host) {
+				http.Error(w, "Forbidden", http.StatusForbidden)
+				return
+			}
+			origin := r.Header.Get("Origin")
+			if origin != "" && !boundaryOriginMatches(origin, r.Host, b.Host) {
+				http.Error(w, "Forbidden", http.StatusForbidden)
+				return
+			}
+			sfs := r.Header.Get("Sec-Fetch-Site")
+			if sfs != "" && sfs != "same-origin" {
+				http.Error(w, "Forbidden", http.StatusForbidden)
+				return
+			}
+			mediaType, _, err := mime.ParseMediaType(r.Header.Get("Content-Type"))
+			mediaTypeAllowed := false
+			if err == nil {
+				for _, candidate := range allowed {
+					if strings.EqualFold(mediaType, candidate) {
+						mediaTypeAllowed = true
+						break
+					}
+				}
+			}
+			if !mediaTypeAllowed {
+				http.Error(w, "Unsupported Media Type", http.StatusUnsupportedMediaType)
+				return
+			}
+			next.ServeHTTP(w, r)
+		})
+	}
 }
 
 // defaultRandom is the production-grade random reader.

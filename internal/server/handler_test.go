@@ -20,6 +20,7 @@ import (
 	"testing/fstest"
 	"time"
 
+	"github.com/sklarsa/kanedias/internal/attachments"
 	"github.com/sklarsa/kanedias/internal/manager"
 	"github.com/sklarsa/kanedias/internal/supervisor"
 )
@@ -957,6 +958,20 @@ func TestFleetRowsBindSelectedSessionClass(t *testing.T) {
 	}
 }
 
+type sentMessage struct {
+	sessionID string
+	message   string
+	images    []attachments.Image
+}
+
+func cloneImages(images []attachments.Image) []attachments.Image {
+	cloned := make([]attachments.Image, len(images))
+	for i, image := range images {
+		cloned[i] = attachments.Image{MIMEType: image.MIMEType, Data: append([]byte(nil), image.Data...)}
+	}
+	return cloned
+}
+
 // streamFakeFleet is a controllable fake fleet manager for SSE stream tests.
 type streamFakeFleet struct {
 	mu              sync.Mutex
@@ -974,6 +989,8 @@ type streamFakeFleet struct {
 	renameSessionID string
 	renameName      string
 	renameErr       error
+	sentMessage     sentMessage
+	messageErr      error
 }
 
 func newStreamFakeFleet() *streamFakeFleet {
@@ -1032,8 +1049,14 @@ func (f *streamFakeFleet) RenameRoot(sessionID, name string) error {
 	return f.renameErr
 }
 func (f *streamFakeFleet) Steer(context.Context, string, string) error { return nil }
-func (f *streamFakeFleet) Interrupt(context.Context, string) error     { return nil }
-func (f *streamFakeFleet) StopSession(context.Context, string) error   { return nil }
+func (f *streamFakeFleet) SendMessage(_ context.Context, sessionID, message string, images []attachments.Image) error {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	f.sentMessage = sentMessage{sessionID: sessionID, message: message, images: cloneImages(images)}
+	return f.messageErr
+}
+func (f *streamFakeFleet) Interrupt(context.Context, string) error   { return nil }
+func (f *streamFakeFleet) StopSession(context.Context, string) error { return nil }
 func (f *streamFakeFleet) AnswerQuestion(context.Context, string, string, json.RawMessage) error {
 	return nil
 }
