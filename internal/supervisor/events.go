@@ -2,10 +2,12 @@ package supervisor
 
 import (
 	"encoding/json"
+	"errors"
 	"fmt"
 	"sync"
 
 	"github.com/sklarsa/kanedias/internal/config"
+	"github.com/sklarsa/kanedias/internal/eventmailbox"
 )
 
 const (
@@ -50,13 +52,7 @@ type EventBroker struct {
 }
 
 type eventMailbox struct {
-	mu         sync.Mutex
-	events     chan EventEnvelope
-	sizes      []int // FIFO of retained byte sizes for events still buffered on events
-	totalBytes int
-	maxEvents  int
-	maxBytes   int
-	closed     bool
+	mailbox *eventmailbox.Mailbox[EventEnvelope]
 }
 
 type eventSubscriber struct {
@@ -65,7 +61,11 @@ type eventSubscriber struct {
 }
 
 func NewEventBroker() *EventBroker {
-	return newEventBrokerWithByteCapacity(DefaultEventRingCapacity, DefaultSubscriberMailboxCapacity, DefaultEventRingByteCapacity)
+	return newEventBrokerWithByteCapacity(
+		DefaultEventRingCapacity,
+		DefaultEventRingCapacity,
+		DefaultEventRingByteCapacity,
+	)
 }
 
 // EventBrokerOptions configures independent broker eviction limits. A zero
@@ -88,7 +88,7 @@ func NewEventBrokerWithOptions(options EventBrokerOptions) (*EventBroker, error)
 	if options.MaxEvents == 0 && options.MaxBytes == 0 {
 		return nil, fmt.Errorf("at least one of MaxEvents or MaxBytes must be positive")
 	}
-	return newEventBrokerWithByteCapacity(options.MaxEvents, DefaultSubscriberMailboxCapacity, options.MaxBytes), nil
+	return newEventBrokerWithByteCapacity(options.MaxEvents, options.MaxEvents, options.MaxBytes), nil
 }
 
 func newEventBroker(ringCapacity, mailboxCapacity int) *EventBroker {
@@ -105,15 +105,11 @@ func newEventBrokerWithByteCapacity(ringCapacity, mailboxCapacity, byteCapacity 
 	if byteCapacity < 0 {
 		byteCapacity = 0
 	}
-	mailboxByteCapacity := byteCapacity
-	if mailboxByteCapacity == 0 {
-		mailboxByteCapacity = DefaultEventRingByteCapacity
-	}
 	return &EventBroker{
 		ringCap:     ringCapacity,
 		byteCap:     byteCapacity,
 		mailCap:     mailboxCapacity,
-		mailByteCap: mailboxByteCapacity,
+		mailByteCap: byteCapacity,
 		sourceSeq:   make(map[string]uint64),
 		subs:        make(map[uint64]*eventMailbox),
 		cloneReplay: cloneEnvelopes,
@@ -189,7 +185,7 @@ func (broker *EventBroker) Subscribe() Subscription {
 	var once sync.Once
 	return Subscription{
 		Replay: replay,
-		Events: mailbox.events,
+		Events: mailbox.mailbox.Events(),
 		Close: func() {
 			once.Do(func() {
 				broker.removeSubscriber(id, mailbox)
@@ -296,92 +292,33 @@ func (broker *EventBroker) removeSubscriber(id uint64, mailbox *eventMailbox) {
 }
 
 func newEventMailbox(maxEvents, maxBytes int) *eventMailbox {
-	return &eventMailbox{
-		// events is the single bounded store: channel capacity maxEvents bounds
-		// total retained count, and sizes/totalBytes bound retained bytes. There
-		// is no worker goroutine; sends are nonblocking while holding mu.
-		events:    make(chan EventEnvelope, maxEvents),
-		sizes:     make([]int, 0, maxEvents),
-		maxEvents: maxEvents,
-		maxBytes:  maxBytes,
+	mailbox, err := eventmailbox.New[EventEnvelope](eventmailbox.Limits{
+		MaxEvents: maxEvents,
+		MaxBytes:  maxBytes,
+	})
+	if err != nil {
+		panic(fmt.Sprintf("construct event broker mailbox: %v", err))
 	}
+	return &eventMailbox{mailbox: mailbox}
 }
 
 func (mailbox *eventMailbox) send(event EventEnvelope) bool {
-	mailbox.mu.Lock()
-	defer mailbox.mu.Unlock()
-	// Reconcile entries the consumer has already read off the buffered channel.
-	// Events are only removed from the channel by the consumer, so sizes can only
-	// outrun len(events); dropping the leading consumed sizes keeps accounting
-	// conservative and never negative.
-	if consumed := len(mailbox.sizes) - len(mailbox.events); consumed > 0 {
-		for _, size := range mailbox.sizes[:consumed] {
-			mailbox.totalBytes -= size
-		}
-		mailbox.sizes = mailbox.sizes[consumed:]
-	}
-	if mailbox.closed {
-		return false
-	}
-	if mailbox.maxEvents > 0 && len(mailbox.sizes) >= mailbox.maxEvents {
-		return false
-	}
-	eventBytes := RetainedEventBytes(event)
-	if mailbox.maxBytes > 0 && mailbox.totalBytes+eventBytes > mailbox.maxBytes {
-		return false
-	}
-	select {
-	case mailbox.events <- event:
-		mailbox.sizes = append(mailbox.sizes, eventBytes)
-		mailbox.totalBytes += eventBytes
+	err := mailbox.mailbox.Send(event, RetainedEventBytes(event))
+	if err == nil {
 		return true
-	default:
+	}
+	if errors.Is(err, eventmailbox.ErrFull) || errors.Is(err, eventmailbox.ErrClosed) {
 		return false
 	}
+	panic(fmt.Sprintf("send event to broker mailbox: %v", err))
 }
 
-// close gracefully terminates the mailbox for broker shutdown: it stops
-// accepting new events and closes the channel WITHOUT draining, so buffered
-// events already accepted remain readable by the consumer. This preserves the
-// final buffered-event delivery contract required of broker.Close.
 func (mailbox *eventMailbox) close() {
-	mailbox.mu.Lock()
-	if !mailbox.closed {
-		mailbox.closed = true
-		close(mailbox.events)
-	}
-	mailbox.mu.Unlock()
+	mailbox.mailbox.Close()
 }
 
-// abort terminates a mailbox for an individual subscription close or overflow
-// detachment: it drains any buffered unread events (releasing their payload and
-// byte count) and closes the channel promptly without requiring a consumer read.
 func (mailbox *eventMailbox) abort() {
-	mailbox.mu.Lock()
-	wasClosed := mailbox.closed
-	mailbox.closed = true
-	for {
-		select {
-		case _, open := <-mailbox.events:
-			if open {
-				continue
-			}
-			// A graceful broker close won the race. Its closed channel can still
-			// contain buffered events, all of which have now been discarded.
-			mailbox.totalBytes = 0
-			mailbox.sizes = nil
-			mailbox.mu.Unlock()
-			return
-		default:
-			mailbox.totalBytes = 0
-			mailbox.sizes = nil
-			if !wasClosed {
-				close(mailbox.events)
-			}
-			mailbox.mu.Unlock()
-			return
-		}
-	}
+	mailbox.mailbox.Abort()
 }
 
 func cloneEnvelopes(events []EventEnvelope) []EventEnvelope {

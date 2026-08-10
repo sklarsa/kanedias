@@ -114,6 +114,31 @@ func TestConsumeSubscriptionDeduplicatesReconnectReplay(t *testing.T) {
 	if len(events) != 3 {
 		t.Fatalf("expected 3 events after reconnect, got %d", len(events))
 	}
+	if gap := handle.mirror.Gap(); gap != nil {
+		t.Fatalf("retained overlap recorded false replay gap: %#v", gap)
+	}
+}
+
+func TestConsumeSubscriptionRecordsReconnectReplayGap(t *testing.T) {
+	m := fakeManager(nil)
+	handle := &rootHandle{
+		socketPath: "/tmp/test-gap.root.sock",
+		rootID:     "root-gap",
+		mirror:     newEventMirror(supervisor.EventBrokerOptions{MaxEvents: 100}),
+	}
+	handle.mirror.Accept(envelope(1, "root-gap"))
+	handle.mirror.Accept(envelope(2, "root-gap"))
+
+	sub := subscriptionFromReplay([]supervisor.EventEnvelope{
+		envelope(4, "root-gap"),
+		envelope(5, "root-gap"),
+	})
+	m.consumeSubscription(handle, sub)
+
+	gap := handle.mirror.Gap()
+	if gap == nil || gap.ExpectedSeq != 3 || gap.FirstAvailableSeq != 4 {
+		t.Fatalf("reconnect replay gap = %#v, want ExpectedSeq 3 and FirstAvailableSeq 4", gap)
+	}
 }
 
 func TestConsumeSubscriptionEOFDoesNotLossPreviousEvents(t *testing.T) {
