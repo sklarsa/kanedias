@@ -15,6 +15,8 @@ import (
 	"sync/atomic"
 	"testing"
 	"time"
+
+	"github.com/sklarsa/kanedias/internal/eventmailbox"
 )
 
 func TestProtocolDecodesExactGetStateEnvelope(t *testing.T) {
@@ -608,14 +610,46 @@ func TestClientCloseClosesUnderlyingConnectionExactlyOnce(t *testing.T) {
 	}
 }
 
-func TestClientDisconnectsStalledEventConsumerAtByteBoundedCapacity(t *testing.T) {
+func TestClientPreservesOrdinaryEventBurstAndRemainsUsable(t *testing.T) {
 	clientConn, peer := net.Pipe()
 	client := NewClient(clientConn)
+	defer func() { _ = client.Close(); _ = peer.Close() }()
+
+	writeDone := make(chan error, 1)
+	go func() {
+		writer := bufio.NewWriter(peer)
+		for seq := 1; seq <= 256; seq++ {
+			if _, err := fmt.Fprintf(writer, "{\"type\":\"message_update\",\"seq\":%d}\n", seq); err != nil {
+				writeDone <- err
+				return
+			}
+		}
+		writeDone <- writer.Flush()
+	}()
+
+	for want := uint64(1); want <= 256; want++ {
+		select {
+		case event, open := <-client.Events():
+			if !open || event.Seq != want {
+				t.Fatalf("event %d = %#v, open=%t", want, event, open)
+			}
+		case <-time.After(time.Second):
+			t.Fatalf("timed out at event %d", want)
+		}
+	}
+	if err := <-writeDone; err != nil {
+		t.Fatal(err)
+	}
+	if client.Err() != nil {
+		t.Fatalf("client failed during burst: %v", client.Err())
+	}
+}
+
+func TestClientDisconnectsStalledEventConsumerAtByteBoundedCapacity(t *testing.T) {
+	clientConn, peer := net.Pipe()
+	client := newClientWithEventLimits(clientConn, eventmailbox.Limits{MaxEvents: 1, MaxBytes: 1024})
 	defer func() { _ = peer.Close() }()
 
-	if cap(client.events) != 1 {
-		t.Fatalf("event channel capacity = %d, want one maximum record", cap(client.events))
-	}
 	writeDone := make(chan error, 1)
 	go func() {
 		_, err := io.WriteString(peer, `{"type":"message_update","payload":"one"}`+"\n"+
@@ -624,8 +658,9 @@ func TestClientDisconnectsStalledEventConsumerAtByteBoundedCapacity(t *testing.T
 	}()
 	select {
 	case <-client.Done():
-		if client.Err() == nil || !strings.Contains(client.Err().Error(), "event consumer") {
-			t.Fatalf("client error = %v, want stalled event consumer", client.Err())
+		const want = "pi RPC event consumer exceeded bounded capacity"
+		if err := client.Err(); err == nil || err.Error() != want {
+			t.Fatalf("client error = %v, want %q", err, want)
 		}
 	case <-time.After(time.Second):
 		t.Fatal("stalled event consumer did not terminate transport")
@@ -633,9 +668,33 @@ func TestClientDisconnectsStalledEventConsumerAtByteBoundedCapacity(t *testing.T
 	<-writeDone
 }
 
+func TestClientDispatchesCorrelatedResponseBeforeFullEventMailbox(t *testing.T) {
+	clientConn, peer := net.Pipe()
+	client := newClientWithEventLimits(clientConn, eventmailbox.Limits{MaxEvents: 1, MaxBytes: 1024})
+	defer func() { _ = client.Close(); _ = peer.Close() }()
+
+	writeJSONLineAsync(t, peer, `{"type":"message_update"}`)
+	callDone := make(chan rpcCallResult, 1)
+	go func() {
+		raw, err := client.Call(context.Background(), json.RawMessage(`{"type":"get_state"}`))
+		callDone <- rpcCallResult{raw: raw, err: err}
+	}()
+	command := readCommand(t, bufio.NewReader(peer))
+	writeJSONLineAsync(t, peer, fmt.Sprintf(`{"id":%q,"type":"response","command":"get_state","success":true}`, command.ID))
+
+	select {
+	case result := <-callDone:
+		if result.err != nil {
+			t.Fatalf("Call() error = %v", result.err)
+		}
+	case <-time.After(time.Second):
+		t.Fatal("correlated response waited for event mailbox draining")
+	}
+}
+
 func TestClientCloseUnblocksEventBackpressure(t *testing.T) {
 	clientConn, peer := net.Pipe()
-	client := NewClient(clientConn)
+	client := newClientWithEventLimits(clientConn, eventmailbox.Limits{MaxEvents: 2, MaxBytes: 1024})
 	defer func() { _ = peer.Close() }()
 
 	writeDone := make(chan error, 1)
@@ -649,7 +708,7 @@ func TestClientCloseUnblocksEventBackpressure(t *testing.T) {
 		writeDone <- nil
 	}()
 
-	// Let the reader fill its bounded event mailbox and terminate on overflow.
+	// Let the reader fill its bounded event mailbox while its consumer is idle.
 	time.Sleep(20 * time.Millisecond)
 	closeDone := make(chan error, 1)
 	go func() { closeDone <- client.Close() }()
