@@ -456,7 +456,7 @@ func modelCatalogFixture() config.Config {
 				ThinkingLevels: []string{"off"}, DefaultThinkingLevel: "off",
 			},
 			"gpt-5-6-sol": {
-				Label: "GPT-5.6 Solver", Provider: "openai-codex", Model: "gpt-5.6-sol",
+				Label: "GPT-5.6 Sol", Provider: "openai-codex", Model: "gpt-5.6-sol",
 				ThinkingLevels:       []string{"minimal", "low", "medium", "high", "xhigh", "max"},
 				DefaultThinkingLevel: "high",
 			},

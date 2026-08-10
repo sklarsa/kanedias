@@ -19,7 +19,7 @@
     if (!event.ctrlKey && event.key === "Enter" && context.target === "deck") return "submit";
     if (!event.ctrlKey && event.key === "Escape" && inConsole && context.canInterrupt) return "interrupt";
     if (!event.ctrlKey || !inConsole) return null;
-    if (key === "a") return context.target === "deck" ? "line-start" : null;
+    if (key === "a") return context.target === "deck" ? "select-all" : null;
     if (key === "c") return context.hasSelection ? null : "clear";
     if (key === "o") return "toggle-tools";
     return null;
@@ -127,11 +127,11 @@
       }
       return true;
     }
-    if (action === "line-start") {
+    if (action === "select-all") {
       var input = documentObject.querySelector(".deck-input");
       if (input) {
         input.focus();
-        input.setSelectionRange(0, 0);
+        input.setSelectionRange(0, input.value.length);
       }
       return true;
     }

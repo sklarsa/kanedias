@@ -292,11 +292,15 @@ func (p *IncusChildProvisioner) ProvisionChild(ctx context.Context, request Chil
 		return nil, err
 	}
 
-	if err := p.client.StartInstance(ctx, instanceName); err != nil {
-		if p.operationWasSubmitted(err) {
-			submittedErrors = append(submittedErrors, err)
+	startErr := p.client.StartInstance(ctx, instanceName)
+	if isDuplicateNICMACError(startErr) {
+		startErr = p.regenerateNICMACAndRetryStart(ctx, instanceName, startErr)
+	}
+	if startErr != nil {
+		if p.operationWasSubmitted(startErr) {
+			submittedErrors = append(submittedErrors, startErr)
 		}
-		return nil, fmt.Errorf("start child instance %q: %w", instanceName, err)
+		return nil, fmt.Errorf("start child instance %q: %w", instanceName, startErr)
 	}
 	if err := p.step("start child instance"); err != nil {
 		return nil, err
@@ -309,6 +313,44 @@ func (p *IncusChildProvisioner) ProvisionChild(ctx context.Context, request Chil
 		return nil, err
 	}
 	return resources, nil
+}
+
+func isDuplicateNICMACError(err error) bool {
+	if err == nil {
+		return false
+	}
+	message := err.Error()
+	return strings.Contains(message, "Failed start validation for device") &&
+		strings.Contains(message, "MAC address") &&
+		strings.Contains(message, "already defined on another NIC")
+}
+
+func (p *IncusChildProvisioner) regenerateNICMACAndRetryStart(ctx context.Context, instanceName string, collisionErr error) error {
+	instance, etag, err := p.client.GetInstance(ctx, instanceName)
+	if err != nil {
+		return errors.Join(collisionErr, fmt.Errorf("get child instance for NIC MAC regeneration: %w", err))
+	}
+	if instance == nil {
+		return errors.Join(collisionErr, fmt.Errorf("get child instance for NIC MAC regeneration: returned no instance"))
+	}
+	put := copyWritableInstance(instance.Writable())
+	regenerated := false
+	for key := range put.Config {
+		if strings.HasPrefix(key, "volatile.") && strings.HasSuffix(key, ".hwaddr") {
+			delete(put.Config, key)
+			regenerated = true
+		}
+	}
+	if !regenerated {
+		return collisionErr
+	}
+	if err := p.client.UpdateInstance(ctx, instanceName, put, etag); err != nil {
+		return errors.Join(collisionErr, fmt.Errorf("clear colliding child NIC MAC: %w", err))
+	}
+	if err := p.client.StartInstance(ctx, instanceName); err != nil {
+		return errors.Join(collisionErr, fmt.Errorf("retry child start with regenerated NIC MAC: %w", err))
+	}
+	return nil
 }
 
 func (p *IncusChildProvisioner) Destroy(ctx context.Context, resources *Resources) error {

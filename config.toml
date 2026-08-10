@@ -48,7 +48,7 @@ thinking_levels = ["off"]
 default_thinking_level = "off"
 
 [models.gpt-5-6-sol]
-label = "GPT-5.6 Solver"
+label = "GPT-5.6 Sol"
 provider = "openai-codex"
 model = "gpt-5.6-sol"
 thinking_levels = ["minimal", "low", "medium", "high", "xhigh", "max"]

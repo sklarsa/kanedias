@@ -41,9 +41,9 @@
   <footer class="deck">
     <span class="deck-lbl">alidade ›</span>
     <input class="deck-input" type="text" placeholder="steer — type a directive…" aria-label="Command input"
-      aria-keyshortcuts="Control+A Control+C Enter" title="Ctrl+A: home · Ctrl+C: clear or copy · Enter: steer"
+      aria-keyshortcuts="Control+A Control+C Enter" title="Ctrl+A: select all · Ctrl+C: clear or copy · Enter: steer"
       data-bind="commandMessage">
-    <span class="deck-hint" aria-hidden="true">^A home · ^C clear/copy · esc abort · ^O tools</span>
+    <span class="deck-hint" aria-hidden="true">^A select all · ^C clear/copy · esc abort · ^O tools</span>
     <button class="dbtn steer" id="steerBtn"
       data-on:click="@post('/ui/sessions/'+$selectedSessionId+'/steer', {payload:{message:$commandMessage}})">
       <span class="g">→</span> Steer

@@ -4,8 +4,8 @@ const ui = require("./terminal-ui.js");
 
 const event = (key, extra = {}) => ({ key, ctrlKey: false, altKey: false, metaKey: false, shiftKey: false, isComposing: false, ...extra });
 
-test("matches Pi editor and interrupt keys without stealing copy", () => {
-  assert.equal(ui.keyAction(event("a", {ctrlKey:true}), {target:"deck", hasSelection:false, canInterrupt:false}), "line-start");
+test("matches terminal editor and interrupt keys without stealing copy", () => {
+  assert.equal(ui.keyAction(event("a", {ctrlKey:true}), {target:"deck", hasSelection:false, canInterrupt:false}), "select-all");
   assert.equal(ui.keyAction(event("a", {ctrlKey:true}), {target:"body", hasSelection:false, canInterrupt:false}), null);
   assert.equal(ui.keyAction(event("c", {ctrlKey:true}), {target:"deck", hasSelection:true, canInterrupt:false}), null);
   assert.equal(ui.keyAction(event("c", {ctrlKey:true}), {target:"deck", hasSelection:false, canInterrupt:false}), "clear");
@@ -194,6 +194,26 @@ test("disabled submit preserves the command without click or input event", () =>
   assert.equal(fixture.input.value, "queued");
   assert.equal(fixture.input.focused, undefined);
   assert.equal(fixture.dispatched.length, 0);
+});
+
+test("Ctrl-A selects the complete deck input", () => {
+  const fixture = fakeSubmitDocument(false);
+  fixture.input.value = "select this directive";
+  fixture.input.setSelectionRange = function (start, end) {
+    this.selectionStart = start;
+    this.selectionEnd = end;
+  };
+  const keyEvent = {preventDefault() { this.prevented = true; }};
+  const action = ui.keyAction(event("a", {ctrlKey: true}), {
+    target: "deck", hasSelection: false, canInterrupt: false
+  });
+
+  ui.performAction(action, {event: keyEvent, document: fixture.document});
+
+  assert.equal(keyEvent.prevented, true);
+  assert.equal(fixture.input.focused, true);
+  assert.equal(fixture.input.selectionStart, 0);
+  assert.equal(fixture.input.selectionEnd, fixture.input.value.length);
 });
 
 test("clear dispatches a bubbling input event and focuses the deck", () => {
