@@ -64,6 +64,7 @@ type ActivityItem struct {
 	Kind       string
 	Label      string
 	Text       string
+	ImageCount int
 	ToolCallID string
 	ToolName   string
 	Status     string

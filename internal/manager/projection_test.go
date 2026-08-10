@@ -158,6 +158,62 @@ func assertOpenAssistantItem(t *testing.T, items []ActivityItem, wantText string
 	}
 }
 
+func TestProjectActivityCountsUserMessageImagesWithoutRetainingPayload(t *testing.T) {
+	const (
+		secretA = "SECRET_BASE64_A"
+		secretB = "SECRET_BASE64_B"
+	)
+	projector := newActivityProjector()
+	projector.Apply(piEvent(7, "s", "message_end", map[string]any{
+		"message": map[string]any{
+			"role": "user",
+			"content": []any{
+				map[string]any{"type": "text", "text": "inspect"},
+				map[string]any{"type": "image", "mimeType": "image/png", "data": secretA},
+				map[string]any{"type": "image", "mimeType": "image/jpeg", "data": secretB},
+			},
+		},
+	}))
+
+	items := projector.Items()
+	if len(items) != 1 {
+		t.Fatalf("items = %d, want 1: %#v", len(items), items)
+	}
+	item := items[0]
+	if item.Kind != "user_message" || item.Text != "inspect" || item.ImageCount != 2 {
+		t.Fatalf("user message = %#v, want text with two image attachments", item)
+	}
+	projected, err := json.Marshal(item)
+	if err != nil {
+		t.Fatal(err)
+	}
+	for _, leaked := range []string{secretA, secretB, "image/png", "image/jpeg"} {
+		if strings.Contains(string(projected), leaked) {
+			t.Fatalf("projected activity retained image payload %q: %s", leaked, projected)
+		}
+	}
+}
+
+func TestProjectActivityIncludesImageOnlyUserMessage(t *testing.T) {
+	projector := newActivityProjector()
+	projector.Apply(piEvent(8, "s", "message_end", map[string]any{
+		"message": map[string]any{
+			"role": "user",
+			"content": []any{
+				map[string]any{"type": "image", "mimeType": "image/png", "data": "IMAGE_ONLY_SECRET"},
+			},
+		},
+	}))
+
+	items := projector.Items()
+	if len(items) != 1 {
+		t.Fatalf("items = %d, want image-only user activity item: %#v", len(items), items)
+	}
+	if item := items[0]; item.Kind != "user_message" || item.Text != "" || item.ImageCount != 1 {
+		t.Fatalf("image-only user message = %#v", item)
+	}
+}
+
 func TestProjectActivityShowsPromptAndCoalescesRepeatedProviderError(t *testing.T) {
 	errorMessage := map[string]any{
 		"message": map[string]any{

@@ -619,6 +619,9 @@ details[open] > summary .twisty{ transform:rotate(90deg); }
 .t-role.tool{ color:var(--violet); border:1px solid rgba(154,127,224,.4); }
 .transcript .t-body{ color:var(--ink-dim); }
 .transcript .t-body .hl{ color:var(--brass-bright); }
+.transcript .t-attachments{
+  color:var(--ink-faint); font-size:10px; line-height:1.4; margin-top:2px;
+}
 .transcript{ user-select:text; -webkit-user-select:text; }
 .transcript .cursor{
   display:inline-block; width:8px; height:14px; background:var(--cyan);

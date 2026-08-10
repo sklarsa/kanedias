@@ -672,6 +672,61 @@ func TestActivityUsesMarkdownClassification(t *testing.T) {
 	}
 }
 
+func TestActivityAttachmentLabelsAreSafe(t *testing.T) {
+	const (
+		secretA = "SECRET_BASE64_A"
+		secretB = "SECRET_BASE64_B"
+	)
+	state := manager.SessionState{RecentActivity: []manager.ActivityItem{
+		{
+			Seq: 1, Kind: "user_message", Label: "You", Text: "inspect", ImageCount: 1, Complete: true,
+			ToolArgs: secretA,
+		},
+		{
+			Seq: 2, Kind: "user_message", Label: "You", ImageCount: 2, Complete: true,
+			ToolOutput: "data:image/png;base64," + secretB, ToolLanguage: "image/jpeg",
+		},
+	}}
+	view := newActivityView(state)
+	if len(view.Items) != 2 {
+		t.Fatalf("items = %d, want 2", len(view.Items))
+	}
+	if got := view.Items[0].AttachmentLabel; got != "1 image attached" {
+		t.Errorf("singular attachment label = %q", got)
+	}
+	if got := view.Items[1].AttachmentLabel; got != "2 images attached" {
+		t.Errorf("plural attachment label = %q", got)
+	}
+	projectedView := fmt.Sprintf("%#v", view)
+	for _, leaked := range []string{secretA, secretB, "image/png", "image/jpeg", "data:image"} {
+		if strings.Contains(projectedView, leaked) {
+			t.Errorf("activity view retained image payload %q: %s", leaked, projectedView)
+		}
+	}
+
+	templates, err := parseTemplates(webFiles)
+	if err != nil {
+		t.Fatal(err)
+	}
+	html, err := renderTemplate(templates, templateActivity, view)
+	if err != nil {
+		t.Fatal(err)
+	}
+	for _, want := range []string{"1 image attached", "2 images attached"} {
+		if !strings.Contains(html, want) {
+			t.Errorf("rendered activity is missing %q:\n%s", want, html)
+		}
+	}
+	for _, leaked := range []string{secretA, secretB, "image/png", "image/jpeg", "data:image"} {
+		if strings.Contains(html, leaked) {
+			t.Errorf("rendered activity leaked image payload %q:\n%s", leaked, html)
+		}
+	}
+	if strings.Contains(strings.ToLower(html), "<img") {
+		t.Errorf("attachment metadata must not render an image element:\n%s", html)
+	}
+}
+
 func TestActivityMarksOnlyConversationTextAsMarkdown(t *testing.T) {
 	templates, err := parseTemplates(webFiles)
 	if err != nil {

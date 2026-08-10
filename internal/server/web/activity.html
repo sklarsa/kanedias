@@ -39,6 +39,7 @@
       <div id="activity-item-{{.Seq}}" class="t-turn {{if .IsError}}t-error{{end}}">
         <span class="t-role {{.Kind}}">{{.Label}}</span>
         {{if .Text}}<div class="t-body"{{if .IsMarkdown}} data-markdown{{end}}{{if .Complete}} data-ignore-morph{{end}}>{{.Text}}</div>{{end}}
+        {{if .AttachmentLabel}}<div class="t-attachments">{{.AttachmentLabel}}</div>{{end}}
       </div>
       {{end}}
       {{end}}
