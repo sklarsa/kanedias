@@ -23,27 +23,28 @@ import (
 )
 
 type fakeService struct {
-	mu             sync.Mutex
-	snapshot       supervisor.NodeSnapshot
-	workers        []contract.WorkerSummary
-	rpcSession     string
-	rpcBody        json.RawMessage
-	rpcResponse    json.RawMessage
-	answerSession  string
-	answerID       string
-	answerBody     json.RawMessage
-	sub            supervisor.Subscription
-	stopSession    string
-	stopCalled     chan struct{}
-	stopMayObserve <-chan struct{}
-	childRequest   contract.CreateChildRequest
-	childResult    supervisor.TerminalResult
-	childStarted   chan struct{}
-	childRelease   <-chan struct{}
-	handoffRequest supervisor.WriteHandoffRequest
-	handoffResult  supervisor.HandoffAcceptance
-	ackCalled      chan struct{}
-	err            error
+	mu              sync.Mutex
+	snapshot        supervisor.NodeSnapshot
+	workers         []contract.WorkerSummary
+	rpcSession      string
+	rpcBody         json.RawMessage
+	rpcResponse     json.RawMessage
+	answerSession   string
+	answerID        string
+	answerBody      json.RawMessage
+	sub             supervisor.Subscription
+	subscribeCalled chan struct{}
+	stopSession     string
+	stopCalled      chan struct{}
+	stopMayObserve  <-chan struct{}
+	childRequest    contract.CreateChildRequest
+	childResult     supervisor.TerminalResult
+	childStarted    chan struct{}
+	childRelease    <-chan struct{}
+	handoffRequest  supervisor.WriteHandoffRequest
+	handoffResult   supervisor.HandoffAcceptance
+	ackCalled       chan struct{}
+	err             error
 }
 
 func (service *fakeService) Snapshot(context.Context) (supervisor.NodeSnapshot, error) {
@@ -67,6 +68,9 @@ func (service *fakeService) AnswerQuestion(_ context.Context, session, id string
 	return service.err
 }
 func (service *fakeService) Subscribe(context.Context) (supervisor.Subscription, error) {
+	if service.subscribeCalled != nil {
+		close(service.subscribeCalled)
+	}
 	return service.sub, service.err
 }
 func (service *fakeService) CreateChild(ctx context.Context, session string, request contract.CreateChildRequest) (supervisor.TerminalResult, error) {
@@ -508,6 +512,51 @@ func TestActiveParentToChildSSEBrokerCloseAllowsPromptCleanUnixShutdown(t *testi
 		t.Fatalf("active SSE shutdown took %s", elapsed)
 	}
 	parentStream.Close()
+}
+
+func TestStalledSupervisorSSEClientDoesNotBlockUnixShutdown(t *testing.T) {
+	path := filepath.Join(t.TempDir(), "stalled-supervisor.sock")
+	broker := supervisor.NewEventBroker()
+	defer broker.Close()
+
+	payload := json.RawMessage(`{"chunk":"` + strings.Repeat("x", 96<<10) + `"}`)
+	for range 96 {
+		broker.PublishLocal("root", "pi", payload)
+	}
+	subscribed := make(chan struct{})
+	service := &fakeService{sub: broker.Subscribe(), subscribeCalled: subscribed}
+	server, err := StartUnix(path, NewHandler(service))
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	stalled, err := net.Dial("unix", path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer stalled.Close()
+	if _, err := io.WriteString(stalled, "GET /v1/events HTTP/1.1\r\nHost: unix\r\nAccept: text/event-stream\r\n\r\n"); err != nil {
+		t.Fatal(err)
+	}
+	select {
+	case <-subscribed:
+	case <-time.After(time.Second):
+		t.Fatal("stalled SSE request did not subscribe")
+	}
+
+	broker.Close()
+	shutdownCtx, cancel := context.WithTimeout(context.Background(), 3*time.Second)
+	defer cancel()
+	started := time.Now()
+	if err := server.Close(shutdownCtx); err != nil {
+		t.Fatalf("stalled SSE shutdown error = %v", err)
+	}
+	if elapsed := time.Since(started); elapsed >= 2*time.Second {
+		t.Fatalf("stalled SSE shutdown took %s, want under 2s", elapsed)
+	}
+	if _, err := os.Lstat(path); !errors.Is(err, os.ErrNotExist) {
+		t.Fatalf("Unix socket remains after stalled SSE shutdown: %v", err)
+	}
 }
 
 func TestDescendantClientMapsSocketFailureToGatewayError(t *testing.T) {

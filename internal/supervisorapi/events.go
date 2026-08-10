@@ -2,12 +2,32 @@ package supervisorapi
 
 import (
 	"encoding/json"
+	"errors"
 	"fmt"
 	"net/http"
 	"strings"
+	"time"
 
 	"github.com/sklarsa/kanedias/internal/supervisor"
 )
+
+const supervisorSSEWriteTimeout = time.Second
+
+func withSupervisorSSEWriteDeadline(controller *http.ResponseController, operation func() error) error {
+	deadlineSet := true
+	if err := controller.SetWriteDeadline(time.Now().Add(supervisorSSEWriteTimeout)); err != nil {
+		if !errors.Is(err, http.ErrNotSupported) {
+			return err
+		}
+		deadlineSet = false
+	}
+
+	operationErr := errors.Join(operation(), controller.Flush())
+	if !deadlineSet {
+		return operationErr
+	}
+	return errors.Join(operationErr, controller.SetWriteDeadline(time.Time{}))
+}
 
 func serveEvents(w http.ResponseWriter, request *http.Request, service Service) {
 	subscription, err := service.Subscribe(request.Context())
@@ -19,16 +39,20 @@ func serveEvents(w http.ResponseWriter, request *http.Request, service Service) 
 		defer subscription.Close()
 	}
 
-	flusher, ok := w.(http.Flusher)
-	if !ok {
+	if _, ok := w.(http.Flusher); !ok {
 		writeError(w, fmt.Errorf("streaming is unsupported"))
 		return
 	}
+	controller := http.NewResponseController(w)
 	w.Header().Set("Content-Type", "text/event-stream")
 	w.Header().Set("Cache-Control", "no-cache")
 	w.Header().Set("X-Content-Type-Options", "nosniff")
-	w.WriteHeader(http.StatusOK)
-	flusher.Flush()
+	if err := withSupervisorSSEWriteDeadline(controller, func() error {
+		w.WriteHeader(http.StatusOK)
+		return nil
+	}); err != nil {
+		return
+	}
 
 	write := func(event supervisor.EventEnvelope) error {
 		wire, err := json.Marshal(event)
@@ -36,11 +60,10 @@ func serveEvents(w http.ResponseWriter, request *http.Request, service Service) 
 			return err
 		}
 		kind := strings.NewReplacer("\r", "", "\n", "").Replace(event.Kind)
-		if _, err := fmt.Fprintf(w, "id: %d\nevent: %s\ndata: %s\n\n", event.Seq, kind, wire); err != nil {
+		return withSupervisorSSEWriteDeadline(controller, func() error {
+			_, err := fmt.Fprintf(w, "id: %d\nevent: %s\ndata: %s\n\n", event.Seq, kind, wire)
 			return err
-		}
-		flusher.Flush()
-		return nil
+		})
 	}
 	for _, event := range subscription.Replay {
 		if write(event) != nil {
