@@ -44,6 +44,34 @@ func TestValidateLifecycleModelPolicyRequiresLocalRootAndWorkers(t *testing.T) {
 	}
 }
 
+func TestValidateLifecycleSettlementTotalsRequiresExactAbsoluteCountsAfterDrain(t *testing.T) {
+	events := []supervisor.EventEnvelope{
+		lifecyclePiEnvelope(1, "root", `{"type":"agent_settled"}`),
+		lifecyclePiEnvelope(2, "child", `{"type":"agent_settled"}`),
+		lifecyclePiEnvelope(3, "root", `{"type":"agent_settled"}`),
+		lifecyclePiEnvelope(4, "root", `{"type":"message_end"}`),
+		{Seq: 5, SessionID: "root", Kind: "supervisor", Payload: json.RawMessage(`{"type":"agent_settled"}`)},
+	}
+	if err := validateLifecycleSettlementTotals(events, map[string]int{"root": 2, "child": 1}); err != nil {
+		t.Fatalf("valid drained settlement totals: %v", err)
+	}
+
+	withBufferedDuplicate := append(append([]supervisor.EventEnvelope(nil), events...),
+		lifecyclePiEnvelope(6, "root", `{"type":"agent_settled"}`))
+	if err := validateLifecycleSettlementTotals(withBufferedDuplicate, map[string]int{"root": 2, "child": 1}); err == nil {
+		t.Fatal("buffered duplicate settlement was accepted")
+	}
+	if err := validateLifecycleSettlementTotals(events, map[string]int{"root": 2, "child": 2}); err == nil {
+		t.Fatal("missing settlement was accepted")
+	}
+	if err := validateLifecycleSettlementTotals(events, map[string]int{"": 0}); err == nil {
+		t.Fatal("empty expected session ID was accepted")
+	}
+	if err := validateLifecycleSettlementTotals(events, map[string]int{"root": -1}); err == nil {
+		t.Fatal("negative expected total was accepted")
+	}
+}
+
 func TestLifecycleEventJournalPreservesOrderAndSupportsRepeatedQueries(t *testing.T) {
 	input := make(chan supervisor.EventEnvelope, 3)
 	stream := &sseCapture{events: input}
@@ -275,6 +303,42 @@ func (journal *lifecycleEventJournal) countPi(sessionID, eventType, toolName str
 		}
 	}
 	return count
+}
+
+// validateLifecycleSettlementTotals verifies absolute per-session settlement
+// totals from a fully drained event snapshot. Callers include their scenario
+// baselines in expected so a buffered duplicate cannot become a later baseline.
+func validateLifecycleSettlementTotals(events []supervisor.EventEnvelope, expected map[string]int) error {
+	counts := make(map[string]int, len(expected))
+	for sessionID, want := range expected {
+		if strings.TrimSpace(sessionID) == "" {
+			return fmt.Errorf("expected settlement session ID is empty")
+		}
+		if want < 0 {
+			return fmt.Errorf("expected settlement total for %q is negative: %d", sessionID, want)
+		}
+		counts[sessionID] = 0
+	}
+	for _, event := range events {
+		if event.Kind != "pi" {
+			continue
+		}
+		if _, tracked := counts[event.SessionID]; !tracked {
+			continue
+		}
+		var payload struct {
+			Type string `json:"type"`
+		}
+		if json.Unmarshal(event.Payload, &payload) == nil && payload.Type == "agent_settled" {
+			counts[event.SessionID]++
+		}
+	}
+	for sessionID, want := range expected {
+		if got := counts[sessionID]; got != want {
+			return fmt.Errorf("session %q agent_settled total = %d, want exactly %d", sessionID, got, want)
+		}
+	}
+	return nil
 }
 
 // validateLifecycleModelToolEvents accepts only the requested root
@@ -572,9 +636,10 @@ func (h *liveAcceptance) startLifecycleRoot(label string) *lifecycleRoot {
 	}
 }
 
-// stopLifecycleRoot issues a graceful root DELETE, waits for the process,
-// closes the stalled SSE connection, verifies the root socket is absent, and
-// polls until every tracked tree session's resources are gone.
+// stopLifecycleRoot issues a graceful root DELETE, waits for the process and
+// the root event journal to close and fully drain, closes the stalled SSE
+// connection, verifies the root socket is absent, and polls until every tracked
+// tree session's resources are gone.
 func (h *liveAcceptance) stopLifecycleRoot(root *lifecycleRoot) {
 	status, _, err := unixRequest(root.client, http.MethodDelete, "/v1/sessions/"+root.tree.SessionID, nil)
 	if err != nil || status != http.StatusAccepted {
@@ -585,6 +650,11 @@ func (h *liveAcceptance) stopLifecycleRoot(root *lifecycleRoot) {
 	}
 	if root.stalled != nil {
 		_ = root.stalled.Close()
+	}
+	select {
+	case <-root.journal.done:
+	case <-time.After(30 * time.Second):
+		h.t.Fatal("lifecycle root event journal did not close and drain after process exit")
 	}
 	if _, err := os.Stat(root.socket); !errors.Is(err, os.ErrNotExist) {
 		h.t.Fatalf("lifecycle root socket remains: %v", err)
@@ -673,26 +743,47 @@ func lifecycleSnapshotByID(tree supervisor.NodeSnapshot, sessionID string) (supe
 	return supervisor.NodeSnapshot{}, false
 }
 
-// waitLifecycleSettlement requires exactly one new terminal settlement and
-// observes typed non-streaming state while the target transport remains open.
+// waitLifecycleSettlement is for durable roots: it first observes exactly one
+// new terminal settlement, then reads typed state over the still-open root
+// transport. A nonterminal state is never cached; every eligible poll re-reads
+// get_state until the terminal requirements hold.
 func (h *liveAcceptance) waitLifecycleSettlement(root *lifecycleRoot, sessionID string, settledBefore int, requireEmptyPending bool, description string) pirpc.GetStateData {
 	var observed pirpc.GetStateData
-	stateObserved := false
 	h.poll(4*time.Minute, description, func() bool {
 		settled := root.journal.countPi(sessionID, "agent_settled", "")
 		if settled > settledBefore+1 {
 			h.t.Fatalf("%s emitted %d new agent_settled events, want exactly 1", description, settled-settledBefore)
 		}
-		if !stateObserved {
-			state := h.lifecycleGetState(root, sessionID)
-			if !state.IsStreaming && (!requireEmptyPending || state.PendingMessageCount == 0) {
-				observed = state
-				stateObserved = true
-			}
+		if settled != settledBefore+1 {
+			return false
 		}
-		return stateObserved && settled == settledBefore+1
+		state := h.lifecycleGetState(root, sessionID)
+		if state.IsStreaming || (requireEmptyPending && state.PendingMessageCount != 0) {
+			return false
+		}
+		observed = state
+		return true
 	})
 	return observed
+}
+
+// waitLifecycleSettlementEvent observes one child settlement solely through
+// the durable root journal. It deliberately does not probe the child's routed
+// RPC API, which may disappear immediately after the terminal child result.
+func (h *liveAcceptance) waitLifecycleSettlementEvent(root *lifecycleRoot, sessionID string, settledBefore int, description string) {
+	h.poll(4*time.Minute, description, func() bool {
+		settled := root.journal.countPi(sessionID, "agent_settled", "")
+		if settled > settledBefore+1 {
+			h.t.Fatalf("%s emitted %d new agent_settled events, want exactly 1", description, settled-settledBefore)
+		}
+		return settled == settledBefore+1
+	})
+}
+
+func (h *liveAcceptance) assertLifecycleSettlementTotals(root *lifecycleRoot, expected map[string]int, description string) {
+	if err := validateLifecycleSettlementTotals(root.journal.snapshot(), expected); err != nil {
+		h.t.Fatalf("%s after drained event boundary: %v", description, err)
+	}
 }
 
 // assertRootUsable sends a short prompt containing the marker, requires its
