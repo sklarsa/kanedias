@@ -83,6 +83,96 @@ func TestSteerActionPatchesCompleteDeckStatusWrapperWithOuterMode(t *testing.T) 
 	}
 }
 
+func TestRenameRootActionValidClearAndStrictSignals(t *testing.T) {
+	fleet := newStreamFakeFleet()
+	handler, cookie := mustNewHandlerWithFleetAuth(t, fleet)
+
+	response := serveActionRequest(t, handler, "/ui/sessions/root-1/name", `{"name":"new name"}`, cookie)
+	if response.Code != http.StatusOK || !strings.Contains(response.Body.String(), "deck-status") {
+		t.Fatalf("valid rename status = %d, body = %q", response.Code, response.Body.String())
+	}
+	if fleet.renameSessionID != "root-1" || fleet.renameName != "new name" {
+		t.Fatalf("RenameRoot called with (%q, %q), want (%q, %q)", fleet.renameSessionID, fleet.renameName, "root-1", "new name")
+	}
+
+	response = serveActionRequest(t, handler, "/ui/sessions/root-1/name", `{"name":""}`, cookie)
+	if response.Code != http.StatusOK || fleet.renameName != "" {
+		t.Fatalf("clear rename status = %d, recorded name = %q", response.Code, fleet.renameName)
+	}
+
+	fleet.renameName = "not-called"
+	for _, body := range []string{`{"name":`, `{"name":"ok","extra":true}`, `{"name":"ok"} {}`} {
+		response = serveActionRequest(t, handler, "/ui/sessions/root-1/name", body, cookie)
+		if response.Code != http.StatusOK || !strings.Contains(response.Body.String(), "deck-status") {
+			t.Fatalf("malformed rename body %q status = %d, body = %q", body, response.Code, response.Body.String())
+		}
+		if fleet.renameName != "not-called" {
+			t.Fatalf("malformed rename invoked manager with %q", fleet.renameName)
+		}
+		if strings.Contains(response.Body.String(), "unexpected") || strings.Contains(response.Body.String(), "invalid character") {
+			t.Fatalf("malformed rename leaked decoder detail: %s", response.Body.String())
+		}
+	}
+}
+
+func TestRenameRootActionRejectsDescendantAndSanitizesManagerFailure(t *testing.T) {
+	for _, failure := range []error{
+		contract.NewError(contract.ErrorInvalidRequest, "descendant child-1 is private"),
+		errors.New("private manager failure /run/secret.sock"),
+	} {
+		var logs bytes.Buffer
+		fleet := newStreamFakeFleet()
+		fleet.renameErr = failure
+		handler, cookie := mustNewHandlerWithFleetAuthLogger(t, fleet, slog.New(slog.NewTextHandler(&logs, nil)))
+		response := serveActionRequest(t, handler, "/ui/sessions/child-1/name", `{"name":"Nope"}`, cookie)
+		if response.Code != http.StatusOK || !strings.Contains(response.Body.String(), "deck-status") {
+			t.Fatalf("failure status = %d, body = %q", response.Code, response.Body.String())
+		}
+		if strings.Contains(response.Body.String(), failure.Error()) || strings.Contains(response.Body.String(), "child-1 is private") || strings.Contains(response.Body.String(), "/run/secret.sock") {
+			t.Fatalf("response leaked manager failure: %s", response.Body.String())
+		}
+		if !strings.Contains(logs.String(), failure.Error()) {
+			t.Fatalf("server log missing manager failure %q: %s", failure, logs.String())
+		}
+	}
+}
+
+func TestRenameRootActionSecurityAndDisabledRoute(t *testing.T) {
+	fleet := newStreamFakeFleet()
+	handler, cookie := mustNewHandlerWithFleetAuth(t, fleet)
+
+	unauthenticated := httptest.NewRequest(http.MethodPost, "/ui/sessions/root-1/name", strings.NewReader(`{"name":"x"}`))
+	unauthenticated.Host = effectiveAddrForTests
+	unauthenticated.Header.Set("Content-Type", "application/json")
+	unauthenticatedResponse := httptest.NewRecorder()
+	handler.ServeHTTP(unauthenticatedResponse, unauthenticated)
+	if unauthenticatedResponse.Code != http.StatusUnauthorized {
+		t.Fatalf("unauthenticated rename status = %d, want 401", unauthenticatedResponse.Code)
+	}
+
+	crossOrigin := httptest.NewRequest(http.MethodPost, "/ui/sessions/root-1/name", strings.NewReader(`{"name":"x"}`))
+	crossOrigin.Host = effectiveAddrForTests
+	crossOrigin.Header.Set("Content-Type", "application/json")
+	crossOrigin.Header.Set("Origin", "http://attacker.example")
+	crossOrigin.AddCookie(cookie)
+	crossOriginResponse := httptest.NewRecorder()
+	handler.ServeHTTP(crossOriginResponse, crossOrigin)
+	if crossOriginResponse.Code != http.StatusForbidden {
+		t.Fatalf("cross-origin rename status = %d, want 403", crossOriginResponse.Code)
+	}
+
+	disabled, disabledCookie := mustNewHandlerWithAuth(t, slog.New(slog.NewTextHandler(&bytes.Buffer{}, nil)))
+	disabledRequest := httptest.NewRequest(http.MethodPost, "/ui/sessions/root-1/name", strings.NewReader(`{"name":"x"}`))
+	disabledRequest.Host = "127.0.0.1:0"
+	disabledRequest.Header.Set("Content-Type", "application/json")
+	disabledRequest.AddCookie(disabledCookie)
+	disabledResponse := httptest.NewRecorder()
+	disabled.ServeHTTP(disabledResponse, disabledRequest)
+	if disabledResponse.Code != http.StatusNotFound {
+		t.Fatalf("disabled rename status = %d, want 404", disabledResponse.Code)
+	}
+}
+
 // TestInterruptActionPatchesDeckStatus verifies that an interrupt action
 // patches #deck-status.
 func TestInterruptActionPatchesDeckStatus(t *testing.T) {
@@ -372,6 +462,7 @@ type errFleet struct {
 	mutationErr error
 }
 
+func (e *errFleet) RenameRoot(string, string) error             { return e.mutationErr }
 func (e *errFleet) Steer(context.Context, string, string) error { return e.mutationErr }
 func (e *errFleet) Interrupt(context.Context, string) error     { return e.mutationErr }
 func (e *errFleet) StopSession(context.Context, string) error   { return e.mutationErr }

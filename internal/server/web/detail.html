@@ -9,11 +9,11 @@
       <div class="det-head">
         <div class="det-ident">
           <div class="breadcrumb" id="breadcrumb">
-            <b>{{.RootSessionID}}</b>
-            {{if ne .SessionID .RootSessionID}}<span class="sep">›</span><b>{{.SessionID}}</b>{{end}}
+            <b>{{.RootDisplayName}}</b>
+            {{if not .IsRoot}}<span class="sep">›</span><b>{{.DisplayLabel}}</b>{{end}}
           </div>
           <div class="det-title-row">
-            <h1 id="detName">{{if .WorkerType}}{{.WorkerType}}{{else}}{{.SessionID}}{{end}}</h1>
+            <h1 id="detName">{{.DisplayLabel}}</h1>
             <div class="det-badges">
               <span class="state-badge {{.Lifecycle}}" id="detState">
                 {{if eq .Lifecycle "question"}}◇ question{{else if eq .Lifecycle "completed"}}○ complete{{else}}● {{.Lifecycle}}{{end}}
@@ -21,6 +21,21 @@
               <span class="type-badge" id="detType">session</span>
             </div>
           </div>
+          {{if .IsRoot}}
+          <details class="session-name-editor">
+            <summary>Edit name</summary>
+            <form data-session-id="{{.RootSessionID}}"
+                  data-on:submit="@post('/ui/sessions/'+el.dataset.sessionId+'/name', {payload:{name:el.querySelector('input').value}})">
+              <label>Session name
+                <input type="text" name="name" maxlength="80" value="{{.RootName}}" autocomplete="off">
+              </label>
+              <div class="session-name-actions">
+                <button type="submit">Save</button>
+                <button type="button" data-on:click="el.closest('details').removeAttribute('open')">Cancel</button>
+              </div>
+            </form>
+          </details>
+          {{end}}
         </div>
       </div>
 

@@ -139,6 +139,7 @@ type fleetView struct {
 // rootView is the template data for one admitted root.
 type rootView struct {
 	RootSessionID   string
+	DisplayName     string
 	Lifecycle       string
 	Stale           bool
 	StreamConnected bool
@@ -188,6 +189,10 @@ type detailView struct {
 	WorkerType      string
 	Lifecycle       string
 	RootSessionID   string
+	RootName        string
+	RootDisplayName string
+	DisplayLabel    string
+	IsRoot          bool
 	RootStale       bool
 	StreamConnected bool
 	Incomplete      bool
@@ -324,6 +329,23 @@ func newFleetView(snap manager.FleetSnapshot) fleetView {
 	return fleetView{Roots: roots, Issues: issues}
 }
 
+func displayRootName(name, rootID string) string {
+	if name != "" {
+		return name
+	}
+	return rootID
+}
+
+func sessionDisplayLabel(state manager.SessionState) string {
+	if state.Node.SessionID == state.RootSessionID {
+		return displayRootName(state.RootName, state.RootSessionID)
+	}
+	if state.Node.WorkerType != "" {
+		return state.Node.WorkerType
+	}
+	return state.Node.SessionID
+}
+
 func newRootView(r manager.RootState) rootView {
 	gapText := ""
 	if r.Gap != nil {
@@ -333,6 +355,7 @@ func newRootView(r manager.RootState) rootView {
 	children := nodeChildren(r.Tree.Children)
 	return rootView{
 		RootSessionID:   r.RootSessionID,
+		DisplayName:     displayRootName(r.Name, r.RootSessionID),
 		Lifecycle:       r.Tree.Lifecycle,
 		Stale:           r.Stale,
 		StreamConnected: r.StreamConnected,
@@ -416,6 +439,10 @@ func newDetailView(state manager.SessionState, stats statsView) detailView {
 		WorkerType:      state.Node.WorkerType,
 		Lifecycle:       state.Node.Lifecycle,
 		RootSessionID:   state.RootSessionID,
+		RootName:        state.RootName,
+		RootDisplayName: displayRootName(state.RootName, state.RootSessionID),
+		DisplayLabel:    sessionDisplayLabel(state),
+		IsRoot:          state.Node.SessionID != "" && state.Node.SessionID == state.RootSessionID,
 		RootStale:       state.RootStale,
 		StreamConnected: state.StreamConnected,
 		Incomplete:      state.Incomplete,

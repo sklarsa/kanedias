@@ -147,12 +147,14 @@ func newHandlerWithOptions(logger *slog.Logger, advertisedAddress string, bootst
 		write.Use(writeRequired)
 		if fleet != nil {
 			write.Post("/ui/sessions", makeNewSessionHandler(fleet, logger))
+			write.Post("/ui/sessions/{sessionID}/name", makeRenameRootHandler(fleet, templates, logger))
 			write.Post("/ui/sessions/{sessionID}/steer", makeSteerHandler(fleet, templates, logger))
 			write.Post("/ui/sessions/{sessionID}/interrupt", makeInterruptHandler(fleet, templates, logger))
 			write.Post("/ui/sessions/{sessionID}/stop", makeStopSessionHandler(fleet, templates, logger))
 			write.Post("/ui/sessions/{sessionID}/questions/{questionID}", makeAnswerQuestionHandler(fleet, templates, logger))
 		} else {
 			write.Post("/ui/sessions", http.NotFoundHandler().ServeHTTP)
+			write.Post("/ui/sessions/{sessionID}/name", http.NotFoundHandler().ServeHTTP)
 			write.Post("/ui/sessions/{sessionID}/steer", http.NotFoundHandler().ServeHTTP)
 			write.Post("/ui/sessions/{sessionID}/interrupt", http.NotFoundHandler().ServeHTTP)
 			write.Post("/ui/sessions/{sessionID}/stop", http.NotFoundHandler().ServeHTTP)

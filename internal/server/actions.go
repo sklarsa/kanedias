@@ -56,6 +56,20 @@ func makeSteerHandler(fleet fleetManager, templates *template.Template, logger *
 	}
 }
 
+// makeRenameRootHandler returns the root-only display-name handler for
+// POST /ui/sessions/{sessionID}/name. The manager validates that sessionID is
+// an admitted root and normalizes the optional name.
+func makeRenameRootHandler(fleet fleetManager, templates *template.Template, logger *slog.Logger) http.HandlerFunc {
+	return func(w http.ResponseWriter, r *http.Request) {
+		sessionID := chi.URLParam(r, "sessionID")
+		signals, err := decodeSignals[renameSignals](w, r)
+		if err == nil {
+			err = fleet.RenameRoot(sessionID, signals.Name)
+		}
+		patchDeckStatusAction(w, r, templates, logger, err)
+	}
+}
+
 // makeInterruptHandler returns the handler for POST /ui/sessions/{sessionID}/interrupt.
 func makeInterruptHandler(fleet fleetManager, templates *template.Template, logger *slog.Logger) http.HandlerFunc {
 	return func(w http.ResponseWriter, r *http.Request) {

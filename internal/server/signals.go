@@ -15,6 +15,11 @@ type steerSignals struct {
 	Message string `json:"message"`
 }
 
+// renameSignals carries the optional root display name.
+type renameSignals struct {
+	Name string `json:"name"`
+}
+
 // selectedSessionSignals carries the selected session ID.
 type selectedSessionSignals struct {
 	SelectedSessionID string `json:"selectedSessionId"`

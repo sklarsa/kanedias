@@ -832,6 +832,93 @@ func TestAstrolabeGroupsNestedSubagentsUnderParents(t *testing.T) {
 	}
 }
 
+func TestRootNameViewUsesFallbackAndKeepsImmutableIdentity(t *testing.T) {
+	templates, err := parseTemplates(webFiles)
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	for _, test := range []struct {
+		name, custom, want string
+	}{
+		{name: "custom", custom: "Release triage", want: "Release triage"},
+		{name: "fallback", want: "root-1"},
+	} {
+		t.Run(test.name, func(t *testing.T) {
+			snapshot := manager.FleetSnapshot{Roots: []manager.RootState{{
+				RootSessionID: "root-1", Name: test.custom,
+				Tree: supervisor.NodeSnapshot{SessionID: "root-1", Lifecycle: "ready"},
+			}}}
+			html, renderErr := renderTemplate(templates, templateFleet, newFleetView(snapshot))
+			if renderErr != nil {
+				t.Fatal(renderErr)
+			}
+			for _, want := range []string{`<span class="r-name">` + test.want + `</span>`, `data-session-id="root-1"`} {
+				if !strings.Contains(html, want) {
+					t.Errorf("fleet missing %q:\n%s", want, html)
+				}
+			}
+		})
+	}
+}
+
+func TestRootNameDetailBreadcrumbEditorAndEscaping(t *testing.T) {
+	templates, err := parseTemplates(webFiles)
+	if err != nil {
+		t.Fatal(err)
+	}
+	custom := `<img src=x onerror=alert(1)>`
+	state := manager.SessionState{
+		RootSessionID: "root-1", RootName: custom, StreamConnected: true,
+		Node: supervisor.NodeSnapshot{SessionID: "root-1", Lifecycle: "ready"},
+	}
+	html, err := renderTemplate(templates, templateDetail, newDetailView(state, statsView{}))
+	if err != nil {
+		t.Fatal(err)
+	}
+	for _, want := range []string{
+		`<b>&lt;img src=x onerror=alert(1)&gt;</b>`,
+		`<h1 id="detName">&lt;img src=x onerror=alert(1)&gt;</h1>`,
+		`<details class="session-name-editor"`,
+		`data-session-id="root-1"`,
+		`data-on:submit="@post('/ui/sessions/'+el.dataset.sessionId+'/name', {payload:{name:el.querySelector('input').value}})"`,
+		`data-on:click="el.closest('details').removeAttribute('open')"`,
+		`value="&lt;img src=x onerror=alert(1)&gt;"`,
+		`<div class="k">Session</div><div class="v num">root-1</div>`,
+	} {
+		if !strings.Contains(html, want) {
+			t.Errorf("root detail missing %q:\n%s", want, html)
+		}
+	}
+	if strings.Contains(html, `<img src=x`) {
+		t.Fatalf("root name was not escaped:\n%s", html)
+	}
+}
+
+func TestChildBreadcrumbUsesRootNameAndWorkerLabel(t *testing.T) {
+	templates, err := parseTemplates(webFiles)
+	if err != nil {
+		t.Fatal(err)
+	}
+	state := manager.SessionState{
+		RootSessionID: "root-1", RootName: "Release triage", StreamConnected: true,
+		Node: supervisor.NodeSnapshot{SessionID: "child-9", WorkerType: "reviewer", Lifecycle: "running"},
+	}
+	html, err := renderTemplate(templates, templateDetail, newDetailView(state, statsView{}))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !strings.Contains(html, `<b>Release triage</b>`) || !strings.Contains(html, `<span class="sep">›</span><b>reviewer</b>`) {
+		t.Fatalf("child breadcrumb does not use root name and worker label:\n%s", html)
+	}
+	if strings.Contains(html, `class="session-name-editor"`) {
+		t.Fatalf("child detail rendered root-only editor:\n%s", html)
+	}
+	if !strings.Contains(html, `<div class="k">Session</div><div class="v num">child-9</div>`) {
+		t.Fatalf("child metric does not retain immutable ID:\n%s", html)
+	}
+}
+
 func TestFleetRowsBindSelectedSessionClass(t *testing.T) {
 	templates, err := parseTemplates(webFiles)
 	if err != nil {
@@ -872,18 +959,21 @@ func TestFleetRowsBindSelectedSessionClass(t *testing.T) {
 
 // streamFakeFleet is a controllable fake fleet manager for SSE stream tests.
 type streamFakeFleet struct {
-	mu             sync.Mutex
-	fleetUpdates   chan uint64
-	sessionUpdates map[string]chan uint64
-	sessions       map[string]manager.SessionState
-	snapshot       manager.FleetSnapshot
-	stats          manager.SessionStats
-	statsErr       error
-	statsCalls     int
-	launchOptions  manager.SessionLaunchOptions
-	spawnRequest   manager.SessionLaunchRequest
-	spawnSessionID string
-	spawnErr       error
+	mu              sync.Mutex
+	fleetUpdates    chan uint64
+	sessionUpdates  map[string]chan uint64
+	sessions        map[string]manager.SessionState
+	snapshot        manager.FleetSnapshot
+	stats           manager.SessionStats
+	statsErr        error
+	statsCalls      int
+	launchOptions   manager.SessionLaunchOptions
+	spawnRequest    manager.SessionLaunchRequest
+	spawnSessionID  string
+	spawnErr        error
+	renameSessionID string
+	renameName      string
+	renameErr       error
 }
 
 func newStreamFakeFleet() *streamFakeFleet {
@@ -933,7 +1023,14 @@ func (f *streamFakeFleet) SpawnRootWithRequest(_ context.Context, request manage
 	}
 	return f.spawnSessionID, f.spawnErr
 }
-func (f *streamFakeFleet) SpawnRoot(context.Context) (string, error)   { return "", nil }
+func (f *streamFakeFleet) SpawnRoot(context.Context) (string, error) { return "", nil }
+func (f *streamFakeFleet) RenameRoot(sessionID, name string) error {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	f.renameSessionID = sessionID
+	f.renameName = name
+	return f.renameErr
+}
 func (f *streamFakeFleet) Steer(context.Context, string, string) error { return nil }
 func (f *streamFakeFleet) Interrupt(context.Context, string) error     { return nil }
 func (f *streamFakeFleet) StopSession(context.Context, string) error   { return nil }
