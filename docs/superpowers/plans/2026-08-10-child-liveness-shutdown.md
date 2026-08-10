@@ -351,6 +351,31 @@ git add internal/supervisor/live_incus_test.go docs/superpowers/specs/2026-08-10
 git commit -m "test: keep recursive acceptance sockets short"
 ```
 
+### Task 5: Wait for Bound Active Child Snapshots in Live Acceptance
+
+**Files:**
+- Modify: `internal/supervisor/live_incus_test.go`
+- Modify: `docs/superpowers/specs/2026-08-10-child-liveness-shutdown-design.md`
+
+- [ ] **Step 1: Add and run the lifecycle-predicate regression**
+
+Add a focused test requiring the child visibility predicate to reject kind/context-matching but unbound `starting` and `running` snapshots, accept bound `ready`, `running`, and `awaiting_handoff` snapshots, and reject terminal states. Run it with the `incus` build tag and observe RED before correcting the predicate helper.
+
+- [ ] **Step 2: Gate read and write assertions on binding and active lifecycle**
+
+Use the helper in both fresh-read and forked-writer visibility polls. Do not hide failed lifecycle states or weaken identity matching. Wait through `starting`, but do not require observing the brief `ready` state before the child enters `running`; require the Pi session ID, session file, and complete model binding used by subsequent assertions and routed control.
+
+- [ ] **Step 3: Verify focused GREEN and rerun the full live lifecycle**
+
+Run the focused predicate test, the tagged hermetic supervisor package, and the exact authorized live recursive acceptance. External baseline resources must not be modified by cleanup.
+
+- [ ] **Step 4: Commit Task 5**
+
+```bash
+git add internal/supervisor/live_incus_test.go docs/superpowers/specs/2026-08-10-child-liveness-shutdown-design.md docs/superpowers/plans/2026-08-10-child-liveness-shutdown.md
+git commit -m "test: wait for bound live child snapshots"
+```
+
 ## Final Verification
 
 After all task reviews are clean, run from the final branch state:

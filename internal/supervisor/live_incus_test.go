@@ -129,6 +129,42 @@ func TestPostNewSessionJSONRejectsInvalidResponses(t *testing.T) {
 	}
 }
 
+func TestControllableChildSnapshotRequiresBindingAndActiveLifecycle(t *testing.T) {
+	child := supervisor.NodeSnapshot{Kind: contract.ChildKindRead, Context: contract.ContextFresh, Lifecycle: string(supervisor.LifecycleStarting)}
+	if isControllableChildSnapshot(child, contract.ChildKindRead, contract.ContextFresh) {
+		t.Fatal("starting child snapshot was accepted as controllable")
+	}
+	child.Lifecycle = string(supervisor.LifecycleRunning)
+	if isControllableChildSnapshot(child, contract.ChildKindRead, contract.ContextFresh) {
+		t.Fatal("unbound running child snapshot was accepted as controllable")
+	}
+	child.PiSessionID = "pi-child"
+	child.SessionFile = "/workspace/.pi/child.jsonl"
+	child.Model = config.ModelProfile{Provider: "provider", Model: "model", ThinkingLevel: "off"}
+	for _, lifecycle := range []supervisor.LifecycleState{supervisor.LifecycleReady, supervisor.LifecycleRunning, supervisor.LifecycleAwaitingHandoff} {
+		child.Lifecycle = string(lifecycle)
+		if !isControllableChildSnapshot(child, contract.ChildKindRead, contract.ContextFresh) {
+			t.Fatalf("matching bound child in %s was rejected", lifecycle)
+		}
+	}
+	for _, lifecycle := range []supervisor.LifecycleState{
+		supervisor.LifecycleProvisioning, supervisor.LifecycleStarting, supervisor.LifecycleCompleted,
+		supervisor.LifecycleFailed, supervisor.LifecycleStopping, supervisor.LifecycleStopped,
+	} {
+		child.Lifecycle = string(lifecycle)
+		if isControllableChildSnapshot(child, contract.ChildKindRead, contract.ContextFresh) {
+			t.Fatalf("bound child in %s was accepted as controllable", lifecycle)
+		}
+	}
+	child.Lifecycle = string(supervisor.LifecycleRunning)
+	if isControllableChildSnapshot(child, contract.ChildKindWrite, contract.ContextFresh) {
+		t.Fatal("child with mismatched kind was accepted as controllable")
+	}
+	if isControllableChildSnapshot(child, contract.ChildKindRead, contract.ContextFork) {
+		t.Fatal("child with mismatched context was accepted as controllable")
+	}
+}
+
 func TestRecursiveAcceptanceUsesShortSocketPaths(t *testing.T) {
 	t.Setenv("XDG_RUNTIME_DIR", "/tmp")
 	h := &liveAcceptance{t: t, runDir: filepath.Join(t.TempDir(), strings.Repeat("deep-artifact-directory-", 4))}
@@ -805,6 +841,19 @@ func (h *liveAcceptance) exerciseQuestionFixture(root supervisor.NodeSnapshot, s
 	h.writeJSON("question-fixture.json", map[string]any{"question": question, "answer": "deterministic-answer", "duplicateStatus": status})
 }
 
+func isControllableChildSnapshot(child supervisor.NodeSnapshot, kind contract.ChildKind, childContext contract.ContextMode) bool {
+	if child.Kind != kind || child.Context != childContext || child.PiSessionID == "" || child.SessionFile == "" ||
+		child.Model.Provider == "" || child.Model.Model == "" || child.Model.ThinkingLevel == "" {
+		return false
+	}
+	switch supervisor.LifecycleState(child.Lifecycle) {
+	case supervisor.LifecycleReady, supervisor.LifecycleRunning, supervisor.LifecycleAwaitingHandoff:
+		return true
+	default:
+		return false
+	}
+}
+
 func (h *liveAcceptance) exerciseFreshRead(root supervisor.NodeSnapshot, socket string, stream *sseCapture) {
 	client := unixHTTPClient(socket)
 	body, err := os.ReadFile(filepath.Join(h.repoRoot, "internal", "supervisor", "testdata", "read-task.md"))
@@ -820,7 +869,7 @@ func (h *liveAcceptance) exerciseFreshRead(root supervisor.NodeSnapshot, socket 
 			return false
 		}
 		child = current.Children[0]
-		return child.Kind == contract.ChildKindRead && child.Context == contract.ContextFresh
+		return isControllableChildSnapshot(child, contract.ChildKindRead, contract.ContextFresh)
 	})
 	h.trackTree(child)
 	h.waitSessionEvent(stream.events, child.SessionID, 2*time.Minute)
@@ -873,7 +922,7 @@ func (h *liveAcceptance) exerciseForkedWrite(root supervisor.NodeSnapshot, socke
 			return false
 		}
 		child = current.Children[0]
-		return child.Kind == contract.ChildKindWrite && child.Context == contract.ContextFork
+		return isControllableChildSnapshot(child, contract.ChildKindWrite, contract.ContextFork)
 	})
 	h.trackTree(child)
 	h.assertDistinct(root, child)
