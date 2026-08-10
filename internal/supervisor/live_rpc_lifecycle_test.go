@@ -192,33 +192,66 @@ func TestLifecycleMarkerIsConciseExactAndRunScoped(t *testing.T) {
 	}
 }
 
-func TestLifecyclePostAbortProbeExplicitlySupersedesPriorTask(t *testing.T) {
-	marker := "KANEDIAS_LIFECYCLE_POST_ABORT_e2e-run"
-	prompt := lifecyclePostAbortProbe(marker)
-
-	if count := strings.Count(prompt, marker); count != 1 {
-		t.Fatalf("post-abort probe contains marker %d times, want exactly 1: %q", count, prompt)
+func TestLifecycleInterruptControlProbeRequiresExactQuestion(t *testing.T) {
+	marker := "KANEDIAS_LIFECYCLE_INTERRUPT_ROOT_USABLE_e2e-run"
+	probe := lifecycleInterruptControlProbe(marker)
+	if want := "/present_e2e_question " + marker; probe != want {
+		t.Fatalf("interrupt control probe = %q, want exact %q", probe, want)
 	}
-	for _, required := range []string{
-		"aborted",
-		"must not be resumed",
-		"Do not call any tools",
-		"only the marker",
-	} {
-		if !strings.Contains(prompt, required) {
-			t.Fatalf("post-abort probe lacks fixed instruction %q: %q", required, prompt)
-		}
+	if count := strings.Count(probe, marker); count != 1 {
+		t.Fatalf("interrupt control probe contains marker %d times, want exactly 1: %q", count, probe)
 	}
-}
 
-// lifecyclePostAbortProbe builds the strict post-abort usability probe. It
-// states the prior request was aborted and must not be resumed, prohibits tool
-// calls, and constrains the response to exactly the byte-exact marker. The
-// marker appears exactly once so a strict strings.Contains final-text check
-// still proves the exact run identity.
-func lifecyclePostAbortProbe(marker string) string {
-	return "The previous request was aborted and must not be resumed. Do not call any tools. " +
-		"Reply with only the marker " + marker + " and nothing else."
+	rootID := "root-session"
+	altID := "child-session"
+	snap := supervisor.NodeSnapshot{
+		SessionID:     rootID,
+		RootSessionID: rootID,
+		Questions: []supervisor.QuestionSummary{
+			{ID: "q-root", Title: marker},
+		},
+		Children: []supervisor.NodeSnapshot{
+			{SessionID: altID, RootSessionID: rootID, Questions: []supervisor.QuestionSummary{
+				{ID: "q-alt", Title: "KANEDIAS_LIFECYCLE_DIFFERENT_e2e-run"},
+			}},
+		},
+	}
+
+	if id, err := selectLifecycleQuestion(snap, rootID, marker); err != nil || id != "q-root" {
+		t.Fatalf("select root question = (%q, %v), want (q-root, nil)", id, err)
+	}
+	if _, err := selectLifecycleQuestion(snap, altID, marker); err == nil {
+		t.Fatal("selected a question of the wrong session with the same title expectation")
+	}
+	if _, err := selectLifecycleQuestion(snap, rootID, "KANEDIAS_LIFECYCLE_MISSING_e2e-run"); err == nil {
+		t.Fatal("selected a question with no exact title match")
+	}
+	if _, err := selectLifecycleQuestion(snap, "not-present", marker); err == nil {
+		t.Fatal("selected a question for a missing target session")
+	}
+
+	duplicate := supervisor.NodeSnapshot{
+		SessionID:     rootID,
+		RootSessionID: rootID,
+		Questions: []supervisor.QuestionSummary{
+			{ID: "q-1", Title: marker},
+			{ID: "q-2", Title: marker},
+		},
+	}
+	if _, err := selectLifecycleQuestion(duplicate, rootID, marker); err == nil {
+		t.Fatal("duplicate exact matches were not rejected")
+	}
+
+	emptyID := supervisor.NodeSnapshot{
+		SessionID:     rootID,
+		RootSessionID: rootID,
+		Questions: []supervisor.QuestionSummary{
+			{Title: marker},
+		},
+	}
+	if _, err := selectLifecycleQuestion(emptyID, rootID, marker); err == nil {
+		t.Fatal("empty question id was not rejected")
+	}
 }
 
 // lifecycleDeterministicMarker builds a concise exact run-scoped provenance
@@ -467,7 +500,7 @@ func (h *liveAcceptance) exerciseLifecycleInterrupt() {
 	rootSettledBefore := root.journal.countPi(root.tree.SessionID, "agent_settled", "")
 	h.lifecycleRPCCommand(root, root.tree.SessionID, map[string]any{"type": "abort"})
 	h.waitLifecycleSettlement(root, root.tree.SessionID, rootSettledBefore, false, "root interrupt settlement and open transport")
-	h.assertLifecycleRootUsableAfterAbort(root, "KANEDIAS_LIFECYCLE_INTERRUPT_ROOT_USABLE_"+h.prefix)
+	h.assertLifecycleRootControlAfterInterrupt(root, "KANEDIAS_LIFECYCLE_INTERRUPT_ROOT_USABLE_"+h.prefix)
 
 	childCall := h.startLifecycleChildCall(root, root.tree.SessionID, "interrupt-child",
 		lifecycleActiveReadTask("KANEDIAS_LIFECYCLE_INTERRUPT_CHILD_UNEXPECTED_"+h.prefix))
@@ -482,10 +515,10 @@ func (h *liveAcceptance) exerciseLifecycleInterrupt() {
 	h.waitLifecycleSettlementEvent(root, child.SessionID, childSettledBefore, "interrupted child journal settlement")
 	h.waitForLifecycleChildrenGone(root, []supervisor.NodeSnapshot{child}, childPIDs, "interrupted child cleanup")
 	h.captureLifecycleBoundary(root, "post-control")
-	h.assertRootUsable(root, "KANEDIAS_LIFECYCLE_INTERRUPT_CHILD_ROOT_USABLE_"+h.prefix)
+	h.assertLifecycleRootControlAfterInterrupt(root, "KANEDIAS_LIFECYCLE_INTERRUPT_CHILD_ROOT_USABLE_"+h.prefix)
 	h.stopLifecycleRoot(root)
 	h.assertLifecycleSettlementTotals(root, map[string]int{
-		root.tree.SessionID: rootSettledBefore + 3,
+		root.tree.SessionID: rootSettledBefore + 1,
 		child.SessionID:     childSettledBefore + 1,
 	}, "interrupt scenario settlement totals")
 }

@@ -1328,11 +1328,94 @@ func (h *liveAcceptance) assertRootUsable(root *lifecycleRoot, marker string) {
 	h.assertRootUsablePrompt(root, marker, "Reply with exactly "+marker+".")
 }
 
-// assertLifecycleRootUsableAfterAbort proves the root remains usable after a
-// Pi abort by sending the explicit supersede-the-prior-task probe. It is used
-// only after a root abort, never for generic usability.
-func (h *liveAcceptance) assertLifecycleRootUsableAfterAbort(root *lifecycleRoot, marker string) {
-	h.assertRootUsablePrompt(root, marker, lifecyclePostAbortProbe(marker))
+// lifecycleInterruptControlProbe builds the deterministic /present_e2e_question
+// extension command for the supplied marker, retaining the complete marker
+// exactly once. Empty markers are rejected because they cannot identify the
+// exact projected question.
+func lifecycleInterruptControlProbe(marker string) string {
+	if strings.TrimSpace(marker) == "" {
+		panic("lifecycle interrupt control probe requires a nonempty marker")
+	}
+	return "/present_e2e_question " + marker
+}
+
+// selectLifecycleQuestion selects exactly one pending question for the target
+// session whose title equals the supplied marker and returns its nonempty ID.
+// It rejects a missing target session, no exact title match, a match on the
+// wrong session, an empty ID, or duplicate exact matches.
+func selectLifecycleQuestion(tree supervisor.NodeSnapshot, sessionID, marker string) (string, error) {
+	node, ok := lifecycleSnapshotByID(tree, sessionID)
+	if !ok {
+		return "", fmt.Errorf("target session %s not present in tree", sessionID)
+	}
+	var matches []string
+	for _, question := range node.Questions {
+		if question.Title == marker {
+			matches = append(matches, question.ID)
+		}
+	}
+	switch len(matches) {
+	case 0:
+		return "", fmt.Errorf("no pending question with exact title %q for session %s", marker, sessionID)
+	case 1:
+		if strings.TrimSpace(matches[0]) == "" {
+			return "", fmt.Errorf("matching question for session %s has empty id", sessionID)
+		}
+		return matches[0], nil
+	default:
+		return "", fmt.Errorf("duplicate pending questions with exact title %q for session %s", marker, sessionID)
+	}
+}
+
+// assertLifecycleRootControlAfterInterrupt proves the same root Pi/supervisor
+// control plane remains addressable and usable after an interrupt by driving
+// the installed /present_e2e_question extension command: exact prompt
+// acknowledgement, root question projection with the exact marker title,
+// exactly one answer routed through the direct question-response route with
+// HTTP 204, question removal, and typed idle/zero state. Extension commands are
+// handled without a model generation, so no agent_settled is expected or
+// manufactured.
+func (h *liveAcceptance) assertLifecycleRootControlAfterInterrupt(root *lifecycleRoot, marker string) {
+	rootSessionID := root.tree.SessionID
+	h.lifecycleRPCCommand(root, rootSessionID, map[string]any{
+		"type": "prompt", "message": lifecycleInterruptControlProbe(marker),
+	})
+
+	var questionID string
+	h.poll(2*time.Minute, "controlled question after interrupt for "+rootSessionID, func() bool {
+		var tree supervisor.NodeSnapshot
+		if unixJSON(root.client, http.MethodGet, "/v1/tree", nil, &tree) != nil {
+			return false
+		}
+		id, err := selectLifecycleQuestion(tree, rootSessionID, marker)
+		if err != nil {
+			return false
+		}
+		questionID = id
+		return true
+	})
+
+	status, _, err := unixRequest(root.client, http.MethodPost,
+		"/v1/sessions/"+url.PathEscape(rootSessionID)+"/questions/"+url.PathEscape(questionID)+"/response",
+		map[string]any{"value": "deterministic answer"})
+	root.recordAction("answer_question", rootSessionID, "answered", status, "")
+	if err != nil || status != http.StatusNoContent {
+		h.t.Fatalf("answer controlled question %s for %s: status=%d err=%v", questionID, rootSessionID, status, err)
+	}
+
+	h.poll(2*time.Minute, "controlled question removal after answer for "+rootSessionID, func() bool {
+		var tree supervisor.NodeSnapshot
+		if unixJSON(root.client, http.MethodGet, "/v1/tree", nil, &tree) != nil {
+			return false
+		}
+		_, err := selectLifecycleQuestion(tree, rootSessionID, marker)
+		return err != nil
+	})
+
+	state := h.lifecycleGetState(root, rootSessionID)
+	if state.IsStreaming || state.PendingMessageCount != 0 {
+		h.t.Fatalf("root %s after interrupt control probe is streaming=%t pending=%d, want idle/zero", rootSessionID, state.IsStreaming, state.PendingMessageCount)
+	}
 }
 
 // assertRootUsablePrompt sends a prompt containing the marker, requires its
