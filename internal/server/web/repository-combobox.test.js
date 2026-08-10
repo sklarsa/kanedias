@@ -72,7 +72,7 @@ class FakeInput extends FakeTarget {
     this.value = value;
     return this.dispatch("input");
   }
-  keydown(key) { return this.dispatch("keydown", { key }); }
+  keydown(key, extra = {}) { return this.dispatch("keydown", { key, ...extra }); }
   blur(relatedTarget = null) {
     this.document.activeElement = relatedTarget;
     return this.dispatch("blur", { relatedTarget });
@@ -87,11 +87,16 @@ function fixture(values) {
   const committed = new FakeInput(document);
   const listbox = new FakeTarget();
   const results = new FakeTarget();
+  const empty = new FakeTarget();
   root.parent = document;
   query.parent = root;
   committed.parent = root;
   listbox.parent = root;
   results.parent = root;
+  empty.parent = listbox;
+  empty.hidden = true;
+  empty.textContent = "No configured repositories match.";
+  empty.setAttribute("role", "presentation");
   listbox.hidden = true;
   query.setAttribute("aria-expanded", "false");
   const options = values.map((value, index) => {
@@ -107,13 +112,14 @@ function fixture(values) {
     ["[data-repository-query]", query],
     ["[data-start-repository]", committed],
     ["[data-repository-listbox]", listbox],
-    ["[data-repository-results]", results]
+    ["[data-repository-results]", results],
+    ["[data-repository-empty]", empty]
   ]);
   root.querySelector = (selector) => bySelector.get(selector) || null;
   root.querySelectorAll = (selector) => selector === "[data-repository-option]" ? options : [];
 
   return {
-    document, root, query, committed, listbox, results, options,
+    document, root, query, committed, listbox, results, empty, options,
     visibleValues() {
       return options.filter((item) => !item.hidden).map((item) => item.getAttribute("data-value") || "");
     },
@@ -145,7 +151,7 @@ test("filtering is case-insensitive but commits canonical server spelling", () =
   assert.deepEqual(f.selectedValues(), ["Owner/Alpha"]);
 });
 
-test("unmatched text is invalid and never becomes a committed value", () => {
+test("unmatched text is invalid and displays a non-option no-results row", () => {
   const f = fixture(["", "one/alpha"]);
   const controller = combo.bind(f.root, f.document);
   f.query.input("invented/repo");
@@ -155,9 +161,14 @@ test("unmatched text is invalid and never becomes a committed value", () => {
   });
   assert.equal(controller.value(), "");
   assert.equal(f.results.textContent, "No configured repositories match.");
+  assert.equal(f.empty.hidden, false);
+  assert.equal(f.empty.getAttribute("role"), "presentation");
+  assert.equal(f.root.querySelectorAll("[data-repository-option]").includes(f.empty), false);
+  f.query.input("one");
+  assert.equal(f.empty.hidden, true);
 });
 
-test("Arrow keys, Home, and End move the active option through filtered results", () => {
+test("Arrow keys, Home, and End move exactly one active option through open results", () => {
   const f = fixture(["", "one/alpha", "one/beta", "two/gamma"]);
   combo.bind(f.root, f.document);
   f.query.input("one/");
@@ -165,12 +176,25 @@ test("Arrow keys, Home, and End move the active option through filtered results"
   assert.equal(f.query.getAttribute("aria-activedescendant"), "repository-option-1");
   f.query.keydown("ArrowDown");
   assert.equal(f.query.getAttribute("aria-activedescendant"), "repository-option-2");
+  assert.deepEqual(f.options.filter((option) => option.getAttribute("data-active") === "true"), [f.options[2]]);
   f.query.keydown("ArrowUp");
   assert.equal(f.query.getAttribute("aria-activedescendant"), "repository-option-1");
+  assert.deepEqual(f.options.filter((option) => option.getAttribute("data-active") === "true"), [f.options[1]]);
   f.query.keydown("End");
   assert.equal(f.query.getAttribute("aria-activedescendant"), "repository-option-2");
   f.query.keydown("Home");
   assert.equal(f.query.getAttribute("aria-activedescendant"), "repository-option-1");
+});
+
+test("Home and End retain native caret behavior while the popup is closed", () => {
+  const f = fixture(["", "one/alpha"]);
+  combo.bind(f.root, f.document);
+  const home = f.query.keydown("Home");
+  const end = f.query.keydown("End");
+  assert.equal(home.defaultPrevented, false);
+  assert.equal(end.defaultPrevented, false);
+  assert.equal(f.listbox.hidden, true);
+  assert.equal(f.query.getAttribute("aria-activedescendant"), null);
 });
 
 test("Enter commits the active option and Escape closes without inventing a value", () => {
@@ -208,15 +232,93 @@ test("Tab commits an exact case-insensitive match and only closes an unmatched q
   assert.equal(f.listbox.hidden, true);
 });
 
-test("pointerdown commits before blur can close the listbox", () => {
+test("mouse pointerdown commits before blur can close the listbox", () => {
   const f = fixture(["", "one/alpha"]);
   const controller = combo.bind(f.root, f.document);
   f.query.input("one");
-  const pointer = f.options[1].dispatch("pointerdown");
+  const pointer = f.options[1].dispatch("pointerdown", {pointerType: "mouse", pointerId: 1});
   f.query.blur();
   assert.equal(pointer.defaultPrevented, true);
   assert.equal(controller.value(), "one/alpha");
   assert.equal(f.query.value, "one/alpha");
+});
+
+test("touch and pen tap commit on pointerup while a pan never chooses an option", () => {
+  for (const pointerType of ["touch", "pen"]) {
+    const tap = fixture(["", "one/alpha"]);
+    const tapController = combo.bind(tap.root, tap.document);
+    tap.query.input("one");
+    const down = tap.options[1].dispatch("pointerdown", {
+      pointerType, pointerId: 7, clientX: 10, clientY: 20
+    });
+    tap.query.blur();
+    assert.equal(down.defaultPrevented, false);
+    assert.equal(tap.listbox.hidden, false);
+    tap.document.dispatch("pointerup", {
+      target: tap.options[1], pointerType, pointerId: 7, clientX: 12, clientY: 23
+    });
+    assert.equal(tapController.value(), "one/alpha");
+
+    const pan = fixture(["", "one/alpha"]);
+    const panController = combo.bind(pan.root, pan.document);
+    pan.query.input("one");
+    pan.options[1].dispatch("pointerdown", {
+      pointerType, pointerId: 8, clientX: 10, clientY: 20
+    });
+    pan.document.dispatch("pointermove", {
+      target: pan.options[1], pointerType, pointerId: 8, clientX: 10, clientY: 45
+    });
+    pan.document.dispatch("pointerup", {
+      target: pan.options[1], pointerType, pointerId: 8, clientX: 10, clientY: 45
+    });
+    assert.equal(panController.value(), "");
+    assert.equal(pan.query.value, "one");
+  }
+});
+
+test("composition ordering protects Enter and Escape, then restores normal two-step keys", () => {
+  const f = fixture(["", "one/alpha"]);
+  const controller = combo.bind(f.root, f.document);
+  f.query.input("one");
+  f.query.dispatch("compositionstart");
+  f.query.keydown("Enter", {isComposing: false, keyCode: 229});
+  assert.equal(controller.value(), "");
+  f.query.dispatch("compositionend");
+  f.query.keydown("Enter", {isComposing: false, keyCode: 13});
+  assert.equal(controller.value(), "", "trailing composition key committed");
+  f.query.keydown("Enter", {isComposing: false, keyCode: 13});
+  assert.equal(controller.value(), "one/alpha");
+
+  f.query.input("one");
+  f.query.dispatch("compositionstart");
+  f.query.dispatch("compositionend");
+  const trailingEscape = f.query.keydown("Escape");
+  assert.equal(trailingEscape.defaultPrevented, false);
+  assert.equal(f.listbox.hidden, false);
+  const normalEscape = f.query.keydown("Escape");
+  assert.equal(normalEscape.defaultPrevented, true);
+  assert.equal(f.listbox.hidden, true);
+});
+
+test("composition guard expires before a later intentional Enter", async () => {
+  const f = fixture(["", "one/alpha"]);
+  const controller = combo.bind(f.root, f.document);
+  f.query.input("one");
+  f.query.dispatch("compositionstart");
+  f.query.dispatch("compositionend");
+  await new Promise((resolve) => setTimeout(resolve, 0));
+  f.query.keydown("Enter");
+  assert.equal(controller.value(), "one/alpha");
+});
+
+test("closure commitment stays authoritative when the hidden mirror drifts", () => {
+  const f = fixture(["", "one/alpha", "two/beta"]);
+  const controller = combo.bind(f.root, f.document);
+  f.query.input("one/alpha");
+  f.options[1].dispatch("pointerdown", {pointerType: "mouse"});
+  f.committed.value = "two/beta";
+  assert.equal(controller.value(), "one/alpha");
+  assert.deepEqual(controller.validate(), {valid: true, message: ""});
 });
 
 test("reset clears commitment and restores the workspace ARIA state", () => {

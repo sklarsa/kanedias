@@ -385,6 +385,7 @@ func TestInitialPageRendersSessionModalFromLaunchOptions(t *testing.T) {
 		`aria-controls="start-repository-list"`, `aria-describedby="start-repository-results"`, `data-repository-query`,
 		`type="hidden"`, `data-start-repository`, `id="start-repository-list"`, `role="listbox"`, `aria-label="Configured repositories"`,
 		`data-repository-listbox hidden`, `id="repository-option-workspace"`, `role="option"`, `data-repository-option data-value=""`, `>/workspace</div>`,
+		`class="repository-empty"`, `role="presentation"`, `data-repository-empty hidden`, `No configured repositories match.`,
 		`id="start-repository-results"`, `role="status"`, `aria-live="polite"`, `data-repository-results`,
 		`id="root-model"`, `data-root-model`, `id="root-thinking"`, `data-root-thinking`, `value="deep-model" selected`, `value="xhigh" selected`,
 		`data-thinking-levels="off,medium"`, `data-default-thinking="off"`, `data-worker-row`, `data-worker-model`, `data-worker-thinking`, `data-modal-close`,
@@ -878,7 +879,7 @@ func TestTemplatesDefineStableRoots(t *testing.T) {
 	if !strings.Contains(fleetHTML, `id="fleet-panel"`) {
 		t.Errorf("fleet.html does not contain #fleet-panel root")
 	}
-	for _, want := range []string{`data-fleet-collapse`, `aria-label="Hide Fleet"`} {
+	for _, want := range []string{`data-fleet-collapse`, `aria-label="Hide Fleet"`, `aria-expanded="true"`} {
 		if !strings.Contains(fleetHTML, want) {
 			t.Errorf("fleet.html does not contain %q", want)
 		}
@@ -1820,6 +1821,7 @@ func TestProjectStylesDefineAstrolabeVisualSystem(t *testing.T) {
 		".repository-combobox{",
 		".repository-listbox[hidden]",
 		"[data-repository-option][aria-selected=\"true\"]",
+		".repository-empty{",
 		"min-height:44px",
 		// persistent desktop Fleet layout and controls
 		`--fleet-width:`,

@@ -961,6 +961,13 @@ details[open] > summary .twisty{ transform:rotate(90deg); }
   color:var(--cyan);
   content:"◆";
 }
+.repository-empty{
+  min-height:38px;
+  padding:10px;
+  color:var(--ink-faint);
+  font:12px/1.35 var(--mono);
+  overflow-wrap:anywhere;
+}
 .repository-results{
   position:absolute;
   width:1px;

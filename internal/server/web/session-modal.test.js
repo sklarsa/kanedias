@@ -143,6 +143,11 @@ function fixture() {
   const repositoryResults = new FakeTarget();
   repositoryResults.parent = repositoryRoot;
   repositoryResults.textContent = "";
+  const repositoryEmpty = new FakeTarget();
+  repositoryEmpty.parent = repositoryListbox;
+  repositoryEmpty.hidden = true;
+  repositoryEmpty.textContent = "No configured repositories match.";
+  repositoryEmpty.setAttribute("role", "presentation");
   const repositoryOptions = ["", "one/alpha", "owner/repo"].map((value, index) => {
     const repositoryOption = new FakeTarget();
     repositoryOption.parent = repositoryListbox;
@@ -156,7 +161,8 @@ function fixture() {
     ["[data-repository-query]", repositoryQuery],
     ["[data-start-repository]", startRepository],
     ["[data-repository-listbox]", repositoryListbox],
-    ["[data-repository-results]", repositoryResults]
+    ["[data-repository-results]", repositoryResults],
+    ["[data-repository-empty]", repositoryEmpty]
   ]);
   repositoryRoot.querySelector = (selector) => repositorySelectors.get(selector) || null;
   repositoryRoot.querySelectorAll = (selector) => selector === "[data-repository-option]" ? repositoryOptions : [];
@@ -228,7 +234,7 @@ function fixture() {
 
   return {
     document, dialog, trigger, form, close, cancel, launch, status, fieldset, details,
-    sessionName, repositoryRoot, repositoryQuery, startRepository, repositoryListbox, repositoryResults, repositoryOptions,
+    sessionName, repositoryRoot, repositoryQuery, startRepository, repositoryListbox, repositoryResults, repositoryEmpty, repositoryOptions,
     rootModel, rootThinking, workerModelA, workerThinkingA, workerModelB, workerThinkingB,
     workerA, workerB, controls, chooseRepository
   };
@@ -318,7 +324,7 @@ test("buildRequest returns raw name and repository with the root and every worke
   f.workerModelB.value = "deep";
   f.workerThinkingB.replaceChildren(option("high"), option("xhigh"));
   f.workerThinkingB.value = "xhigh";
-  const got = modalUI.buildRequest(f.dialog);
+  const got = modalUI.buildRequest(f.dialog, "owner/repo");
   assert.deepEqual(got, {
     name: "release triage",
     repository: "owner/repo",
@@ -344,7 +350,7 @@ test("unmatched repository blocks fetch and preserves the modal", () => {
     "Choose a configured repository or clear the field to use /workspace.");
 });
 
-test("selected autocomplete value is the exact launch repository", async () => {
+test("selected autocomplete value is the exact launch repository despite hidden mirror drift", async () => {
   const f = fixture();
   const calls = [];
   modalUI.bind(f.document, async (_url, options) => {
@@ -352,10 +358,11 @@ test("selected autocomplete value is the exact launch repository", async () => {
     return response(201, { sessionId: "created" });
   });
   f.trigger.dispatch("click");
-  f.chooseRepository("owner/repo");
+  f.chooseRepository("one/alpha");
+  f.startRepository.value = "owner/repo";
   f.form.dispatch("submit");
   await settle();
-  assert.equal(calls[0].repository, "owner/repo");
+  assert.equal(calls[0].repository, "one/alpha");
 });
 
 test("Launch posts the exact complete request and disables controls while pending", async () => {
@@ -368,8 +375,8 @@ test("Launch posts the exact complete request and disables controls while pendin
   });
   f.trigger.dispatch("click");
   f.sessionName.value = "release triage";
-  f.startRepository.value = "owner/repo";
-  const expected = modalUI.buildRequest(f.dialog);
+  f.chooseRepository("owner/repo");
+  const expected = modalUI.buildRequest(f.dialog, "owner/repo");
   f.form.dispatch("submit");
   assert.equal(calls.length, 1);
   assert.equal(calls[0].url, "/ui/sessions");
@@ -542,7 +549,7 @@ test("201 closes and resets the modal", async () => {
   modalUI.bind(f.document, async () => response(201, { sessionId: "created" }));
   f.trigger.dispatch("click");
   f.sessionName.value = "completed name";
-  f.startRepository.value = "owner/repo";
+  f.chooseRepository("owner/repo");
   f.rootModel.value = "fast";
   f.form.dispatch("submit");
   await settle();
@@ -572,6 +579,73 @@ test("Cancel, close, backdrop, and native cancel close without fetch", () => {
     if (event) assert.equal(event.defaultPrevented, true);
   }
   assert.equal(fetchCalls, 0);
+});
+
+test("composition Escape ordering cannot close or reset the modal", () => {
+  const f = fixture();
+  modalUI.bind(f.document, async () => response(201, { sessionId: "created" }));
+  f.trigger.dispatch("click");
+  const resets = f.form.resetCalls;
+
+  f.document.dispatch("compositionstart", {target: f.sessionName});
+  const legacyIME = f.document.dispatch("keydown", {
+    key: "Escape", keyCode: 229, isComposing: false, target: f.sessionName
+  });
+  assert.equal(legacyIME.defaultPrevented, true);
+  assert.equal(f.dialog.open, true);
+  assert.equal(f.form.resetCalls, resets);
+
+  f.document.dispatch("compositionend", {target: f.sessionName});
+  const trailingEscape = f.document.dispatch("keydown", {
+    key: "Escape", keyCode: 27, isComposing: false, target: f.sessionName
+  });
+  assert.equal(trailingEscape.defaultPrevented, true);
+  assert.equal(f.dialog.open, true);
+  assert.equal(f.form.resetCalls, resets);
+
+  const normalEscape = f.document.dispatch("keydown", {
+    key: "Escape", keyCode: 27, isComposing: false, target: f.sessionName
+  });
+  assert.equal(normalEscape.defaultPrevented, true);
+  assert.equal(f.dialog.open, false);
+  assert.equal(f.form.resetCalls, resets + 1);
+});
+
+test("composition guard expires before a later intentional modal Escape", async () => {
+  const f = fixture();
+  modalUI.bind(f.document, async () => response(201, { sessionId: "created" }));
+  f.trigger.dispatch("click");
+  f.document.dispatch("compositionstart", {target: f.sessionName});
+  f.document.dispatch("compositionend", {target: f.sessionName});
+  await new Promise((resolve) => setTimeout(resolve, 0));
+  f.document.dispatch("keydown", {key: "Escape", target: f.sessionName});
+  assert.equal(f.dialog.open, false);
+});
+
+test("repository composition preserves combobox then modal two-step Escape", () => {
+  const f = fixture();
+  modalUI.bind(f.document, async () => response(201, { sessionId: "created" }));
+  f.trigger.dispatch("click");
+  f.repositoryQuery.value = "one";
+  f.repositoryQuery.dispatch("input");
+  assert.equal(f.repositoryQuery.getAttribute("aria-expanded"), "true");
+
+  f.document.dispatch("compositionstart", {target: f.repositoryQuery});
+  f.repositoryQuery.dispatch("compositionstart");
+  f.document.dispatch("compositionend", {target: f.repositoryQuery});
+  f.repositoryQuery.dispatch("compositionend");
+  f.document.dispatch("keydown", {key: "Escape", target: f.repositoryQuery});
+  f.repositoryQuery.dispatch("keydown", {key: "Escape"});
+  assert.equal(f.repositoryQuery.getAttribute("aria-expanded"), "true");
+  assert.equal(f.dialog.open, true);
+
+  f.document.dispatch("keydown", {key: "Escape", target: f.repositoryQuery});
+  f.repositoryQuery.dispatch("keydown", {key: "Escape"});
+  assert.equal(f.repositoryQuery.getAttribute("aria-expanded"), "false");
+  assert.equal(f.dialog.open, true);
+
+  f.document.dispatch("keydown", {key: "Escape", target: f.repositoryQuery});
+  assert.equal(f.dialog.open, false);
 });
 
 test("Escape is capture-consumed while open before terminal interrupt but unchanged outside", () => {

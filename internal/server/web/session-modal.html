@@ -26,6 +26,7 @@
           <div id="repository-option-{{$index}}" role="option" aria-selected="false"
             data-repository-option data-value="{{$repository.Slug}}">{{$repository.Slug}}</div>
           {{end}}
+          <div class="repository-empty" role="presentation" data-repository-empty hidden>No configured repositories match.</div>
         </div>
         <div id="start-repository-results" class="repository-results" role="status"
           aria-live="polite" data-repository-results></div>

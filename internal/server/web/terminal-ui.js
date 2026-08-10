@@ -8,9 +8,13 @@
 
   var capabilityAttributes = ["data-can-steer", "data-can-interrupt", "data-can-stop"];
 
+  function isCompositionKey(event) {
+    return !!event && (event.isComposing === true || event.keyCode === 229);
+  }
+
   function keyAction(event, context) {
     context = context || {};
-    if (!event || event.isComposing || event.altKey || event.metaKey) return null;
+    if (!event || isCompositionKey(event) || event.altKey || event.metaKey) return null;
     if (event.key === "Enter" && context.target === "deck") {
       return !event.ctrlKey && !event.shiftKey ? "submit" : null;
     }
@@ -235,6 +239,7 @@
   }
 
   return {
+    isCompositionKey: isCompositionKey,
     keyAction: keyAction,
     nextToolExpansion: nextToolExpansion,
     hasTextSelection: hasTextSelection,

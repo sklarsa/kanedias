@@ -61,7 +61,7 @@
 
     var savedWidthValue = readStorage(WIDTH_KEY);
     var savedWidth = Number(savedWidthValue);
-    var preferredWidth = savedWidthValue !== null && Number.isFinite(savedWidth)
+    var preferredWidth = savedWidthValue !== null && savedWidthValue.trim() !== "" && Number.isFinite(savedWidth)
       ? savedWidth
       : defaultWidth(windowObject.innerWidth);
     var effectiveWidth = clampWidth(preferredWidth, windowObject.innerWidth);
@@ -98,9 +98,14 @@
 
     function syncCollapseControls() {
       var controls = documentObject.querySelectorAll("[data-fleet-collapse]");
+      var currentSidebar = sidebar();
+      var expanded = isMobile()
+        ? !!currentSidebar && currentSidebar.classList.contains("open")
+        : !collapsed;
       for (var index = 0; index < controls.length; index++) {
         controls[index].setAttribute("aria-label", "Hide Fleet");
         controls[index].setAttribute("aria-controls", "fleet-panel");
+        controls[index].setAttribute("aria-expanded", expanded ? "true" : "false");
       }
     }
 

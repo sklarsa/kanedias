@@ -74,10 +74,10 @@
     };
   }
 
-  function buildRequest(dialog) {
+  function buildRequest(dialog, repositoryValue) {
     return {
       name: dialog.querySelector("[data-session-name]").value,
-      repository: dialog.querySelector("[data-start-repository]").value,
+      repository: repositoryValue,
       root: selection(
         dialog.querySelector("[data-root-model]"),
         dialog.querySelector("[data-root-thinking]")
@@ -200,6 +200,13 @@
     var removers = [];
     var pendingSnapshot = null;
     var requestGeneration = 0;
+    var composing = false;
+    var ignoreNextKey = false;
+    var compositionTimer = null;
+
+    function isCompositionKey(event) {
+      return !!event && (event.isComposing === true || event.keyCode === 229);
+    }
 
     function listen(target, type, listener, options) {
       if (!target) return;
@@ -235,7 +242,15 @@
       rebuildAll();
     }
 
+    function clearCompositionState() {
+      if (compositionTimer !== null) clearTimeout(compositionTimer);
+      compositionTimer = null;
+      composing = false;
+      ignoreNextKey = false;
+    }
+
     function reset() {
+      clearCompositionState();
       form.reset();
       repository.reset();
       modelPairs.forEach(function (pair) {
@@ -274,11 +289,12 @@
         if (status) status.textContent = repositoryValidation.message;
         return;
       }
+      var repositoryValue = repository.value();
       var generation = ++requestGeneration;
       setPending(true);
       var request;
       try {
-        request = buildRequest(dialog);
+        request = buildRequest(dialog, repositoryValue);
       } catch (_error) {
         setPending(false);
         if (status) status.textContent = GENERIC_ERROR;
@@ -329,8 +345,40 @@
       closeAndReset();
     }
 
+    function onCompositionStart() {
+      clearCompositionState();
+      composing = true;
+    }
+
+    function onCompositionEnd() {
+      clearCompositionState();
+      ignoreNextKey = true;
+      compositionTimer = setTimeout(function () {
+        compositionTimer = null;
+        ignoreNextKey = false;
+      }, 0);
+    }
+
     function escapeGuard(event) {
-      if (event.key !== "Escape" || !dialog.open) return;
+      if (!dialog.open) return;
+      if (composing || isCompositionKey(event)) {
+        if (event.key === "Escape") {
+          event.preventDefault();
+          event.stopImmediatePropagation();
+        }
+        return;
+      }
+      if (ignoreNextKey) {
+        if (compositionTimer !== null) clearTimeout(compositionTimer);
+        compositionTimer = null;
+        ignoreNextKey = false;
+        if (event.key === "Escape") {
+          event.preventDefault();
+          event.stopImmediatePropagation();
+        }
+        return;
+      }
+      if (event.key !== "Escape") return;
       if (event.target === repositoryQuery && repositoryQuery.getAttribute("aria-expanded") === "true") return;
       event.preventDefault();
       event.stopImmediatePropagation();
@@ -343,6 +391,8 @@
     listen(dialog, "click", backdropClick);
     listen(dialog, "cancel", nativeCancel);
     listen(form, "submit", onSubmit);
+    listen(documentObject, "compositionstart", onCompositionStart, true);
+    listen(documentObject, "compositionend", onCompositionEnd, true);
     listen(documentObject, "keydown", escapeGuard, true);
     modelPairs.forEach(function (pair) {
       listen(pair.model, "change", function () {
@@ -355,6 +405,7 @@
       close: closeAndReset,
       destroy: function () {
         requestGeneration++;
+        clearCompositionState();
         setPending(false);
         removers.forEach(function (remove) { remove(); });
         removers = [];

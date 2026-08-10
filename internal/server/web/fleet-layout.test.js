@@ -190,12 +190,19 @@ test("saved preferred width survives a narrow viewport clamp", () => {
   assert.equal(controller.state().effectiveWidth, 540);
 });
 
-test("invalid or throwing storage falls back without aborting bind", () => {
+test("invalid, empty, whitespace, or throwing storage falls back without aborting bind", () => {
   const f = fixture({innerWidth: 1400, storage: throwingStorage()});
   assert.doesNotThrow(() => layout.bind(f.document, f.window, f.storage));
-  assert.equal(layout.bind(f.document, f.window, fakeStorage({
-    "kanedias.fleet.width.v1": "not-a-number"
-  })).state().preferredWidth, 340);
+  for (const saved of ["not-a-number", "", "   \t"] ) {
+    const stored = fixture({innerWidth: 1400, storage: fakeStorage({
+      "kanedias.fleet.width.v1": saved
+    })});
+    assert.equal(layout.bind(stored.document, stored.window, stored.storage).state().preferredWidth, 340);
+  }
+  const responsive = fixture({innerWidth: 900, storage: fakeStorage({
+    "kanedias.fleet.width.v1": " "
+  })});
+  assert.equal(layout.bind(responsive.document, responsive.window, responsive.storage).state().preferredWidth, 300);
 });
 
 test("pointer and keyboard resizing clamp, persist, and synchronize ARIA", () => {
@@ -232,14 +239,20 @@ test("patched collapse controls hide and restore through the stable top bar", ()
   const collapse = f.installCollapseButton();
   assert.equal(collapse.getAttribute("aria-label"), "Hide Fleet");
   assert.equal(collapse.getAttribute("aria-controls"), "fleet-panel");
+  assert.equal(collapse.getAttribute("aria-expanded"), "true");
   collapse.click();
   assert.equal(controller.state().collapsed, true);
   assert.equal(f.app.classList.contains("fleet-collapsed"), true);
   assert.equal(f.storage.getItem("kanedias.fleet.collapsed.v1"), "true");
   assert.equal(f.menu.getAttribute("aria-label"), "Show Fleet");
+  assert.equal(collapse.getAttribute("aria-expanded"), "false");
+  const patchedWhileCollapsed = f.installCollapseButton();
+  assert.equal(patchedWhileCollapsed.getAttribute("aria-expanded"), "false");
   f.menu.click();
   assert.equal(controller.state().collapsed, false);
   assert.equal(f.storage.getItem("kanedias.fleet.collapsed.v1"), "false");
+  assert.equal(collapse.getAttribute("aria-expanded"), "true");
+  assert.equal(patchedWhileCollapsed.getAttribute("aria-expanded"), "true");
 });
 
 test("show restores a question-hidden Fleet without changing width", () => {
