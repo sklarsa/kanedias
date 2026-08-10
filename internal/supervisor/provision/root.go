@@ -106,6 +106,9 @@ func (provisioner *IncusRootProvisioner) ProvisionRoot(ctx context.Context, requ
 	if err := validateRootModel(request.Model); err != nil {
 		return nil, contract.NewError(contract.ErrorInvalidRequest, err.Error())
 	}
+	if err := request.Workspace.Validate(); err != nil {
+		return nil, contract.NewError(contract.ErrorInvalidRequest, err.Error())
+	}
 	if err := provisioner.config.ValidateLifecycle(); err != nil {
 		return nil, err
 	}
@@ -243,6 +246,7 @@ func (provisioner *IncusRootProvisioner) ProvisionRoot(ctx context.Context, requ
 				"environment.KANEDIAS_PI_MODEL":          request.Model.Model,
 				"environment.KANEDIAS_PI_THINKING":       request.Model.ThinkingLevel,
 				"environment.KANEDIAS_PI_SESSION_FILE":   "",
+				"environment.KANEDIAS_PI_WORKDIR":        request.Workspace.Directory(),
 				"environment.KANEDIAS_SUPERVISOR_SOCKET": guestSupervisorSocket,
 			},
 			Devices: api.DevicesMap{
@@ -281,9 +285,9 @@ func (provisioner *IncusRootProvisioner) ProvisionRoot(ctx context.Context, requ
 	}
 	owned.running = true
 
-	// Repair the cloned workspace's seeded ownership immediately after start and
-	// before any RPC readiness gate, so descendants never surface root-owned.
-	if err := prepareSessionWorkspace(ctx, client, name, config.WorkspaceStart{}); err != nil {
+	// Repair and validate the cloned workspace immediately after start and before
+	// any RPC readiness gate, so Pi only starts in an attested checkout.
+	if err := prepareSessionWorkspace(ctx, client, name, request.Workspace); err != nil {
 		return nil, err
 	}
 

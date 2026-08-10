@@ -9,21 +9,22 @@ import (
 type ErrorCode string
 
 const (
-	ErrorInvalidRequest     ErrorCode = "invalid_request"
-	ErrorUnknownWorkerType  ErrorCode = "unknown_worker_type"
-	ErrorForbiddenRPC       ErrorCode = "forbidden_rpc"
-	ErrorProxyUnavailable   ErrorCode = "proxy_unavailable"
-	ErrorProvisioningFailed ErrorCode = "provisioning_failed"
-	ErrorChildFailed        ErrorCode = "child_failed"
-	ErrorChildAborted       ErrorCode = "child_aborted"
-	ErrorHandoffRefMissing  ErrorCode = "handoff_ref_missing"
-	ErrorHandoffRefMismatch ErrorCode = "handoff_ref_mismatch"
-	ErrorSessionStopping    ErrorCode = "session_stopping"
-	ErrorNotFound           ErrorCode = "not_found"
-	ErrorChildUnavailable   ErrorCode = "child_unavailable"
-	ErrorConflict           ErrorCode = "conflict"
-	ErrorSaturated          ErrorCode = "saturated"
-	ErrorInternal           ErrorCode = "internal"
+	ErrorInvalidRequest                 ErrorCode = "invalid_request"
+	ErrorUnknownWorkerType              ErrorCode = "unknown_worker_type"
+	ErrorForbiddenRPC                   ErrorCode = "forbidden_rpc"
+	ErrorProxyUnavailable               ErrorCode = "proxy_unavailable"
+	ErrorWorkspaceRepositoryUnavailable ErrorCode = "workspace_repository_unavailable"
+	ErrorProvisioningFailed             ErrorCode = "provisioning_failed"
+	ErrorChildFailed                    ErrorCode = "child_failed"
+	ErrorChildAborted                   ErrorCode = "child_aborted"
+	ErrorHandoffRefMissing              ErrorCode = "handoff_ref_missing"
+	ErrorHandoffRefMismatch             ErrorCode = "handoff_ref_mismatch"
+	ErrorSessionStopping                ErrorCode = "session_stopping"
+	ErrorNotFound                       ErrorCode = "not_found"
+	ErrorChildUnavailable               ErrorCode = "child_unavailable"
+	ErrorConflict                       ErrorCode = "conflict"
+	ErrorSaturated                      ErrorCode = "saturated"
+	ErrorInternal                       ErrorCode = "internal"
 )
 
 type Error struct {
@@ -53,6 +54,8 @@ func (code ErrorCode) HTTPStatus() int {
 		return http.StatusNotFound
 	case ErrorSaturated:
 		return http.StatusTooManyRequests
+	case ErrorWorkspaceRepositoryUnavailable:
+		return http.StatusServiceUnavailable
 	case ErrorProxyUnavailable, ErrorChildFailed, ErrorChildUnavailable:
 		return http.StatusBadGateway
 	case ErrorProvisioningFailed, ErrorInternal:
