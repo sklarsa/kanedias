@@ -22,15 +22,24 @@ type SessionOptions struct {
 	RootStatus io.WriteCloser
 }
 
-type onceWriteCloser struct {
-	io.WriteCloser
+type onceFile struct {
+	*os.File
 	once sync.Once
 	err  error
 }
 
-func (closer *onceWriteCloser) Close() error {
-	closer.once.Do(func() { closer.err = closer.WriteCloser.Close() })
-	return closer.err
+func (file *onceFile) Close() error {
+	file.once.Do(func() { file.err = file.File.Close() })
+	return file.err
+}
+
+func openSessionInheritedFile(descriptor int, name string) *onceFile {
+	syscall.CloseOnExec(descriptor)
+	file := os.NewFile(uintptr(descriptor), name)
+	if file == nil {
+		return nil
+	}
+	return &onceFile{File: file}
 }
 
 func newSessionCommand(service services, configPath func() string) *cobra.Command {
@@ -44,6 +53,38 @@ func newSessionCommand(service services, configPath func() string) *cobra.Comman
 		RunE: func(cmd *cobra.Command, _ []string) error {
 			inheritedBootstrap := cmd.Flags().Changed("bootstrap-fd")
 			inheritedStatus := cmd.Flags().Changed("status-fd")
+
+			// Own every supplied non-stdio descriptor before validating the pair,
+			// so a bad counterpart cannot leak an otherwise valid endpoint. Equal
+			// descriptors share one idempotently closed file object.
+			owned := make(map[int]*onceFile, 2)
+			own := func(descriptor int, name string) *onceFile {
+				if descriptor < process.RootBootstrapFD {
+					return nil
+				}
+				if file := owned[descriptor]; file != nil {
+					return file
+				}
+				file := openSessionInheritedFile(descriptor, name)
+				if file != nil {
+					owned[descriptor] = file
+				}
+				return file
+			}
+			var bootstrapFile, rootStatus *onceFile
+			if inheritedBootstrap {
+				bootstrapFile = own(bootstrapFD, "root-bootstrap")
+				if bootstrapFile != nil {
+					defer bootstrapFile.Close()
+				}
+			}
+			if inheritedStatus {
+				rootStatus = own(statusFD, "root-status")
+				if rootStatus != nil {
+					defer rootStatus.Close()
+				}
+			}
+
 			if inheritedBootstrap && bootstrapFD < process.RootBootstrapFD {
 				return fmt.Errorf("--bootstrap-fd must be at least %d", process.RootBootstrapFD)
 			}
@@ -53,23 +94,13 @@ func newSessionCommand(service services, configPath func() string) *cobra.Comman
 			if inheritedBootstrap && inheritedStatus && bootstrapFD == statusFD {
 				return fmt.Errorf("--bootstrap-fd and --status-fd must be distinct")
 			}
-
-			var rootStatus *onceWriteCloser
-			if inheritedStatus {
-				syscall.CloseOnExec(statusFD)
-				statusFile := os.NewFile(uintptr(statusFD), "root-status")
-				if statusFile == nil {
-					return fmt.Errorf("open inherited root status descriptor %d", statusFD)
-				}
-				rootStatus = &onceWriteCloser{WriteCloser: statusFile}
-				defer rootStatus.Close()
+			if inheritedStatus && rootStatus == nil {
+				return fmt.Errorf("open inherited root status descriptor %d", statusFD)
 			}
 
 			var policy config.SessionModelPolicy
 			var workspace config.WorkspaceStart
 			if inheritedBootstrap {
-				syscall.CloseOnExec(bootstrapFD)
-				bootstrapFile := os.NewFile(uintptr(bootstrapFD), "root-bootstrap")
 				if bootstrapFile == nil {
 					return fmt.Errorf("open inherited root bootstrap descriptor %d", bootstrapFD)
 				}

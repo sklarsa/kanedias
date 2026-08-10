@@ -672,6 +672,57 @@ func TestRootSpawnerRealExecSetsSid(t *testing.T) {
 
 // ---- Admission polling tests ----
 
+type probeHookClient struct {
+	*fakeClient
+	hook func()
+}
+
+func (client *probeHookClient) Snapshot(ctx context.Context) (supervisor.NodeSnapshot, error) {
+	if client.hook != nil {
+		client.hook()
+	}
+	return client.fakeClient.Snapshot(ctx)
+}
+
+func TestSpawnRootProbeExitBeforeCommitIsRejected(t *testing.T) {
+	dir := t.TempDir()
+	socketPath := makeRootSocket(t, dir, "probe-exit.root.sock")
+	processFake := newFakeProcess(9201)
+	status := make(chan rootStatusResult, 1)
+	status <- rootStatusResult{status: process.RootStartupStatus{Status: process.RootStartupReady}}
+	client := &probeHookClient{fakeClient: &fakeClient{snapshot: rootTree("probe-exit")}, hook: func() {
+		processFake.exit(exec.ErrNotFound)
+	}}
+	m := fakeManager(func(string) (rootClient, error) { return client, nil })
+	pending := &pendingRoot{socketPath: socketPath, process: processFake, statusResult: status}
+	rootID, err := m.admitRoot(context.Background(), pending)
+	if rootID != "" || err == nil || !errors.Is(err, exec.ErrNotFound) {
+		t.Fatalf("admitRoot = (%q, %v), want post-probe process-exit rejection", rootID, err)
+	}
+	if len(m.roots) != 0 {
+		t.Fatalf("post-probe exited root committed: %#v", m.roots)
+	}
+}
+
+func TestSpawnRootFailureStatusDuringProbeBeforeCommitIsRejected(t *testing.T) {
+	dir := t.TempDir()
+	socketPath := makeRootSocket(t, dir, "probe-status.root.sock")
+	status := make(chan rootStatusResult, 1)
+	client := &probeHookClient{fakeClient: &fakeClient{snapshot: rootTree("probe-status")}, hook: func() {
+		status <- rootStatusResult{status: process.RootStartupStatus{Status: process.RootStartupFailure, Code: contract.ErrorWorkspaceRepositoryUnavailable}}
+	}}
+	m := fakeManager(func(string) (rootClient, error) { return client, nil })
+	pending := &pendingRoot{socketPath: socketPath, process: newFakeProcess(9202), statusResult: status}
+	rootID, err := m.admitRoot(context.Background(), pending)
+	var typed *contract.Error
+	if rootID != "" || !errors.As(err, &typed) || typed.Code != contract.ErrorWorkspaceRepositoryUnavailable {
+		t.Fatalf("admitRoot = (%q, %v), want post-probe typed repository rejection", rootID, err)
+	}
+	if len(m.roots) != 0 {
+		t.Fatalf("post-probe failed root committed: %#v", m.roots)
+	}
+}
+
 func TestSpawnRootRepositoryStatusFailureBeforeProcessExit(t *testing.T) {
 	status := make(chan rootStatusResult, 1)
 	status <- rootStatusResult{status: process.RootStartupStatus{Status: process.RootStartupFailure, Code: contract.ErrorWorkspaceRepositoryUnavailable}}

@@ -4,8 +4,10 @@ import (
 	"bytes"
 	"context"
 	"errors"
+	"fmt"
 	"io"
 	"os"
+	"os/exec"
 	"path/filepath"
 	"reflect"
 	"strconv"
@@ -321,6 +323,96 @@ func TestSessionStartupDescriptorsCloseOnBootstrapDecodeError(t *testing.T) {
 	assertDescriptorClosed(t, bootstrapFD)
 	assertDescriptorClosed(t, statusFD)
 	_ = statusRead.Close()
+}
+
+func duplicateSessionTestDescriptor(t *testing.T) int {
+	t.Helper()
+	readEnd, writeEnd, err := os.Pipe()
+	if err != nil {
+		t.Fatal(err)
+	}
+	duplicate, err := unix.FcntlInt(readEnd.Fd(), unix.F_DUPFD_CLOEXEC, 10)
+	_ = readEnd.Close()
+	_ = writeEnd.Close()
+	if err != nil {
+		t.Fatal(err)
+	}
+	return duplicate
+}
+
+func TestSessionValidationClosesEveryOwnedInheritedDescriptor(t *testing.T) {
+	for _, test := range []struct {
+		name string
+		args func(t *testing.T) ([]string, []int)
+	}{
+		{name: "invalid bootstrap and valid status", args: func(t *testing.T) ([]string, []int) {
+			statusFD := duplicateSessionTestDescriptor(t)
+			return []string{"--bootstrap-fd", "0", "--status-fd", strconv.Itoa(statusFD)}, []int{statusFD}
+		}},
+		{name: "valid bootstrap and invalid status", args: func(t *testing.T) ([]string, []int) {
+			bootstrapFD := duplicateSessionTestDescriptor(t)
+			return []string{"--bootstrap-fd", strconv.Itoa(bootstrapFD), "--status-fd", "0"}, []int{bootstrapFD}
+		}},
+		{name: "equal descriptor", args: func(t *testing.T) ([]string, []int) {
+			sharedFD := duplicateSessionTestDescriptor(t)
+			return []string{"--bootstrap-fd", strconv.Itoa(sharedFD), "--status-fd", strconv.Itoa(sharedFD)}, []int{sharedFD}
+		}},
+	} {
+		t.Run(test.name, func(t *testing.T) {
+			args, descriptors := test.args(t)
+			root := newRootCommand(stubServices(), testProxyOptions())
+			root.SetOut(io.Discard)
+			root.SetErr(io.Discard)
+			root.SetArgs(append([]string{"session", "--socket", "/tmp/root.sock"}, args...))
+			if err := root.Execute(); err == nil {
+				t.Fatal("invalid inherited descriptors succeeded")
+			}
+			for _, descriptor := range descriptors {
+				assertDescriptorClosed(t, descriptor)
+			}
+		})
+	}
+}
+
+func TestSessionInheritedFDsAreMarkedCloseOnExec(t *testing.T) {
+	if os.Getenv("KANEDIAS_SESSION_CLOEXEC_HELPER") == "1" {
+		files := make([]*onceFile, 0, 2)
+		for descriptor := process.RootBootstrapFD; descriptor <= process.RootStatusFD; descriptor++ {
+			file := openSessionInheritedFile(descriptor, fmt.Sprintf("session-inherited-%d", descriptor))
+			if file == nil {
+				t.Fatalf("open inherited fd %d", descriptor)
+			}
+			files = append(files, file)
+			flags, err := unix.FcntlInt(file.Fd(), unix.F_GETFD, 0)
+			if err != nil || flags&unix.FD_CLOEXEC == 0 {
+				t.Fatalf("fd %d flags = %#x, err = %v; want FD_CLOEXEC", descriptor, flags, err)
+			}
+		}
+		for _, file := range files {
+			_ = file.Close()
+		}
+		return
+	}
+
+	bootstrapRead, bootstrapWrite, err := os.Pipe()
+	if err != nil {
+		t.Fatal(err)
+	}
+	statusRead, statusWrite, err := os.Pipe()
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer bootstrapWrite.Close()
+	defer statusRead.Close()
+	command := exec.Command(os.Args[0], "-test.run=TestSessionInheritedFDsAreMarkedCloseOnExec", "--")
+	command.Env = append(os.Environ(), "KANEDIAS_SESSION_CLOEXEC_HELPER=1")
+	command.ExtraFiles = []*os.File{bootstrapRead, statusWrite}
+	output, err := command.CombinedOutput()
+	_ = bootstrapRead.Close()
+	_ = statusWrite.Close()
+	if err != nil {
+		t.Fatalf("CLOEXEC helper: %v: %s", err, output)
+	}
 }
 
 func TestSessionStatusDescriptorValidation(t *testing.T) {

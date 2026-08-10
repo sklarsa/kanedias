@@ -371,14 +371,7 @@ func (m *Manager) admitRoot(ctx context.Context, pending *pendingRoot) (string, 
 				return "", err
 			}
 		case <-pending.process.Done():
-			if pending.statusResult != nil {
-				result := <-pending.statusResult
-				pending.statusResult = nil
-				if err := m.rootStatusAdmissionError(result); err != nil {
-					return "", err
-				}
-			}
-			return "", fmt.Errorf("root exited before admission: %w", pending.process.WaitErr())
+			return "", m.rootExitAdmissionError(pending)
 		case <-admissionCtx.Done():
 			return "", admissionCtx.Err()
 		case <-probe.C:
@@ -416,10 +409,44 @@ func (m *Manager) admitRoot(ctx context.Context, pending *pendingRoot) (string, 
 			if !admissible(snapshot) {
 				continue
 			}
+			// The probe can block while the root exits or its startup decoder
+			// reports failure. Observe both again before making the snapshot
+			// durable, and drain status whenever process completion is visible.
+			if err := m.observeRootBeforeCommit(pending); err != nil {
+				return "", err
+			}
 			// Atomic commit.
 			return m.commitSpawn(pending, snapshot)
 		}
 	}
+}
+
+func (m *Manager) observeRootBeforeCommit(pending *pendingRoot) error {
+	select {
+	case result := <-pending.statusResult:
+		pending.statusResult = nil
+		if err := m.rootStatusAdmissionError(result); err != nil {
+			return err
+		}
+	default:
+	}
+	select {
+	case <-pending.process.Done():
+		return m.rootExitAdmissionError(pending)
+	default:
+		return nil
+	}
+}
+
+func (m *Manager) rootExitAdmissionError(pending *pendingRoot) error {
+	if pending.statusResult != nil {
+		result := <-pending.statusResult
+		pending.statusResult = nil
+		if err := m.rootStatusAdmissionError(result); err != nil {
+			return err
+		}
+	}
+	return fmt.Errorf("root exited before admission: %w", pending.process.WaitErr())
 }
 
 func (m *Manager) rootStatusAdmissionError(result rootStatusResult) error {
