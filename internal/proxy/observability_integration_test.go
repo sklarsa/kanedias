@@ -6,6 +6,7 @@ import (
 	"crypto/tls"
 	"crypto/x509"
 	"errors"
+	"fmt"
 	"io"
 	"log/slog"
 	"net"
@@ -13,8 +14,12 @@ import (
 	"net/http/httptest"
 	"net/url"
 	"strings"
+	"sync"
+	"syscall"
 	"testing"
+	"time"
 
+	"github.com/elazarl/goproxy"
 	"github.com/prometheus/client_golang/prometheus/testutil"
 )
 
@@ -167,6 +172,98 @@ func TestObservedProxyFinishesUpstreamErrors(t *testing.T) {
 			t.Fatalf("secret %q leaked into error log: %s", secret, logs.String())
 		}
 	}
+}
+
+func TestObservedProxySuppressesExpectedConnectTeardown(t *testing.T) {
+	tests := []struct {
+		name string
+		err  error
+	}{
+		{name: "cancellation", err: context.Canceled},
+		{name: "broken pipe", err: syscall.EPIPE},
+		{name: "connection reset", err: syscall.ECONNRESET},
+	}
+	for _, test := range tests {
+		t.Run(test.name, func(t *testing.T) {
+			var logs bytes.Buffer
+			handler := goproxy.NewProxyHttpServer()
+			handler.Logger = privacySafeProxyLogger{logger: slog.New(slog.NewJSONHandler(&logs, nil))}
+			handler.ConnectDial = func(string, string) (net.Conn, error) {
+				return nil, fmt.Errorf("wrapped connect teardown: %w", test.err)
+			}
+			proxyServer := httptest.NewServer(handler)
+			defer proxyServer.Close()
+			proxyURL, err := url.Parse(proxyServer.URL)
+			if err != nil {
+				t.Fatal(err)
+			}
+			client := &http.Client{Transport: &http.Transport{Proxy: http.ProxyURL(proxyURL)}}
+
+			_, err = client.Get("https://example.test/private")
+			if err == nil {
+				t.Fatal("CONNECT teardown unexpectedly succeeded")
+			}
+			if logs.Len() != 0 {
+				t.Fatalf("expected CONNECT teardown produced log: %s", logs.String())
+			}
+		})
+	}
+}
+
+func TestObservedProxySuppressesExpectedTunnelCopyTeardown(t *testing.T) {
+	var logs bytes.Buffer
+	upstream := &teardownTunnelConn{
+		err:    fmt.Errorf("wrapped tunnel teardown: %w", syscall.EPIPE),
+		closed: make(chan struct{}),
+	}
+	handler := goproxy.NewProxyHttpServer()
+	handler.Logger = privacySafeProxyLogger{logger: slog.New(slog.NewJSONHandler(&logs, nil))}
+	handler.ConnectDial = func(string, string) (net.Conn, error) {
+		return upstream, nil
+	}
+	proxyServer := httptest.NewServer(handler)
+	defer proxyServer.Close()
+	proxyURL, err := url.Parse(proxyServer.URL)
+	if err != nil {
+		t.Fatal(err)
+	}
+	client := &http.Client{
+		Timeout:   2 * time.Second,
+		Transport: &http.Transport{Proxy: http.ProxyURL(proxyURL)},
+	}
+
+	_, err = client.Get("https://example.test/private")
+	if err == nil {
+		t.Fatal("tunnel copy teardown unexpectedly succeeded")
+	}
+	select {
+	case <-upstream.closed:
+	case <-time.After(2 * time.Second):
+		t.Fatal("tunnel connection was not closed after copy teardown")
+	}
+	if logs.Len() != 0 {
+		t.Fatalf("expected tunnel copy teardown produced log: %s", logs.String())
+	}
+}
+
+type teardownTunnelConn struct {
+	err       error
+	closed    chan struct{}
+	closeOnce sync.Once
+}
+
+func (c *teardownTunnelConn) Read([]byte) (int, error)         { return 0, c.err }
+func (c *teardownTunnelConn) Write(p []byte) (int, error)      { return len(p), nil }
+func (c *teardownTunnelConn) LocalAddr() net.Addr              { return &net.TCPAddr{} }
+func (c *teardownTunnelConn) RemoteAddr() net.Addr             { return &net.TCPAddr{} }
+func (c *teardownTunnelConn) SetDeadline(time.Time) error      { return nil }
+func (c *teardownTunnelConn) SetReadDeadline(time.Time) error  { return nil }
+func (c *teardownTunnelConn) SetWriteDeadline(time.Time) error { return nil }
+func (c *teardownTunnelConn) CloseRead() error                 { return nil }
+func (c *teardownTunnelConn) CloseWrite() error                { return nil }
+func (c *teardownTunnelConn) Close() error {
+	c.closeOnce.Do(func() { close(c.closed) })
+	return nil
 }
 
 func TestObservedProxySanitizesMITMInternalErrors(t *testing.T) {
