@@ -12,7 +12,9 @@ import (
 	"path/filepath"
 	"reflect"
 	"strings"
+	"sync"
 	"testing"
+	"time"
 
 	"github.com/sklarsa/kanedias/internal/config"
 	"github.com/sklarsa/kanedias/internal/supervisor"
@@ -468,6 +470,121 @@ model_type = "missing-current-worker-default"
 	if len(nested[1].Policy.Workers) != len(originalPolicy.Workers) {
 		t.Fatalf("nested workers = %#v, want every role %#v", nested[1].Policy.Workers, originalPolicy.Workers)
 	}
+}
+
+func TestProductionReadFailurePublishesTypedMessageAndWaitsForAcknowledgement(t *testing.T) {
+	report := &recordingWriteCloser{onWrite: make(chan struct{}, 1)}
+	ackReport, ackAck := net.Pipe()
+	reporter := process.NewAcknowledgedReporter(context.Background(), report, ackAck, "session-child")
+
+	done := make(chan error, 1)
+	go func() {
+		done <- publishReadFailure(context.Background(), reporter,
+			contract.NewError(contract.ErrorChildAborted, "child was stopped"))
+	}()
+
+	select {
+	case <-report.onWrite:
+	case <-time.After(time.Second):
+		t.Fatal("typed failure was not published")
+	}
+	// The helper must remain blocked awaiting the parent acknowledgement before
+	// returning, so the runtime's deferred node teardown cannot precede ingestion.
+	select {
+	case err := <-done:
+		t.Fatalf("publishReadFailure returned before acknowledgement: %v", err)
+	case <-time.After(20 * time.Millisecond):
+	}
+	if _, err := ackReport.Write([]byte{process.TerminalAckByte}); err != nil {
+		t.Fatal(err)
+	}
+	_ = ackReport.Close()
+
+	var msg process.ChildMessage
+	if err := json.Unmarshal([]byte(report.String()), &msg); err != nil {
+		t.Fatalf("decode published failure: %v", err)
+	}
+	if msg.Type != process.MessageFailure || msg.Error == nil ||
+		msg.Error.Code != contract.ErrorChildAborted || msg.Error.Message != "child was stopped" ||
+		msg.SessionID != "session-child" {
+		t.Fatalf("published failure = %#v", msg)
+	}
+	if err := <-done; err == nil {
+		t.Fatal("publishReadFailure returned no error for a failed read")
+	}
+	if !reporter.TerminalSent() {
+		t.Fatal("terminal failure was not marked sent")
+	}
+}
+
+func TestProductionReadFailureMapsUntypedErrorToInternal(t *testing.T) {
+	report := &recordingWriteCloser{}
+	ackReport, ackAck := net.Pipe()
+	reporter := process.NewAcknowledgedReporter(context.Background(), report, ackAck, "session-child")
+	done := make(chan error, 1)
+	go func() {
+		done <- publishReadFailure(context.Background(), reporter, errors.New("boom"))
+	}()
+	if _, err := ackReport.Write([]byte{process.TerminalAckByte}); err != nil {
+		t.Fatal(err)
+	}
+	_ = ackReport.Close()
+	if err := <-done; err == nil {
+		t.Fatal("publishReadFailure returned no joined error")
+	}
+	var msg process.ChildMessage
+	if err := json.Unmarshal([]byte(report.String()), &msg); err != nil {
+		t.Fatalf("decode published failure: %v", err)
+	}
+	if msg.Error == nil || msg.Error.Code != contract.ErrorInternal || msg.Error.Message != "internal supervisor error" {
+		t.Fatalf("untyped failure mapped to %#v", msg.Error)
+	}
+}
+
+func TestInheritedCancellationPublishesNoTerminalFailure(t *testing.T) {
+	report := &recordingWriteCloser{}
+	ackReport, ackAck := net.Pipe()
+	defer func() { _ = ackAck.Close() }()
+	defer func() { _ = ackReport.Close() }()
+	reporter := process.NewAcknowledgedReporter(context.Background(), report, ackAck, "session-child")
+	ctx, cancel := context.WithCancel(context.Background())
+	cancel()
+	err := publishReadFailure(ctx, reporter, contract.NewError(contract.ErrorChildAborted, "child was stopped"))
+	if !errors.Is(err, context.Canceled) {
+		t.Fatalf("publishReadFailure returned %v, want context.Canceled under inherited cancellation", err)
+	}
+	if reporter.TerminalSent() {
+		t.Fatal("terminal failure published under inherited cancellation")
+	}
+	if report.String() != "" {
+		t.Fatalf("terminal report written under inherited cancellation: %q", report.String())
+	}
+}
+
+// recordingWriteCloser captures report bytes and optionally signals once per write.
+type recordingWriteCloser struct {
+	mu      sync.Mutex
+	buf     bytes.Buffer
+	onWrite chan struct{}
+}
+
+func (w *recordingWriteCloser) Write(p []byte) (int, error) {
+	w.mu.Lock()
+	defer w.mu.Unlock()
+	w.buf.Write(p)
+	if w.onWrite != nil {
+		select {
+		case w.onWrite <- struct{}{}:
+		default:
+		}
+	}
+	return len(p), nil
+}
+
+func (w *recordingWriteCloser) String() string {
+	w.mu.Lock()
+	defer w.mu.Unlock()
+	return w.buf.String()
 }
 
 func runtimePolicyBootstrap(t *testing.T) process.Bootstrap {

@@ -375,7 +375,7 @@ func productionChildRunnerWithRuntime(ctx context.Context, bootstrap process.Boo
 	case contract.ChildKindRead:
 		readResult, err := node.RunReadTask(ctx, bootstrap.Request.Task)
 		if err != nil {
-			return err
+			return publishReadFailure(ctx, reporter, err)
 		}
 		return reporter.Read(readResult)
 	case contract.ChildKindWrite:
@@ -391,6 +391,29 @@ func productionChildRunnerWithRuntime(ctx context.Context, bootstrap process.Boo
 	default:
 		return contract.NewError(contract.ErrorConflict, "unsupported child kind")
 	}
+}
+
+// publishReadFailure publishes a typed privacy-safe terminal failure over the
+// inherited report/ack channels for a failed read child while its supervisor
+// transport is still live, so the runtime's deferred node teardown cannot close
+// Unix/SSE before the direct parent ingests and acknowledges the report. When the
+// inherited context is already cancelled, it publishes nothing and returns the
+// context error: parent-liveness cancellation is already the canonical signal and
+// must not produce a terminal report. reporter.Failure blocks for the exact
+// parent acknowledgement; parent-liveness cancellation still unblocks that wait.
+func publishReadFailure(ctx context.Context, reporter *process.Reporter, runErr error) error {
+	if ctx.Err() != nil {
+		return ctx.Err()
+	}
+	code := contract.ErrorInternal
+	message := "internal supervisor error"
+	var typed *contract.Error
+	if errors.As(runErr, &typed) {
+		code = typed.Code
+		message = typed.Message
+	}
+	reportErr := reporter.Failure(code, message)
+	return errors.Join(runErr, reportErr)
 }
 
 func recoverySocketIdentity(path string) (provision.SocketIdentity, error) {

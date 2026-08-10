@@ -44,6 +44,27 @@ type ChildProcess interface {
 
 type ChildSpawner func(context.Context, process.Bootstrap) (ChildProcess, error)
 
+// childDisposition is the single linearization point between terminal acceptance
+// and an external direct-child cancellation. Exactly one side wins; later claims
+// from the losing side are rejected, so a race can never both acknowledge a
+// terminal report and cancel a child.
+type childDisposition uint8
+
+const (
+	childUndecided childDisposition = iota
+	childAccepted                   // terminal acceptance linearized first
+	childCancelled                  // external cancellation linearized first
+)
+
+// childCleanupMode selects how a direct child's cleanup signals its stop.
+type childCleanupMode uint8
+
+const (
+	childCleanupComplete  childCleanupMode = iota // terminal acceptance: no stop signaled
+	childCleanupForced                            // generic startup/runtime failure: route descendant stop
+	childCleanupCancelled                         // external cancellation: ack + liveness, no HTTP stop
+)
+
 type childEntry struct {
 	id       string
 	socket   string
@@ -57,6 +78,7 @@ type childEntry struct {
 	spawnOnce   sync.Once
 	eventCancel context.CancelFunc
 	recovery    *provision.RecoveryTicket
+	disposition childDisposition
 
 	cleanupOnce        sync.Once
 	cleanupDone        chan struct{}
@@ -113,6 +135,45 @@ func (entry *childEntry) setStreamError(err error) {
 	entry.mu.Lock()
 	entry.streamErr = err
 	entry.mu.Unlock()
+}
+
+// claimAccepted claims the terminal-acceptance disposition, marking descendant SSE
+// closure expected is deferred to the caller only after a successful claim. It
+// returns true only for the first (winning) claim; once cancellation has already
+// won, a terminal report must never be acknowledged.
+func (entry *childEntry) claimAccepted() bool {
+	entry.mu.Lock()
+	defer entry.mu.Unlock()
+	if entry.disposition != childUndecided {
+		return false
+	}
+	entry.disposition = childAccepted
+	return true
+}
+
+// claimCancelled claims the external-cancellation disposition. It returns true
+// only for the first (winning) claim; after terminal acceptance has already won,
+// an external cancellation is benign and still bounds its own cleanup.
+func (entry *childEntry) claimCancelled() bool {
+	entry.mu.Lock()
+	defer entry.mu.Unlock()
+	if entry.disposition != childUndecided {
+		return false
+	}
+	entry.disposition = childCancelled
+	return true
+}
+
+func (entry *childEntry) isCancelled() bool {
+	entry.mu.RLock()
+	defer entry.mu.RUnlock()
+	return entry.disposition == childCancelled
+}
+
+func (entry *childEntry) isAccepted() bool {
+	entry.mu.RLock()
+	defer entry.mu.RUnlock()
+	return entry.disposition == childAccepted
 }
 
 func (entry *childEntry) expectEventStreamClose() {
@@ -234,6 +295,38 @@ func (node *Node) forwardChildEvents(ctx context.Context, cancel context.CancelF
 }
 
 func (node *Node) cleanupChild(ctx context.Context, entry *childEntry, requestStop bool) error {
+	if requestStop {
+		return node.cleanupChildMode(ctx, entry, childCleanupForced)
+	}
+	return node.cleanupChildMode(ctx, entry, childCleanupComplete)
+}
+
+// cancelChildExternal is the parent-owned cancellation path for a directly-owned
+// child. It linearizes external cancellation ahead of any terminal acceptance,
+// closes the terminal-ack endpoint without acknowledging and the inherited
+// parent-liveness endpoint (the canonical cancellation signal that recursively
+// stops the child subtree), then bounds process wait/escalation/recovery/removal.
+// It never routes a descendant HTTP stop before the liveness EOF and never turns
+// the expected closed child server into a cleanup failure.
+func (node *Node) cancelChildExternal(ctx context.Context, entry *childEntry) error {
+	entry.claimCancelled()
+	return node.cleanupChildMode(ctx, entry, childCleanupCancelled)
+}
+
+// awaitChildCancellation waits for the one bounded cleanup already running for an
+// externally cancelled child and reports exact child_aborted to the blocked
+// CreateChild caller. It never acknowledges a terminal report.
+func (node *Node) awaitChildCancellation(ctx context.Context, entry *childEntry) error {
+	cleanupCtx, cancel := context.WithTimeout(context.WithoutCancel(ctx), node.childStopTimeout())
+	defer cancel()
+	select {
+	case <-entry.cleanupDone:
+	case <-cleanupCtx.Done():
+	}
+	return contract.NewError(contract.ErrorChildAborted, "child was stopped")
+}
+
+func (node *Node) cleanupChildMode(ctx context.Context, entry *childEntry, mode childCleanupMode) error {
 	entry.cleanupOnce.Do(func() {
 		defer close(entry.cleanupDone)
 		client, child, cancelEvents := entry.values()
@@ -248,18 +341,30 @@ func (node *Node) cleanupChild(ctx context.Context, entry *childEntry, requestSt
 			client, child, cancelEvents = entry.values()
 		}
 		var cleanupErr error
-		if child != nil && requestStop {
-			// A forced/cancelled stop is not a terminal acceptance. Closing the
-			// private ack endpoint unblocks any terminal reporter without granting
-			// acknowledgement, then normal stop cascades through the child subtree.
-			cleanupErr = errors.Join(cleanupErr, child.CloseTerminalAck())
-			// Mark and cancel event ownership before any intentional child stop.
-			// Its server may close SSE as part of Stop before the process/report
-			// paths have otherwise had a chance to classify that EOF.
-			entry.expectEventStreamClose()
-			if client != nil {
-				cleanupErr = errors.Join(cleanupErr, client.Stop(ctx, entry.id))
-			} else {
+		if child != nil {
+			switch mode {
+			case childCleanupForced:
+				// A forced/cancelled stop is not a terminal acceptance. Closing the
+				// private ack endpoint unblocks any terminal reporter without granting
+				// acknowledgement, then normal stop cascades through the child subtree.
+				cleanupErr = errors.Join(cleanupErr, child.CloseTerminalAck())
+				// Mark and cancel event ownership before any intentional child stop.
+				// Its server may close SSE as part of Stop before the process/report
+				// paths have otherwise had a chance to classify that EOF.
+				entry.expectEventStreamClose()
+				if client != nil {
+					cleanupErr = errors.Join(cleanupErr, client.Stop(ctx, entry.id))
+				} else {
+					cleanupErr = errors.Join(cleanupErr, child.CloseLiveness())
+				}
+			case childCleanupCancelled:
+				// External cancellation already claimed the disposition in
+				// cancelChildExternal. Close the ack endpoint without acknowledging
+				// and close the inherited parent-liveness endpoint as the canonical
+				// cancellation signal. Do not wait for a descendant HTTP stop before
+				// the liveness EOF.
+				cleanupErr = errors.Join(cleanupErr, child.CloseTerminalAck())
+				entry.expectEventStreamClose()
 				cleanupErr = errors.Join(cleanupErr, child.CloseLiveness())
 			}
 		}
@@ -328,7 +433,7 @@ func (node *Node) stopChildren(ctx context.Context) error {
 		wait.Add(1)
 		go func(index int, entry *childEntry) {
 			defer wait.Done()
-			errorsByChild[index] = node.cleanupChild(ctx, entry, true)
+			errorsByChild[index] = node.cancelChildExternal(ctx, entry)
 		}(index, entry)
 	}
 	wait.Wait()

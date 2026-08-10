@@ -52,6 +52,12 @@ func (node *Node) RunReadTask(ctx context.Context, task string) (contract.ReadCh
 				}
 				event = liveEvent
 			case <-local.rpc.Done():
+				if ctx.Err() != nil {
+					// The inherited read context was already cancelled. Prefer that
+					// cancellation over classifying the racing Pi RPC EOF as a child
+					// failure, so parent-liveness cancellation stays a cancellation.
+					return contract.ReadChildResult{}, ctx.Err()
+				}
 				return contract.ReadChildResult{}, childFailure(contract.ErrorChildFailed, "Pi RPC stream ended before read settlement", local.rpc.Err())
 			case <-ctx.Done():
 				return contract.ReadChildResult{}, ctx.Err()

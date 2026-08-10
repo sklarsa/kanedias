@@ -384,6 +384,12 @@ func (node *Node) CreateChild(ctx context.Context, parent string, request contra
 
 	message, err := child.NextMessage(ctx)
 	if err != nil {
+		// External cancellation linearized before a terminal report; this expected
+		// stream end is a cancellation, never a child_failed. Wait for the one
+		// bounded cleanup already running and report exact child_aborted.
+		if entry.isCancelled() {
+			return TerminalResult{}, node.awaitChildCancellation(ctx, entry)
+		}
 		return TerminalResult{}, node.failChildCreation(ctx, entry, err)
 	}
 	if message.SessionID != childID {
@@ -415,11 +421,22 @@ func (node *Node) CreateChild(ctx context.Context, parent string, request contra
 	}
 
 	// The terminal report has now been ingested and checked against the exact
-	// admission. Mark SSE closure expected before acknowledging that same report.
-	// The child cannot return from Reporter.Read/Write/Failure and begin teardown
-	// until this inherited protocol write succeeds.
+	// admission. If an external cancellation already won the disposition, never
+	// acknowledge a terminal; await the running cancellation and report
+	// child_aborted instead.
+	if !entry.claimAccepted() {
+		return TerminalResult{}, node.awaitChildCancellation(ctx, entry)
+	}
+	// Mark SSE closure expected before acknowledging that same report. The child
+	// cannot return from Reporter.Read/Write/Failure and begin teardown until this
+	// inherited protocol write succeeds.
 	entry.expectEventStreamClose()
 	if err := child.AcknowledgeTerminal(message); err != nil {
+		// A cancellation that won during the acknowledgement race is still an
+		// external cancellation, not a child_failed acknowledgement fault.
+		if entry.isCancelled() {
+			return TerminalResult{}, node.awaitChildCancellation(ctx, entry)
+		}
 		return TerminalResult{}, node.failChildCreation(ctx, entry, errors.Join(contract.NewError(contract.ErrorChildFailed, "acknowledge child terminal report failed"), err))
 	}
 

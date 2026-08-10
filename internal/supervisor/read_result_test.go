@@ -151,6 +151,65 @@ func boundReadNodeForContext(t *testing.T, mode contract.ContextMode) (*Node, ne
 	return &Node{identity: identity, broker: broker, local: local, state: LifecycleReady}, peer
 }
 
+// TestRunReadTaskPrefersCancelledContextOverRPCStreamEnd proves that when the
+// inherited read context is already cancelled, RunReadTask returns that context
+// error rather than classifying a racing Pi RPC stream EOF as child_failed.
+// The select between the already-cancelled context and the RPC EOF is random, so
+// the assertion (always context.Canceled) is repeated across many trials so that
+// any single rpc.Done selection that incorrectly returns child_failed fails RED.
+func TestRunReadTaskPrefersCancelledContextOverRPCStreamEnd(t *testing.T) {
+	for trial := 0; trial < 40; trial++ {
+		identity, err := NewIdentity(IdentitySpec{SessionID: "child-1", ParentID: "root-1", RootID: "root-1", Kind: contract.ChildKindRead, Context: contract.ContextFresh, Worker: "reviewer"})
+		if err != nil {
+			t.Fatal(err)
+		}
+		host, peer := net.Pipe()
+		defer func() { _ = peer.Close() }()
+		rpc := pirpc.NewClient(host)
+		broker := NewEventBroker()
+		local := NewLocalSession(identity, rpc, broker)
+		serverDone := make(chan struct{})
+		promptAcked := make(chan struct{})
+		release := make(chan struct{})
+		go func() {
+			defer close(serverDone)
+			reader := bufio.NewReader(peer)
+			getState := readRPCCommand(t, reader)
+			writeRPCResponse(t, peer, getState.ID, "get_state", true, map[string]any{"sessionId": "pi-child", "sessionFile": "/tmp/child.jsonl", "isStreaming": false})
+			prompt := readRPCCommand(t, reader)
+			writeRPCResponse(t, peer, prompt.ID, "prompt", true, nil)
+			close(promptAcked)
+			// Await the release so the prompt is submitted under a live context before
+			// the transport EOF races the cancellation inside RunReadTask.
+			<-release
+			_ = peer.Close()
+		}()
+		if err := local.Bind(context.Background()); err != nil {
+			t.Fatal(err)
+		}
+		node := &Node{identity: identity, broker: broker, local: local, state: LifecycleReady}
+
+		ctx, cancel := context.WithCancel(context.Background())
+		result := make(chan error, 1)
+		go func() {
+			_, err := node.RunReadTask(ctx, "exact task")
+			result <- err
+		}()
+		<-promptAcked
+		cancel()
+		close(release)
+		err = <-result
+		if !errors.Is(err, context.Canceled) {
+			t.Fatalf("trial %d: error = %v, want inherited context.Canceled (not child_failed)", trial, err)
+		}
+		select {
+		case <-serverDone:
+		case <-time.After(time.Second):
+			t.Fatalf("trial %d: fake Pi did not finish", trial)
+		}
+	}
+}
+
 func TestRunReadTaskIgnoresSuccessfulRetainedGenerationBeforeExactPrompt(t *testing.T) {
 	node, peer := boundReadNode(t)
 	defer func() { _ = peer.Close() }()
