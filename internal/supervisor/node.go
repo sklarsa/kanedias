@@ -423,18 +423,13 @@ func (node *Node) CreateChild(ctx context.Context, parent string, request contra
 		return TerminalResult{}, node.failChildCreation(ctx, entry, errors.Join(contract.NewError(contract.ErrorChildFailed, "acknowledge child terminal report failed"), err))
 	}
 
-	select {
-	case <-child.Done():
-		cleanupCtx, cancel := context.WithTimeout(context.WithoutCancel(ctx), node.childStopTimeout())
-		cleanupErr := node.cleanupChild(cleanupCtx, entry, false)
-		cancel()
-		if cleanupErr != nil && terminalErr == nil {
-			terminalErr = contract.NewError(contract.ErrorChildFailed, "child process or resource cleanup failed")
-		}
-		return result, errors.Join(terminalErr, cleanupErr)
-	case <-ctx.Done():
-		return TerminalResult{}, node.failChildCreation(ctx, entry, ctx.Err())
+	cleanupCtx, cancel := context.WithTimeout(ctx, node.childStopTimeout())
+	cleanupErr := node.cleanupChild(cleanupCtx, entry, false)
+	cancel()
+	if cleanupErr != nil && terminalErr == nil {
+		terminalErr = contract.NewError(contract.ErrorChildFailed, "child process or resource cleanup failed")
 	}
+	return result, errors.Join(terminalErr, cleanupErr)
 }
 
 func validateDirectChildSnapshot(snapshot NodeSnapshot, childID, parentID, rootID string) error {
