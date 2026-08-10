@@ -59,13 +59,19 @@ func TestValidateLifecycleModelPolicyRequiresLocalRootAndWorkers(t *testing.T) {
 }
 
 func TestValidateLifecycleFinalEventsRequiresOrderedPairedGenerations(t *testing.T) {
+	// Pi's run boundary is agent_end, so every generation must contain
+	// agent_start -> agent_end. agent_settled is an optional post-end
+	// confirmation; root generation 1 (positions 0-1) intentionally omits it
+	// before root generation 2 starts. The broker order at positions 0-4 is
+	// agent_start -> agent_end -> agent_start -> agent_end -> agent_settled.
 	events := []supervisor.EventEnvelope{
 		lifecyclePiEnvelope(1, "root", `{"type":"agent_start"}`),
-		lifecyclePiEnvelope(2, "child", `{"type":"agent_start"}`),
-		lifecyclePiEnvelope(3, "child", `{"type":"agent_settled"}`),
-		lifecyclePiEnvelope(4, "root", `{"type":"agent_settled"}`),
-		lifecyclePiEnvelope(5, "root", `{"type":"agent_start"}`),
-		lifecyclePiEnvelope(6, "root", `{"type":"agent_settled"}`),
+		lifecyclePiEnvelope(2, "root", `{"type":"agent_end"}`),
+		lifecyclePiEnvelope(3, "child", `{"type":"agent_start"}`),
+		lifecyclePiEnvelope(4, "child", `{"type":"agent_end"}`),
+		lifecyclePiEnvelope(5, "child", `{"type":"agent_settled"}`),
+		lifecyclePiEnvelope(6, "root", `{"type":"agent_start"}`),
+		lifecyclePiEnvelope(7, "root", `{"type":"agent_end"}`),
 	}
 	if err := validateLifecycleFinalEvents(events); err != nil {
 		t.Fatalf("valid final events: %v", err)
@@ -84,23 +90,27 @@ func TestValidateLifecycleFinalEventsRequiresOrderedPairedGenerations(t *testing
 			return events
 		}},
 		{name: "duplicate source identity", edit: func(events []supervisor.EventEnvelope) []supervisor.EventEnvelope {
-			events[3].SessionID = events[0].SessionID
-			events[3].SourceSeq = events[0].SourceSeq
+			events[4].SessionID = events[0].SessionID
+			events[4].SourceSeq = events[0].SourceSeq
 			return events
 		}},
-		{name: "settlement before start", edit: func(events []supervisor.EventEnvelope) []supervisor.EventEnvelope {
-			events[0].Payload, events[3].Payload = events[3].Payload, events[0].Payload
+		{name: "end without start", edit: func(events []supervisor.EventEnvelope) []supervisor.EventEnvelope {
+			events[0].Payload = json.RawMessage(`{"type":"agent_end"}`)
 			return events
 		}},
-		{name: "overlapping start", edit: func(events []supervisor.EventEnvelope) []supervisor.EventEnvelope {
-			events[1].SessionID = "root"
+		{name: "overlapping start before end", edit: func(events []supervisor.EventEnvelope) []supervisor.EventEnvelope {
+			events[6].Payload = json.RawMessage(`{"type":"agent_start"}`)
 			return events
 		}},
 		{name: "unclosed start", edit: func(events []supervisor.EventEnvelope) []supervisor.EventEnvelope {
 			return events[:len(events)-1]
 		}},
-		{name: "extra settlement", edit: func(events []supervisor.EventEnvelope) []supervisor.EventEnvelope {
-			return append(events, supervisor.EventEnvelope{Seq: 7, SessionID: "root", SourceSeq: 7, Kind: "pi", Payload: json.RawMessage(`{"type":"agent_settled"}`)})
+		{name: "settled while generation open", edit: func(events []supervisor.EventEnvelope) []supervisor.EventEnvelope {
+			events[6].Payload = json.RawMessage(`{"type":"agent_settled"}`)
+			return events
+		}},
+		{name: "duplicate settled confirmation", edit: func(events []supervisor.EventEnvelope) []supervisor.EventEnvelope {
+			return append(events, lifecyclePiEnvelope(8, "child", `{"type":"agent_settled"}`))
 		}},
 	} {
 		t.Run(test.name, func(t *testing.T) {
@@ -499,13 +509,16 @@ func (journal *lifecycleEventJournal) countPi(sessionID, eventType, toolName str
 }
 
 // validateLifecycleFinalEvents requires strict broker ordering, strict
-// per-session source ordering, unique source identities, and exactly one
-// settlement for each observed agent-start generation.
+// per-session source ordering, unique source identities, and non-overlapping
+// agent_start/agent_end generation boundaries. agent_settled is an optional
+// post-end confirmation: at most one is accepted per ended generation, and only
+// when no generation is open.
 func validateLifecycleFinalEvents(events []supervisor.EventEnvelope) error {
 	var brokerSeq uint64
 	sourceSeq := make(map[string]uint64)
 	seenSources := make(map[string]struct{}, len(events))
 	openGeneration := make(map[string]bool)
+	settlementEligible := make(map[string]bool)
 	for index, event := range events {
 		if event.Seq == 0 || (index > 0 && event.Seq <= brokerSeq) {
 			return fmt.Errorf("broker sequence at position %d = %d after %d", index, event.Seq, brokerSeq)
@@ -538,11 +551,23 @@ func validateLifecycleFinalEvents(events []supervisor.EventEnvelope) error {
 				return fmt.Errorf("session %q started a generation while its prior generation remained open", event.SessionID)
 			}
 			openGeneration[event.SessionID] = true
-		case "agent_settled":
+			// A new generation clears any unconsumed settlement confirmation
+			// eligibility from an earlier ended generation.
+			settlementEligible[event.SessionID] = false
+		case "agent_end":
 			if !openGeneration[event.SessionID] {
-				return fmt.Errorf("session %q settled without an unmatched prior start", event.SessionID)
+				return fmt.Errorf("session %q ended a generation without an open start", event.SessionID)
 			}
 			openGeneration[event.SessionID] = false
+			settlementEligible[event.SessionID] = true
+		case "agent_settled":
+			if openGeneration[event.SessionID] {
+				return fmt.Errorf("session %q settled while its generation was open", event.SessionID)
+			}
+			if !settlementEligible[event.SessionID] {
+				return fmt.Errorf("session %q settled without an eligible ended generation", event.SessionID)
+			}
+			settlementEligible[event.SessionID] = false
 		}
 	}
 	for sessionID, open := range openGeneration {
