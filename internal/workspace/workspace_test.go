@@ -258,13 +258,25 @@ func TestSyncValidatesRepositoriesBeforeConnecting(t *testing.T) {
 }
 
 func TestSyncEmptyRepositoriesEnsuresSeedAndWarns(t *testing.T) {
+	create := []string{
+		"resolve-pool", "get-seed", "create-seed", "init-ca", "ensure-network", "ensure-profile sandbox",
+		"create-instance base pool seed", "start",
+		"exec systemctl is-system-running --wait",
+		"exec test ! -L /workspace/repos",
+		"exec chown kanedias:kanedias /workspace",
+		"exec chmod 0755 /workspace",
+		"exec install -d -o kanedias -g kanedias -m 0755 /workspace/repos",
+		"exec chown kanedias:kanedias /workspace/repos",
+		"exec chmod 0755 /workspace/repos",
+		"stop", "get-instance", "update-instance", "delete-instance", "disconnect",
+	}
 	for _, tt := range []struct {
 		name         string
 		storageFound bool
 		want         []string
 	}{
-		{name: "create", want: []string{"resolve-pool", "get-seed", "create-seed", "disconnect"}},
-		{name: "reuse", storageFound: true, want: []string{"resolve-pool", "get-seed", "disconnect"}},
+		{name: "create", want: create},
+		{name: "reuse", storageFound: true, want: before(create, "create-seed")},
 	} {
 		t.Run(tt.name, func(t *testing.T) {
 			fake := &fakeClient{storageFound: tt.storageFound}
@@ -278,8 +290,24 @@ func TestSyncEmptyRepositoriesEnsuresSeedAndWarns(t *testing.T) {
 			if !strings.Contains(stderr.String(), "no repositories configured") {
 				t.Fatalf("stderr = %q, want empty-list warning", stderr.String())
 			}
+			for _, forbidden := range []string{"exec update-ca-certificates", "exec getent ahosts github.com", "exec runuser -u kanedias"} {
+				if containsWorkspaceCall(fake.calls, forbidden) {
+					t.Fatalf("empty config ran disallowed call %q after ownership repair: %v", forbidden, fake.calls)
+				}
+			}
 		})
 	}
+}
+
+// before returns the slice with all occurrences of exclude removed.
+func before(slice []string, exclude string) []string {
+	result := make([]string, 0, len(slice))
+	for _, item := range slice {
+		if item != exclude {
+			result = append(result, item)
+		}
+	}
+	return result
 }
 
 type workspaceTestCtxKey struct{}
@@ -301,8 +329,12 @@ func TestSyncRetriesSystemdBeforeCAAndDNSAndDestructiveRefresh(t *testing.T) {
 		"resolve-pool", "get-seed", "create-seed", "init-ca", "ensure-network", "ensure-profile sandbox",
 		"create-instance base pool seed", "start",
 		"exec systemctl is-system-running --wait", "exec systemctl is-system-running --wait",
+		"exec chown kanedias:kanedias /workspace",
+		"exec chmod 0755 /workspace",
+		"exec install -d -o kanedias -g kanedias -m 0755 /workspace/repos",
+		"exec chown kanedias:kanedias /workspace/repos",
+		"exec chmod 0755 /workspace/repos",
 		"exec update-ca-certificates", "exec getent ahosts github.com",
-		"exec install -d -o kanedias -g kanedias /workspace/repos",
 		"exec runuser -u kanedias -- env HOME=/home/kanedias USER=kanedias LOGNAME=kanedias gh auth setup-git --hostname github.com --force",
 		"exec runuser -u kanedias -- env HOME=/home/kanedias USER=kanedias LOGNAME=kanedias git config --global --replace-all url.https://github.com/.insteadOf git@github.com:",
 		"exec runuser -u kanedias -- env HOME=/home/kanedias USER=kanedias LOGNAME=kanedias git config --global --add url.https://github.com/.insteadOf ssh://git@github.com/",

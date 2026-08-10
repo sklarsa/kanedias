@@ -105,10 +105,6 @@ func syncWithDependencies(ctx context.Context, cfg config.Config, stdout, stderr
 	if err := ensureSeedVolume(ctx, incus, pool, volume); err != nil {
 		return err
 	}
-	if len(repositories) == 0 {
-		_, _ = fmt.Fprintln(stderr, "warning: no repositories configured; workspace seed volume is ready")
-		return nil
-	}
 
 	if err := deps.initCA(); err != nil {
 		return fmt.Errorf("initialize proxy CA: %w", err)
@@ -164,13 +160,17 @@ func syncWithDependencies(ctx context.Context, cfg config.Config, stdout, stderr
 	if err := waitForSystemd(ctx, incus, name, deps.readinessTimeout, deps.readinessPollInterval); err != nil {
 		return err
 	}
+	if err := prepareWorkspaceRoot(ctx, incus, name, stdout, stderr); err != nil {
+		return err
+	}
+	if len(repositories) == 0 {
+		_, _ = fmt.Fprintln(stderr, "warning: no repositories configured; workspace seed volume is ready")
+		return nil
+	}
 	if err := exec(ctx, incus, name, stdout, stderr, []string{"update-ca-certificates"}); err != nil {
 		return err
 	}
 	if err := waitForDNS(ctx, incus, name); err != nil {
-		return err
-	}
-	if err := prepareRepositoryRoot(ctx, incus, name, stdout, stderr); err != nil {
 		return err
 	}
 	if err := syncRepositories(ctx, incus, name, repositories, stdout, stderr); err != nil {

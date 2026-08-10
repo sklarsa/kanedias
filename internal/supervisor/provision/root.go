@@ -46,6 +46,7 @@ type rootClient interface {
 	StopInstance(context.Context, string, bool) error
 	DeleteInstance(context.Context, string) error
 	GetInstanceState(context.Context, string) (*api.InstanceState, error)
+	Exec(context.Context, string, incusclient.ExecRequest) (string, string, error)
 }
 
 type rootDependencies struct {
@@ -279,6 +280,12 @@ func (provisioner *IncusRootProvisioner) ProvisionRoot(ctx context.Context, requ
 		return nil, err
 	}
 	owned.running = true
+
+	// Repair the cloned workspace's seeded ownership immediately after start and
+	// before any RPC readiness gate, so descendants never surface root-owned.
+	if err := prepareSessionWorkspace(ctx, client, name, config.WorkspaceStart{}); err != nil {
+		return nil, err
+	}
 
 	address, waitErr := waitForRootRPCAddress(ctx, client, name, provisioner.deps.readinessTimeout, provisioner.deps.retryInterval)
 	if waitErr != nil {

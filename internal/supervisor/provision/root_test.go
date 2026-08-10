@@ -11,6 +11,7 @@ import (
 
 	"github.com/lxc/incus/v7/shared/api"
 	"github.com/sklarsa/kanedias/internal/config"
+	"github.com/sklarsa/kanedias/internal/incusclient"
 )
 
 type recordingRootClient struct {
@@ -21,6 +22,7 @@ type recordingRootClient struct {
 	stopErr       error
 	deleteInstErr error
 	deleteVolErr  error
+	execErr       error
 	request       api.InstancesPost
 	volumePut     api.StorageVolumePut
 	lateVolume    bool
@@ -95,6 +97,11 @@ func (client *recordingRootClient) DeleteInstance(context.Context, string) error
 	client.calls = append(client.calls, "delete-instance")
 	return client.deleteInstErr
 }
+func (client *recordingRootClient) Exec(_ context.Context, _ string, request incusclient.ExecRequest) (string, string, error) {
+	client.calls = append(client.calls, "exec "+strings.Join(request.Command, " "))
+	return "", "", client.execErr
+}
+
 func (client *recordingRootClient) GetInstanceState(context.Context, string) (*api.InstanceState, error) {
 	client.calls = append(client.calls, "get-state")
 	if client.lateInstance && !client.instanceReady {
@@ -315,6 +322,51 @@ func TestRootProvisionerAwaitsSubmittedStartBeforeCleanupProbe(t *testing.T) {
 	calls := strings.Join(client.calls, ",")
 	if !strings.Contains(calls, "start-instance,await-operation,get-state,get-state,stop-instance,delete-instance,delete-volume") {
 		t.Fatalf("late start cleanup order = %s", calls)
+	}
+}
+
+func TestRootProvisionerRepairsClonedWorkspaceBeforeReadiness(t *testing.T) {
+	client := &recordingRootClient{}
+	_, err := newRootProvisioner(rootTestConfig(), testRootDependencies(client)).ProvisionRoot(context.Background(), validRootRequest())
+	if err != nil {
+		t.Fatal(err)
+	}
+	assertOrderedCalls(t, client.calls,
+		"start-instance",
+		"exec chown kanedias:kanedias /workspace",
+		"exec chmod 0755 /workspace",
+		"exec install -d -o kanedias -g kanedias -m 0755 /workspace/repos",
+		"exec chown kanedias:kanedias /workspace/repos",
+		"exec chmod 0755 /workspace/repos",
+		"get-state",
+	)
+}
+
+func TestRootProvisionerCleansWorkspacePreparationFailure(t *testing.T) {
+	primary := errors.New("workspace preparation failed")
+	client := &recordingRootClient{execErr: primary}
+	provisioner := newRootProvisioner(rootTestConfig(), testRootDependencies(client))
+
+	resources, err := provisioner.ProvisionRoot(context.Background(), validRootRequest())
+	if resources != nil || !errors.Is(err, primary) {
+		t.Fatalf("ProvisionRoot() = (%v, %v), want nil resources and workspace prep error", resources, err)
+	}
+	calls := strings.Join(client.calls, ",")
+	if !strings.Contains(calls, "start-instance,exec chown kanedias:kanedias /workspace,stop-instance,delete-instance,delete-volume") {
+		t.Fatalf("workspace preparation failure cleanup order = %s", calls)
+	}
+}
+
+func assertOrderedCalls(t *testing.T, calls []string, want ...string) {
+	t.Helper()
+	next := 0
+	for _, call := range calls {
+		if next < len(want) && call == want[next] {
+			next++
+		}
+	}
+	if next != len(want) {
+		t.Fatalf("calls missing ordered item %q at index %d\ncalls:\n%s", want[next], next, strings.Join(calls, "\n"))
 	}
 }
 

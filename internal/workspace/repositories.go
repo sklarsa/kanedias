@@ -37,16 +37,25 @@ var managedCommandPrefix = []string{
 	"env", "HOME=" + managedHome, "USER=" + managedUser, "LOGNAME=" + managedUser,
 }
 
-func prepareRepositoryRoot(ctx context.Context, incus client, instance string, stdout, stderr io.Writer) error {
+func prepareWorkspaceRoot(ctx context.Context, incus client, instance string, stdout, stderr io.Writer) error {
 	if err := exec(ctx, incus, instance, stdout, stderr, []string{"test", "!", "-L", workspacePath + "/repos"}); err != nil {
 		return fmt.Errorf("refusing symlinked repository root: %s/repos: %w", workspacePath, err)
 	}
-	if err := exec(ctx, incus, instance, stdout, stderr, []string{"test", "!", "-e", workspacePath + "/repos", "-o", "-d", workspacePath + "/repos"}); err != nil {
-		return fmt.Errorf("repository root is not a directory: %s/repos: %w", workspacePath, err)
+	// Enforce durable ownership and mode with explicit root argument arrays so an
+	// existing (already-mounted) seeded directory is repaired, not only created.
+	commands := [][]string{
+		{"chown", managedUser + ":" + managedUser, workspacePath},
+		{"chmod", "0755", workspacePath},
+		{"install", "-d", "-o", managedUser, "-g", managedUser, "-m", "0755", workspacePath + "/repos"},
+		{"chown", managedUser + ":" + managedUser, workspacePath + "/repos"},
+		{"chmod", "0755", workspacePath + "/repos"},
 	}
-	return exec(ctx, incus, instance, stdout, stderr, []string{
-		"install", "-d", "-o", managedUser, "-g", managedUser, workspacePath + "/repos",
-	})
+	for _, command := range commands {
+		if err := exec(ctx, incus, instance, stdout, stderr, command); err != nil {
+			return err
+		}
+	}
+	return nil
 }
 
 func syncRepositories(ctx context.Context, incus client, instance string, repositories []repository, stdout, stderr io.Writer) error {
