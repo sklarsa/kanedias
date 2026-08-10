@@ -1885,6 +1885,78 @@ Then rerun Task 6H rapid control and Task 6I deterministic children on the final
 
 ---
 
+### Task 6N: Bound deterministic-child reading context while proving real tool execution
+
+**Failed invariant and evidence:**
+
+- On final-code Task 6I verification, `/home/steven/.cache/kanedias/e2e/e2e-3618702-1786404767107214377/` proves direct single completed as a typed 200 read child with the concise exact marker. All three simultaneously observed parallel children then returned typed `child_failed` with `read child ended with stop reason error`.
+- Each parallel child's Pi stream contains `agent_start`, many successful assistant `toolUse` rounds and tool-result messages, then `message_end(stopReason=error)` with the same exact internal error `Context size has been exceeded.` Two children emitted `agent_end`; teardown of the third began after all three terminal create calls had already returned the same typed error. Exact cleanup restored baseline; proxy remained quiet.
+- The deterministic parallel task asks every child to read README, `go.mod`, and at least five Go source files. In this multi-repository workspace the local model repeatedly searches/reads broad content until its context overflows. This is a real local-model tool-workload failure, not concurrency admission, provider binding, marker transcription, supervisor transport, or timeout.
+- The lifecycle acceptance needs one real read-tool execution per child, strict typed/result identity, simultaneous three-child topology, strict per-run marker, natural settlement, and cleanup. It does not need a context-expanding seven-file survey. Bound the task rather than retrying, increasing context, accepting an error, or removing tool evidence.
+
+**Files and scope:**
+
+- Modify/Test only: `internal/supervisor/live_rpc_lifecycle_test.go`, `internal/supervisor/live_rpc_lifecycle_support_test.go`
+- Do not modify provider/model context, Pi, production supervisor, timeouts, parallelism, exact marker matching, or child count.
+
+Independent review of this Task 6N amendment is required before implementation.
+
+- [ ] **Step 1: Add RED bounded-task and read-tool evidence regressions**
+
+Add pure helpers/tests:
+
+1. `lifecycleDeterministicReadTask(marker)` returns a nonempty task containing the exact marker once, requires reading only `README.md`, asks for one concise repository-identification sentence, forbids modification/delegation/other-file inspection, and contains none of the prior multi-file/internal-path workload.
+2. `validateLifecycleReadToolEvents(events, childIDs)` requires every nonempty distinct child ID to have at least one Pi `tool_execution_start` with `toolName == "read"`; rejects missing child evidence, duplicate/empty expected IDs, and any `delegate_session` tool start by those children. It ignores root and unrelated-session events and never inspects/retains tool arguments or output.
+
+Use synthetic `EventEnvelope` values only. Prove compile RED for the missing helpers before implementation.
+
+- [ ] **Step 2: Use the bounded task for direct single and all parallel children**
+
+In `exerciseDeterministicChildren`, replace the direct-single and direct-parallel repository prompts with `lifecycleDeterministicReadTask(marker)`. Preserve:
+
+- one single child followed by three concurrently started child calls;
+- one snapshot containing all three parallel children before any call result is consumed;
+- strict typed reviewer/read/session identity and distinct result IDs;
+- concise exact markers from Task 6I;
+- natural disappearance, process/socket/resource cleanup, root usability, and final invariants.
+
+After each phase's child calls settle but before discarding their identities, apply `validateLifecycleReadToolEvents` to the durable journal for the exact single/parallel child IDs. Failure is an acceptance failure; do not infer tool use from model text.
+
+- [ ] **Step 3: Prove focused GREEN/race and tagged compilation**
+
+```bash
+gofmt -w internal/supervisor/live_rpc_lifecycle_test.go internal/supervisor/live_rpc_lifecycle_support_test.go
+go test -v -count=1 -tags=incus ./internal/supervisor \
+  -run '^TestLifecycleDeterministicReadTaskRequiresBoundedRealToolEvidence$'
+go test -race -v -count=1 -tags=incus ./internal/supervisor \
+  -run '^TestLifecycleDeterministicReadTaskRequiresBoundedRealToolEvidence$'
+go test -count=1 -tags=incus ./internal/supervisor -run '^$'
+git diff --check
+```
+
+Expected: bounded prompt and strict per-child read-tool evidence cases pass normally/race; tagged compile and diff check pass; no production edit.
+
+- [ ] **Step 4: Rerun deterministic children once**
+
+```bash
+set -a; . /home/steven/source/github/kanedias/.env; set +a
+go test -v -count=1 -tags=incus ./internal/supervisor \
+  -run '^TestLiveRPCDeterministicChildLifecycle$' -timeout 90m
+```
+
+Expected: exact single and three-parallel topology, at least one real read tool per child, strict concise markers and typed IDs, natural cleanup, reusable root, final event/action/resource invariants, and exact baseline restoration.
+
+- [ ] **Step 5: Review, commit, and run the complete one-pass matrix**
+
+```bash
+git add internal/supervisor/live_rpc_lifecycle_test.go internal/supervisor/live_rpc_lifecycle_support_test.go
+git commit -m "test: bound deterministic child workload"
+```
+
+After independent implementation review and live GREEN, rerun all eight scenarios once. Any new failure receives another evidence-gated amendment before Task 7.
+
+---
+
 ### Task 7: Prove five consecutive clean runs and complete verification
 
 **Files:**
