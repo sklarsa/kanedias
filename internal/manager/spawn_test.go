@@ -211,20 +211,37 @@ func TestSpawnRootWithRequestValidatesBeforeSideEffects(t *testing.T) {
 		pipes++
 		return os.Pipe()
 	}
-	invalid := m.launch.DefaultRequest()
-	invalid.Root.ModelType = "not-allowlisted"
-	if _, err := m.SpawnRootWithRequest(context.Background(), invalid); err == nil {
-		t.Fatal("invalid request succeeded")
+
+	unknownModel := m.launch.DefaultRequest()
+	unknownModel.Root.ModelType = "not-allowlisted"
+	badName := m.launch.DefaultRequest()
+	badName.Name = "triage\n" // control character
+	overlongName := m.launch.DefaultRequest()
+	overlongName.Name = strings.Repeat("a", 81)
+	unknownRepo := m.launch.DefaultRequest()
+	unknownRepo.Repository = "owner/not-configured"
+
+	cases := map[string]SessionLaunchRequest{
+		"unknown model":          unknownModel,
+		"control-character name": badName,
+		"overlong name":          overlongName,
+		"unknown repository":     unknownRepo,
 	}
-	if tokens != 0 || pipes != 0 || fs.starts != 0 {
-		t.Fatalf("side effects after invalid request: tokens=%d pipes=%d starts=%d", tokens, pipes, fs.starts)
+	for name, request := range cases {
+		tokens, pipes = 0, 0
+		if _, err := m.SpawnRootWithRequest(context.Background(), request); err == nil {
+			t.Fatalf("%s: invalid request succeeded", name)
+		}
+		if tokens != 0 || pipes != 0 || fs.starts != 0 {
+			t.Fatalf("%s: side effects after invalid request: tokens=%d pipes=%d starts=%d", name, tokens, pipes, fs.starts)
+		}
 	}
 	entries, err := os.ReadDir(logDir)
 	if err != nil {
 		t.Fatal(err)
 	}
 	if len(entries) != 0 {
-		t.Fatalf("invalid request created log files: %v", entries)
+		t.Fatalf("invalid requests created log files: %v", entries)
 	}
 }
 
@@ -252,10 +269,11 @@ func TestSpawnRootWithRequestTransfersResolvedPolicyOnlyThroughFD3(t *testing.T)
 		request.Workers[index].ModelType = "local-qwen"
 		request.Workers[index].ThinkingLevel = "off"
 	}
-	wantPolicy, err := m.launch.Resolve(request)
+	resolved, err := m.launch.Resolve(request)
 	if err != nil {
 		t.Fatal(err)
 	}
+	wantPolicy := resolved.Policy
 	go func() {
 		time.Sleep(20 * time.Millisecond)
 		fs.process.exit(nil)
@@ -402,10 +420,11 @@ func TestSpawnRootCancellationJoinsBlockedBootstrapWriter(t *testing.T) {
 		t.Fatal(err)
 	}
 	m.launch = launch
-	policy, err := launch.Resolve(launch.DefaultRequest())
+	resolved, err := launch.Resolve(launch.DefaultRequest())
 	if err != nil {
 		t.Fatal(err)
 	}
+	policy := resolved.Policy
 	var encoded bytes.Buffer
 	if err := process.EncodeRootBootstrap(&encoded, process.RootBootstrap{Policy: policy}); err != nil {
 		t.Fatal(err)

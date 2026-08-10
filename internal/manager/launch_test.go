@@ -61,10 +61,11 @@ func TestLaunchConfigurationValidCustomRequest(t *testing.T) {
 			{WorkerType: "worker", ModelType: "gpt-5-6-sol", ThinkingLevel: "low"},
 		},
 	}
-	policy, err := launch.Resolve(request)
+	resolved, err := launch.Resolve(request)
 	if err != nil {
 		t.Fatalf("Resolve: %v", err)
 	}
+	policy := resolved.Policy
 	if policy.Root != (config.ModelProfile{Provider: "openai-codex", Model: "gpt-5.6-sol", ThinkingLevel: "high"}) {
 		t.Fatalf("root = %#v", policy.Root)
 	}
@@ -161,8 +162,8 @@ func TestLaunchConfigurationDefaultThinkingFallsBack(t *testing.T) {
 	if err != nil {
 		t.Fatalf("Resolve: %v", err)
 	}
-	if policy.Root.ThinkingLevel != "high" {
-		t.Fatalf("root thinking = %q, want model default high", policy.Root.ThinkingLevel)
+	if policy.Policy.Root.ThinkingLevel != "high" {
+		t.Fatalf("root thinking = %q, want model default high", policy.Policy.Root.ThinkingLevel)
 	}
 }
 
@@ -172,12 +173,12 @@ func TestLaunchConfigurationResolveReturnsIndependentPolicy(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	first.Workers["reviewer"] = config.WorkerProfile{Description: "changed", Provider: "x", Model: "y", ThinkingLevel: "off"}
+	first.Policy.Workers["reviewer"] = config.WorkerProfile{Description: "changed", Provider: "x", Model: "y", ThinkingLevel: "off"}
 	second, err := launch.Resolve(launch.DefaultRequest())
 	if err != nil {
 		t.Fatal(err)
 	}
-	if second.Workers["reviewer"].Provider == "x" {
+	if second.Policy.Workers["reviewer"].Provider == "x" {
 		t.Fatal("launch policy aliased prior result")
 	}
 }
@@ -324,5 +325,137 @@ func TestManagerLaunchOptionsExposesView(t *testing.T) {
 	opts := m.LaunchOptions()
 	if len(opts.Models) != 2 || len(opts.Workers) != 2 {
 		t.Fatalf("manager LaunchOptions models/workers = %d/%d, want 2/2", len(opts.Models), len(opts.Workers))
+	}
+	if len(opts.Repositories) != 3 {
+		t.Fatalf("manager LaunchOptions repositories = %d, want 3", len(opts.Repositories))
+	}
+}
+
+func TestLaunchConfigurationResolvesNameRepositoryAndPolicy(t *testing.T) {
+	launch := mustLaunchConfiguration(t, modelConfigFixture())
+	request := launch.DefaultRequest()
+	request.Name = "  release triage  "
+	request.Repository = "owner/repo"
+	got, err := launch.Resolve(request)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if got.Name != "release triage" {
+		t.Fatalf("name = %q", got.Name)
+	}
+	if got.Workspace != (config.WorkspaceStart{Repository: "owner/repo", Checkout: "repo"}) {
+		t.Fatalf("workspace = %#v", got.Workspace)
+	}
+	if got.Policy.Root.Provider == "" {
+		t.Fatalf("policy not resolved: %#v", got.Policy)
+	}
+}
+
+func TestLaunchConfigurationResolveEmptyNameAndRepository(t *testing.T) {
+	launch := mustLaunchConfiguration(t, modelConfigFixture())
+	request := launch.DefaultRequest()
+	request.Name = "   "
+	request.Repository = ""
+	got, err := launch.Resolve(request)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if got.Name != "" {
+		t.Fatalf("empty name = %q, want empty", got.Name)
+	}
+	if got.Workspace != (config.WorkspaceStart{}) {
+		t.Fatalf("empty workspace = %#v, want zero value", got.Workspace)
+	}
+}
+
+func TestLaunchConfigurationRejectsUnknownRepository(t *testing.T) {
+	launch := mustLaunchConfiguration(t, modelConfigFixture())
+	request := launch.DefaultRequest()
+	request.Repository = "owner/not-configured"
+	_, err := launch.Resolve(request)
+	assertInvalidRequest(t, err)
+}
+
+func TestNewLaunchConfigurationRejectsInvalidConfiguredRepository(t *testing.T) {
+	cfg := modelConfigFixture()
+	cfg.Workspace.Repos = []string{"https://github.com/owner/repo"}
+	if _, err := NewLaunchConfiguration(cfg); err == nil {
+		t.Fatal("invalid configured repository accepted")
+	}
+}
+
+func TestLaunchConfigurationAcceptsDuplicateNames(t *testing.T) {
+	launch := mustLaunchConfiguration(t, modelConfigFixture())
+	a := launch.DefaultRequest()
+	a.Name = "triage"
+	b := launch.DefaultRequest()
+	b.Name = "triage"
+	ra, err := launch.Resolve(a)
+	if err != nil {
+		t.Fatal(err)
+	}
+	rb, err := launch.Resolve(b)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if ra.Name != "triage" || rb.Name != "triage" {
+		t.Fatalf("duplicate names not accepted: %q vs %q", ra.Name, rb.Name)
+	}
+}
+
+func TestLaunchConfigurationRejectsNameOver80CodePoints(t *testing.T) {
+	launch := mustLaunchConfiguration(t, modelConfigFixture())
+	request := launch.DefaultRequest()
+	request.Name = strings.Repeat("界", 81)
+	if _, err := launch.Resolve(request); err == nil {
+		t.Fatal("81 code-point name accepted")
+	} else {
+		assertInvalidRequest(t, err)
+	}
+	request.Name = strings.Repeat("界", 80)
+	if _, err := launch.Resolve(request); err != nil {
+		t.Fatalf("80 code-point name rejected: %v", err)
+	}
+}
+
+func TestLaunchConfigurationRejectsNameWithControlCharacter(t *testing.T) {
+	launch := mustLaunchConfiguration(t, modelConfigFixture())
+	for _, name := range []string{"triage\n", "tri\tage", "\x00triage"} {
+		request := launch.DefaultRequest()
+		request.Name = name
+		if _, err := launch.Resolve(request); err == nil {
+			t.Errorf("name %q with control character accepted", name)
+		} else {
+			assertInvalidRequest(t, err)
+		}
+	}
+}
+
+func TestLaunchOptionsExposeRepositorySlugsOnlySortedAndCopied(t *testing.T) {
+	launch := mustLaunchConfiguration(t, modelConfigFixture())
+	opts := launch.LaunchOptions()
+
+	want := []string{"one/alpha", "owner/repo", "two/beta"}
+	got := make([]string, 0, len(opts.Repositories))
+	for _, repo := range opts.Repositories {
+		got = append(got, repo.Slug)
+	}
+	if !reflect.DeepEqual(got, want) {
+		t.Fatalf("repository order = %#v, want %#v", got, want)
+	}
+
+	// Slugs only: no URL or absolute path leak.
+	for _, repo := range opts.Repositories {
+		if strings.HasPrefix(repo.Slug, "/") || strings.HasPrefix(repo.Slug, "http") || strings.HasPrefix(repo.Slug, "_") || strings.HasPrefix(repo.Slug, ".") {
+			t.Fatalf("repository option leaked URL/path: %q", repo.Slug)
+		}
+	}
+
+	// Copied slice: mutating one view must not alias the catalog.
+	first := launch.LaunchOptions()
+	first.Repositories[0].Slug = "mutated"
+	second := launch.LaunchOptions()
+	if second.Repositories[0].Slug == "mutated" {
+		t.Fatal("LaunchOptions aliased repository slice")
 	}
 }

@@ -164,6 +164,7 @@ func discardLogger() *slog.Logger {
 func modelConfigFixture() config.Config {
 	return config.Config{
 		BaseImage: config.BaseImage{Name: "sandbox", Source: "https://images.linuxcontainers.org", Image: "debian/13"},
+		Workspace: config.Workspace{Repos: []string{"owner/repo", "two/beta", "one/alpha"}},
 		Models: map[string]config.ModelDefinition{
 			"local-qwen": {
 				Label: "Local Qwen", Provider: "local-executor", Model: "Qwen3.6-27B-GGUF",

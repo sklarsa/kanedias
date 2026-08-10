@@ -138,6 +138,7 @@ type pendingRoot struct {
 	process    spawnedProcess
 	client     rootClient
 	rootID     string // set after first successful snapshot
+	name       string // normalized optional display name, resolved before spawn
 }
 
 // probe fetches a snapshot from the pending root and validates the socket
@@ -190,12 +191,12 @@ func (m *Manager) SpawnRoot(ctx context.Context) (string, error) {
 // SpawnRootWithRequest validates an allowlisted launch request before creating
 // any spawn artifact, then transfers the resolved policy through inherited fd 3.
 func (m *Manager) SpawnRootWithRequest(ctx context.Context, request SessionLaunchRequest) (string, error) {
-	policy, err := m.launch.Resolve(request)
+	resolved, err := m.launch.Resolve(request)
 	if err != nil {
 		return "", err
 	}
 	var encoded bytes.Buffer
-	if err := process.EncodeRootBootstrap(&encoded, process.RootBootstrap{Policy: policy}); err != nil {
+	if err := process.EncodeRootBootstrap(&encoded, process.RootBootstrap{Policy: resolved.Policy}); err != nil {
 		return "", fmt.Errorf("manager: encode root bootstrap: %w", err)
 	}
 
@@ -292,7 +293,7 @@ func (m *Manager) SpawnRootWithRequest(ctx context.Context, request SessionLaunc
 	}
 	closeBootstrap()
 
-	pending := &pendingRoot{socketPath: socketPath, logPath: logPath, process: spawned}
+	pending := &pendingRoot{socketPath: socketPath, logPath: logPath, process: spawned, name: resolved.Name}
 	rootID, err := m.admitRoot(ctx, pending)
 	if err != nil {
 		go m.cleanupFailedSpawn(pending)
