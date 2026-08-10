@@ -245,3 +245,61 @@ test("Ctrl-O with no cards primes a fresh patched card", () => {
   tools.refresh(root);
   assert.equal(fresh.open, true);
 });
+
+function fakeToolRoot(initialCards) {
+  const cards = initialCards.slice();
+  return {
+    cards,
+    querySelectorAll(selector) {
+      return selector === "[data-tool-card]" ? cards : [];
+    }
+  };
+}
+
+test("stream refresh preserves a manual open after global collapse", () => {
+  const existing = {open: true};
+  const root = fakeToolRoot([existing]);
+  const tools = ui.createToolExpansionController();
+
+  assert.equal(tools.toggle(root), false);
+  assert.equal(existing.open, false);
+
+  existing.open = true;
+  tools.refresh(root);
+  assert.equal(existing.open, true);
+
+  const fresh = {open: true};
+  root.cards.push(fresh);
+  tools.refresh(root);
+  assert.equal(existing.open, true);
+  assert.equal(fresh.open, false);
+});
+
+test("stream refresh preserves a manual close after global expansion", () => {
+  const existing = {open: false};
+  const root = fakeToolRoot([existing]);
+  const tools = ui.createToolExpansionController();
+
+  assert.equal(tools.toggle(root), true);
+  assert.equal(existing.open, true);
+
+  existing.open = false;
+  tools.refresh(root);
+  assert.equal(existing.open, false);
+});
+
+test("a later global toggle still updates manually overridden cards", () => {
+  const first = {open: true};
+  const second = {open: true};
+  const root = fakeToolRoot([first, second]);
+  const tools = ui.createToolExpansionController();
+
+  assert.equal(tools.toggle(root), false);
+  first.open = true;
+  tools.refresh(root);
+  assert.equal(first.open, true);
+
+  assert.equal(tools.toggle(root), true);
+  assert.equal(first.open, true);
+  assert.equal(second.open, true);
+});
