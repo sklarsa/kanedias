@@ -162,6 +162,10 @@ func launchOptionsFixture() manager.SessionLaunchOptions {
 			{WorkerType: "oracle", Description: "Advise <carefully> & independently", ModelType: "deep-model", ThinkingLevel: "high"},
 			{WorkerType: "reviewer", Description: "Review & verify", ModelType: "fast-model", ThinkingLevel: "medium"},
 		},
+		Repositories: []manager.RepositoryLaunchOption{
+			{Slug: "two/beta"},
+			{Slug: "one/alpha"},
+		},
 	}
 }
 
@@ -349,6 +353,8 @@ func TestInitialPageRendersSessionModalFromLaunchOptions(t *testing.T) {
 	required := []string{
 		`<dialog id="new-session-modal"`, `id="new-session-form"`, `aria-labelledby="new-session-title"`,
 		`id="new-session-title"`, `New session`, `aria-label="Close"`,
+		`id="session-name"`, `type="text"`, `maxlength="80"`, `autocomplete="off"`, `data-session-name`, `Session name`, `optional`,
+		`id="start-repository"`, `data-start-repository`, `<option value="" selected>/workspace</option>`,
 		`id="root-model"`, `data-root-model`, `id="root-thinking"`, `data-root-thinking`, `value="deep-model" selected`, `value="xhigh" selected`,
 		`data-thinking-levels="off,medium"`, `data-default-thinking="off"`, `data-worker-row`, `data-worker-model`, `data-worker-thinking`, `data-modal-close`,
 		`Fast &amp; safe`, `Deep model`, `<summary>Subagent model profiles</summary>`,
@@ -361,6 +367,27 @@ func TestInitialPageRendersSessionModalFromLaunchOptions(t *testing.T) {
 	}
 	if strings.Contains(body, `<dialog id="new-session-modal" open`) {
 		t.Error("session modal must be closed initially")
+	}
+	if got := strings.Count(body, `data-session-name`); got != 1 {
+		t.Errorf("session name input count = %d, want 1", got)
+	}
+	workspace := strings.Index(body, `<option value="" selected>/workspace</option>`)
+	lastRepository := workspace
+	for _, slug := range []string{"one/alpha", "two/beta"} {
+		marker := `<option value="` + slug + `">` + slug + `</option>`
+		if got := strings.Count(body, marker); got != 1 {
+			t.Errorf("repository %q option count = %d, want 1", slug, got)
+		}
+		position := strings.Index(body, marker)
+		if workspace < 0 || position <= lastRepository {
+			t.Errorf("repository %q is not after /workspace in deterministic slug order", slug)
+		}
+		lastRepository = position
+	}
+	for _, forbidden := range []string{"/workspace/repos", "https://", "github_pat_", "oauth2:"} {
+		if strings.Contains(body, forbidden) {
+			t.Errorf("session modal leaked repository checkout path/credential marker %q", forbidden)
+		}
 	}
 	if deep, fast := strings.Index(body, `>Deep model</option>`), strings.Index(body, `>Fast &amp; safe</option>`); deep < 0 || fast < 0 || deep >= fast {
 		t.Error("model options are not in deterministic model-type order")

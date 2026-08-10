@@ -89,9 +89,14 @@ func makeNewSessionHandler(fleet fleetManager, logger *slog.Logger) http.Handler
 			status := http.StatusServiceUnavailable
 			message := "The session could not be started."
 			var contractErr *contract.Error
-			if errors.As(err, &contractErr) && contractErr.Code == contract.ErrorInvalidRequest {
-				status = http.StatusBadRequest
-				message = "The session configuration was not valid."
+			if errors.As(err, &contractErr) {
+				switch contractErr.Code {
+				case contract.ErrorInvalidRequest:
+					status = http.StatusBadRequest
+					message = "The session configuration was not valid."
+				case contract.ErrorWorkspaceRepositoryUnavailable:
+					message = "The selected repository is not present in the workspace."
+				}
 			}
 			writeLaunchJSON(w, status, map[string]string{"error": message})
 			return

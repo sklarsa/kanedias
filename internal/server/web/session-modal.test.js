@@ -78,6 +78,15 @@ class FakeSelect extends FakeTarget {
   }
 }
 
+class FakeInput extends FakeTarget {
+  constructor(defaultValue = "") {
+    super();
+    this.defaultValue = defaultValue;
+    this.value = defaultValue;
+  }
+  reset() { this.value = this.defaultValue; }
+}
+
 class FakeDialog extends FakeTarget {
   constructor() {
     super();
@@ -105,8 +114,8 @@ function fixture() {
   form.resetCalls = 0;
   form.reset = function () {
     this.resetCalls++;
-    for (const select of [rootModel, rootThinking, workerModelA, workerThinkingA, workerModelB, workerThinkingB]) {
-      select.reset();
+    for (const control of [sessionName, startRepository, rootModel, rootThinking, workerModelA, workerThinkingA, workerModelB, workerThinkingB]) {
+      control.reset();
     }
   };
   const close = new FakeTarget();
@@ -118,6 +127,12 @@ function fixture() {
   const details = new FakeTarget();
   details.open = true;
 
+  const sessionName = new FakeInput();
+  const startRepository = new FakeSelect([
+    option("", undefined, undefined, true),
+    option("one/alpha"),
+    option("owner/repo")
+  ]);
   const rootModel = new FakeSelect([
     option("deep", "high,xhigh", "high", true),
     option("fast", "off,medium", "off")
@@ -144,7 +159,7 @@ function fixture() {
   workerB.setAttribute("data-worker-type", "worker");
   workerB.querySelector = (selector) => selector === "[data-worker-model]" ? workerModelB : workerThinkingB;
 
-  const controls = [close, cancel, launch, rootModel, rootThinking, workerModelA, workerThinkingA, workerModelB, workerThinkingB];
+  const controls = [close, cancel, launch, sessionName, startRepository, rootModel, rootThinking, workerModelA, workerThinkingA, workerModelB, workerThinkingB];
   const query = new Map([
     ["#new-session-modal", dialog],
     ["#new-session-button", trigger],
@@ -153,6 +168,8 @@ function fixture() {
     ["#new-session-cancel", cancel],
     ["#new-session-launch", launch],
     ["#new-session-status", status],
+    ["[data-session-name]", sessionName],
+    ["[data-start-repository]", startRepository],
     ["[data-root-model]", rootModel],
     ["[data-root-thinking]", rootThinking]
   ]);
@@ -167,7 +184,7 @@ function fixture() {
 
   return {
     document, dialog, trigger, form, close, cancel, launch, status, fieldset, details,
-    rootModel, rootThinking, workerModelA, workerThinkingA, workerModelB, workerThinkingB,
+    sessionName, startRepository, rootModel, rootThinking, workerModelA, workerThinkingA, workerModelB, workerThinkingB,
     workerA, workerB, controls
   };
 }
@@ -201,12 +218,16 @@ test("open resets configured defaults, rebuilds thinking, and focuses the root m
   const f = fixture();
   // Native selects keep the server's selected attribute as defaultSelected even
   // when their current selectedIndex/value changes before binding.
+  f.sessionName.value = "stale name";
+  f.startRepository.value = "owner/repo";
   f.rootModel.value = "fast";
   f.rootThinking.value = "high";
   const controller = modalUI.bind(f.document, async () => response(201, { sessionId: "new" }));
   f.trigger.dispatch("click");
   assert.equal(f.form.resetCalls, 1);
   assert.equal(f.dialog.open, true);
+  assert.equal(f.sessionName.value, "");
+  assert.equal(f.startRepository.value, "");
   assert.equal(f.rootModel.value, "deep");
   assert.equal(f.rootModel.selectedIndex, 0);
   assert.equal(f.rootModel.options[0].defaultSelected, true);
@@ -239,8 +260,10 @@ test("one-level model displays but disables its thinking selector", () => {
   assert.equal(f.workerThinkingB.disabled, true);
 });
 
-test("buildRequest returns the root and every worker exactly once", () => {
+test("buildRequest returns raw name and repository with the root and every worker exactly once", () => {
   const f = fixture();
+  f.sessionName.value = "release triage";
+  f.startRepository.value = "owner/repo";
   f.rootModel.value = "fast";
   f.rootThinking.replaceChildren(option("off"), option("medium"));
   f.rootThinking.value = "medium";
@@ -252,6 +275,8 @@ test("buildRequest returns the root and every worker exactly once", () => {
   f.workerThinkingB.value = "xhigh";
   const got = modalUI.buildRequest(f.dialog);
   assert.deepEqual(got, {
+    name: "release triage",
+    repository: "owner/repo",
     root: { modelType: "fast", thinkingLevel: "medium" },
     workers: [
       { workerType: "oracle", modelType: "fast", thinkingLevel: "off" },
@@ -269,6 +294,8 @@ test("Launch posts the exact complete request and disables controls while pendin
     return new Promise((resolve) => { resolveFetch = resolve; });
   });
   f.trigger.dispatch("click");
+  f.sessionName.value = "release triage";
+  f.startRepository.value = "owner/repo";
   const expected = modalUI.buildRequest(f.dialog);
   f.form.dispatch("submit");
   assert.equal(calls.length, 1);
@@ -281,6 +308,8 @@ test("Launch posts the exact complete request and disables controls while pendin
   });
   assert.equal(f.dialog.getAttribute("aria-busy"), "true");
   assert.equal(f.launch.textContent, "Launching…");
+  assert.equal(f.sessionName.disabled, true);
+  assert.equal(f.startRepository.disabled, true);
   assert.ok(f.controls.every((control) => control.disabled));
 
   resolveFetch(response(201, { sessionId: "created" }));
@@ -324,10 +353,14 @@ test("failed HTTP keeps modal open, restores controls, and shows bounded sanitiz
   const unsafe = " <b>not allowed</b> " + "x".repeat(700);
   modalUI.bind(f.document, async () => response(400, { error: unsafe }));
   f.trigger.dispatch("click");
+  f.sessionName.value = "keep this name";
+  f.startRepository.value = "owner/repo";
   f.form.dispatch("submit");
   await settle();
 
   assert.equal(f.dialog.open, true);
+  assert.equal(f.sessionName.value, "keep this name");
+  assert.equal(f.startRepository.value, "owner/repo");
   assert.equal(f.dialog.getAttribute("aria-busy"), null);
   assert.equal(f.launch.disabled, false);
   assert.equal(f.cancel.disabled, false);
@@ -434,11 +467,15 @@ test("201 closes and resets the modal", async () => {
   const f = fixture();
   modalUI.bind(f.document, async () => response(201, { sessionId: "created" }));
   f.trigger.dispatch("click");
+  f.sessionName.value = "completed name";
+  f.startRepository.value = "owner/repo";
   f.rootModel.value = "fast";
   f.form.dispatch("submit");
   await settle();
   assert.equal(f.dialog.open, false);
   assert.equal(f.form.resetCalls, 2);
+  assert.equal(f.sessionName.value, "");
+  assert.equal(f.startRepository.value, "");
   assert.equal(f.rootModel.value, "deep");
   assert.equal(f.status.textContent, "");
 });

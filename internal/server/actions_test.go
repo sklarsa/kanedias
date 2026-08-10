@@ -120,7 +120,7 @@ func TestNewSessionActionAcceptsStrictJSONAndReturnsCreatedSession(t *testing.T)
 	fleet.launchOptions = launchOptionsFixture()
 	fleet.spawnSessionID = "session-created"
 	handler, cookie := mustNewHandlerWithFleetAuth(t, fleet)
-	body := `{"root":{"modelType":"deep-model","thinkingLevel":"xhigh"},"workers":[{"workerType":"oracle","modelType":"deep-model","thinkingLevel":"high"},{"workerType":"reviewer","modelType":"fast-model","thinkingLevel":"medium"},{"workerType":"worker","modelType":"deep-model","thinkingLevel":"xhigh"}]}`
+	body := `{"name":"release triage","repository":"one/alpha","root":{"modelType":"deep-model","thinkingLevel":"xhigh"},"workers":[{"workerType":"oracle","modelType":"deep-model","thinkingLevel":"high"},{"workerType":"reviewer","modelType":"fast-model","thinkingLevel":"medium"},{"workerType":"worker","modelType":"deep-model","thinkingLevel":"xhigh"}]}`
 
 	resp := serveActionRequest(t, handler, "/ui/sessions", body, cookie)
 	if resp.Code != http.StatusCreated {
@@ -133,7 +133,9 @@ func TestNewSessionActionAcceptsStrictJSONAndReturnsCreatedSession(t *testing.T)
 		t.Fatalf("response = %q", got)
 	}
 	want := manager.SessionLaunchRequest{
-		Root: manager.ModelSelection{ModelType: "deep-model", ThinkingLevel: "xhigh"},
+		Name:       "release triage",
+		Repository: "one/alpha",
+		Root:       manager.ModelSelection{ModelType: "deep-model", ThinkingLevel: "xhigh"},
 		Workers: []manager.WorkerModelSelection{
 			{WorkerType: "oracle", ModelType: "deep-model", ThinkingLevel: "high"},
 			{WorkerType: "reviewer", ModelType: "fast-model", ThinkingLevel: "medium"},
@@ -214,6 +216,7 @@ func TestNewSessionActionMapsTypedInvalidAndSpawnFailure(t *testing.T) {
 		wantBody   string
 	}{
 		{name: "invalid request", err: contract.NewError(contract.ErrorInvalidRequest, "unknown private model"), wantStatus: http.StatusBadRequest, wantBody: `{"error":"The session configuration was not valid."}`},
+		{name: "repository unavailable", err: contract.NewError(contract.ErrorWorkspaceRepositoryUnavailable, "/private/path"), wantStatus: http.StatusServiceUnavailable, wantBody: `{"error":"The selected repository is not present in the workspace."}`},
 		{name: "admission failure", err: errors.New("private socket path /run/secret.sock"), wantStatus: http.StatusServiceUnavailable, wantBody: `{"error":"The session could not be started."}`},
 	}
 	for _, test := range tests {
@@ -229,7 +232,7 @@ func TestNewSessionActionMapsTypedInvalidAndSpawnFailure(t *testing.T) {
 			if got := strings.TrimSpace(resp.Body.String()); got != test.wantBody {
 				t.Fatalf("response = %q, want %q", got, test.wantBody)
 			}
-			if strings.Contains(resp.Body.String(), test.err.Error()) {
+			if strings.Contains(resp.Body.String(), test.err.Error()) || strings.Contains(resp.Body.String(), "/private/path") {
 				t.Errorf("response leaked real error: %s", resp.Body.String())
 			}
 			if !strings.Contains(logs.String(), test.err.Error()) {

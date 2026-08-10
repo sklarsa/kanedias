@@ -776,7 +776,8 @@ details[open] > summary .twisty{ transform:rotate(90deg); }
   letter-spacing:.08em;
   text-transform:uppercase;
 }
-#new-session-modal select{
+#new-session-modal select,
+#new-session-modal input[type="text"]{
   min-width:0;
   width:100%;
   padding:9px 34px 9px 10px;
@@ -786,7 +787,17 @@ details[open] > summary .twisty{ transform:rotate(90deg); }
   background:var(--bg-sunk);
   font:13px var(--mono);
 }
-#new-session-modal select:disabled{
+#new-session-modal input[type="text"]{
+  padding-right:10px;
+}
+#new-session-modal .optional{
+  color:var(--ink-faint);
+  font-size:10px;
+  letter-spacing:0;
+  text-transform:none;
+}
+#new-session-modal select:disabled,
+#new-session-modal input[type="text"]:disabled{
   opacity:.68;
   color:var(--ink-dim);
   cursor:not-allowed;
@@ -862,11 +873,13 @@ details[open] > summary .twisty{ transform:rotate(90deg); }
   background:var(--amber-glow);
 }
 #new-session-modal button:disabled,
-#new-session-modal select:disabled{
+#new-session-modal select:disabled,
+#new-session-modal input[type="text"]:disabled{
   cursor:not-allowed;
 }
 #new-session-modal button:focus-visible,
 #new-session-modal select:focus-visible,
+#new-session-modal input[type="text"]:focus-visible,
 #new-session-modal summary:focus-visible{
   outline:2px solid var(--brass-bright);
   outline-offset:2px;
@@ -931,6 +944,7 @@ details[open] > summary .twisty{ transform:rotate(90deg); }
   }
   #new-session-modal fieldset{ grid-template-columns:1fr; gap:7px; }
   #new-session-modal select,
+  #new-session-modal input[type="text"],
   #new-session-modal button,
   #new-session-modal summary{ min-height:44px; }
   #new-session-modal .modal-close{ min-width:44px; }

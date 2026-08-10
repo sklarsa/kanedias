@@ -76,6 +76,8 @@
 
   function buildRequest(dialog) {
     return {
+      name: dialog.querySelector("[data-session-name]").value,
+      repository: dialog.querySelector("[data-start-repository]").value,
       root: selection(
         dialog.querySelector("[data-root-model]"),
         dialog.querySelector("[data-root-thinking]")

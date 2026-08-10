@@ -30,9 +30,18 @@ type indexView struct {
 // sessionModalView is the launch configuration rendered into the closed dialog.
 type sessionModalView struct {
 	Enabled      bool
+	Repositories []repositoryOptionView
 	RootModels   []modelOptionView
 	RootThinking []thinkingOptionView
 	Workers      []workerOptionView
+}
+
+// repositoryOptionView exposes only the configured slug and whether it is the
+// configured browser default. Repository paths and credentials never enter the
+// template projection.
+type repositoryOptionView struct {
+	Slug     string
+	Selected bool
 }
 
 // modelOptionView intentionally exposes only allowlisted browser-facing model
@@ -65,12 +74,18 @@ func newIndexView(options manager.SessionLaunchOptions) indexView {
 	sort.Slice(models, func(i, j int) bool { return models[i].ModelType < models[j].ModelType })
 	workers := append([]manager.WorkerLaunchOption(nil), options.Workers...)
 	sort.Slice(workers, func(i, j int) bool { return workers[i].WorkerType < workers[j].WorkerType })
+	repositories := append([]manager.RepositoryLaunchOption(nil), options.Repositories...)
+	sort.Slice(repositories, func(i, j int) bool { return repositories[i].Slug < repositories[j].Slug })
 
 	modal := sessionModalView{
 		Enabled:      true,
+		Repositories: make([]repositoryOptionView, 0, len(repositories)),
 		RootModels:   newModelOptionViews(models, options.Root.ModelType),
 		RootThinking: thinkingOptionsFor(models, options.Root.ModelType, options.Root.ThinkingLevel),
 		Workers:      make([]workerOptionView, 0, len(workers)),
+	}
+	for _, repository := range repositories {
+		modal.Repositories = append(modal.Repositories, repositoryOptionView{Slug: repository.Slug})
 	}
 	for i, worker := range workers {
 		modal.Workers = append(modal.Workers, workerOptionView{
