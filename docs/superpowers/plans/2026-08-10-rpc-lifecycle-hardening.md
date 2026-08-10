@@ -525,7 +525,7 @@ Before each scenario marks success, write:
 - pre-control, post-control, and final tree snapshots; and
 - exact resource snapshots.
 
-Assert monotonic broker sequence, monotonic per-session source sequence, no duplicate `(sessionID, sourceSeq)`, one terminal settlement per started generation, no remaining descendant socket, no owned process, and no proxy warning.
+Assert monotonic broker sequence, monotonic per-session source sequence, no duplicate `(sessionID, sourceSeq)`, and one non-overlapping `agent_start`/`agent_end` pair per observed generation. Treat `agent_settled` as an optional post-end confirmation in the shared validator because Pi may omit it for an aborted generation when queued work starts immediately; retain exact `agent_settled` totals in each scenario whose control contract requires them. Also require no remaining descendant socket, no owned process, and no proxy warning.
 
 - [ ] **Step 5: Format, compile, race support tests, and commit**
 
@@ -1351,6 +1351,237 @@ git commit -m "test: harden managed server acceptance"
 ```
 
 Update Task 6B through 6F reports with the shared commit and evidence, then resume Task 6 Step 2. Both the dedicated descendant-interrupt and rapid-control scenarios must still run in Task 6 Step 3 and may not borrow this test-only separation as evidence of their correctness.
+
+---
+
+### Task 6G: Linearize direct-child cancellation and publish typed abort before child teardown
+
+**Failed invariants and evidence:**
+
+- Required direct-stop invariant: after an accepted direct-child `DELETE`, the in-flight create call returns exact `child_aborted`/HTTP 409, the child exits cleanly, and the root remains usable. `/home/steven/.cache/kanedias/e2e/e2e-3420990-1786397870366777991/` instead returned `child_failed`/HTTP 502 at terminal acknowledgement.
+- Required root-end invariant: stopping a root with three active children returns each create call as `child_aborted`, exits the root zero, and restores the exact four-session baseline. `/home/steven/.cache/kanedias/e2e/e2e-3420990-1786397881990136240/` instead recorded three cancelled child runtimes and root exit status 1.
+- Required abort invariant: routed Pi `abort` acknowledges while the child server remains available, the child emits one aborted terminal generation, and the create call returns `child_aborted`. `/home/steven/.cache/kanedias/e2e/e2e-3420990-1786397894750893548/` and the abort sibling in `/home/steven/.cache/kanedias/e2e/e2e-3420990-1786398052076315968/` both contain the correct Pi order `message_end(stopReason=aborted) -> agent_end -> agent_settled`, but the routed abort lost the child transport and the create call later returned `child_failed` while attempting terminal acknowledgement.
+- Earliest abort divergence: `productionChildRunnerWithRuntime` returns the `RunReadTask` error and executes its deferred `node.Stop` before `RunInheritedChild` can publish `reporter.Failure`. The child Unix/SSE server therefore closes before the in-flight abort response and before the direct parent can ingest and acknowledge the typed terminal report.
+- Earliest requested-stop divergence: cancellation deliberately closes the terminal-ack endpoint, but `childEntry` has no external-cancellation versus terminal-acceptance linearization. `CreateChild` can ingest a terminal message or EOF after cancellation and still attempt acknowledgement or classify the failure as `child_failed`. When a descendant client exists, cleanup requests child HTTP stop without closing the inherited parent-liveness endpoint that is the architecture's canonical cancellation signal.
+- The terminal-ack errors after failed abort routing are secondary cleanup fallout, not evidence that Pi ignored abort. Do not increase timeouts, retry controls, or weaken the `child_aborted` contract.
+
+**Files:**
+
+- Modify/Test: `cmd/session_runtime.go`, `cmd/session_runtime_test.go`
+- Modify/Test: `internal/supervisor/result.go`, `internal/supervisor/read_result_test.go`
+- Modify/Test: `internal/supervisor/children.go`, `internal/supervisor/children_test.go`
+- Modify/Test: `internal/supervisor/node.go`, `internal/supervisor/node_test.go`
+- Modify/Test if required by the direct-owner seam: `internal/supervisor/router.go`, `internal/supervisor/router_test.go`
+- Read comparison: `internal/supervisor/process/liveness.go`, `internal/supervisor/process/protocol.go`, `internal/supervisor/process/spawn.go`, and `docs/architecture/session-supervisor.md`
+
+**Interfaces and non-negotiable ordering:**
+
+- A successfully validated terminal report still linearizes before cancellation, marks descendant SSE closure expected, receives exactly one acknowledgement byte, and only then begins normal cleanup.
+- External cancellation still closes the terminal-ack endpoint without acknowledgement and closes inherited parent liveness so the child recursively cancels its subtree.
+- Generic failure cleanup must never mark a child as externally cancelled; real startup/runtime failures remain `child_failed`.
+- A typed non-cancellation read failure is published and acknowledged while the child supervisor transport is still live. Inherited-context cancellation publishes no terminal report.
+
+Independent review of this Task 6G amendment is required before Step 1 changes production code.
+
+- [ ] **Step 1: Add narrow RED regressions for all three race boundaries**
+
+Add hermetic tests proving:
+
+1. `RunReadTask` returns the already-cancelled inherited context rather than `child_failed` when RPC EOF races that cancellation.
+2. A production read-child aborted/error result publishes one privacy-safe typed `MessageFailure` and waits for parent acknowledgement before `CloseListener`/deferred node teardown; when the inherited context is cancelled, no terminal report is published.
+3. An external direct-child cancellation that wins before terminal acceptance closes ack and liveness, produces no acknowledgement, waits for process cleanup, and resolves the blocked `CreateChild` as `child_aborted` rather than `child_failed`.
+4. A valid terminal report that wins the same race is acknowledged exactly once and retains its original success/failure result; a genuine child failure through generic cleanup remains `child_failed`.
+5. Root stop applies the external-cancellation path concurrently to all registered children without a deadlock, nonzero cleanup error, or residual entry.
+
+Use explicit channels for cancellation admission, terminal-message admission, acknowledgement, liveness close, and process completion. Do not use sleeps as the ordering seam.
+
+- [ ] **Step 2: Prove RED before implementation**
+
+Run the exact new test names selected in Step 1 under their owning packages. Expected: compile failures for the missing child-entry cancellation/terminal-claim seams and/or assertion failures showing teardown precedes failure publication and cancellation becomes `child_failed`. Record the exact RED commands and output in the Task 6G report before editing production.
+
+- [ ] **Step 3: Publish read failures before the child runtime defer tears down transport**
+
+In `cmd/session_runtime.go`, add one private helper used by the read-child branch:
+
+1. If `RunReadTask` succeeds, preserve `reporter.Read` exactly.
+2. If the inherited context is cancelled, return the context error without publishing a terminal report; parent cancellation already closed the ack endpoint.
+3. Otherwise map a typed `contract.Error` to its existing code/message, map an untyped error to fixed `internal`/`internal supervisor error`, call `reporter.Failure`, and return `errors.Join(runErr, reportErr)`. `Reporter.TerminalSent` prevents `RunInheritedChild` from publishing a duplicate.
+4. Because `reporter.Failure` waits for the direct-parent acknowledgement, the existing deferred `node.Stop` cannot close Unix/SSE before terminal ingestion. Parent-liveness cancellation must remain able to unblock that wait; do not add a timeout or detached goroutine.
+
+In `internal/supervisor/result.go`, when `local.rpc.Done()` wins, return `ctx.Err()` if the inherited context is already cancelled before classifying an unexpected RPC EOF as `child_failed`.
+
+- [ ] **Step 4: Add a direct-child cancellation versus terminal-acceptance linearization**
+
+Add monotonic state and small locked methods on `childEntry` so exactly one boundary wins:
+
+1. An external cancellation origin claims cancellation only if terminal acceptance has not already been claimed.
+2. Terminal acceptance claims only if external cancellation has not already been claimed; claiming terminal acceptance also marks descendant SSE closure expected before acknowledgement.
+3. Generic `failChildCreation` cleanup does not claim external cancellation.
+
+Add a dedicated parent-owned cancellation helper. Use it from direct-target `Router.Stop` and `stopChildren`; deeper targets continue routing to the direct owner, which applies the same rule. If cancellation wins, close terminal ack and inherited liveness as the canonical non-acknowledged cancellation signal, mark/cancel event ownership, then bound process wait/escalation/recovery/removal with the existing cleanup deadline. Do not wait for a descendant HTTP stop before liveness EOF, and do not turn an expected closed child server into a cleanup failure.
+
+In `CreateChild`, check the linearized outcome after `NextMessage` failure and at the terminal-acceptance boundary. If cancellation won, do not acknowledge any terminal report; wait for the one existing cleanup operation with the normal bounded child-stop context and return exact `child_aborted`. If terminal acceptance won, retain all existing identity/kind/worker checks, exact acknowledgement, and normal cleanup. Cover the residual cancellation-versus-ack error race by consulting the same linearized outcome rather than rewriting unrelated acknowledgement failures.
+
+- [ ] **Step 5: Prove focused GREEN and race safety**
+
+Run:
+
+```bash
+gofmt -w cmd/session_runtime.go cmd/session_runtime_test.go \
+  internal/supervisor/result.go internal/supervisor/read_result_test.go \
+  internal/supervisor/children.go internal/supervisor/children_test.go \
+  internal/supervisor/node.go internal/supervisor/node_test.go \
+  internal/supervisor/router.go internal/supervisor/router_test.go
+go test -v -count=1 ./cmd ./internal/supervisor -run '<exact Task 6G regression alternation>'
+go test -race -v -count=1 ./cmd ./internal/supervisor -run '<exact Task 6G regression alternation>'
+go test -count=1 ./cmd ./internal/supervisor
+git diff --check
+```
+
+If no router production/test edit is required, omit those paths from `gofmt`; do not create placeholder files. Expected: all new comparisons pass normally and under race, existing child terminal-ordering/cancellation tests remain green, and diff check is silent.
+
+- [ ] **Step 6: Rerun only the four affected live scenarios once**
+
+```bash
+set -a; . /home/steven/source/github/kanedias/.env; set +a
+go test -v -count=1 -tags=incus ./internal/supervisor \
+  -run '^TestLiveRPC(ChildStop|RootEnd|Interrupt|MixedSibling)Lifecycle$' \
+  -timeout 2h
+```
+
+Expected: direct stop and root cascade return exact `child_aborted`; root exit is zero; root and child aborts acknowledge over live transports; mixed natural/delete/abort siblings retain independent outcomes; exact process/socket/Incus baseline is restored. A later failure gets a new artifact and plan amendment rather than a broadened fix.
+
+- [ ] **Step 7: Review and commit**
+
+After focused and live GREEN, obtain independent implementation review, then commit only the verified Task 6G production/tests:
+
+```bash
+git add cmd/session_runtime.go cmd/session_runtime_test.go \
+  internal/supervisor/result.go internal/supervisor/read_result_test.go \
+  internal/supervisor/children.go internal/supervisor/children_test.go \
+  internal/supervisor/node.go internal/supervisor/node_test.go \
+  internal/supervisor/router.go internal/supervisor/router_test.go
+git commit -m "fix: linearize child cancellation teardown"
+```
+
+Stage only files that actually changed.
+
+---
+
+### Task 6H: Validate Pi generations by `agent_end` while treating `agent_settled` as optional confirmation
+
+**Failed invariant and evidence:**
+
+- `/home/steven/.cache/kanedias/e2e/e2e-3420990-1786398020084033881/` completed rapid steer -> abort -> isolated follow-up and exact cleanup, then `validateLifecycleFinalEvents` rejected a new `agent_start` because the prior generation lacked `agent_settled`.
+- The complete source order is: generation 1 `agent_start -> message_end(aborted) -> agent_end` with no settled event; generation 2 `agent_start -> message_end(stop) -> agent_end -> agent_settled`; generation 3 has the same complete order. Starts and ends are exactly 3/3 and never overlap.
+- Earliest divergence is test-only: `validateLifecycleFinalEvents` closes an open generation only on `agent_settled`, but Pi's run boundary is `agent_end`; `agent_settled` is a later confirmation that may be omitted for an aborted generation when queued work immediately starts another run. Existing scenario-specific settlement totals remain authoritative where exact settled counts are part of the control contract.
+
+**Files and scope:**
+
+- Modify/Test only: `internal/supervisor/live_rpc_lifecycle_support_test.go`
+- Do not modify Pi, event forwarding, control semantics, or scenario-specific settlement assertions.
+
+Independent review of this Task 6H amendment is required before implementation.
+
+- [ ] **Step 1: Add a RED event-order regression**
+
+Rewrite the existing valid fixture in `TestValidateLifecycleFinalEventsRequiresOrderedPairedGenerations` so every generation contains `agent_start -> agent_end`, with selected generations followed by `agent_settled`; the fixture must include one ended generation whose optional settlement is omitted before a later `agent_start`. Re-derive every mutation index against this new fixture rather than retaining edits that target the old start/settled-only positions. Require acceptance of a sequence containing `agent_start -> agent_end -> agent_start -> agent_end -> agent_settled`. Add invalid comparisons for end without start, overlapping start before end, unclosed start, settled while a generation is open, and duplicate settled confirmation for one ended generation. Keep broker/source ordering and uniqueness cases.
+
+Run:
+
+```bash
+go test -v -count=1 -tags=incus ./internal/supervisor \
+  -run '^TestValidateLifecycleFinalEventsRequiresOrderedPairedGenerations$'
+```
+
+Expected RED: the valid missing-settled sequence is rejected as overlapping.
+
+- [ ] **Step 2: Close generations on `agent_end` and validate optional settlement locally**
+
+Change only `validateLifecycleFinalEvents`:
+
+1. `agent_start` opens a generation and clears any unconsumed settlement eligibility from an earlier ended generation.
+2. `agent_end` requires one open generation, closes it, and makes that ended generation eligible for at most one `agent_settled` confirmation.
+3. `agent_settled` is allowed only with no open generation and one current eligible ended generation, then consumes eligibility.
+4. Final validation requires no open generation but does not require every ended generation to settle.
+5. Preserve strict broker sequence, source sequence, source identity, and JSON parsing behavior.
+
+Do not weaken `validateLifecycleSettlementTotals`, `waitLifecycleSettlement`, or scenario-specific exact settlement counts.
+
+- [ ] **Step 3: Prove GREEN and rerun rapid control**
+
+```bash
+gofmt -w internal/supervisor/live_rpc_lifecycle_support_test.go
+go test -v -count=1 -tags=incus ./internal/supervisor \
+  -run '^TestValidateLifecycleFinalEventsRequiresOrderedPairedGenerations$'
+go test -race -v -count=1 -tags=incus ./internal/supervisor \
+  -run '^TestValidateLifecycleFinalEventsRequiresOrderedPairedGenerations$'
+set -a; . /home/steven/source/github/kanedias/.env; set +a
+go test -v -count=1 -tags=incus ./internal/supervisor \
+  -run '^TestLiveRPCRapidControlLifecycle$' -timeout 90m
+git diff --check
+```
+
+Expected: hermetic/race/live GREEN with exact cleanup and the scenario's existing two-settlement total unchanged.
+
+- [ ] **Step 4: Review and commit**
+
+After independent implementation review:
+
+```bash
+git add internal/supervisor/live_rpc_lifecycle_support_test.go
+git commit -m "test: validate lifecycle generations by agent end"
+```
+
+---
+
+### Task 6I: Preserve strict deterministic-child provenance with concise model-facing markers
+
+**Failed invariant and evidence:**
+
+- `/home/steven/.cache/kanedias/e2e/e2e-3420990-1786397593102734287/` returned a healthy HTTP 200 typed reviewer/read result for the observed child session after real repository reads, but its assistant output dropped one character from the requested long marker (`LIFECYCLE` became a one-character transcription variant).
+- Prompt bytes, event delivery, JSON encoding, and the assertion all contain the same correct ASCII marker. The first divergence is the local model's terminal echo, not supervisor transport or stale output.
+- Exact run provenance remains required. Do not add edit distance, case folding, retry, or a fallback that accepts output lacking the exact run prefix. Reduce the model-facing lexical burden instead.
+
+**Files and scope:**
+
+- Modify/Test only: `internal/supervisor/live_rpc_lifecycle_test.go`
+- Do not modify the provider/model, production child result contract, or exact `strings.Contains` assertion.
+
+Independent review of this Task 6I amendment is required before implementation.
+
+- [ ] **Step 1: Add a RED concise-marker regression**
+
+Add `TestLifecycleMarkerIsConciseExactAndRunScoped` for a new pure helper. Require exact outputs such as `KDS_DS_e2e-run` and `KDS_DP_2_e2e-run`, no spaces, and retention of the complete supplied run prefix. The helper is missing, so the focused test must fail to compile before implementation.
+
+- [ ] **Step 2: Use compact codes without weakening exactness**
+
+Implement the pure marker constructor and use it for deterministic direct single/parallel child markers only: `DS` for direct single and `DP_<index>` for direct parallel. Continue passing the exact marker in each task and requiring byte-exact containment in `assertLifecycleReadResult`. Keep unique child identity, real read workload, output summary, natural completion, and root-usability assertions unchanged.
+
+- [ ] **Step 3: Prove GREEN and rerun deterministic children**
+
+```bash
+gofmt -w internal/supervisor/live_rpc_lifecycle_test.go
+go test -v -count=1 -tags=incus ./internal/supervisor \
+  -run '^TestLifecycleMarkerIsConciseExactAndRunScoped$'
+go test -race -v -count=1 -tags=incus ./internal/supervisor \
+  -run '^TestLifecycleMarkerIsConciseExactAndRunScoped$'
+set -a; . /home/steven/source/github/kanedias/.env; set +a
+go test -v -count=1 -tags=incus ./internal/supervisor \
+  -run '^TestLiveRPCDeterministicChildLifecycle$' -timeout 90m
+git diff --check
+```
+
+Expected: strict marker assertion passes without fuzzy matching; the one-single/three-parallel topology, typed results, exact identities, natural cleanup, and baseline restoration all pass.
+
+- [ ] **Step 4: Review, commit, and resume the complete matrix**
+
+```bash
+git add internal/supervisor/live_rpc_lifecycle_test.go
+git commit -m "test: shorten lifecycle provenance markers"
+```
+
+After Tasks 6G–6I are independently live GREEN, rerun all eight scenarios once. Only a complete clean matrix may proceed to Task 7; any code change or failure resets the affected scenario's five-run count.
 
 ---
 
