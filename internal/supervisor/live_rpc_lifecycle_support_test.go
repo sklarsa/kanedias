@@ -18,6 +18,7 @@ import (
 
 	"github.com/sklarsa/kanedias/internal/config"
 	"github.com/sklarsa/kanedias/internal/supervisor"
+	"github.com/sklarsa/kanedias/internal/supervisor/contract"
 )
 
 func TestValidateLifecycleModelPolicyRequiresLocalRootAndWorkers(t *testing.T) {
@@ -67,16 +68,22 @@ func TestLifecycleEventJournalPreservesOrderAndSupportsRepeatedQueries(t *testin
 
 func TestValidateLifecycleModelToolEventsRequiresExactParallelSuccess(t *testing.T) {
 	markers := []string{"MARKER_ONE", "MARKER_TWO", "MARKER_THREE"}
+	childIDs := []string{"child-one", "child-two", "child-three"}
 	events := []supervisor.EventEnvelope{
 		lifecyclePiEnvelope(1, "root", `{"type":"tool_execution_start","toolCallId":"one","toolName":"delegate_session","args":{"workerType":"reviewer","kind":"read","context":"fresh","task":"return MARKER_ONE"}}`),
 		lifecyclePiEnvelope(2, "root", `{"type":"tool_execution_start","toolCallId":"two","toolName":"delegate_session","args":{"workerType":"reviewer","kind":"read","context":"fresh","task":"return MARKER_TWO"}}`),
 		lifecyclePiEnvelope(3, "root", `{"type":"tool_execution_start","toolCallId":"three","toolName":"delegate_session","args":{"workerType":"reviewer","kind":"read","context":"fresh","task":"return MARKER_THREE"}}`),
-		lifecyclePiEnvelope(4, "root", `{"type":"tool_execution_end","toolCallId":"two","toolName":"delegate_session","isError":false,"result":{"content":[{"type":"text","text":"MARKER_TWO"}]}}`),
-		lifecyclePiEnvelope(5, "root", `{"type":"tool_execution_end","toolCallId":"one","toolName":"delegate_session","isError":false,"result":{"content":[{"type":"text","text":"MARKER_ONE"}]}}`),
-		lifecyclePiEnvelope(6, "root", `{"type":"tool_execution_end","toolCallId":"three","toolName":"delegate_session","isError":false,"result":{"content":[{"type":"text","text":"MARKER_THREE"}]}}`),
+		lifecyclePiEnvelope(4, "root", `{"type":"tool_execution_end","toolCallId":"two","toolName":"delegate_session","isError":false,"result":{"content":[{"type":"text","text":"MARKER_TWO"}],"details":{"kind":"read","workerType":"reviewer","sessionId":"child-two","output":"MARKER_TWO"}}}`),
+		lifecyclePiEnvelope(5, "root", `{"type":"tool_execution_end","toolCallId":"one","toolName":"delegate_session","isError":false,"result":{"content":[{"type":"text","text":"MARKER_ONE"}],"details":{"kind":"read","workerType":"reviewer","sessionId":"child-one","output":"MARKER_ONE"}}}`),
+		lifecyclePiEnvelope(6, "root", `{"type":"tool_execution_end","toolCallId":"three","toolName":"delegate_session","isError":false,"result":{"content":[{"type":"text","text":"MARKER_THREE"}],"details":{"kind":"read","workerType":"reviewer","sessionId":"child-three","output":"MARKER_THREE"}}}`),
 	}
-	if err := validateLifecycleModelToolEvents(events, "root", markers, true); err != nil {
+	if err := validateLifecycleModelToolEvents(events, "root", markers, childIDs, true); err != nil {
 		t.Fatalf("valid parallel model tools: %v", err)
+	}
+	withUnrelatedEnd := append(append([]supervisor.EventEnvelope(nil), events...),
+		lifecyclePiEnvelope(7, "root", `{"type":"tool_execution_end","toolCallId":"unrelated","toolName":"read","isError":false}`))
+	if err := validateLifecycleModelToolEvents(withUnrelatedEnd, "root", markers, childIDs, true); err != nil {
+		t.Fatalf("unrelated tool terminal was not ignored: %v", err)
 	}
 
 	for _, test := range []struct {
@@ -103,8 +110,35 @@ func TestValidateLifecycleModelToolEventsRequiresExactParallelSuccess(t *testing
 		{name: "duplicate terminal", edit: func(events []supervisor.EventEnvelope) []supervisor.EventEnvelope {
 			return append(events, cloneLifecycleEnvelope(events[3]))
 		}},
+		{name: "unmatched delegate terminal", edit: func(events []supervisor.EventEnvelope) []supervisor.EventEnvelope {
+			return append(events, lifecyclePiEnvelope(7, "root", `{"type":"tool_execution_end","toolCallId":"extra","toolName":"delegate_session","isError":false}`))
+		}},
+		{name: "absent details", edit: func(events []supervisor.EventEnvelope) []supervisor.EventEnvelope {
+			events[3].Payload = json.RawMessage(strings.Replace(string(events[3].Payload), `,"details":{"kind":"read","workerType":"reviewer","sessionId":"child-two","output":"MARKER_TWO"}`, "", 1))
+			return events
+		}},
+		{name: "duplicate result session ID", edit: func(events []supervisor.EventEnvelope) []supervisor.EventEnvelope {
+			events[3].Payload = json.RawMessage(strings.Replace(string(events[3].Payload), "child-two", "child-one", 1))
+			return events
+		}},
+		{name: "unobserved result session ID", edit: func(events []supervisor.EventEnvelope) []supervisor.EventEnvelope {
+			events[3].Payload = json.RawMessage(strings.Replace(string(events[3].Payload), "child-two", "child-other", 1))
+			return events
+		}},
+		{name: "incorrect typed kind", edit: func(events []supervisor.EventEnvelope) []supervisor.EventEnvelope {
+			events[3].Payload = json.RawMessage(strings.Replace(string(events[3].Payload), `"kind":"read"`, `"kind":"write"`, 1))
+			return events
+		}},
+		{name: "missing typed worker identity", edit: func(events []supervisor.EventEnvelope) []supervisor.EventEnvelope {
+			events[3].Payload = json.RawMessage(strings.Replace(string(events[3].Payload), `"workerType":"reviewer"`, `"workerType":""`, 1))
+			return events
+		}},
+		{name: "missing typed session identity", edit: func(events []supervisor.EventEnvelope) []supervisor.EventEnvelope {
+			events[3].Payload = json.RawMessage(strings.Replace(string(events[3].Payload), `"sessionId":"child-two"`, `"sessionId":""`, 1))
+			return events
+		}},
 		{name: "missing result marker", edit: func(events []supervisor.EventEnvelope) []supervisor.EventEnvelope {
-			events[5].Payload = json.RawMessage(strings.Replace(string(events[5].Payload), "MARKER_THREE", "missing", 1))
+			events[5].Payload = json.RawMessage(strings.ReplaceAll(string(events[5].Payload), "MARKER_THREE", "missing"))
 			return events
 		}},
 	} {
@@ -113,7 +147,7 @@ func TestValidateLifecycleModelToolEventsRequiresExactParallelSuccess(t *testing
 			for index, event := range events {
 				cloned[index] = cloneLifecycleEnvelope(event)
 			}
-			if err := validateLifecycleModelToolEvents(test.edit(cloned), "root", markers, true); err == nil {
+			if err := validateLifecycleModelToolEvents(test.edit(cloned), "root", markers, childIDs, true); err == nil {
 				t.Fatal("invalid model tool events were accepted")
 			}
 		})
@@ -244,9 +278,9 @@ func (journal *lifecycleEventJournal) countPi(sessionID, eventType, toolName str
 
 // validateLifecycleModelToolEvents accepts only the requested root
 // delegate_session calls, exact reviewer/read/fresh arguments, one successful
-// marked result per call, and (when requested) starts for the whole batch
-// before any matching tool ends.
-func validateLifecycleModelToolEvents(events []supervisor.EventEnvelope, rootID string, markers []string, requireParallel bool) error {
+// typed child result per observed session, and (when requested) starts for the
+// whole batch before any matching tool ends.
+func validateLifecycleModelToolEvents(events []supervisor.EventEnvelope, rootID string, markers, observedChildIDs []string, requireParallel bool) error {
 	type toolEvent struct {
 		position int
 		payload  struct {
@@ -324,14 +358,37 @@ func validateLifecycleModelToolEvents(events []supervisor.EventEnvelope, rootID 
 		markerByID[start.payload.ToolCallID] = matched
 	}
 
+	if len(observedChildIDs) != len(markers) {
+		return fmt.Errorf("observed child IDs = %d, want exactly %d", len(observedChildIDs), len(markers))
+	}
+	observedSessions := make(map[string]struct{}, len(observedChildIDs))
+	for _, childID := range observedChildIDs {
+		if childID == "" {
+			return fmt.Errorf("observed child session ID is empty")
+		}
+		if _, duplicate := observedSessions[childID]; duplicate {
+			return fmt.Errorf("duplicate observed child session ID %q", childID)
+		}
+		observedSessions[childID] = struct{}{}
+	}
+
 	endsByID := make(map[string][]toolEvent, len(starts))
 	for _, end := range ends {
-		if _, expected := startsByID[end.payload.ToolCallID]; expected {
-			endsByID[end.payload.ToolCallID] = append(endsByID[end.payload.ToolCallID], end)
+		_, expected := startsByID[end.payload.ToolCallID]
+		if end.payload.ToolName == "delegate_session" && !expected {
+			return fmt.Errorf("unmatched delegate_session terminal toolCallId %q", end.payload.ToolCallID)
 		}
+		if !expected {
+			continue
+		}
+		if end.payload.ToolName != "" && end.payload.ToolName != "delegate_session" {
+			return fmt.Errorf("delegate_session %q terminal has conflicting tool name %q", end.payload.ToolCallID, end.payload.ToolName)
+		}
+		endsByID[end.payload.ToolCallID] = append(endsByID[end.payload.ToolCallID], end)
 	}
 	firstEnd := len(events)
 	lastStart := -1
+	resultSessions := make(map[string]string, len(starts))
 	for id, start := range startsByID {
 		if start.position > lastStart {
 			lastStart = start.position
@@ -347,8 +404,33 @@ func validateLifecycleModelToolEvents(events []supervisor.EventEnvelope, rootID 
 		if end.payload.IsError == nil || *end.payload.IsError {
 			return fmt.Errorf("delegate_session %q did not end with explicit success", id)
 		}
-		if !strings.Contains(string(end.payload.Result), markerByID[id]) {
-			return fmt.Errorf("delegate_session %q result lacks marker %q", id, markerByID[id])
+		var result struct {
+			Details *contract.ReadChildResult `json:"details"`
+		}
+		if err := json.Unmarshal(end.payload.Result, &result); err != nil {
+			return fmt.Errorf("decode delegate_session %q result: %w", id, err)
+		}
+		if result.Details == nil {
+			return fmt.Errorf("delegate_session %q result has no typed details", id)
+		}
+		details := *result.Details
+		if details.Kind != contract.ChildKindRead || details.WorkerType != "reviewer" || details.SessionID == "" {
+			return fmt.Errorf("delegate_session %q result has incorrect typed read-child identity: %#v", id, details)
+		}
+		if _, observed := observedSessions[details.SessionID]; !observed {
+			return fmt.Errorf("delegate_session %q result session %q was not observed", id, details.SessionID)
+		}
+		if prior, duplicate := resultSessions[details.SessionID]; duplicate {
+			return fmt.Errorf("delegate_session calls %q and %q returned duplicate child session %q", prior, id, details.SessionID)
+		}
+		if !strings.Contains(details.Output, markerByID[id]) {
+			return fmt.Errorf("delegate_session %q typed output lacks marker %q", id, markerByID[id])
+		}
+		resultSessions[details.SessionID] = id
+	}
+	for childID := range observedSessions {
+		if _, matched := resultSessions[childID]; !matched {
+			return fmt.Errorf("observed child session %q has no delegate_session result", childID)
 		}
 	}
 	if requireParallel && lastStart >= firstEnd {

@@ -207,7 +207,7 @@ func (h *liveAcceptance) exerciseModelDirectedChildren() {
 	h.assertLifecycleChildren(root.tree, singleTree.Children)
 	h.waitForLifecycleRootSettlement(root, singleSettled, "single model-directed root settlement")
 	singleEvents := root.journal.snapshot()[singleBoundary:]
-	if err := validateLifecycleModelToolEvents(singleEvents, root.tree.SessionID, []string{singleMarker}, false); err != nil {
+	if err := validateLifecycleModelToolEvents(singleEvents, root.tree.SessionID, []string{singleMarker}, []string{singleChild.SessionID}, false); err != nil {
 		h.t.Fatalf("single model-directed tool acceptance: %v", err)
 	}
 	if text := h.lastAssistantText(root.client, root.tree.SessionID); !strings.Contains(text, singleMarker) {
@@ -238,7 +238,11 @@ func (h *liveAcceptance) exerciseModelDirectedChildren() {
 	h.assertLifecycleChildren(root.tree, parallelTree.Children)
 	h.waitForLifecycleRootSettlement(root, parallelSettled, "parallel model-directed root settlement")
 	parallelEvents := root.journal.snapshot()[parallelBoundary:]
-	if err := validateLifecycleModelToolEvents(parallelEvents, root.tree.SessionID, parallelMarkers, true); err != nil {
+	parallelChildIDs := make([]string, 0, len(parallelTree.Children))
+	for _, child := range parallelTree.Children {
+		parallelChildIDs = append(parallelChildIDs, child.SessionID)
+	}
+	if err := validateLifecycleModelToolEvents(parallelEvents, root.tree.SessionID, parallelMarkers, parallelChildIDs, true); err != nil {
 		h.t.Fatalf("parallel model-directed tool acceptance: %v", err)
 	}
 	parallelText := h.lastAssistantText(root.client, root.tree.SessionID)
