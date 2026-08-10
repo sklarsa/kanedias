@@ -175,6 +175,31 @@ func TestHandlerCreateChildStrictlyDecodesAndBlocksForTerminalResult(t *testing.
 	}
 }
 
+func TestHandlerChildProvisionFailureOmitsInternalDiagnostics(t *testing.T) {
+	const publicMessage = "selected workspace repository is unavailable"
+	service := &fakeService{err: errors.Join(
+		contract.NewError(contract.ErrorWorkspaceRepositoryUnavailable, publicMessage),
+		errors.New("execute test -d /workspace/repos/repo: fatal: selected checkout is missing"),
+		errors.New("delete owned child volume: permission denied"),
+	)}
+	response := jsonRequest(t, NewHandler(service), http.MethodPost, "/v1/sessions/self/children", `{"workerType":"reviewer","kind":"read","context":"fresh","task":"review"}`)
+	if response.Code != http.StatusServiceUnavailable {
+		t.Fatalf("status = %d body=%s, want 503", response.Code, response.Body.String())
+	}
+	var public contract.Error
+	if err := json.Unmarshal(response.Body.Bytes(), &public); err != nil {
+		t.Fatal(err)
+	}
+	if public.Code != contract.ErrorWorkspaceRepositoryUnavailable || public.Message != publicMessage {
+		t.Fatalf("public error = %#v, want exact typed generic failure", public)
+	}
+	for _, forbidden := range []string{"execute test", "fatal:", "delete owned child volume", "permission denied"} {
+		if strings.Contains(response.Body.String(), forbidden) {
+			t.Fatalf("public response %q exposed internal detail %q", response.Body.String(), forbidden)
+		}
+	}
+}
+
 func TestHandlerEventsUsesStandardSSEFraming(t *testing.T) {
 	closed := make(chan supervisor.EventEnvelope)
 	close(closed)

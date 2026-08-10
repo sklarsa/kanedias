@@ -75,13 +75,16 @@ func RunInheritedChild(ctx context.Context, bootstrapFD, livenessFD, reportFD, t
 	var reportErr error
 	if runErr != nil && !reporter.TerminalSent() && (!errors.Is(runErr, context.Canceled) || childCtx.Err() == nil) {
 		code := contract.ErrorChildFailed
+		message := runErr.Error()
 		var contractErr *contract.Error
 		if errors.As(runErr, &contractErr) {
 			code = contractErr.Code
+			message = contractErr.Message
 		}
 		// The child context remains live while the terminal failure is reported;
-		// the direct parent's acknowledgement is the teardown boundary.
-		reportErr = reporter.Failure(code, runErr.Error())
+		// the direct parent's acknowledgement is the teardown boundary. Typed
+		// failures expose only their contract message; runErr retains diagnostics.
+		reportErr = reporter.Failure(code, message)
 	}
 	_ = stop(context.WithoutCancel(ctx))
 	monitorErr := <-monitorDone
