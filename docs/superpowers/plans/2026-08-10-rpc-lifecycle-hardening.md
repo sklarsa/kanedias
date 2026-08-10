@@ -1024,6 +1024,120 @@ Then update both Task 6B and Task 6C reports with the shared commit and verifica
 
 ---
 
+### Task 6D: Wait for a running descendant to enter the restarted manager projection before server control
+
+**Failed invariant and evidence:**
+
+- Required invariant: after the restarted server rediscovers the managed roots, descendant controls through that server must begin only after the descendant is both directly running under its root supervisor and atomically present in the restarted manager's fleet tree/routes.
+- The Task 6C live rerun advanced through trusted restart and fleet rediscovery, then failed at `internal/supervisor/live_incus_test.go:2876` after 11.55 seconds when the first descendant steer returned the normalized command-failure patch. Retained artifacts are at `/home/steven/.cache/kanedias/e2e/e2e-3356673-1786395184455477592/`.
+- `managed-server-restart.log` proves `GET /ui/fleet` returned HTTP 200 in 322 microseconds at `16:53:14.133`, so Task 6C's per-patch rediscovery assertion succeeded. The test then logged direct root-socket discovery of descendant `session-8e338e2d50ea5632aa1b4321a1cf4dbc`, but the server steer at `16:53:14.234` failed with `session ... not found`, only 101 milliseconds after the initial fleet response.
+- Earliest divergent boundary: `spawnManagedChild` gives the local model a trivial exact-reply task, `waitForManagedDescendant` accepts the first child with any nonempty session ID regardless of binding/lifecycle, and the test immediately addresses it through the restarted manager. The restarted manager learned the root tree before this direct child spawn; `internal/manager/monitor.go` installs descendant routes atomically with its next configured one-second snapshot commit. Direct root visibility therefore does not yet imply manager route visibility, and a trivial local-model task may also settle before that snapshot. The later asynchronous `managed-descendant-managed-child-result.json` 502 was captured while failure teardown stopped the session and does not establish an earlier child startup/model failure; it is not the basis for this amendment.
+
+**Files and scope:**
+
+- Modify/Test only: `internal/supervisor/live_incus_test.go`
+- Reuse test helper only: `lifecycleActiveReadTask` from `internal/supervisor/live_rpc_lifecycle_test.go`
+- Read comparison only: `internal/manager/monitor.go`, `internal/manager/discovery.go`, `internal/server/handler.go`, and `internal/server/web/fleet.html`
+- Read artifacts: `/home/steven/.cache/kanedias/e2e/e2e-3356673-1786395184455477592/`
+- Do not modify manager snapshot timing, route admission, server actions, supervisor child lifecycle, local provider behavior, or any production file.
+
+**Interfaces:**
+
+- Consumes: `isControllableChildSnapshot`, `lifecycleActiveReadTask`, the root `/v1/tree` snapshot, and complete Datastar fleet replacement patches containing one `data-session-id="SESSION_ID"` marker per projected session row.
+- Produces: a directly running bound descendant selection and an observable restarted-manager projection barrier before the first descendant server action.
+
+Independent review of this Task 6D amendment is required before Step 1 edits `internal/supervisor/live_incus_test.go`.
+
+- [ ] **Step 1: Add hermetic running-descendant and fleet-projection regressions**
+
+Add `TestManagedDescendantFromTreeRequiresOneRunningBoundReadChild`. Construct a root tree with exactly one child and require a new pure helper:
+
+```go
+func managedDescendantFromTree(tree supervisor.NodeSnapshot) (supervisor.NodeSnapshot, bool)
+```
+
+The valid child must be a bound `read`/`fresh` child with nonempty Pi session ID, session file, and model fields and lifecycle `running`. Add negative cases for no child, multiple children, unbound child, wrong kind/context, and `ready`, `completed`, or `failed` lifecycle. This is stricter than general `isControllableChildSnapshot` because the managed control sequence requires observable active work, not merely a ready transport.
+
+Add `TestFleetStreamContainsSessionEvaluatesIndividualPatches`. Feed in-memory complete Datastar SSE events where the first fleet patch lacks the descendant and the second contains exactly one `data-session-id="child-one"` marker; require a new helper:
+
+```go
+func fleetStreamContainsSession(r io.Reader, sessionID string) (bool, error)
+```
+
+Require false for a missing marker, a duplicate marker in one patch, a prefix-collision event type, and an empty session ID. No test may source `.env`, start a server, or require Incus despite the file's build tag.
+
+- [ ] **Step 2: Prove RED for the missing test-only barriers**
+
+Run:
+
+```bash
+go test -v -count=1 -tags=incus ./internal/supervisor \
+  -run '^Test(ManagedDescendantFromTreeRequiresOneRunningBoundReadChild|FleetStreamContainsSessionEvaluatesIndividualPatches)$'
+```
+
+Expected: FAIL to compile only because `managedDescendantFromTree` and `fleetStreamContainsSession` do not exist.
+
+- [ ] **Step 3: Implement exact running-child selection and reuse the bounded fleet-event scanner**
+
+Modify only `internal/supervisor/live_incus_test.go`:
+
+1. Implement `managedDescendantFromTree` to require exactly one direct child, require `isControllableChildSnapshot(child, contract.ChildKindRead, contract.ContextFresh)`, and additionally require lifecycle exactly `supervisor.LifecycleRunning`.
+2. Refactor Task 6C's scanner body into a private `fleetStreamContainsPatch(r io.Reader, match func(string) bool) (bool, error)`. Preserve the exact `event: datastar-patch-elements` match, blank-line event boundaries, one-MiB token bound, immediate return, final nonempty event handling, and scanner-error propagation. Keep `fleetStreamContainsExactly` as a thin wrapper using `fleetPatchMatches`.
+3. Implement `fleetStreamContainsSession` as another thin wrapper. Reject a blank session ID. A matching individual patch contains the exact `data-session-id="SESSION_ID"` marker once; zero or multiple occurrences reject that patch. Do not count across replacement patches.
+4. Use exact equality for the SSE event type rather than a prefix match, so the prefix-collision regression fails closed.
+
+- [ ] **Step 4: Keep the descendant observably active and wait for restarted-manager projection**
+
+Modify only the managed acceptance flow and its private helpers:
+
+1. Change `spawnManagedChild` to use `lifecycleActiveReadTask("KANEDIAS_E2E_MANAGED_DESCENDANT_OK")`, the already-reviewed bounded local-model workload used by the lifecycle control scenarios. It reads a fixed file list, forbids delegation and long-lived commands, and remains active long enough to expose a running child without sleeps.
+2. Change `waitForManagedDescendant` to call `managedDescendantFromTree`; do not accept merely nonempty or terminal child snapshots. Preserve the existing bounded poll and direct root-socket observation.
+3. Add `assertFleetContainsSession(client, serverOrigin, sessionID)`. Like `assertFleetContainsExactly`, use a five-second request context inside a 30-second `h.poll`, pass the response body to `fleetStreamContainsSession`, close it on every attempt, and accept only `matched && err == nil`.
+4. Immediately after direct descendant discovery/tracking and before the first descendant server action, call `assertFleetContainsSession` against the restarted connection. Seeing the descendant row proves the manager's tree and routes were committed atomically; do not retry an action request and do not add a sleep.
+5. Keep the existing descendant steer/interrupt/question/stop sequence unchanged in this task. If a later distinct control boundary fails, preserve its artifact and add another evidence-gated amendment rather than anticipating it here.
+
+- [ ] **Step 5: Prove focused GREEN and race safety**
+
+Run:
+
+```bash
+gofmt -w internal/supervisor/live_incus_test.go
+go test -v -count=1 -tags=incus ./internal/supervisor \
+  -run '^Test(ManagedDescendantFromTreeRequiresOneRunningBoundReadChild|FleetStreamContainsSessionEvaluatesIndividualPatches|FleetStreamContainsExactlyEvaluatesIndividualPatches|ParseManagedServerStartupModes|NormalizeManagedBootstrapURLToEffectiveOrigin|ManagedServerConnection(AuthenticatedAuthority|TrustedNoBootstrap))$'
+go test -race -v -count=1 -tags=incus ./internal/supervisor \
+  -run '^Test(ManagedDescendantFromTreeRequiresOneRunningBoundReadChild|FleetStreamContainsSessionEvaluatesIndividualPatches|FleetStreamContainsExactlyEvaluatesIndividualPatches|ParseManagedServerStartupModes|NormalizeManagedBootstrapURLToEffectiveOrigin|ManagedServerConnection(AuthenticatedAuthority|TrustedNoBootstrap))$'
+go test -count=1 -tags=incus ./internal/supervisor -run '^$'
+git diff --check
+```
+
+Expected: running/binding selection and delayed manager projection pass; invalid child snapshots, missing/duplicate markers, and non-Datastar prefix collisions fail closed; all Task 6B/6C tests stay green normally and under the race detector; tagged compilation succeeds; `git diff --check` is silent.
+
+- [ ] **Step 6: Rerun only the failed managed live acceptance**
+
+Run:
+
+```bash
+set -a; . /home/steven/source/github/kanedias/.env; set +a
+go test -v -count=1 -tags=incus ./internal/supervisor \
+  -run '^TestLiveServerManagedSupervisorAcceptance$' \
+  -timeout 90m
+```
+
+Expected: PASS through the restarted-manager descendant projection barrier and all remaining controls, with exact process, socket, Incus instance, and volume baseline restoration. On a later failure, preserve the artifact and return to read-only diagnosis.
+
+- [ ] **Step 7: Commit all jointly verified managed-acceptance hardening only after live GREEN**
+
+Task 6B through 6D intentionally remain one uncommitted test-only change while each newly exposed live boundary is repaired and rerun. After focused and live GREEN:
+
+```bash
+git add internal/supervisor/live_incus_test.go
+git commit -m "test: harden managed server acceptance"
+```
+
+Update the Task 6B/6C/6D reports with the shared commit and evidence, obtain independent implementation review, then resume Task 6 Step 2. Do not run the eight new lifecycle scenarios before both existing acceptances pass together.
+
+---
+
 ### Task 7: Prove five consecutive clean runs and complete verification
 
 **Files:**
