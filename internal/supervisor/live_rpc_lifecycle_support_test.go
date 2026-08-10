@@ -65,6 +65,79 @@ func TestLifecycleEventJournalPreservesOrderAndSupportsRepeatedQueries(t *testin
 	}
 }
 
+func TestValidateLifecycleModelToolEventsRequiresExactParallelSuccess(t *testing.T) {
+	markers := []string{"MARKER_ONE", "MARKER_TWO", "MARKER_THREE"}
+	events := []supervisor.EventEnvelope{
+		lifecyclePiEnvelope(1, "root", `{"type":"tool_execution_start","toolCallId":"one","toolName":"delegate_session","args":{"workerType":"reviewer","kind":"read","context":"fresh","task":"return MARKER_ONE"}}`),
+		lifecyclePiEnvelope(2, "root", `{"type":"tool_execution_start","toolCallId":"two","toolName":"delegate_session","args":{"workerType":"reviewer","kind":"read","context":"fresh","task":"return MARKER_TWO"}}`),
+		lifecyclePiEnvelope(3, "root", `{"type":"tool_execution_start","toolCallId":"three","toolName":"delegate_session","args":{"workerType":"reviewer","kind":"read","context":"fresh","task":"return MARKER_THREE"}}`),
+		lifecyclePiEnvelope(4, "root", `{"type":"tool_execution_end","toolCallId":"two","toolName":"delegate_session","isError":false,"result":{"content":[{"type":"text","text":"MARKER_TWO"}]}}`),
+		lifecyclePiEnvelope(5, "root", `{"type":"tool_execution_end","toolCallId":"one","toolName":"delegate_session","isError":false,"result":{"content":[{"type":"text","text":"MARKER_ONE"}]}}`),
+		lifecyclePiEnvelope(6, "root", `{"type":"tool_execution_end","toolCallId":"three","toolName":"delegate_session","isError":false,"result":{"content":[{"type":"text","text":"MARKER_THREE"}]}}`),
+	}
+	if err := validateLifecycleModelToolEvents(events, "root", markers, true); err != nil {
+		t.Fatalf("valid parallel model tools: %v", err)
+	}
+
+	for _, test := range []struct {
+		name string
+		edit func([]supervisor.EventEnvelope) []supervisor.EventEnvelope
+	}{
+		{name: "fewer starts", edit: func(events []supervisor.EventEnvelope) []supervisor.EventEnvelope { return events[1:] }},
+		{name: "sequential execution", edit: func(events []supervisor.EventEnvelope) []supervisor.EventEnvelope {
+			events[1], events[3] = events[3], events[1]
+			return events
+		}},
+		{name: "duplicate tool call ID", edit: func(events []supervisor.EventEnvelope) []supervisor.EventEnvelope {
+			events[1].Payload = json.RawMessage(strings.ReplaceAll(string(events[1].Payload), `"two"`, `"one"`))
+			return events
+		}},
+		{name: "wrong arguments", edit: func(events []supervisor.EventEnvelope) []supervisor.EventEnvelope {
+			events[0].Payload = json.RawMessage(strings.Replace(string(events[0].Payload), `"reviewer"`, `"worker"`, 1))
+			return events
+		}},
+		{name: "error result", edit: func(events []supervisor.EventEnvelope) []supervisor.EventEnvelope {
+			events[3].Payload = json.RawMessage(strings.Replace(string(events[3].Payload), `"isError":false`, `"isError":true`, 1))
+			return events
+		}},
+		{name: "duplicate terminal", edit: func(events []supervisor.EventEnvelope) []supervisor.EventEnvelope {
+			return append(events, cloneLifecycleEnvelope(events[3]))
+		}},
+		{name: "missing result marker", edit: func(events []supervisor.EventEnvelope) []supervisor.EventEnvelope {
+			events[5].Payload = json.RawMessage(strings.Replace(string(events[5].Payload), "MARKER_THREE", "missing", 1))
+			return events
+		}},
+	} {
+		t.Run(test.name, func(t *testing.T) {
+			cloned := make([]supervisor.EventEnvelope, len(events))
+			for index, event := range events {
+				cloned[index] = cloneLifecycleEnvelope(event)
+			}
+			if err := validateLifecycleModelToolEvents(test.edit(cloned), "root", markers, true); err == nil {
+				t.Fatal("invalid model tool events were accepted")
+			}
+		})
+	}
+}
+
+func TestValidateLifecycleNaturalChildEventsRejectsDuplicateTerminalEvent(t *testing.T) {
+	events := []supervisor.EventEnvelope{
+		lifecyclePiEnvelope(1, "child", `{"type":"message_end","message":{"role":"assistant","stopReason":"stop"}}`),
+		lifecyclePiEnvelope(2, "child", `{"type":"agent_settled"}`),
+	}
+	if err := validateLifecycleNaturalChildEvents(events, []string{"child"}); err != nil {
+		t.Fatalf("valid natural child events: %v", err)
+	}
+	events = append(events, lifecyclePiEnvelope(3, "child", `{"type":"agent_settled"}`))
+	if err := validateLifecycleNaturalChildEvents(events, []string{"child"}); err == nil {
+		t.Fatal("duplicate child terminal event was accepted")
+	}
+}
+
+func lifecyclePiEnvelope(seq uint64, sessionID, payload string) supervisor.EventEnvelope {
+	return supervisor.EventEnvelope{Seq: seq, SessionID: sessionID, Kind: "pi", Payload: json.RawMessage(payload)}
+}
+
 // validateLifecycleModelPolicy resolves the whole session model policy and
 // requires the root and every configured worker to resolve to one exact
 // provider/model pair. Failures identify the worker by name so a mixed live
@@ -167,6 +240,158 @@ func (journal *lifecycleEventJournal) countPi(sessionID, eventType, toolName str
 		}
 	}
 	return count
+}
+
+// validateLifecycleModelToolEvents accepts only the requested root
+// delegate_session calls, exact reviewer/read/fresh arguments, one successful
+// marked result per call, and (when requested) starts for the whole batch
+// before any matching tool ends.
+func validateLifecycleModelToolEvents(events []supervisor.EventEnvelope, rootID string, markers []string, requireParallel bool) error {
+	type toolEvent struct {
+		position int
+		payload  struct {
+			Type       string          `json:"type"`
+			ToolCallID string          `json:"toolCallId"`
+			ToolName   string          `json:"toolName"`
+			Args       json.RawMessage `json:"args"`
+			IsError    *bool           `json:"isError"`
+			Result     json.RawMessage `json:"result"`
+		}
+	}
+	var starts, ends []toolEvent
+	for position, event := range events {
+		if event.SessionID != rootID || event.Kind != "pi" {
+			continue
+		}
+		candidate := toolEvent{position: position}
+		if err := json.Unmarshal(event.Payload, &candidate.payload); err != nil {
+			continue
+		}
+		switch candidate.payload.Type {
+		case "tool_execution_start":
+			if candidate.payload.ToolName == "delegate_session" {
+				starts = append(starts, candidate)
+			}
+		case "tool_execution_end":
+			if candidate.payload.ToolName == "delegate_session" || candidate.payload.ToolCallID != "" {
+				ends = append(ends, candidate)
+			}
+		}
+	}
+	if len(starts) != len(markers) {
+		return fmt.Errorf("delegate_session starts = %d, want exactly %d", len(starts), len(markers))
+	}
+
+	startsByID := make(map[string]toolEvent, len(starts))
+	markerByID := make(map[string]string, len(starts))
+	for _, start := range starts {
+		if start.payload.ToolCallID == "" {
+			return fmt.Errorf("delegate_session start has empty toolCallId")
+		}
+		if _, duplicate := startsByID[start.payload.ToolCallID]; duplicate {
+			return fmt.Errorf("duplicate delegate_session toolCallId %q", start.payload.ToolCallID)
+		}
+		var args struct {
+			WorkerType string `json:"workerType"`
+			Kind       string `json:"kind"`
+			Context    string `json:"context"`
+			Task       string `json:"task"`
+		}
+		if err := json.Unmarshal(start.payload.Args, &args); err != nil {
+			return fmt.Errorf("decode delegate_session %q arguments: %w", start.payload.ToolCallID, err)
+		}
+		if args.WorkerType != "reviewer" || args.Kind != "read" || args.Context != "fresh" || strings.TrimSpace(args.Task) == "" {
+			return fmt.Errorf("delegate_session %q arguments are not exact reviewer/read/fresh with a task", start.payload.ToolCallID)
+		}
+		matched := ""
+		for _, marker := range markers {
+			if strings.Contains(args.Task, marker) {
+				if matched != "" {
+					return fmt.Errorf("delegate_session %q task contains multiple requested markers", start.payload.ToolCallID)
+				}
+				matched = marker
+			}
+		}
+		if matched == "" {
+			return fmt.Errorf("delegate_session %q task contains no requested marker", start.payload.ToolCallID)
+		}
+		for _, existing := range markerByID {
+			if existing == matched {
+				return fmt.Errorf("requested marker %q used by multiple delegate_session calls", matched)
+			}
+		}
+		startsByID[start.payload.ToolCallID] = start
+		markerByID[start.payload.ToolCallID] = matched
+	}
+
+	endsByID := make(map[string][]toolEvent, len(starts))
+	for _, end := range ends {
+		if _, expected := startsByID[end.payload.ToolCallID]; expected {
+			endsByID[end.payload.ToolCallID] = append(endsByID[end.payload.ToolCallID], end)
+		}
+	}
+	firstEnd := len(events)
+	lastStart := -1
+	for id, start := range startsByID {
+		if start.position > lastStart {
+			lastStart = start.position
+		}
+		matchingEnds := endsByID[id]
+		if len(matchingEnds) != 1 {
+			return fmt.Errorf("delegate_session %q terminal tool events = %d, want exactly 1", id, len(matchingEnds))
+		}
+		end := matchingEnds[0]
+		if end.position < firstEnd {
+			firstEnd = end.position
+		}
+		if end.payload.IsError == nil || *end.payload.IsError {
+			return fmt.Errorf("delegate_session %q did not end with explicit success", id)
+		}
+		if !strings.Contains(string(end.payload.Result), markerByID[id]) {
+			return fmt.Errorf("delegate_session %q result lacks marker %q", id, markerByID[id])
+		}
+	}
+	if requireParallel && lastStart >= firstEnd {
+		return fmt.Errorf("delegate_session calls were not one parallel batch: last start position %d, first end position %d", lastStart, firstEnd)
+	}
+	return nil
+}
+
+// validateLifecycleNaturalChildEvents requires one successful assistant
+// message terminal and one (non-duplicated) settlement for every observed child.
+func validateLifecycleNaturalChildEvents(events []supervisor.EventEnvelope, childIDs []string) error {
+	for _, childID := range childIDs {
+		settled := 0
+		naturalMessages := 0
+		for _, event := range events {
+			if event.SessionID != childID || event.Kind != "pi" {
+				continue
+			}
+			var payload struct {
+				Type    string `json:"type"`
+				Message struct {
+					Role       string `json:"role"`
+					StopReason string `json:"stopReason"`
+				} `json:"message"`
+			}
+			if json.Unmarshal(event.Payload, &payload) != nil {
+				continue
+			}
+			if payload.Type == "agent_settled" {
+				settled++
+			}
+			if payload.Type == "message_end" && payload.Message.Role == "assistant" && payload.Message.StopReason == "stop" {
+				naturalMessages++
+			}
+		}
+		if settled != 1 {
+			return fmt.Errorf("child %q agent_settled events = %d, want exactly 1", childID, settled)
+		}
+		if naturalMessages != 1 {
+			return fmt.Errorf("child %q natural assistant message terminals = %d, want exactly 1", childID, naturalMessages)
+		}
+	}
+	return nil
 }
 
 func cloneLifecycleEnvelope(event supervisor.EventEnvelope) supervisor.EventEnvelope {

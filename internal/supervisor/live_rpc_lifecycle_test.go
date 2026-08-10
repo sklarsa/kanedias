@@ -24,6 +24,12 @@ func TestLiveRPCDeterministicChildLifecycle(t *testing.T) {
 	})
 }
 
+func TestLiveRPCModelChildLifecycle(t *testing.T) {
+	runLifecycleScenario(t, "model-children", func(h *liveAcceptance) {
+		h.exerciseModelDirectedChildren()
+	})
+}
+
 func TestLiveRPCChildStopLifecycle(t *testing.T) {
 	runLifecycleScenario(t, "child-stop", func(h *liveAcceptance) {
 		h.exerciseLifecycleChildStop()
@@ -183,6 +189,71 @@ func (h *liveAcceptance) exerciseDeterministicChildren() {
 	h.stopLifecycleRoot(root)
 }
 
+func (h *liveAcceptance) exerciseModelDirectedChildren() {
+	root := h.startLifecycleRoot("model-children")
+	defer h.writeLifecycleModelEvidence(root, "model-children-final")
+
+	singleMarker := "KANEDIAS_LIFECYCLE_MODEL_SINGLE_" + h.prefix
+	singleBoundary := len(root.journal.snapshot())
+	singleSettled := root.journal.countPi(root.tree.SessionID, "agent_settled", "")
+	singlePrompt := "In your next assistant turn, call delegate_session exactly once with workerType reviewer, kind read, context fresh. " +
+		"The child task is: inspect internal/supervisor/lifecycle.go and return exactly " + singleMarker + " after the inspection. " +
+		"After the tool returns, reply with exactly " + singleMarker + "."
+	h.sendLifecycleModelPrompt(root, singlePrompt)
+
+	singleTree := h.waitForLifecycleModelChildren(root, singleBoundary, singleSettled, 1, "single model-directed bound child")
+	singleChild := singleTree.Children[0]
+	singlePIDs := h.captureLifecycleChildPIDs(root, 1, "model-single")
+	h.assertLifecycleChildren(root.tree, singleTree.Children)
+	h.waitForLifecycleRootSettlement(root, singleSettled, "single model-directed root settlement")
+	singleEvents := root.journal.snapshot()[singleBoundary:]
+	if err := validateLifecycleModelToolEvents(singleEvents, root.tree.SessionID, []string{singleMarker}, false); err != nil {
+		h.t.Fatalf("single model-directed tool acceptance: %v", err)
+	}
+	if text := h.lastAssistantText(root.client, root.tree.SessionID); !strings.Contains(text, singleMarker) {
+		h.t.Fatalf("single model-directed root final text %q lacks marker %q", text, singleMarker)
+	}
+	h.waitForLifecycleNaturalChildEvents(root, []supervisor.NodeSnapshot{singleChild}, "single model-directed child natural completion")
+	h.waitForLifecycleChildrenGone(root, []supervisor.NodeSnapshot{singleChild}, singlePIDs, "single model-directed child disappearance")
+	h.writeLifecycleModelEvidence(root, "model-single-complete")
+	h.assertRootUsable(root, "KANEDIAS_LIFECYCLE_MODEL_SINGLE_ROOT_USABLE_"+h.prefix)
+
+	parallelMarkers := []string{
+		"KANEDIAS_LIFECYCLE_MODEL_PARALLEL_1_" + h.prefix,
+		"KANEDIAS_LIFECYCLE_MODEL_PARALLEL_2_" + h.prefix,
+		"KANEDIAS_LIFECYCLE_MODEL_PARALLEL_3_" + h.prefix,
+	}
+	parallelBoundary := len(root.journal.snapshot())
+	parallelSettled := root.journal.countPi(root.tree.SessionID, "agent_settled", "")
+	parallelPrompt := "In your next assistant turn, call delegate_session exactly three times in one parallel tool-call batch. " +
+		"Use workerType reviewer, kind read, context fresh for every call. " +
+		"Call 1 child task is: inspect README.md and return exactly " + parallelMarkers[0] + " after the inspection. " +
+		"Call 2 child task is: inspect go.mod and return exactly " + parallelMarkers[1] + " after the inspection. " +
+		"Call 3 child task is: inspect internal/supervisor/node.go and return exactly " + parallelMarkers[2] + " after the inspection. " +
+		"After all three tools return, reply with exactly " + strings.Join(parallelMarkers, " ") + "."
+	h.sendLifecycleModelPrompt(root, parallelPrompt)
+
+	parallelTree := h.waitForLifecycleModelChildren(root, parallelBoundary, parallelSettled, 3, "three simultaneous model-directed children")
+	parallelPIDs := h.captureLifecycleChildPIDs(root, 3, "model-parallel")
+	h.assertLifecycleChildren(root.tree, parallelTree.Children)
+	h.waitForLifecycleRootSettlement(root, parallelSettled, "parallel model-directed root settlement")
+	parallelEvents := root.journal.snapshot()[parallelBoundary:]
+	if err := validateLifecycleModelToolEvents(parallelEvents, root.tree.SessionID, parallelMarkers, true); err != nil {
+		h.t.Fatalf("parallel model-directed tool acceptance: %v", err)
+	}
+	parallelText := h.lastAssistantText(root.client, root.tree.SessionID)
+	for _, marker := range parallelMarkers {
+		if !strings.Contains(parallelText, marker) {
+			h.t.Fatalf("parallel model-directed aggregate text %q lacks marker %q", parallelText, marker)
+		}
+	}
+	h.waitForLifecycleNaturalChildEvents(root, parallelTree.Children, "parallel model-directed children natural completion")
+	h.waitForLifecycleChildrenGone(root, parallelTree.Children, parallelPIDs, "parallel model-directed child resource cleanup")
+	h.writeLifecycleModelEvidence(root, "model-parallel-complete")
+	h.assertRootUsable(root, "KANEDIAS_LIFECYCLE_MODEL_PARALLEL_ROOT_USABLE_"+h.prefix)
+	h.stopLifecycleRoot(root)
+}
+
 func (h *liveAcceptance) exerciseLifecycleChildStop() {
 	root := h.startLifecycleRoot("child-stop")
 	call := h.startLifecycleChildCall(root.client, root.tree.SessionID, "active-child-stop",
@@ -284,6 +355,105 @@ func (h *liveAcceptance) exerciseLifecycleRootEnd() {
 	if status, body, err := unixRequest(root.client, http.MethodGet, "/v1/tree", nil); err == nil {
 		h.t.Fatalf("request through ended root socket unexpectedly succeeded: status=%d body=%q", status, body)
 	}
+}
+
+func (h *liveAcceptance) sendLifecycleModelPrompt(root *lifecycleRoot, prompt string) {
+	response := h.rpc(root.client, root.tree.SessionID, map[string]any{"type": "prompt", "message": prompt})
+	if response["success"] != true {
+		h.t.Fatalf("model-directed prompt was not accepted: %#v", response)
+	}
+}
+
+func (h *liveAcceptance) waitForLifecycleModelChildren(root *lifecycleRoot, eventBoundary, settledBefore, count int, description string) supervisor.NodeSnapshot {
+	var observed supervisor.NodeSnapshot
+	h.poll(8*time.Minute, description, func() bool {
+		events := root.journal.snapshot()
+		if eventBoundary > len(events) {
+			h.t.Fatalf("model event boundary %d exceeds journal length %d", eventBoundary, len(events))
+		}
+		events = events[eventBoundary:]
+		starts := countLifecycleDelegateEvents(events, root.tree.SessionID, "tool_execution_start")
+		ends := countLifecycleDelegateEvents(events, root.tree.SessionID, "tool_execution_end")
+		if starts > count {
+			h.writeLifecycleModelEvidence(root, safeName(description)+"-too-many-tool-calls")
+			h.t.Fatalf("%s emitted %d delegate_session starts, want exactly %d", description, starts, count)
+		}
+		if ends > 0 {
+			h.writeLifecycleModelEvidence(root, safeName(description)+"-child-ended-before-snapshot")
+			h.t.Fatalf("%s reached a delegate_session tool end before one snapshot showed all %d children (starts=%d)", description, count, starts)
+		}
+		settled := root.journal.countPi(root.tree.SessionID, "agent_settled", "")
+		if settled > settledBefore && starts != count {
+			h.writeLifecycleModelEvidence(root, safeName(description)+"-missing-tool-calls")
+			h.t.Fatalf("%s settled after %d delegate_session starts, want exactly %d; no retry or direct fallback is permitted", description, starts, count)
+		}
+
+		var current supervisor.NodeSnapshot
+		if unixJSON(root.client, http.MethodGet, "/v1/tree", nil, &current) != nil || len(current.Children) != count {
+			return false
+		}
+		for _, child := range current.Children {
+			if !isControllableChildSnapshot(child, contract.ChildKindRead, contract.ContextFresh) {
+				return false
+			}
+		}
+		observed = current
+		return true
+	})
+	h.trackTree(observed)
+	h.writeJSON(safeName(description)+"-tree.json", observed)
+	return observed
+}
+
+func countLifecycleDelegateEvents(events []supervisor.EventEnvelope, rootID, eventType string) int {
+	count := 0
+	for _, event := range events {
+		if event.SessionID != rootID || event.Kind != "pi" {
+			continue
+		}
+		var payload struct {
+			Type     string `json:"type"`
+			ToolName string `json:"toolName"`
+		}
+		if json.Unmarshal(event.Payload, &payload) == nil && payload.Type == eventType && payload.ToolName == "delegate_session" {
+			count++
+		}
+	}
+	return count
+}
+
+func (h *liveAcceptance) waitForLifecycleRootSettlement(root *lifecycleRoot, settledBefore int, description string) {
+	h.poll(8*time.Minute, description, func() bool {
+		return root.journal.countPi(root.tree.SessionID, "agent_settled", "") > settledBefore
+	})
+}
+
+func (h *liveAcceptance) waitForLifecycleNaturalChildEvents(root *lifecycleRoot, children []supervisor.NodeSnapshot, description string) {
+	childIDs := make([]string, 0, len(children))
+	for _, child := range children {
+		childIDs = append(childIDs, child.SessionID)
+	}
+	h.poll(2*time.Minute, description, func() bool {
+		events := root.journal.snapshot()
+		for _, childID := range childIDs {
+			if root.journal.countPi(childID, "agent_settled", "") > 1 {
+				h.writeLifecycleModelEvidence(root, safeName(description)+"-duplicate-terminal")
+				h.t.Fatalf("child %q emitted a duplicate agent_settled terminal event", childID)
+			}
+		}
+		return validateLifecycleNaturalChildEvents(events, childIDs) == nil
+	})
+}
+
+func (h *liveAcceptance) writeLifecycleModelEvidence(root *lifecycleRoot, label string) {
+	var tree supervisor.NodeSnapshot
+	treeErr := unixJSON(root.client, http.MethodGet, "/v1/tree", nil, &tree)
+	h.writeJSON(label+"-model-evidence.json", map[string]any{
+		"rootModel": root.tree.Model,
+		"tree":      tree,
+		"treeError": errorString(treeErr),
+		"events":    root.journal.snapshot(),
+	})
 }
 
 func (h *liveAcceptance) waitForLifecycleChildren(root *lifecycleRoot, count int, requireRunning bool, description string) supervisor.NodeSnapshot {
