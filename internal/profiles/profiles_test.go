@@ -2,7 +2,6 @@ package profiles
 
 import (
 	"bytes"
-	"path/filepath"
 	"reflect"
 	"strings"
 	"testing"
@@ -32,10 +31,7 @@ func TestRenderSandboxUsesConfiguredIPv4(t *testing.T) {
 	}
 }
 
-func TestRenderSandboxUsesLifecycleDevicesAndDefaultProxyCA(t *testing.T) {
-	configHome := t.TempDir()
-	t.Setenv("XDG_CONFIG_HOME", configHome)
-
+func TestRenderSandboxUsesLifecycleDevicesAndBakedProxyCA(t *testing.T) {
 	cfg := config.Config{Network: config.Network{IPv4: "10.76.111.1/24"}}
 	var output bytes.Buffer
 	if err := Render(&output, "sandbox", cfg); err != nil {
@@ -46,6 +42,8 @@ func TestRenderSandboxUsesLifecycleDevicesAndDefaultProxyCA(t *testing.T) {
 	for _, want := range []string{
 		`  security.nesting: "true"`,
 		`  security.privileged: "false"`,
+		`  environment.NODE_EXTRA_CA_CERTS: "/usr/local/share/ca-certificates/kanedias-proxy.crt"`,
+		`  environment.SSL_CERT_FILE: "/etc/ssl/certs/ca-certificates.crt"`,
 	} {
 		if !strings.Contains(rendered, want) {
 			t.Errorf("rendered sandbox missing %q", want)
@@ -65,8 +63,16 @@ func TestRenderSandboxUsesLifecycleDevicesAndDefaultProxyCA(t *testing.T) {
 	if strings.Contains(rendered, "  workspace:") {
 		t.Error("rendered sandbox contains inherited workspace disk")
 	}
-	if want := "    source: " + filepath.Join(configHome, "kanedias-proxy", "ca.crt"); !strings.Contains(rendered, want) {
-		t.Errorf("rendered sandbox missing proxy CA source %q", want)
+	// The CA is baked into the image; the profile must no longer mount the
+	// host certificate or reference the on-host config layout.
+	for _, unwanted := range []string{
+		"proxy-ca:",
+		"kanedias-proxy/ca.crt",
+		"path: /usr/local/share/ca-certificates/kanedias-proxy.crt",
+	} {
+		if strings.Contains(rendered, unwanted) {
+			t.Errorf("rendered sandbox retained runtime proxy CA mount %q", unwanted)
+		}
 	}
 }
 

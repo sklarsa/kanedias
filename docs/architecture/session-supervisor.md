@@ -56,7 +56,7 @@ A Kanedias credential proxy must already be running before any root or child sup
 kanedias proxy run
 ```
 
-The proxy listens on the configured Incus network gateway on port `3128`. The sandbox profile sets `HTTP_PROXY`, `HTTPS_PROXY`, their lowercase equivalents, and the Kanedias proxy CA for processes inside each container. Model-provider, GitHub, package-manager, and other outbound requests therefore depend on this service.
+The proxy listens on the configured Incus network gateway on port `3128`. The public proxy CA is baked into the base image and the Debian trust bundle by `kanedias image create`; the sandbox profile supplies the proxy and CA environment variables (`HTTP_PROXY`, `HTTPS_PROXY`, their lowercase equivalents, `NODE_EXTRA_CA_CERTS`, and `SSL_CERT_FILE`) for processes inside each container but no longer mounts the host certificate. Model-provider, GitHub, package-manager, and other outbound requests therefore depend on this service.
 
 Every supervisor performs a fail-fast TCP reachability check against the configured proxy listener before creating or starting session-owned resources. If the listener is unavailable, session creation returns a clear prerequisite error instead of allowing Pi or Git operations to fail later with indirect connectivity errors.
 

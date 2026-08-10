@@ -56,6 +56,37 @@ func TestInstallerActivatesOnlyKanediasDelegationExtensionAndSkills(t *testing.T
 	}
 }
 
+func TestInstallerInstallsProxyCAIntoSystemTrust(t *testing.T) {
+	script := string(installer)
+	for _, want := range []string{
+		`proxy_ca_file="$assets_dir/kanedias-proxy.crt"`,
+		`"$proxy_ca_file"`,
+		`/usr/local/share/ca-certificates/kanedias-proxy.crt`,
+		`update-ca-certificates`,
+	} {
+		if !strings.Contains(script, want) {
+			t.Errorf("installer missing proxy CA trust behavior %q", want)
+		}
+	}
+
+	// The install and registration steps must come after the initial
+	// apt-get install so that update-ca-certificates is available on PATH.
+	aptIdx := strings.Index(script, "apt-get install -y --no-install-recommends")
+	// Anchor on the install destination, not the early asset-var definition.
+	caCertDest := "/usr/local/share/ca-certificates/kanedias-proxy.crt"
+	caIdx := strings.Index(script, caCertDest)
+	updateIdx := strings.Index(script, "update-ca-certificates")
+	if aptIdx < 0 {
+		t.Fatal("installer missing apt-get install command")
+	}
+	if caIdx < 0 || updateIdx < 0 {
+		t.Fatal("installer missing proxy CA install or update step")
+	}
+	if caIdx < aptIdx || updateIdx < caIdx {
+		t.Error("proxy CA install/update must occur after apt-get install so update-ca-certificates is available")
+	}
+}
+
 func TestCoreInstallerExcludesMovedToolchainPackages(t *testing.T) {
 	script := string(installer)
 	const command = "apt-get install -y --no-install-recommends \\\n"
