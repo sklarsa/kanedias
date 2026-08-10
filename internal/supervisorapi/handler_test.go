@@ -18,6 +18,7 @@ import (
 
 	"github.com/sklarsa/kanedias/internal/supervisor"
 	"github.com/sklarsa/kanedias/internal/supervisor/contract"
+	"github.com/sklarsa/kanedias/internal/supervisor/pirpc"
 )
 
 type fakeService struct {
@@ -26,6 +27,7 @@ type fakeService struct {
 	workers        []contract.WorkerSummary
 	rpcSession     string
 	rpcBody        json.RawMessage
+	rpcResponse    json.RawMessage
 	answerSession  string
 	answerID       string
 	answerBody     json.RawMessage
@@ -51,7 +53,11 @@ func (service *fakeService) CallRPC(_ context.Context, session string, body json
 	service.mu.Lock()
 	defer service.mu.Unlock()
 	service.rpcSession, service.rpcBody = session, append(json.RawMessage(nil), body...)
-	return json.RawMessage(`{"type":"response","success":true}`), service.err
+	response := service.rpcResponse
+	if response == nil {
+		response = json.RawMessage(`{"type":"response","success":true}`)
+	}
+	return append(json.RawMessage(nil), response...), service.err
 }
 func (service *fakeService) AnswerQuestion(_ context.Context, session, id string, body json.RawMessage) error {
 	service.mu.Lock()
@@ -101,6 +107,21 @@ func jsonRequest(t *testing.T, handler http.Handler, method, path, body string) 
 	response := httptest.NewRecorder()
 	handler.ServeHTTP(response, request)
 	return response
+}
+
+func sizedRPCJSON(t *testing.T, size int) json.RawMessage {
+	t.Helper()
+	const prefix = `{"type":"prompt","message":"`
+	const suffix = `"}`
+	padding := size - len(prefix) - len(suffix)
+	if padding < 0 {
+		t.Fatalf("RPC JSON size %d is too small", size)
+	}
+	body := json.RawMessage(prefix + strings.Repeat("x", padding) + suffix)
+	if len(body) != size || !json.Valid(body) {
+		t.Fatalf("RPC JSON bytes = %d, valid = %t; want %d valid bytes", len(body), json.Valid(body), size)
+	}
+	return body
 }
 
 func TestHandlerRootRoutes(t *testing.T) {
@@ -281,15 +302,16 @@ func TestHandlerPreservesArbitraryPiRPCFields(t *testing.T) {
 }
 
 func TestRPCBodyUsesImageAwareLimit(t *testing.T) {
-	payload := `{"type":"prompt","message":"` + strings.Repeat("x", MaxRequestBodyBytes) + `"}`
-	response := jsonRequest(t, NewHandler(&fakeService{}), http.MethodPost, "/v1/sessions/self/rpc", payload)
+	payload := sizedRPCJSON(t, pirpc.MaxRecordBytes)
+	response := jsonRequest(t, NewHandler(&fakeService{}), http.MethodPost, "/v1/sessions/self/rpc", string(payload))
 	if response.Code != http.StatusOK {
 		t.Fatalf("status = %d; body = %s", response.Code, response.Body.String())
 	}
 }
 
 func TestRPCBodyRejectsOneByteOverImageAwareLimit(t *testing.T) {
-	response := jsonRequest(t, NewHandler(&fakeService{}), http.MethodPost, "/v1/sessions/self/rpc", strings.Repeat("x", MaxRPCRequestBodyBytes+1))
+	payload := sizedRPCJSON(t, pirpc.MaxRecordBytes+1)
+	response := jsonRequest(t, NewHandler(&fakeService{}), http.MethodPost, "/v1/sessions/self/rpc", string(payload))
 	if response.Code != http.StatusRequestEntityTooLarge {
 		t.Fatalf("status = %d; body = %s", response.Code, response.Body.String())
 	}
@@ -748,25 +770,17 @@ func TestDescendantUnaryOperationsHaveInternalDeadline(t *testing.T) {
 	}
 }
 
-func TestDescendantClientRPCResponseUsesImageAwareLimit(t *testing.T) {
+func TestDescendantClientRPCResponseUsesExactImageAwareLimit(t *testing.T) {
 	path := filepath.Join(t.TempDir(), "rpc-response.sock")
-	largeRPC := []byte(`{"type":"response","success":true,"data":{"text":"` + strings.Repeat("x", MaxRequestBodyBytes) + `"}}`)
-	largeSnapshot := []byte(`{"sessionId":"self","rootSessionId":"self","children":[],"padding":"` + strings.Repeat("x", MaxRequestBodyBytes) + `"}`)
+	service := &fakeService{
+		rpcResponse: sizedRPCJSON(t, pirpc.MaxRecordBytes),
+		snapshot: supervisor.NodeSnapshot{
+			SessionID: "self", RootSessionID: "self", SessionFile: strings.Repeat("x", MaxRequestBodyBytes), Children: []supervisor.NodeSnapshot{},
+		},
+	}
 	ctx, cancel := context.WithCancel(context.Background())
 	done := make(chan error, 1)
-	go func() {
-		done <- ServeUnix(ctx, path, http.HandlerFunc(func(w http.ResponseWriter, request *http.Request) {
-			w.Header().Set("Content-Type", "application/json")
-			switch request.URL.Path {
-			case "/v1/sessions/self/rpc":
-				_, _ = w.Write(largeRPC)
-			case "/v1/tree":
-				_, _ = w.Write(largeSnapshot)
-			default:
-				http.NotFound(w, request)
-			}
-		}))
-	}()
+	go func() { done <- ServeUnix(ctx, path, NewHandler(service)) }()
 	waitForSocket(t, path)
 	client, err := NewClient(path)
 	if err != nil {
@@ -775,10 +789,18 @@ func TestDescendantClientRPCResponseUsesImageAwareLimit(t *testing.T) {
 
 	response, err := client.CallRPC(context.Background(), "self", json.RawMessage(`{"type":"get_state"}`))
 	if err != nil {
-		t.Fatalf("CallRPC() error = %v", err)
+		t.Fatalf("exact-limit CallRPC() error = %v", err)
 	}
-	if len(response) != len(largeRPC) {
-		t.Fatalf("CallRPC() response bytes = %d, want %d", len(response), len(largeRPC))
+	if len(response) != pirpc.MaxRecordBytes {
+		t.Fatalf("CallRPC() response bytes = %d, want %d", len(response), pirpc.MaxRecordBytes)
+	}
+
+	oversizedResponse := sizedRPCJSON(t, pirpc.MaxRecordBytes+1)
+	service.mu.Lock()
+	service.rpcResponse = oversizedResponse
+	service.mu.Unlock()
+	if _, err := client.CallRPC(context.Background(), "self", json.RawMessage(`{"type":"get_state"}`)); err == nil || !strings.Contains(err.Error(), "exceeds") {
+		t.Fatalf("one-byte-over CallRPC() error = %v, want size rejection", err)
 	}
 	if _, err := client.Snapshot(context.Background()); err == nil || !strings.Contains(err.Error(), "exceeds 1 MiB") {
 		t.Fatalf("Snapshot() error = %v, want 1 MiB response rejection", err)

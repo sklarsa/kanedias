@@ -95,6 +95,9 @@ func (client *Client) CallWithSequence(ctx context.Context, command json.RawMess
 	if err != nil {
 		return nil, 0, err
 	}
+	if err := checkRecordSize(wire); err != nil {
+		return nil, 0, err
+	}
 	result := make(chan callResult, 1)
 
 	client.mu.Lock()
@@ -134,6 +137,9 @@ func (client *Client) Send(ctx context.Context, command json.RawMessage) error {
 	var compact bytes.Buffer
 	if err := json.Compact(&compact, command); err != nil {
 		return fmt.Errorf("encode Pi RPC command: %w", err)
+	}
+	if err := checkRecordSize(compact.Bytes()); err != nil {
+		return err
 	}
 	if err := client.write(ctx, compact.Bytes()); err != nil {
 		if ctxErr := ctx.Err(); ctxErr != nil {
@@ -223,6 +229,13 @@ func (client *Client) removePending(id string) {
 	client.mu.Lock()
 	delete(client.pending, id)
 	client.mu.Unlock()
+}
+
+func checkRecordSize(record []byte) error {
+	if len(record) > MaxRecordBytes {
+		return fmt.Errorf("record exceeds %d bytes on the Pi RPC transport", MaxRecordBytes)
+	}
+	return nil
 }
 
 func (client *Client) write(ctx context.Context, record []byte) error {

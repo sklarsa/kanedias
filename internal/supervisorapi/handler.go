@@ -236,7 +236,4 @@ func writeRawJSON(w http.ResponseWriter, status int, raw json.RawMessage) {
 	w.Header().Set("Content-Type", "application/json")
 	w.WriteHeader(status)
 	_, _ = w.Write(raw)
-	if !strings.HasSuffix(string(raw), "\n") {
-		_, _ = w.Write([]byte("\n"))
-	}
 }

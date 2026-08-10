@@ -331,16 +331,16 @@ func TestClientEOFFailsEveryPendingCall(t *testing.T) {
 	}
 }
 
-func TestClientAcceptsImageSizedRecord(t *testing.T) {
+func TestClientAcceptsExactMaxRecord(t *testing.T) {
 	clientConn, peer := net.Pipe()
 	client := NewClient(clientConn)
 	defer func() { _ = client.Close() }()
 	defer func() { _ = peer.Close() }()
 
-	record := `{"type":"message_update","text":"` + strings.Repeat("x", 11<<20) + `"}`
+	record := sizedJSONRecord(t, "message_update", MaxRecordBytes)
 	writeDone := make(chan error, 1)
 	go func() {
-		_, err := io.WriteString(peer, record+"\n")
+		_, err := peer.Write(append(append([]byte(nil), record...), '\n'))
 		writeDone <- err
 	}()
 
@@ -350,12 +350,112 @@ func TestClientAcceptsImageSizedRecord(t *testing.T) {
 			t.Fatalf("event type = %q, bytes = %d; want message_update with %d bytes", event.Type, len(event.Raw), len(record))
 		}
 	case <-client.Done():
-		t.Fatalf("image-sized record terminated client: %v", client.Err())
+		t.Fatalf("exact-limit record terminated client: %v", client.Err())
 	case <-time.After(3 * time.Second):
-		t.Fatal("image-sized record was not published")
+		t.Fatal("exact-limit record was not published")
 	}
 	if err := <-writeDone; err != nil {
-		t.Fatalf("write image-sized record: %v", err)
+		t.Fatalf("write exact-limit record: %v", err)
+	}
+}
+
+func TestClientCallFinalRecordBoundary(t *testing.T) {
+	t.Run("exact limit", func(t *testing.T) {
+		clientConn, peer := net.Pipe()
+		client := NewClient(clientConn)
+		defer func() { _ = client.Close() }()
+		defer func() { _ = peer.Close() }()
+
+		nextID := fmt.Sprintf("kanedias-%s-%d", processIDPrefix, requestCounter.Load()+1)
+		command := sizedCallCommand(t, nextID, MaxRecordBytes)
+		result := make(chan error, 1)
+		go func() {
+			_, err := client.Call(context.Background(), command)
+			result <- err
+		}()
+		line, err := bufio.NewReader(peer).ReadBytes('\n')
+		if err != nil {
+			t.Fatal(err)
+		}
+		if got := len(line) - 1; got != MaxRecordBytes {
+			t.Fatalf("record bytes = %d, want %d", got, MaxRecordBytes)
+		}
+		var written wireCommand
+		if err := json.Unmarshal(line, &written); err != nil {
+			t.Fatal(err)
+		}
+		writeJSONLine(t, peer, fmt.Sprintf(`{"id":%q,"type":"response","success":true}`, written.ID))
+		if err := <-result; err != nil {
+			t.Fatalf("Call() error = %v", err)
+		}
+	})
+
+	t.Run("one byte over", func(t *testing.T) {
+		conn := newWriteCountConn()
+		client := NewClient(conn)
+		defer func() { _ = client.Close() }()
+
+		nextID := fmt.Sprintf("kanedias-%s-%d", processIDPrefix, requestCounter.Load()+1)
+		command := sizedCallCommand(t, nextID, MaxRecordBytes+1)
+		ctx, cancel := context.WithTimeout(context.Background(), 2*time.Second)
+		defer cancel()
+		_, err := client.Call(ctx, command)
+		want := fmt.Sprintf("record exceeds %d bytes on the Pi RPC transport", MaxRecordBytes)
+		if err == nil || err.Error() != want {
+			t.Fatalf("Call() error = %v, want %q", err, want)
+		}
+		if got := conn.bytes.Load(); got != 0 {
+			t.Fatalf("oversized Call() emitted %d bytes", got)
+		}
+		if got := pendingCount(client); got != 0 {
+			t.Fatalf("oversized Call() registered %d pending calls", got)
+		}
+		select {
+		case <-client.Done():
+			t.Fatalf("oversized Call() terminated healthy transport: %v", client.Err())
+		default:
+		}
+	})
+}
+
+func TestClientSendFinalRecordBoundary(t *testing.T) {
+	for _, tt := range []struct {
+		name      string
+		recordLen int
+		wantErr   bool
+	}{
+		{name: "exact limit", recordLen: MaxRecordBytes},
+		{name: "one byte over", recordLen: MaxRecordBytes + 1, wantErr: true},
+	} {
+		t.Run(tt.name, func(t *testing.T) {
+			conn := newWriteCountConn()
+			client := NewClient(conn)
+			defer func() { _ = client.Close() }()
+			command := sizedJSONRecord(t, "extension_ui_response", tt.recordLen)
+
+			err := client.Send(context.Background(), command)
+			if tt.wantErr {
+				want := fmt.Sprintf("record exceeds %d bytes on the Pi RPC transport", MaxRecordBytes)
+				if err == nil || err.Error() != want {
+					t.Fatalf("Send() error = %v, want %q", err, want)
+				}
+				if got := conn.bytes.Load(); got != 0 {
+					t.Fatalf("oversized Send() emitted %d bytes", got)
+				}
+				select {
+				case <-client.Done():
+					t.Fatalf("oversized Send() terminated healthy transport: %v", client.Err())
+				default:
+				}
+				return
+			}
+			if err != nil {
+				t.Fatalf("Send() error = %v", err)
+			}
+			if got := conn.bytes.Load(); got != int64(MaxRecordBytes+1) {
+				t.Fatalf("exact-limit Send() wire bytes = %d, want %d including delimiter", got, MaxRecordBytes+1)
+			}
+		})
 	}
 }
 
@@ -367,7 +467,11 @@ func TestClientRejectsPartialMalformedAndOversizedRecords(t *testing.T) {
 	}{
 		{name: "partial", record: func(w io.Writer) error { _, err := io.WriteString(w, `{"type":"agent_start"}`); return err }, want: "partial record"},
 		{name: "malformed", record: func(w io.Writer) error { _, err := io.WriteString(w, "{bad json}\n"); return err }, want: "decode RPC record"},
-		{name: "oversized", record: func(w io.Writer) error { _, err := w.Write(bytes.Repeat([]byte{'x'}, MaxRecordBytes+1)); return err }, want: "exceeds"},
+		{name: "oversized", record: func(w io.Writer) error {
+			record := sizedJSONRecord(t, "message_update", MaxRecordBytes+1)
+			_, err := w.Write(append(record, '\n'))
+			return err
+		}, want: "exceeds"},
 	}
 
 	for _, tt := range tests {
@@ -559,6 +663,68 @@ func TestClientSendWritesExtensionUIResponseWithoutWaiting(t *testing.T) {
 	case <-time.After(time.Second):
 		t.Fatal("Send() waited for a correlated response")
 	}
+}
+
+func sizedJSONRecord(t *testing.T, recordType string, size int) json.RawMessage {
+	t.Helper()
+	prefix := fmt.Sprintf(`{"type":%q,"padding":"`, recordType)
+	const suffix = `"}`
+	padding := size - len(prefix) - len(suffix)
+	if padding < 0 {
+		t.Fatalf("record size %d is too small", size)
+	}
+	record := json.RawMessage(prefix + strings.Repeat("x", padding) + suffix)
+	if len(record) != size || !json.Valid(record) {
+		t.Fatalf("sized record bytes = %d, valid = %t; want %d valid bytes", len(record), json.Valid(record), size)
+	}
+	return record
+}
+
+func sizedCallCommand(t *testing.T, id string, finalSize int) json.RawMessage {
+	t.Helper()
+	base := json.RawMessage(`{"type":"get_state","padding":""}`)
+	wire, err := commandWithID(base, id)
+	if err != nil {
+		t.Fatal(err)
+	}
+	padding := finalSize - len(wire)
+	if padding < 0 {
+		t.Fatalf("final record size %d is too small", finalSize)
+	}
+	command := json.RawMessage(`{"type":"get_state","padding":"` + strings.Repeat("x", padding) + `"}`)
+	wire, err = commandWithID(command, id)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(wire) != finalSize {
+		t.Fatalf("final record bytes = %d, want %d", len(wire), finalSize)
+	}
+	return command
+}
+
+type writeCountConn struct {
+	closed chan struct{}
+	once   sync.Once
+	bytes  atomic.Int64
+}
+
+func newWriteCountConn() *writeCountConn {
+	return &writeCountConn{closed: make(chan struct{})}
+}
+
+func (conn *writeCountConn) Read([]byte) (int, error) {
+	<-conn.closed
+	return 0, io.ErrClosedPipe
+}
+
+func (conn *writeCountConn) Write(p []byte) (int, error) {
+	conn.bytes.Add(int64(len(p)))
+	return len(p), nil
+}
+
+func (conn *writeCountConn) Close() error {
+	conn.once.Do(func() { close(conn.closed) })
+	return nil
 }
 
 type wireCommand struct {
