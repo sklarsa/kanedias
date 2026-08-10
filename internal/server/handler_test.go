@@ -544,7 +544,7 @@ func TestAstrolabeConsoleIsInteractive(t *testing.T) {
 		`class="deck-input"`, `data-bind="commandMessage"`, `data-on:click=`,
 		`aria-keyshortcuts="Control+A Control+C Enter"`,
 		`aria-keyshortcuts="Escape"`,
-		`^A home · ^C clear/copy · esc abort · ^O tools`,
+		`^A select all · ^C clear/copy · esc abort · ^O tools`,
 	} {
 		if !strings.Contains(body, want) {
 			t.Errorf("interactive console is missing wiring %q", want)

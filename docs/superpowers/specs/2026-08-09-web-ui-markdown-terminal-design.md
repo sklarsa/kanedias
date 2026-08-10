@@ -136,8 +136,8 @@ A pure key-decision helper defines behavior and is called by the delegated
 browser handler. It preserves browser-native selection and clipboard behavior.
 
 - `Enter` submits the current deck input and clears it after dispatch.
-- `Ctrl-A`, while the deck input is active, moves the caret to the beginning
-  instead of selecting the page.
+- `Ctrl-A`, while the deck input is active, selects the complete command input
+  without selecting the page.
 - `Ctrl-C` with selected document or input text is not intercepted, so native
   copy works. With no selection and deck/body focus, it clears the command input
   and emits an `input` event so Datastar state stays synchronized.
@@ -282,8 +282,8 @@ Using Node's built-in test runner and the vendored libraries:
 - raw HTML is literal;
 - JavaScript/data URLs and control-character scheme tricks are rejected;
 - safe links include the required relationship attributes;
-- key decisions implement Pi's selection-aware `Ctrl-A`, `Ctrl-C`, Escape, and
-  `Ctrl-O` behavior; and
+- key decisions implement the deck's selection-aware `Ctrl-A`, `Ctrl-C`, Escape,
+  and `Ctrl-O` behavior; and
 - tool toggle decisions are deterministic.
 
 `make test` runs both `go test ./...` and the Node tests. CI continues to call
@@ -300,7 +300,8 @@ Against a live local session:
 3. Run `read`, `bash`, and one custom tool; inspect individual and global tool
    expansion and copy controls.
 4. Select transcript/code text and copy with `Ctrl-C`.
-5. Use `Ctrl-A` and `Ctrl-C` in the deck, then send with Enter.
+5. Use `Ctrl-A` to select the complete deck input, use `Ctrl-C` to copy or clear,
+   then send with Enter.
 6. Start a turn and confirm Interrupt becomes armed after the live lifecycle
    patch; abort with Escape and confirm it disables after settlement.
 7. Confirm Stop remains usable for a retained stale root.

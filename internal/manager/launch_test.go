@@ -3,6 +3,7 @@ package manager
 import (
 	"context"
 	"errors"
+	"path/filepath"
 	"reflect"
 	"strings"
 	"testing"
@@ -32,6 +33,23 @@ func assertInvalidRequest(t *testing.T, err error) {
 	if !errors.As(err, &typed) || typed.Code != contract.ErrorInvalidRequest {
 		t.Fatalf("error = %v, want *contract.Error with code %q", err, contract.ErrorInvalidRequest)
 	}
+}
+
+func TestRepositoryLaunchOptionsNameGPT56SolCorrectly(t *testing.T) {
+	cfg, err := config.Load(filepath.Join("..", "..", "config.toml"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	options := mustLaunchConfiguration(t, cfg).LaunchOptions()
+	for _, model := range options.Models {
+		if model.ModelType == "gpt-5-6-sol" {
+			if model.Label != "GPT-5.6 Sol" {
+				t.Fatalf("GPT-5.6 Sol launch label = %q", model.Label)
+			}
+			return
+		}
+	}
+	t.Fatal("gpt-5-6-sol is missing from repository launch options")
 }
 
 func TestLaunchConfigurationValidCustomRequest(t *testing.T) {

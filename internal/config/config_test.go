@@ -243,7 +243,7 @@ thinking_levels = ["off"]
 default_thinking_level = "off"
 
 [models.gpt-5-6-sol]
-label = "GPT-5.6 Solver"
+label = "GPT-5.6 Sol"
 provider = "openai-codex"
 model = "gpt-5.6-sol"
 thinking_levels = ["low", "high", "xhigh"]
@@ -533,7 +533,7 @@ func modelConfigFixture() Config {
 				ThinkingLevels: []string{"off"}, DefaultThinkingLevel: "off",
 			},
 			"gpt-5-6-sol": {
-				Label: "GPT-5.6 Solver", Provider: "openai-codex", Model: "gpt-5.6-sol",
+				Label: "GPT-5.6 Sol", Provider: "openai-codex", Model: "gpt-5.6-sol",
 				ThinkingLevels:       []string{"minimal", "low", "medium", "high", "xhigh", "max"},
 				DefaultThinkingLevel: "high",
 			},

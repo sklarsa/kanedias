@@ -180,7 +180,7 @@ source = "https://images.linuxcontainers.org"
 image = "debian/13"
 
 [models.gpt-5-6-sol]
-label = "GPT-5.6 Solver"
+label = "GPT-5.6 Sol"
 provider = "openai-codex"
 model = "gpt-5.6-sol"
 thinking_levels = ["low", "high", "xhigh"]

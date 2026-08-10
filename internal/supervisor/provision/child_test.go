@@ -43,6 +43,7 @@ type recordingChildClient struct {
 	copyInstanceErr error
 	updateErr       error
 	startErr        error
+	startErrs       []error
 	calls           []string
 	instancePut     *api.InstancePut
 	volumePut       *api.StorageVolumePut
@@ -133,9 +134,16 @@ func (f *recordingChildClient) UpdateStorageVolume(_ context.Context, _, name st
 }
 func (f *recordingChildClient) StartInstance(_ context.Context, name string) error {
 	f.calls = append(f.calls, "start "+name)
-	f.child.Status = "Running"
-	f.child.StatusCode = api.Running
-	return f.startErr
+	err := f.startErr
+	if len(f.startErrs) > 0 {
+		err = f.startErrs[0]
+		f.startErrs = f.startErrs[1:]
+	}
+	if err == nil {
+		f.child.Status = "Running"
+		f.child.StatusCode = api.Running
+	}
+	return err
 }
 func (f *recordingChildClient) StopInstance(_ context.Context, name string, force bool) error {
 	f.calls = append(f.calls, fmt.Sprintf("stop %s force=%v", name, force))
@@ -275,6 +283,33 @@ func TestProvisionChildFollowsFailClosedOrderAndReplacesInheritedState(t *testin
 		if got, want := client.volumePut.Config[key], wantConfig[key]; got != want {
 			t.Errorf("volume metadata %q = %q, want %q", key, got, want)
 		}
+	}
+}
+
+func TestProvisionChildRegeneratesCollidingIncusMACAndRetriesStart(t *testing.T) {
+	client := newRecordingChildClient()
+	client.parent.Config["volatile.eth0.hwaddr"] = "10:66:6a:cb:6a:3c"
+	collision := errors.New(`await submitted Incus local operation: Failed start validation for device "eth0": MAC address "10:66:6a:cb:6a:3c" already defined on another NIC`)
+	client.startErrs = []error{collision, nil}
+
+	resources, err := newTestChildProvisioner(t, client).ProvisionChild(context.Background(), validChildRequest())
+	if err != nil {
+		t.Fatal(err)
+	}
+	if resources.Instance != "session-child-1" {
+		t.Fatalf("instance = %q, want session-child-1", resources.Instance)
+	}
+	var starts int
+	for _, call := range client.calls {
+		if call == "start session-child-1" {
+			starts++
+		}
+	}
+	if starts != 2 {
+		t.Fatalf("start calls = %d, want collision plus one retry: %v", starts, client.calls)
+	}
+	if _, retained := client.child.Config["volatile.eth0.hwaddr"]; retained {
+		t.Fatalf("retried child retained colliding volatile MAC: %#v", client.child.Config)
 	}
 }
 
