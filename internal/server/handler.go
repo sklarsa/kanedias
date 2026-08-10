@@ -105,6 +105,7 @@ func newHandlerWithOptions(logger *slog.Logger, advertisedAddress string, bootst
 	serveMarkdownRenderer := serveEmbeddedAsset(logger, "web/markdown-renderer.js", "text/javascript; charset=utf-8")
 	serveTerminalUI := serveEmbeddedAsset(logger, "web/terminal-ui.js", "text/javascript; charset=utf-8")
 	serveFleetLayout := serveEmbeddedAsset(logger, "web/fleet-layout.js", "text/javascript; charset=utf-8")
+	serveRepositoryCombobox := serveEmbeddedAsset(logger, "web/repository-combobox.js", "text/javascript; charset=utf-8")
 	serveSessionModal := serveEmbeddedAsset(logger, "web/session-modal.js", "text/javascript; charset=utf-8")
 	serveImageAttachments := serveEmbeddedAsset(logger, "web/image-attachments.js", "text/javascript; charset=utf-8")
 
@@ -124,6 +125,7 @@ func newHandlerWithOptions(logger *slog.Logger, advertisedAddress string, bootst
 	router.Get("/assets/markdown-renderer.js", serveMarkdownRenderer)
 	router.Get("/assets/terminal-ui.js", serveTerminalUI)
 	router.Get("/assets/fleet-layout.js", serveFleetLayout)
+	router.Get("/assets/repository-combobox.js", serveRepositoryCombobox)
 	router.Get("/assets/session-modal.js", serveSessionModal)
 	router.Get("/assets/image-attachments.js", serveImageAttachments)
 	router.Get("/assets/app.js", serveAppJS)

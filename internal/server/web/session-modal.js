@@ -1,11 +1,11 @@
 (function (root, factory) {
   "use strict";
   if (typeof module === "object" && module.exports) {
-    module.exports = factory();
+    module.exports = factory(require("./repository-combobox.js"));
   } else {
-    root.KanediasSessionModal = factory();
+    root.KanediasSessionModal = factory(root.KanediasRepositoryCombobox);
   }
-})(typeof self !== "undefined" ? self : this, function () {
+})(typeof self !== "undefined" ? self : this, function (repositoryCombobox) {
   "use strict";
 
   var BINDING_KEY = "__kanediasSessionModalBinding";
@@ -176,6 +176,10 @@
     var form = documentObject.querySelector("#new-session-form");
     if (!dialog || !trigger || !form) return null;
 
+    var repositoryRoot = dialog.querySelector("[data-repository-combobox]");
+    var repository = repositoryCombobox && repositoryCombobox.bind(repositoryRoot, documentObject);
+    if (!repository) return null;
+    var repositoryQuery = repositoryRoot.querySelector("[data-repository-query]");
     var closeButton = dialog.querySelector("[data-modal-close]");
     var cancelButton = dialog.querySelector("#new-session-cancel");
     var launchButton = dialog.querySelector("#new-session-launch");
@@ -210,6 +214,7 @@
     }
 
     function setPending(pending) {
+      repository.setPending(pending);
       var controls = Array.from(dialog.querySelectorAll("button, select, input, textarea"));
       if (pending) {
         pendingSnapshot = controls.map(function (control) {
@@ -232,6 +237,7 @@
 
     function reset() {
       form.reset();
+      repository.reset();
       modelPairs.forEach(function (pair) {
         pair.model.value = pair.configuredModel;
         rebuildThinking(documentObject, pair.model, pair.thinking);
@@ -262,8 +268,13 @@
     function onSubmit(event) {
       event.preventDefault();
       if (pendingSnapshot) return;
-      var generation = ++requestGeneration;
       if (status) status.textContent = "";
+      var repositoryValidation = repository.validate();
+      if (!repositoryValidation.valid) {
+        if (status) status.textContent = repositoryValidation.message;
+        return;
+      }
+      var generation = ++requestGeneration;
       setPending(true);
       var request;
       try {
@@ -320,6 +331,7 @@
 
     function escapeGuard(event) {
       if (event.key !== "Escape" || !dialog.open) return;
+      if (event.target === repositoryQuery && repositoryQuery.getAttribute("aria-expanded") === "true") return;
       event.preventDefault();
       event.stopImmediatePropagation();
       closeAndReset();
@@ -346,6 +358,7 @@
         setPending(false);
         removers.forEach(function (remove) { remove(); });
         removers = [];
+        repository.destroy();
         if (documentObject[BINDING_KEY] === controller) delete documentObject[BINDING_KEY];
       }
     };
