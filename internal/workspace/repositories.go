@@ -5,8 +5,8 @@ import (
 	"fmt"
 	"io"
 	"strings"
-	"unicode"
 
+	"github.com/sklarsa/kanedias/internal/config"
 	"github.com/sklarsa/kanedias/internal/incusclient"
 )
 
@@ -17,25 +17,16 @@ type repository struct {
 }
 
 func parseRepositories(slugs []string) ([]repository, error) {
-	repositories := make([]repository, 0, len(slugs))
-	destinations := make(map[string]struct{}, len(slugs))
-	for _, slug := range slugs {
-		parts := strings.Split(slug, "/")
-		if len(parts) != 2 || parts[0] == "" || parts[1] == "" || strings.IndexFunc(slug, unicode.IsSpace) >= 0 {
-			return nil, fmt.Errorf("invalid GitHub repository slug: %s", slug)
-		}
-		name := parts[1]
-		if name == "." || name == ".." {
-			return nil, fmt.Errorf("invalid GitHub repository slug: %s", slug)
-		}
-		if _, exists := destinations[name]; exists {
-			return nil, fmt.Errorf("duplicate repository destination: %s", name)
-		}
-		destinations[name] = struct{}{}
+	configured, err := config.ParseWorkspaceRepositories(slugs)
+	if err != nil {
+		return nil, err
+	}
+	repositories := make([]repository, 0, len(configured))
+	for _, item := range configured {
 		repositories = append(repositories, repository{
-			slug: slug,
-			name: name,
-			url:  "https://github.com/" + slug + ".git",
+			slug: item.Slug,
+			name: item.Checkout,
+			url:  "https://github.com/" + item.Slug + ".git",
 		})
 	}
 	return repositories, nil
