@@ -4,6 +4,187 @@
   /* -------- Accessible New Session modal -------- */
   window.KanediasSessionModal.bind(document, window.fetch.bind(window));
 
+  var terminalUI = window.KanediasTerminalUI;
+
+  /* -------- Session-scoped image drafts and composer bindings -------- */
+  var appShell = document.querySelector(".app");
+  var deck = document.querySelector(".deck");
+  var input = document.querySelector(".deck-input");
+  var tray = document.getElementById("image-attachment-tray");
+  var attachButton = document.getElementById("attach-images-button");
+  var fileInput = document.getElementById("image-file-input");
+  var steerButton = document.getElementById("steerBtn");
+  var deckStatus = document.getElementById("deck-status");
+  var selectedSessionID = "";
+  var dragDepth = 0;
+  tray.classList.add("image-attachment-tray");
+  tray.setAttribute("aria-label", "Image attachments");
+
+  function formatBytes(bytes) {
+    if (bytes < 1024) return bytes + " B";
+    if (bytes < 1024 * 1024) return (bytes / 1024).toFixed(bytes < 10 * 1024 ? 1 : 0) + " KiB";
+    return (bytes / (1024 * 1024)).toFixed(1) + " MiB";
+  }
+
+  function renderDraft(snapshot) {
+    if (!snapshot || snapshot.sessionID !== selectedSessionID) return;
+    if (input.value !== snapshot.text) input.value = snapshot.text;
+
+    while (tray.firstChild) tray.removeChild(tray.firstChild);
+    snapshot.images.forEach(function (image) {
+      var card = document.createElement("div");
+      card.className = "image-attachment-card";
+
+      var preview = document.createElement("img");
+      preview.src = image.url;
+      preview.alt = "";
+      card.appendChild(preview);
+
+      var metadata = document.createElement("span");
+      metadata.className = "image-attachment-meta";
+      var filename = document.createElement("span");
+      filename.className = "image-attachment-name";
+      filename.textContent = image.name;
+      var size = document.createElement("span");
+      size.className = "image-attachment-size";
+      size.textContent = formatBytes(image.size);
+      metadata.appendChild(filename);
+      metadata.appendChild(size);
+      card.appendChild(metadata);
+
+      var remove = document.createElement("button");
+      remove.type = "button";
+      remove.className = "image-attachment-remove";
+      remove.setAttribute("data-remove-image", String(image.id));
+      remove.setAttribute("aria-label", "Remove " + image.name);
+      remove.textContent = "×";
+      remove.disabled = snapshot.busy;
+      card.appendChild(remove);
+      tray.appendChild(card);
+    });
+
+    tray.hidden = snapshot.images.length === 0;
+    appShell.classList.toggle("has-image-draft", snapshot.images.length > 0);
+    deck.setAttribute("aria-busy", snapshot.busy ? "true" : "false");
+    input.disabled = snapshot.busy;
+    terminalUI.syncDeckState(document);
+  }
+
+  var attachmentController = window.KanediasImageAttachments.createController({
+    fetch: window.fetch.bind(window),
+    FormData: window.FormData,
+    createObjectURL: window.URL.createObjectURL.bind(window.URL),
+    revokeObjectURL: window.URL.revokeObjectURL.bind(window.URL),
+    onChange: renderDraft,
+    onStatus: function (message) { deckStatus.textContent = message; }
+  });
+
+  function selectComposerSession(sessionID) {
+    if (selectedSessionID) attachmentController.setText(input.value);
+    selectedSessionID = sessionID || "";
+    renderDraft(attachmentController.selectSession(selectedSessionID));
+  }
+
+  function submitSelectedDraft() {
+    var capturedSessionID = selectedSessionID;
+    if (capturedSessionID) attachmentController.setText(input.value);
+    attachmentController.submit(capturedSessionID);
+  }
+
+  input.addEventListener("input", function () {
+    attachmentController.setText(input.value);
+  });
+
+  attachButton.addEventListener("click", function () {
+    if (!attachButton.disabled) fileInput.click();
+  });
+
+  fileInput.addEventListener("change", function () {
+    terminalUI.stagePickedFiles(fileInput, attachmentController);
+  });
+
+  input.addEventListener("paste", function (event) {
+    var items = event.clipboardData && event.clipboardData.items;
+    if (!items) return;
+    var images = [];
+    for (var i = 0; i < items.length; i++) {
+      if (items[i].kind !== "file" || String(items[i].type || "").indexOf("image/") !== 0) continue;
+      var image = items[i].getAsFile();
+      if (image) images.push(image);
+    }
+    if (images.length === 0) return;
+    event.preventDefault();
+    attachmentController.stageFiles(images);
+  });
+
+  function hasFiles(dataTransfer) {
+    if (!dataTransfer) return false;
+    var types = dataTransfer.types || [];
+    for (var i = 0; i < types.length; i++) {
+      if (types[i] === "Files") return true;
+    }
+    return !!dataTransfer.files && dataTransfer.files.length > 0;
+  }
+
+  deck.addEventListener("dragenter", function (event) {
+    if (!hasFiles(event.dataTransfer)) return;
+    event.preventDefault();
+    dragDepth++;
+    deck.classList.add("drop-active");
+  });
+  deck.addEventListener("dragover", function (event) {
+    if (!hasFiles(event.dataTransfer)) return;
+    event.preventDefault();
+    if (event.dataTransfer) event.dataTransfer.dropEffect = "copy";
+  });
+  deck.addEventListener("dragleave", function (event) {
+    if (!hasFiles(event.dataTransfer) && dragDepth === 0) return;
+    event.preventDefault();
+    dragDepth = Math.max(0, dragDepth - 1);
+    if (dragDepth === 0) deck.classList.remove("drop-active");
+  });
+  deck.addEventListener("drop", function (event) {
+    if (!hasFiles(event.dataTransfer)) return;
+    event.preventDefault();
+    dragDepth = 0;
+    deck.classList.remove("drop-active");
+    attachmentController.stageFiles(event.dataTransfer.files);
+  });
+
+  tray.addEventListener("click", function (event) {
+    var remove = event.target.closest("[data-remove-image]");
+    if (!remove || remove.disabled) return;
+    attachmentController.removeImage(remove.getAttribute("data-remove-image"));
+  });
+
+  steerButton.addEventListener("click", function () {
+    if (!steerButton.disabled) submitSelectedDraft();
+  });
+
+  document.addEventListener("click", function (event) {
+    var row = event.target.closest(".row[data-session-id]");
+    if (!row) return;
+    selectComposerSession(row.dataset.sessionId);
+  });
+
+  function reconcileFleetSessions() {
+    var rows = document.querySelectorAll(".row[data-session-id]");
+    var sessionIDs = Array.prototype.map.call(rows, function (row) { return row.dataset.sessionId; });
+    attachmentController.reconcileSessions(sessionIDs);
+    if (selectedSessionID && sessionIDs.indexOf(selectedSessionID) === -1) {
+      selectedSessionID = "";
+      renderDraft(attachmentController.draft(""));
+    }
+  }
+
+  var fleetPanel = document.getElementById("fleet-panel");
+  if (fleetPanel) {
+    new MutationObserver(reconcileFleetSessions).observe(fleetPanel, {childList: true, subtree: true});
+    reconcileFleetSessions();
+  }
+
+  window.addEventListener("beforeunload", function () { attachmentController.destroy(); });
+
   /* -------- Tab switching (delegated) -------- */
   document.addEventListener("click", function (e) {
     var tab = e.target.closest(".tab");
@@ -97,7 +278,6 @@
   }
 
   /* -------- Pi-like keyboard decisions (delegated) -------- */
-  var terminalUI = window.KanediasTerminalUI;
   var toolExpansion = terminalUI.createToolExpansionController();
 
   document.addEventListener("keydown", function (e) {
@@ -110,7 +290,8 @@
       event: e,
       document: document,
       Event: window.Event,
-      tools: toolExpansion
+      tools: toolExpansion,
+      submit: submitSelectedDraft
     });
   });
 
@@ -234,7 +415,10 @@
 
   /* -------- Detail stream is authoritative for deck capabilities -------- */
   function disarmSessionActions() {
+    terminalUI.setActionControlState(document.querySelector(".deck-input"), false);
     terminalUI.setActionControlState(document.getElementById("steerBtn"), false);
+    terminalUI.setActionControlState(document.getElementById("attach-images-button"), false);
+    terminalUI.setActionControlState(document.getElementById("image-file-input"), false);
     terminalUI.setActionControlState(document.getElementById("interruptBtn"), false);
     terminalUI.setActionControlState(document.querySelector(".dbtn.stop"), false);
   }

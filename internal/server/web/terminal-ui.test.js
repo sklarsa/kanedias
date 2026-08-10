@@ -65,11 +65,28 @@ test("same-node capability attribute morph synchronizes controls", () => {
   const steer = fakeControl();
   const interrupt = fakeControl();
   const stop = fakeControl();
+  const attach = fakeControl();
+  const fileInput = fakeControl();
+  const deckInput = fakeControl();
+  let deckBusy = false;
+  const deck = {getAttribute(name) { return name === "aria-busy" ? String(deckBusy) : null; }};
   const document = {
     getElementById(id) {
-      return {"main-stack": mainStack, "detail-panel": detail, steerBtn: steer, interruptBtn: interrupt}[id] || null;
+      return {
+        "main-stack": mainStack,
+        "detail-panel": detail,
+        steerBtn: steer,
+        interruptBtn: interrupt,
+        "attach-images-button": attach,
+        "image-file-input": fileInput
+      }[id] || null;
     },
-    querySelector(selector) { return selector === ".dbtn.stop" ? stop : null; }
+    querySelector(selector) {
+      if (selector === ".dbtn.stop") return stop;
+      if (selector === ".deck") return deck;
+      if (selector === ".deck-input") return deckInput;
+      return null;
+    }
   };
   class FakeMutationObserver {
     constructor(callback) { this.callback = callback; }
@@ -84,7 +101,7 @@ test("same-node capability attribute morph synchronizes controls", () => {
     attributes: true,
     attributeFilter: ["data-can-steer", "data-can-interrupt", "data-can-stop"]
   });
-  for (const control of [steer, interrupt, stop]) {
+  for (const control of [steer, interrupt, stop, attach, fileInput, deckInput]) {
     assert.equal(control.disabled, true);
     assert.equal(control.getAttribute("aria-disabled"), "true");
     assert.equal(control.classList.contains("armed"), false);
@@ -94,11 +111,20 @@ test("same-node capability attribute morph synchronizes controls", () => {
   detail.setAttribute("data-can-interrupt", "true");
   detail.setAttribute("data-can-stop", "true");
   observer.callback([{type: "attributes", target: detail}]);
-  for (const control of [steer, interrupt, stop]) {
+  for (const control of [steer, interrupt, stop, attach, fileInput, deckInput]) {
     assert.equal(control.disabled, false);
     assert.equal(control.getAttribute("aria-disabled"), "false");
     assert.equal(control.classList.contains("armed"), true);
   }
+
+  deckBusy = true;
+  ui.syncDeckState(document);
+  for (const control of [steer, attach, fileInput, deckInput]) {
+    assert.equal(control.disabled, true);
+    assert.equal(control.getAttribute("aria-disabled"), "true");
+  }
+  assert.equal(interrupt.disabled, false);
+  assert.equal(stop.disabled, false);
 });
 
 test("selection detection preserves non-text and input ranges", () => {
@@ -168,32 +194,57 @@ class FakeInputEvent {
   constructor(type, options) { this.type = type; this.bubbles = options.bubbles; }
 }
 
-function performSubmit(fixture) {
+function performSubmit(fixture, submit) {
   const keyEvent = {preventDefault() { this.prevented = true; }};
-  ui.performAction("submit", {event: keyEvent, document: fixture.document, Event: FakeInputEvent});
+  ui.performAction("submit", {
+    event: keyEvent,
+    document: fixture.document,
+    Event: FakeInputEvent,
+    submit
+  });
   return keyEvent;
 }
 
-test("enabled submit clicks Steer then clears with a bubbling input event", () => {
+test("Enter delegates submission without clearing before acceptance", () => {
   const fixture = fakeSubmitDocument(false);
-  const keyEvent = performSubmit(fixture);
+  fixture.input.value = "inspect this";
+  let submits = 0;
+  const keyEvent = performSubmit(fixture, () => { submits++; });
   assert.equal(keyEvent.prevented, true);
-  assert.equal(fixture.steer.clicks, 1);
-  assert.equal(fixture.input.value, "");
-  assert.equal(fixture.input.focused, true);
-  assert.equal(fixture.dispatched.length, 1);
-  assert.equal(fixture.dispatched[0].type, "input");
-  assert.equal(fixture.dispatched[0].bubbles, true);
+  assert.equal(submits, 1);
+  assert.equal(fixture.steer.clicks, 0);
+  assert.equal(fixture.input.value, "inspect this");
+  assert.equal(fixture.dispatched.length, 0);
 });
 
-test("disabled submit preserves the command without click or input event", () => {
-  const fixture = fakeSubmitDocument(true);
-  const keyEvent = performSubmit(fixture);
-  assert.equal(keyEvent.prevented, true);
-  assert.equal(fixture.steer.clicks, 0);
+test("submit falls back to enabled Steer without optimistic clear", () => {
+  const fixture = fakeSubmitDocument(false);
+  performSubmit(fixture);
+  assert.equal(fixture.steer.clicks, 1);
   assert.equal(fixture.input.value, "queued");
-  assert.equal(fixture.input.focused, undefined);
   assert.equal(fixture.dispatched.length, 0);
+
+  const disabled = fakeSubmitDocument(true);
+  performSubmit(disabled);
+  assert.equal(disabled.steer.clicks, 0);
+  assert.equal(disabled.input.value, "queued");
+});
+
+test("picker staging resets its value so the same file can be selected again", () => {
+  const file = {name: "same.png", type: "image/png", size: 1};
+  const input = {files: [file], value: "C:\\fakepath\\same.png"};
+  const staged = [];
+  const controller = {stageFiles(files) { staged.push(Array.from(files)); }};
+
+  ui.stagePickedFiles(input, controller);
+  assert.deepEqual(staged, [[file]]);
+  assert.equal(input.value, "");
+
+  input.files = [file];
+  input.value = "C:\\fakepath\\same.png";
+  ui.stagePickedFiles(input, controller);
+  assert.deepEqual(staged, [[file], [file]]);
+  assert.equal(input.value, "");
 });
 
 test("Ctrl-A selects the complete deck input", () => {

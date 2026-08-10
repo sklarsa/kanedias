@@ -259,6 +259,13 @@ func TestHandlerRoutes(t *testing.T) {
 			contentType: "text/javascript; charset=utf-8",
 		},
 		{
+			name:        "image attachment controller",
+			path:        "/assets/image-attachments.js",
+			method:      http.MethodGet,
+			status:      http.StatusOK,
+			contentType: "text/javascript; charset=utf-8",
+		},
+		{
 			name:   "unknown",
 			path:   "/unknown",
 			method: http.MethodGet,
@@ -446,13 +453,15 @@ func TestInitialPageContainsAstrolabeConsole(t *testing.T) {
 		// Datastar wiring: signals and init
 		`data-signals=`,
 		`selectedSessionId`,
-		`commandMessage`,
 		`data-init=`,
-		// command deck actions
+		// command deck and accessible attachment controls
 		`Steer`,
 		`Interrupt`,
 		`Stop Session`,
 		`New Session`,
+		`id="image-attachment-tray" aria-live="polite" hidden`,
+		`id="image-file-input" type="file" accept="image/png,image/jpeg,image/gif,image/webp" multiple hidden`,
+		`id="attach-images-button" type="button"`,
 	}
 	for _, want := range required {
 		if !strings.Contains(body, want) {
@@ -499,19 +508,20 @@ func TestAstrolabeConsoleIsInteractive(t *testing.T) {
 	// There are no external scripts and no inline controller.
 	scriptRE := regexp.MustCompile(`(?s)<script\b([^>]*)>(.*?)</script>`)
 	scripts := scriptRE.FindAllStringSubmatch(body, -1)
-	wantScripts := 7 // Datastar + 3 Markdown assets + terminal decisions + session modal + app.js
+	wantScripts := 8 // Datastar + 3 Markdown assets + terminal decisions + session modal + attachments + app.js
 	if len(scripts) != wantScripts {
-		t.Fatalf("script count = %d, want %d (Datastar + 3 Markdown assets + terminal-ui.js + session-modal.js + app.js)", len(scripts), wantScripts)
+		t.Fatalf("script count = %d, want %d (Datastar + 3 Markdown assets + terminal-ui.js + session-modal.js + image-attachments.js + app.js)", len(scripts), wantScripts)
 	}
 
-	var sawDatastar, sawTerminalUI, sawSessionModal, sawAppJS bool
+	var sawDatastar, sawTerminalUI, sawSessionModal, sawAttachments, sawAppJS bool
+	attachmentIndex, appIndex := -1, -1
 	markdownAssets := []string{
 		`src="/assets/marked.min.js"`,
 		`src="/assets/highlight.min.js"`,
 		`src="/assets/markdown-renderer.js"`,
 	}
 	sawMarkdown := make(map[string]bool)
-	for _, script := range scripts {
+	for scriptIndex, script := range scripts {
 		attrs, inner := script[1], strings.TrimSpace(script[2])
 		if strings.Contains(attrs, `src="http://`) || strings.Contains(attrs, `src="https://`) {
 			t.Errorf("script references a remote origin: %s", script[0])
@@ -537,11 +547,19 @@ func TestAstrolabeConsoleIsInteractive(t *testing.T) {
 			}
 			sawSessionModal = true
 		}
+		if strings.Contains(attrs, `src="/assets/image-attachments.js"`) {
+			if inner != "" {
+				t.Errorf("image-attachments.js script has unexpected inline body %q", inner)
+			}
+			sawAttachments = true
+			attachmentIndex = scriptIndex
+		}
 		if strings.Contains(attrs, `src="/assets/app.js"`) {
 			if inner != "" {
 				t.Errorf("app.js script has unexpected inline body %q", inner)
 			}
 			sawAppJS = true
+			appIndex = scriptIndex
 		}
 		for _, asset := range markdownAssets {
 			if strings.Contains(attrs, asset) {
@@ -558,8 +576,14 @@ func TestAstrolabeConsoleIsInteractive(t *testing.T) {
 	if !sawSessionModal {
 		t.Error("page is missing the local session-modal.js script")
 	}
+	if !sawAttachments {
+		t.Error("page is missing the local image-attachments.js script")
+	}
 	if !sawAppJS {
 		t.Error("page is missing the app.js script")
+	}
+	if attachmentIndex < 0 || appIndex < 0 || attachmentIndex >= appIndex {
+		t.Error("image-attachments.js must load before app.js")
 	}
 	for _, asset := range markdownAssets {
 		if !sawMarkdown[asset] {
@@ -569,7 +593,7 @@ func TestAstrolabeConsoleIsInteractive(t *testing.T) {
 
 	// The console is a working control surface with delegated Datastar wiring.
 	for _, want := range []string{
-		`class="deck-input"`, `data-bind="commandMessage"`, `data-on:click=`,
+		`class="deck-input"`, `data-on:click=`,
 		`aria-keyshortcuts="Control+A Control+C Enter"`,
 		`aria-keyshortcuts="Escape"`,
 		`^A select all · ^C clear/copy · esc abort · ^O tools`,
@@ -581,8 +605,20 @@ func TestAstrolabeConsoleIsInteractive(t *testing.T) {
 	if strings.Contains(body, " disabled") {
 		t.Error("Astrolabe console must not ship disabled placeholder controls")
 	}
-	if strings.Contains(strings.ToLower(body), "onkeydown=") || strings.Contains(strings.ToLower(body), "onkeyup=") {
-		t.Error("Astrolabe console must use delegated keyboard handling, not inline key handlers")
+	if strings.Contains(body, `data-bind="commandMessage"`) {
+		t.Error("directive input must be owned by the image draft controller, not a Datastar signal")
+	}
+	steerRE := regexp.MustCompile(`(?s)<button\b[^>]*id="steerBtn"[^>]*>`)
+	steer := steerRE.FindString(body)
+	if steer == "" || !strings.Contains(steer, `type="button"`) {
+		t.Error("Steer must be a stable type=button control")
+	}
+	if strings.Contains(steer, `data-on:click`) {
+		t.Error("Steer must delegate browser submission to the image draft controller")
+	}
+	inlineHandlerRE := regexp.MustCompile(`(?i)\s(onclick|onchange|oninput|onpaste|ondragenter|ondragover|ondragleave|ondrop|onkeydown|onkeyup)\s*=`)
+	if inlineHandlerRE.MatchString(body) {
+		t.Error("Astrolabe console must use delegated browser handling, not inline event handlers")
 	}
 }
 
@@ -1562,6 +1598,7 @@ func TestRenderedPageHasOnlyOrderedLocalRuntimeAssets(t *testing.T) {
 		"/assets/markdown-renderer.js",
 		"/assets/terminal-ui.js",
 		"/assets/session-modal.js",
+		"/assets/image-attachments.js",
 		"/assets/app.js",
 	}
 	if len(matches) != len(want) {
