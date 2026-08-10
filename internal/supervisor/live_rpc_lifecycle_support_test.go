@@ -3,6 +3,7 @@
 package supervisor_test
 
 import (
+	"bufio"
 	"encoding/json"
 	"errors"
 	"fmt"
@@ -44,12 +45,14 @@ func TestValidateLifecycleModelPolicyRequiresLocalRootAndWorkers(t *testing.T) {
 	}
 }
 
-func TestValidateLifecycleFinalEventsRequiresOrderedSingleGenerationSettlements(t *testing.T) {
+func TestValidateLifecycleFinalEventsRequiresOrderedPairedGenerations(t *testing.T) {
 	events := []supervisor.EventEnvelope{
 		lifecyclePiEnvelope(1, "root", `{"type":"agent_start"}`),
 		lifecyclePiEnvelope(2, "child", `{"type":"agent_start"}`),
 		lifecyclePiEnvelope(3, "child", `{"type":"agent_settled"}`),
 		lifecyclePiEnvelope(4, "root", `{"type":"agent_settled"}`),
+		lifecyclePiEnvelope(5, "root", `{"type":"agent_start"}`),
+		lifecyclePiEnvelope(6, "root", `{"type":"agent_settled"}`),
 	}
 	if err := validateLifecycleFinalEvents(events); err != nil {
 		t.Fatalf("valid final events: %v", err)
@@ -72,11 +75,19 @@ func TestValidateLifecycleFinalEventsRequiresOrderedSingleGenerationSettlements(
 			events[3].SourceSeq = events[0].SourceSeq
 			return events
 		}},
-		{name: "missing settlement", edit: func(events []supervisor.EventEnvelope) []supervisor.EventEnvelope {
+		{name: "settlement before start", edit: func(events []supervisor.EventEnvelope) []supervisor.EventEnvelope {
+			events[0].Payload, events[3].Payload = events[3].Payload, events[0].Payload
+			return events
+		}},
+		{name: "overlapping start", edit: func(events []supervisor.EventEnvelope) []supervisor.EventEnvelope {
+			events[1].SessionID = "root"
+			return events
+		}},
+		{name: "unclosed start", edit: func(events []supervisor.EventEnvelope) []supervisor.EventEnvelope {
 			return events[:len(events)-1]
 		}},
 		{name: "extra settlement", edit: func(events []supervisor.EventEnvelope) []supervisor.EventEnvelope {
-			return append(events, supervisor.EventEnvelope{Seq: 5, SessionID: "root", SourceSeq: 5, Kind: "pi", Payload: json.RawMessage(`{"type":"agent_settled"}`)})
+			return append(events, supervisor.EventEnvelope{Seq: 7, SessionID: "root", SourceSeq: 7, Kind: "pi", Payload: json.RawMessage(`{"type":"agent_settled"}`)})
 		}},
 	} {
 		t.Run(test.name, func(t *testing.T) {
@@ -88,6 +99,56 @@ func TestValidateLifecycleFinalEventsRequiresOrderedSingleGenerationSettlements(
 				t.Fatal("invalid final events were accepted")
 			}
 		})
+	}
+}
+
+func TestValidateLifecycleFinalBoundaryRequiresStoppedUnavailableTree(t *testing.T) {
+	valid := lifecycleBoundaryEvidence{Tree: lifecycleTreeEvidence{Available: false, RootStopped: true, RootSocketPresent: false}}
+	if err := validateLifecycleFinalBoundary(valid); err != nil {
+		t.Fatalf("valid stopped final boundary: %v", err)
+	}
+	for _, invalid := range []lifecycleBoundaryEvidence{
+		{Tree: lifecycleTreeEvidence{Available: true, RootStopped: true}},
+		{Tree: lifecycleTreeEvidence{Available: false, RootStopped: true, Tree: &supervisor.NodeSnapshot{SessionID: "stale-root"}}},
+		{Tree: lifecycleTreeEvidence{Available: false, RootStopped: false}},
+		{Tree: lifecycleTreeEvidence{Available: false, RootStopped: true, RootSocketPresent: true}},
+	} {
+		if err := validateLifecycleFinalBoundary(invalid); err == nil {
+			t.Fatalf("invalid final boundary was accepted: %#v", invalid.Tree)
+		}
+	}
+}
+
+func TestValidateLifecycleSSECaptureRequiresCleanExactData(t *testing.T) {
+	event := lifecyclePiEnvelope(1, "root", `{"type":"agent_start"}`)
+	encoded, err := json.Marshal(event)
+	if err != nil {
+		t.Fatal(err)
+	}
+	path := filepath.Join(t.TempDir(), "root-events.sse")
+	if err := os.WriteFile(path, []byte("event: message\n"+"data: "+string(encoded)+"\n\n"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	if err := validateLifecycleSSECapture(path, []supervisor.EventEnvelope{event}); err != nil {
+		t.Fatalf("valid SSE capture: %v", err)
+	}
+	if err := validateLifecycleSSECompletion(nil); err != nil {
+		t.Fatalf("clean SSE completion: %v", err)
+	}
+	if err := validateLifecycleSSECompletion(errors.New("truncated stream")); err == nil {
+		t.Fatal("SSE scanner error was accepted")
+	}
+	if err := os.WriteFile(path, []byte("data: {not-json}\n\n"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	if err := validateLifecycleSSECapture(path, nil); err == nil {
+		t.Fatal("malformed SSE data envelope was accepted")
+	}
+	if err := os.WriteFile(path, []byte("data: "+string(encoded)+"\n\n"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	if err := validateLifecycleSSECapture(path, nil); err == nil {
+		t.Fatal("SSE capture/journal mismatch was accepted")
 	}
 }
 
@@ -360,13 +421,14 @@ type lifecycleEventJournal struct {
 // lifecycleRoot bundles the owned root process, socket, faithful tree, HTTP
 // client, SSE capture, and the event journal started as soon as the root is up.
 type lifecycleRoot struct {
-	process *acceptanceProcess
-	socket  string
-	tree    supervisor.NodeSnapshot
-	client  *http.Client
-	stream  *sseCapture
-	journal *lifecycleEventJournal
-	stalled net.Conn
+	process   *acceptanceProcess
+	socket    string
+	tree      supervisor.NodeSnapshot
+	client    *http.Client
+	stream    *sseCapture
+	journal   *lifecycleEventJournal
+	stalled   net.Conn
+	eventPath string
 
 	mu              sync.Mutex
 	actions         []lifecycleAction
@@ -430,8 +492,7 @@ func validateLifecycleFinalEvents(events []supervisor.EventEnvelope) error {
 	var brokerSeq uint64
 	sourceSeq := make(map[string]uint64)
 	seenSources := make(map[string]struct{}, len(events))
-	starts := make(map[string]int)
-	settled := make(map[string]int)
+	openGeneration := make(map[string]bool)
 	for index, event := range events {
 		if event.Seq == 0 || (index > 0 && event.Seq <= brokerSeq) {
 			return fmt.Errorf("broker sequence at position %d = %d after %d", index, event.Seq, brokerSeq)
@@ -460,19 +521,74 @@ func validateLifecycleFinalEvents(events []supervisor.EventEnvelope) error {
 		}
 		switch payload.Type {
 		case "agent_start":
-			starts[event.SessionID]++
+			if openGeneration[event.SessionID] {
+				return fmt.Errorf("session %q started a generation while its prior generation remained open", event.SessionID)
+			}
+			openGeneration[event.SessionID] = true
 		case "agent_settled":
-			settled[event.SessionID]++
+			if !openGeneration[event.SessionID] {
+				return fmt.Errorf("session %q settled without an unmatched prior start", event.SessionID)
+			}
+			openGeneration[event.SessionID] = false
 		}
 	}
-	for sessionID, generations := range starts {
-		if generations == 0 || settled[sessionID] != generations {
-			return fmt.Errorf("session %q settlements = %d, want one for each of %d started generations", sessionID, settled[sessionID], generations)
+	for sessionID, open := range openGeneration {
+		if open {
+			return fmt.Errorf("session %q has an unclosed started generation", sessionID)
 		}
 	}
-	for sessionID, terminals := range settled {
-		if starts[sessionID] != terminals {
-			return fmt.Errorf("session %q settlements = %d without matching started generations %d", sessionID, terminals, starts[sessionID])
+	return nil
+}
+
+func validateLifecycleFinalBoundary(final lifecycleBoundaryEvidence) error {
+	if final.Tree.Available || !final.Tree.RootStopped || final.Tree.RootSocketPresent || final.Tree.Tree != nil {
+		return fmt.Errorf("final tree boundary is not a truthful stopped/unavailable root: %#v", final.Tree)
+	}
+	return nil
+}
+
+func validateLifecycleSSECompletion(captureErr error) error {
+	if captureErr != nil {
+		return fmt.Errorf("lifecycle SSE capture did not complete cleanly: %w", captureErr)
+	}
+	return nil
+}
+
+func validateLifecycleSSECapture(path string, journal []supervisor.EventEnvelope) error {
+	file, err := os.Open(path)
+	if err != nil {
+		return fmt.Errorf("open lifecycle SSE capture: %w", err)
+	}
+	defer file.Close()
+
+	var captured []supervisor.EventEnvelope
+	scanner := bufio.NewScanner(file)
+	scanner.Buffer(make([]byte, 64*1024), 1<<20)
+	lineNumber := 0
+	for scanner.Scan() {
+		lineNumber++
+		line := scanner.Text()
+		if !strings.HasPrefix(line, "data:") {
+			continue
+		}
+		data := strings.TrimSpace(strings.TrimPrefix(line, "data:"))
+		var event supervisor.EventEnvelope
+		if data == "" || json.Unmarshal([]byte(data), &event) != nil {
+			return fmt.Errorf("lifecycle SSE data line %d is not a valid event envelope", lineNumber)
+		}
+		captured = append(captured, event)
+	}
+	if err := scanner.Err(); err != nil {
+		return fmt.Errorf("read lifecycle SSE capture: %w", err)
+	}
+	if len(captured) != len(journal) {
+		return fmt.Errorf("lifecycle SSE envelopes = %d, journal events = %d", len(captured), len(journal))
+	}
+	for index := range captured {
+		left, right := captured[index], journal[index]
+		if left.Seq != right.Seq || left.SessionID != right.SessionID || left.SourceSeq != right.SourceSeq ||
+			left.Kind != right.Kind || string(left.Payload) != string(right.Payload) {
+			return fmt.Errorf("lifecycle SSE envelope %d does not match journal", index)
 		}
 	}
 	return nil
@@ -840,9 +956,11 @@ func (h *liveAcceptance) startLifecycleRoot(label string) *lifecycleRoot {
 		stream:          stream,
 		journal:         newLifecycleEventJournal(stream),
 		stalled:         stalled,
+		eventPath:       filepath.Join(h.runDir, label+"-events.sse"),
 		childPIDs:       make(map[int]struct{}),
 		immutableEvents: make(map[string][]supervisor.EventEnvelope),
 	}
+	h.recordLifecycleDescendantPIDs(root, "root-start")
 	h.captureLifecycleBoundary(root, "pre-control")
 	return root
 }
@@ -858,12 +976,12 @@ func (h *liveAcceptance) stopLifecycleRoot(root *lifecycleRoot) {
 	if !hasPostControl {
 		h.captureLifecycleBoundary(root, "post-control")
 	}
-	h.captureLifecycleBoundary(root, "final")
 	status, err := h.deleteLifecycleSession(root, root.tree.SessionID)
 	if err != nil || status != http.StatusAccepted {
 		h.t.Fatalf("lifecycle root DELETE = %d, %v", status, err)
 	}
 	h.finishStoppedLifecycleRoot(root, "root DELETE")
+	h.captureLifecycleBoundary(root, "final")
 	h.assertLifecycleFinalInvariants(root)
 }
 
@@ -879,19 +997,25 @@ func (h *liveAcceptance) finishStoppedLifecycleRoot(root *lifecycleRoot, descrip
 	case <-time.After(30 * time.Second):
 		h.t.Fatal("lifecycle root event journal did not close and drain after process exit")
 	}
+	var captureErr error
+	select {
+	case captureErr = <-root.stream.done:
+		root.stream.done <- captureErr
+	case <-time.After(30 * time.Second):
+		h.t.Fatal("lifecycle root SSE capture did not report completion")
+	}
+	if err := validateLifecycleSSECompletion(captureErr); err != nil {
+		h.t.Fatal(err)
+	}
+	if err := validateLifecycleSSECapture(root.eventPath, root.journal.snapshot()); err != nil {
+		h.t.Fatalf("validate lifecycle SSE capture: %v", err)
+	}
 	if _, err := os.Stat(root.socket); !errors.Is(err, os.ErrNotExist) {
 		h.t.Fatalf("lifecycle root socket remains: %v", err)
 	}
 	h.poll(2*time.Minute, "lifecycle root tree cleanup", func() bool {
 		return h.sessionsAbsent(h.sessionIDs())
 	})
-	root.mu.Lock()
-	if root.final != nil {
-		root.final.Tree.RootStopped = true
-		root.final.Tree.RootSocketPresent = pathExists(root.socket)
-		root.final.Resources = h.snapshotResources("lifecycle-final-resources")
-	}
-	root.mu.Unlock()
 }
 
 func (h *liveAcceptance) deleteLifecycleSession(root *lifecycleRoot, sessionID string) (int, error) {
@@ -1033,6 +1157,16 @@ func (h *liveAcceptance) waitLifecycleSettlementEvent(root *lifecycleRoot, sessi
 	})
 }
 
+func (h *liveAcceptance) waitLifecycleSettlementTotal(root *lifecycleRoot, sessionID string, want int, description string) {
+	h.poll(4*time.Minute, description, func() bool {
+		got := root.journal.countPi(sessionID, "agent_settled", "")
+		if got > want {
+			h.t.Fatalf("%s settlements = %d, want exactly %d", description, got, want)
+		}
+		return got == want
+	})
+}
+
 func (h *liveAcceptance) assertLifecycleSettlementTotals(root *lifecycleRoot, expected map[string]int, description string) {
 	if err := validateLifecycleSettlementTotals(root.journal.snapshot(), expected); err != nil {
 		h.t.Fatalf("%s after drained event boundary: %v", description, err)
@@ -1062,7 +1196,21 @@ func (h *liveAcceptance) assertRootUsable(root *lifecycleRoot, marker string) {
 	}
 }
 
+func (h *liveAcceptance) recordLifecycleDescendantPIDs(root *lifecycleRoot, label string) []int {
+	pids := descendantPIDs(root.process.cmd.Process.Pid)
+	root.mu.Lock()
+	for _, pid := range pids {
+		root.childPIDs[pid] = struct{}{}
+	}
+	root.mu.Unlock()
+	h.writeJSON(label+"-owned-descendant-pids.json", map[string]any{
+		"rootPid": root.process.cmd.Process.Pid, "descendantPids": pids,
+	})
+	return pids
+}
+
 func (h *liveAcceptance) captureLifecycleBoundary(root *lifecycleRoot, boundary string) {
+	h.recordLifecycleDescendantPIDs(root, "lifecycle-"+boundary)
 	var tree supervisor.NodeSnapshot
 	treeErr := unixJSON(root.client, http.MethodGet, "/v1/tree", nil, &tree)
 	stopped := false
@@ -1113,9 +1261,9 @@ func (h *liveAcceptance) assertLifecycleFinalInvariants(root *lifecycleRoot) {
 	postControl := root.postControl
 	final := root.final
 	actions := append([]lifecycleAction(nil), root.actions...)
-	childPIDs := make([]int, 0, len(root.childPIDs))
+	ownedDescendantPIDs := make([]int, 0, len(root.childPIDs))
 	for pid := range root.childPIDs {
-		childPIDs = append(childPIDs, pid)
+		ownedDescendantPIDs = append(ownedDescendantPIDs, pid)
 	}
 	immutable := make(map[string][]supervisor.EventEnvelope, len(root.immutableEvents))
 	for sessionID, frozen := range root.immutableEvents {
@@ -1124,6 +1272,9 @@ func (h *liveAcceptance) assertLifecycleFinalInvariants(root *lifecycleRoot) {
 	root.mu.Unlock()
 	if preControl == nil || postControl == nil || final == nil {
 		h.t.Fatalf("lifecycle boundary evidence incomplete: pre=%t post=%t final=%t", preControl != nil, postControl != nil, final != nil)
+	}
+	if err := validateLifecycleFinalBoundary(*final); err != nil {
+		h.t.Fatalf("final lifecycle boundary: %v", err)
 	}
 	select {
 	case <-root.process.done:
@@ -1138,9 +1289,9 @@ func (h *liveAcceptance) assertLifecycleFinalInvariants(root *lifecycleRoot) {
 			h.t.Fatalf("descendant socket remains for session %s", sessionID)
 		}
 	}
-	for _, pid := range childPIDs {
+	for _, pid := range ownedDescendantPIDs {
 		if pathExists(filepath.Join("/proc", fmt.Sprint(pid))) {
-			h.t.Fatalf("owned lifecycle child process %d remains", pid)
+			h.t.Fatalf("observed owned lifecycle descendant process %d remains", pid)
 		}
 	}
 	for sessionID, frozen := range immutable {
@@ -1155,7 +1306,6 @@ func (h *liveAcceptance) assertLifecycleFinalInvariants(root *lifecycleRoot) {
 			}
 		}
 	}
-	final.Resources = h.snapshotResources("lifecycle-final-invariant-resources")
 	if !sameResourceNames(h.baseline, final.Resources) {
 		h.t.Fatalf("final lifecycle resources differ from exact baseline: %s", resourceDiff(h.baseline, final.Resources))
 	}

@@ -525,37 +525,37 @@ func (h *liveAcceptance) exerciseMixedSiblingOutcomes() {
 	h.assertLifecycleChildren(root.tree, allTree.Children)
 	allPIDs := h.captureLifecycleChildPIDs(root, 3, "mixed-siblings")
 	childrenByOutcome := h.identifyLifecycleChildrenByMarker(root, allTree.Children, markers)
-	settledBefore := make(map[string]int, len(childrenByOutcome))
-	for outcome, child := range childrenByOutcome {
-		settledBefore[outcome] = root.journal.countPi(child.SessionID, "agent_settled", "")
-	}
-
 	naturalChild := childrenByOutcome["natural"]
-	naturalResult := calls["natural"].wait(h.t, 8*time.Minute)
-	h.assertLifecycleReadResult(naturalResult, naturalChild.SessionID, markers["natural"])
-	h.waitForLifecycleNaturalChildEvents(root, []supervisor.NodeSnapshot{naturalChild}, "mixed natural child exact terminal events")
-	h.waitForLifecycleChildGone(root, naturalChild.SessionID, "mixed natural child independent disappearance")
-	root.freezeLifecycleEvents(naturalChild.SessionID, root.journal.snapshot())
-
-	for _, outcome := range []string{"delete", "abort"} {
-		h.waitLifecycleStreaming(root, childrenByOutcome[outcome].SessionID, "mixed "+outcome+" child running and streaming immediately before control")
-	}
-	h.captureLifecycleBoundary(root, "pre-control")
-
 	deleteChild := childrenByOutcome["delete"]
+	abortChild := childrenByOutcome["abort"]
+
+	h.captureLifecycleBoundary(root, "pre-control")
+	h.waitLifecycleStreaming(root, deleteChild.SessionID, "mixed DELETE child running and streaming immediately before control")
 	status, err := h.deleteLifecycleSession(root, deleteChild.SessionID)
 	if err != nil || status != http.StatusAccepted {
 		h.t.Fatalf("mixed sibling DELETE = %d, %v", status, err)
 	}
-	abortChild := childrenByOutcome["abort"]
+	h.waitLifecycleStreaming(root, abortChild.SessionID, "mixed abort child running and streaming immediately before control")
 	h.lifecycleRPCCommand(root, abortChild.SessionID, map[string]any{"type": "abort"})
 
 	h.assertLifecycleStoppedResult(calls["delete"].wait(h.t, 2*time.Minute))
-	h.waitLifecycleSettlementEvent(root, deleteChild.SessionID, settledBefore["delete"], "mixed DELETE child drained settlement")
+	h.waitLifecycleSettlementTotal(root, deleteChild.SessionID, 1, "mixed DELETE child exact drained settlement")
 	h.waitForLifecycleChildGone(root, deleteChild.SessionID, "mixed DELETE child independent disappearance")
 	h.assertLifecycleStoppedResult(calls["abort"].wait(h.t, 2*time.Minute))
-	h.waitLifecycleSettlementEvent(root, abortChild.SessionID, settledBefore["abort"], "mixed abort child drained settlement")
+	h.waitLifecycleSettlementTotal(root, abortChild.SessionID, 1, "mixed abort child exact drained settlement")
 	h.waitForLifecycleChildGone(root, abortChild.SessionID, "mixed abort child independent disappearance")
+
+	naturalResult := calls["natural"].wait(h.t, 8*time.Minute)
+	naturalRead := h.assertLifecycleReadResult(naturalResult, naturalChild.SessionID, markers["natural"])
+	for _, siblingMarker := range []string{markers["delete"], markers["abort"]} {
+		if strings.Contains(naturalRead.Output, siblingMarker) {
+			h.t.Fatalf("mixed natural child output was contaminated by sibling marker %q", siblingMarker)
+		}
+	}
+	h.waitForLifecycleNaturalChildEvents(root, []supervisor.NodeSnapshot{naturalChild}, "mixed natural child exact terminal events")
+	h.waitLifecycleSettlementTotal(root, naturalChild.SessionID, 1, "mixed natural child exact drained settlement")
+	h.waitForLifecycleChildGone(root, naturalChild.SessionID, "mixed natural child independent disappearance")
+	root.freezeLifecycleEvents(naturalChild.SessionID, root.journal.snapshot())
 
 	h.waitForLifecycleChildrenGone(root, allTree.Children, allPIDs, "mixed sibling identity-specific cleanup")
 	h.captureLifecycleBoundary(root, "post-control")
@@ -563,10 +563,10 @@ func (h *liveAcceptance) exerciseMixedSiblingOutcomes() {
 	h.stopLifecycleRoot(root)
 	h.assertLifecycleSettlementTotals(root, map[string]int{
 		root.tree.SessionID:    1,
-		naturalChild.SessionID: settledBefore["natural"] + 1,
-		deleteChild.SessionID:  settledBefore["delete"] + 1,
-		abortChild.SessionID:   settledBefore["abort"] + 1,
-	}, "mixed sibling settlement totals")
+		naturalChild.SessionID: 1,
+		deleteChild.SessionID:  1,
+		abortChild.SessionID:   1,
+	}, "mixed sibling exact one-generation settlement totals")
 }
 
 func (h *liveAcceptance) identifyLifecycleChildrenByMarker(root *lifecycleRoot, children []supervisor.NodeSnapshot, markers map[string]string) map[string]supervisor.NodeSnapshot {
@@ -865,7 +865,10 @@ func (h *liveAcceptance) captureLifecycleChildPIDs(root *lifecycleRoot, count in
 		root.childPIDs[pid] = struct{}{}
 	}
 	root.mu.Unlock()
-	h.writeJSON(label+"-child-supervisor-pids.json", map[string]any{"rootPid": root.process.cmd.Process.Pid, "childPids": pids})
+	allDescendants := h.recordLifecycleDescendantPIDs(root, label+"-active-children")
+	h.writeJSON(label+"-child-supervisor-pids.json", map[string]any{
+		"rootPid": root.process.cmd.Process.Pid, "childPids": pids, "allDescendantPids": allDescendants,
+	})
 	return pids
 }
 
