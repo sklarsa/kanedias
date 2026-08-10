@@ -2,6 +2,7 @@ package cmd
 
 import (
 	"bufio"
+	"bytes"
 	"context"
 	"encoding/json"
 	"errors"
@@ -36,6 +37,46 @@ func validSupervisorConfig() config.Config {
 		Workers: map[string]config.WorkerDefaults{"worker": {
 			Description: "work", ModelType: "gpt-5-6-sol",
 		}},
+	}
+}
+
+type recordingRootStatusWriter struct {
+	bytes.Buffer
+	closes int
+}
+
+func (writer *recordingRootStatusWriter) Close() error {
+	writer.closes++
+	return nil
+}
+
+func TestSessionStartupStatusReportsNodeStartOutcomeExactlyOnce(t *testing.T) {
+	tests := []struct {
+		name     string
+		startErr error
+		want     process.RootStartupStatus
+	}{
+		{name: "ready", want: process.RootStartupStatus{Status: process.RootStartupReady}},
+		{name: "repository failure", startErr: errors.Join(contract.NewError(contract.ErrorWorkspaceRepositoryUnavailable, "public"), errors.New("private detail")), want: process.RootStartupStatus{Status: process.RootStartupFailure, Code: contract.ErrorWorkspaceRepositoryUnavailable}},
+		{name: "internal failure", startErr: errors.New("plain failure"), want: process.RootStartupStatus{Status: process.RootStartupFailure, Code: contract.ErrorInternal}},
+	}
+	for _, test := range tests {
+		t.Run(test.name, func(t *testing.T) {
+			writer := &recordingRootStatusWriter{}
+			if err := reportRootStartup(writer, test.startErr); err != nil {
+				t.Fatal(err)
+			}
+			if writer.closes != 1 {
+				t.Fatalf("status closes = %d, want 1", writer.closes)
+			}
+			got, err := process.DecodeRootStartupStatus(bytes.NewReader(writer.Bytes()))
+			if err != nil {
+				t.Fatal(err)
+			}
+			if got != test.want {
+				t.Fatalf("status = %#v, want %#v", got, test.want)
+			}
+		})
 	}
 }
 

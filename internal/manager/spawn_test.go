@@ -18,6 +18,7 @@ import (
 	"time"
 
 	"github.com/sklarsa/kanedias/internal/supervisor"
+	"github.com/sklarsa/kanedias/internal/supervisor/contract"
 	"github.com/sklarsa/kanedias/internal/supervisor/process"
 	"golang.org/x/sys/unix"
 )
@@ -85,32 +86,47 @@ type retainingStarter struct {
 
 type closingBootstrapStarter struct{ process *fakeProcess }
 
-func (starter closingBootstrapStarter) Start(spec spawnSpec) (spawnedProcess, error) {
-	if len(spec.ExtraFiles) != 1 {
-		return nil, fmt.Errorf("ExtraFiles = %d, want 1", len(spec.ExtraFiles))
+func duplicateExtraFiles(spec spawnSpec) (*os.File, *os.File, error) {
+	if len(spec.ExtraFiles) != 2 {
+		return nil, nil, fmt.Errorf("ExtraFiles = %d, want 2", len(spec.ExtraFiles))
 	}
-	duplicate, err := unix.Dup(int(spec.ExtraFiles[0].Fd()))
+	bootstrapFD, err := unix.Dup(int(spec.ExtraFiles[0].Fd()))
+	if err != nil {
+		return nil, nil, err
+	}
+	statusFD, err := unix.Dup(int(spec.ExtraFiles[1].Fd()))
+	if err != nil {
+		_ = unix.Close(bootstrapFD)
+		return nil, nil, err
+	}
+	return os.NewFile(uintptr(bootstrapFD), "fake-root-bootstrap"), os.NewFile(uintptr(statusFD), "fake-root-status"), nil
+}
+
+func writeFakeReadyStatus(file *os.File) {
+	_ = errors.Join(process.EncodeRootStartupStatus(file, process.RootStartupStatus{Status: process.RootStartupReady}), file.Close())
+}
+
+func (starter closingBootstrapStarter) Start(spec spawnSpec) (spawnedProcess, error) {
+	bootstrap, status, err := duplicateExtraFiles(spec)
 	if err != nil {
 		return nil, err
 	}
-	if err := unix.Close(duplicate); err != nil {
+	if err := bootstrap.Close(); err != nil {
+		_ = status.Close()
 		return nil, err
 	}
+	writeFakeReadyStatus(status)
 	return starter.process, nil
 }
 
 func (starter *retainingStarter) Start(spec spawnSpec) (spawnedProcess, error) {
-	if len(spec.ExtraFiles) != 1 {
-		err := fmt.Errorf("ExtraFiles = %d, want 1", len(spec.ExtraFiles))
-		starter.started <- err
-		return nil, err
-	}
-	duplicate, err := unix.Dup(int(spec.ExtraFiles[0].Fd()))
+	bootstrap, status, err := duplicateExtraFiles(spec)
 	if err != nil {
 		starter.started <- err
 		return nil, err
 	}
-	starter.inheritedRead = os.NewFile(uintptr(duplicate), "retained-root-bootstrap")
+	starter.inheritedRead = bootstrap
+	writeFakeReadyStatus(status)
 	starter.started <- nil
 	return starter.process, nil
 }
@@ -121,14 +137,11 @@ func (fs *fakeStarter) Start(spec spawnSpec) (spawnedProcess, error) {
 	if fs.err != nil {
 		return nil, fs.err
 	}
-	if len(spec.ExtraFiles) != 1 {
-		return nil, fmt.Errorf("ExtraFiles = %d, want 1", len(spec.ExtraFiles))
-	}
-	duplicate, err := unix.Dup(int(spec.ExtraFiles[0].Fd()))
+	file, status, err := duplicateExtraFiles(spec)
 	if err != nil {
 		return nil, err
 	}
-	file := os.NewFile(uintptr(duplicate), "fake-root-bootstrap")
+	writeFakeReadyStatus(status)
 	go func() {
 		bootstrap, decodeErr := process.DecodeRootBootstrap(file)
 		closeErr := file.Close()
@@ -245,7 +258,7 @@ func TestSpawnRootWithRequestValidatesBeforeSideEffects(t *testing.T) {
 	}
 }
 
-func TestSpawnRootWithRequestTransfersResolvedPolicyAndWorkspaceOnlyThroughFD3(t *testing.T) {
+func TestSpawnRootWithRequestTransfersResolvedPolicyAndStartupDescriptors(t *testing.T) {
 	fs := &fakeStarter{process: newFakeProcess(1236), rootBootstraps: make(chan rootBootstrapResult, 1)}
 	m := fakeManager(nil)
 	m.starter = fs
@@ -256,11 +269,16 @@ func TestSpawnRootWithRequestTransfersResolvedPolicyAndWorkspaceOnlyThroughFD3(t
 	m.opts.SessionLogDir = logDir
 	m.opts.SpawnTimeout = time.Second
 	m.newSpawnToken = func() (string, error) { return "fixed-token", nil }
-	var parentRead, parentWrite *os.File
+	var parentRead, parentWrite, statusRead, statusWrite *os.File
 	m.newBootstrapPipe = func() (*os.File, *os.File, error) {
 		var pipeErr error
 		parentRead, parentWrite, pipeErr = os.Pipe()
 		return parentRead, parentWrite, pipeErr
+	}
+	m.newRootStatusPipe = func() (*os.File, *os.File, error) {
+		var pipeErr error
+		statusRead, statusWrite, pipeErr = os.Pipe()
+		return statusRead, statusWrite, pipeErr
 	}
 
 	request := m.launch.DefaultRequest()
@@ -298,14 +316,16 @@ func TestSpawnRootWithRequestTransfersResolvedPolicyAndWorkspaceOnlyThroughFD3(t
 	}
 	assertFileClosed(t, parentRead)
 	assertFileClosed(t, parentWrite)
+	assertFileClosed(t, statusRead)
+	assertFileClosed(t, statusWrite)
 
 	spec := fs.lastSpec
-	wantSuffix := []string{"session", "--socket", filepath.Join(rootDir, "fixed-token.root.sock"), "--bootstrap-fd", "3"}
+	wantSuffix := []string{"session", "--socket", filepath.Join(rootDir, "fixed-token.root.sock"), "--bootstrap-fd", "3", "--status-fd", "4"}
 	if len(spec.Args) < len(wantSuffix) || !reflect.DeepEqual(spec.Args[len(spec.Args)-len(wantSuffix):], wantSuffix) {
 		t.Fatalf("argv = %#v, want suffix %#v", spec.Args, wantSuffix)
 	}
-	if len(spec.ExtraFiles) != 1 {
-		t.Fatalf("ExtraFiles = %d, want 1", len(spec.ExtraFiles))
+	if len(spec.ExtraFiles) != 2 || spec.ExtraFiles[0] != parentRead || spec.ExtraFiles[1] != statusWrite {
+		t.Fatalf("ExtraFiles = %#v, want ordered bootstrap-read(fd3), status-write(fd4)", spec.ExtraFiles)
 	}
 	argv := strings.Join(spec.Args, "\x00")
 	for _, value := range []string{wantPolicy.Root.Provider, wantPolicy.Root.Model, wantWorkspace.Repository, wantWorkspace.Checkout, `"provider"`, `"workers"`, `"workspace"`} {
@@ -318,20 +338,44 @@ func TestSpawnRootWithRequestTransfersResolvedPolicyAndWorkspaceOnlyThroughFD3(t
 	}
 }
 
-func TestSpawnRootClosesBootstrapPipeOnStartFailure(t *testing.T) {
+func TestSpawnRootClosesStartupDescriptorsOnStartFailure(t *testing.T) {
 	fs := &fakeStarter{err: errors.New("start sentinel")}
 	m := configuredSpawnManager(t, fs)
-	var readEnd, writeEnd *os.File
+	var bootstrapRead, bootstrapWrite, statusRead, statusWrite *os.File
 	m.newBootstrapPipe = func() (*os.File, *os.File, error) {
 		var err error
-		readEnd, writeEnd, err = os.Pipe()
-		return readEnd, writeEnd, err
+		bootstrapRead, bootstrapWrite, err = os.Pipe()
+		return bootstrapRead, bootstrapWrite, err
+	}
+	m.newRootStatusPipe = func() (*os.File, *os.File, error) {
+		var err error
+		statusRead, statusWrite, err = os.Pipe()
+		return statusRead, statusWrite, err
 	}
 	if _, err := m.SpawnRoot(context.Background()); err == nil || !strings.Contains(err.Error(), "start sentinel") {
 		t.Fatalf("SpawnRoot error = %v", err)
 	}
-	assertFileClosed(t, readEnd)
-	assertFileClosed(t, writeEnd)
+	for _, file := range []*os.File{bootstrapRead, bootstrapWrite, statusRead, statusWrite} {
+		assertFileClosed(t, file)
+	}
+}
+
+func TestSpawnRootStatusPipeFailureClosesBootstrapDescriptors(t *testing.T) {
+	m := configuredSpawnManager(t, &fakeStarter{process: newFakeProcess(1237)})
+	var bootstrapRead, bootstrapWrite *os.File
+	m.newBootstrapPipe = func() (*os.File, *os.File, error) {
+		var err error
+		bootstrapRead, bootstrapWrite, err = os.Pipe()
+		return bootstrapRead, bootstrapWrite, err
+	}
+	m.newRootStatusPipe = func() (*os.File, *os.File, error) {
+		return nil, nil, errors.New("status pipe sentinel")
+	}
+	if _, err := m.SpawnRoot(context.Background()); err == nil || !strings.Contains(err.Error(), "status pipe sentinel") {
+		t.Fatalf("SpawnRoot error = %v", err)
+	}
+	assertFileClosed(t, bootstrapRead)
+	assertFileClosed(t, bootstrapWrite)
 }
 
 func TestSpawnRootClosesBootstrapPipeOnWriteFailure(t *testing.T) {
@@ -627,6 +671,114 @@ func TestRootSpawnerRealExecSetsSid(t *testing.T) {
 }
 
 // ---- Admission polling tests ----
+
+func TestSpawnRootRepositoryStatusFailureBeforeProcessExit(t *testing.T) {
+	status := make(chan rootStatusResult, 1)
+	status <- rootStatusResult{status: process.RootStartupStatus{Status: process.RootStartupFailure, Code: contract.ErrorWorkspaceRepositoryUnavailable}}
+	pending := &pendingRoot{process: newFakeProcess(9101), statusResult: status}
+	_, err := fakeManager(nil).admitRoot(context.Background(), pending)
+	var typed *contract.Error
+	if !errors.As(err, &typed) || typed.Code != contract.ErrorWorkspaceRepositoryUnavailable {
+		t.Fatalf("admitRoot error = %v, want typed repository failure", err)
+	}
+}
+
+func TestSpawnRootRepositoryStatusWinsProcessExitRace(t *testing.T) {
+	status := make(chan rootStatusResult, 1)
+	processFake := newFakeProcess(9102)
+	processFake.exit(exec.ErrNotFound)
+	pending := &pendingRoot{process: processFake, statusResult: status}
+	result := make(chan error, 1)
+	go func() {
+		_, err := fakeManager(nil).admitRoot(context.Background(), pending)
+		result <- err
+	}()
+	select {
+	case err := <-result:
+		t.Fatalf("admitRoot returned before the delayed status decode: %v", err)
+	case <-time.After(20 * time.Millisecond):
+	}
+	status <- rootStatusResult{status: process.RootStartupStatus{Status: process.RootStartupFailure, Code: contract.ErrorWorkspaceRepositoryUnavailable}}
+	select {
+	case err := <-result:
+		var typed *contract.Error
+		if !errors.As(err, &typed) || typed.Code != contract.ErrorWorkspaceRepositoryUnavailable {
+			t.Fatalf("admitRoot error = %v, want typed repository failure", err)
+		}
+	case <-time.After(time.Second):
+		t.Fatal("admitRoot did not receive delayed status after process exit")
+	}
+}
+
+func TestSpawnRootReadyStatusThenProcessExitIsGeneric(t *testing.T) {
+	status := make(chan rootStatusResult, 1)
+	status <- rootStatusResult{status: process.RootStartupStatus{Status: process.RootStartupReady}}
+	processFake := newFakeProcess(9103)
+	processFake.exit(exec.ErrNotFound)
+	pending := &pendingRoot{process: processFake, statusResult: status}
+	_, err := fakeManager(nil).admitRoot(context.Background(), pending)
+	var typed *contract.Error
+	if errors.As(err, &typed) {
+		t.Fatalf("ready then exit error = %v, want generic process failure", err)
+	}
+	if !errors.Is(err, exec.ErrNotFound) {
+		t.Fatalf("ready then exit error = %v, want wrapped process failure", err)
+	}
+}
+
+func TestSpawnRootMalformedOrOversizeStatusIsGenericWithoutRawDetail(t *testing.T) {
+	for _, test := range []struct {
+		name   string
+		detail error
+	}{
+		{name: "malformed", detail: errors.New("private malformed bytes")},
+		{name: "oversize", detail: process.ErrRecordTooLarge},
+	} {
+		t.Run(test.name, func(t *testing.T) {
+			status := make(chan rootStatusResult, 1)
+			status <- rootStatusResult{err: test.detail}
+			pending := &pendingRoot{process: newFakeProcess(9104), statusResult: status}
+			_, err := fakeManager(nil).admitRoot(context.Background(), pending)
+			var typed *contract.Error
+			if errors.As(err, &typed) {
+				t.Fatalf("invalid status error = %v, want generic failure", err)
+			}
+			if err == nil || strings.Contains(err.Error(), test.detail.Error()) {
+				t.Fatalf("invalid status error leaked raw detail: %v", err)
+			}
+		})
+	}
+}
+
+func TestSpawnRootSuccessfulAdmissionClosesStatusDescriptors(t *testing.T) {
+	dir := t.TempDir()
+	socketPath := makeRootSocket(t, dir, "status-success.root.sock")
+	client := &fakeClient{snapshot: rootTree("status-success")}
+	m := fakeManager(func(string) (rootClient, error) { return client, nil })
+	statusRead, statusWrite, err := os.Pipe()
+	if err != nil {
+		t.Fatal(err)
+	}
+	pending := &pendingRoot{socketPath: socketPath, process: newFakeProcess(9105), statusRead: statusRead}
+	pending.startRootStatusDecoder()
+	if err := process.EncodeRootStartupStatus(statusWrite, process.RootStartupStatus{Status: process.RootStartupReady}); err != nil {
+		t.Fatal(err)
+	}
+	if err := statusWrite.Close(); err != nil {
+		t.Fatal(err)
+	}
+	rootID, err := m.admitRoot(context.Background(), pending)
+	if err != nil || rootID != "status-success" {
+		t.Fatalf("admitRoot = (%q, %v), want successful admission", rootID, err)
+	}
+	assertFileClosed(t, statusRead)
+	assertFileClosed(t, statusWrite)
+	closeCtx, cancel := context.WithTimeout(context.Background(), time.Second)
+	defer cancel()
+	if err := m.Close(closeCtx); err != nil {
+		t.Fatal(err)
+	}
+}
 
 func TestSpawnRootAdmissionTimeout(t *testing.T) {
 	fs := &fakeStarter{process: newFakeProcess(9999)}

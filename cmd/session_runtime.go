@@ -83,7 +83,14 @@ func runSupervisor(ctx context.Context, cfg config.Config, opts SessionOptions, 
 	return runSupervisorWithBrokerFactory(ctx, cfg, opts, out, supervisor.NewEventBrokerWithOptions)
 }
 
-func runSupervisorWithBrokerFactory(ctx context.Context, cfg config.Config, options SessionOptions, output io.Writer, factory eventBrokerFactory) error {
+func runSupervisorWithBrokerFactory(ctx context.Context, cfg config.Config, options SessionOptions, output io.Writer, factory eventBrokerFactory) (resultErr error) {
+	rootStatus := options.RootStatus
+	defer func() {
+		if rootStatus != nil {
+			resultErr = errors.Join(resultErr, rootStatus.Close())
+		}
+	}()
+
 	policy := options.Policy.Clone()
 	if err := policy.Validate(); err != nil {
 		return fmt.Errorf("validate session model policy: %w", err)
@@ -168,8 +175,21 @@ func runSupervisorWithBrokerFactory(ctx context.Context, cfg config.Config, opti
 	runtimeCtx, cancelRuntime := context.WithCancel(ctx)
 	defer cancelRuntime()
 	go func() { <-unixServer.Done(); cancelRuntime() }()
-	if err := node.Start(runtimeCtx); err != nil {
-		return errors.Join(err, unixServer.Err())
+	startErr := node.Start(runtimeCtx)
+	if rootStatus != nil {
+		reportErr := reportRootStartup(rootStatus, startErr)
+		rootStatus = nil
+		if reportErr != nil {
+			if startErr == nil {
+				cleanupCtx, cancel := context.WithTimeout(context.WithoutCancel(ctx), supervisorCleanupTimeout)
+				defer cancel()
+				return errors.Join(reportErr, node.Stop(cleanupCtx, supervisor.StopReasonRPCFailure))
+			}
+			return errors.Join(startErr, unixServer.Err(), reportErr)
+		}
+	}
+	if startErr != nil {
+		return errors.Join(startErr, unixServer.Err())
 	}
 	if output != nil {
 		_ = json.NewEncoder(output).Encode(node.Snapshot())
@@ -187,6 +207,19 @@ func runSupervisorWithBrokerFactory(ctx context.Context, cfg config.Config, opti
 		defer cancel()
 		return errors.Join(unixServer.Err(), node.Stop(cleanupCtx, supervisor.StopReasonRPCFailure))
 	}
+}
+
+func reportRootStartup(writer io.WriteCloser, startErr error) error {
+	status := process.RootStartupStatus{Status: process.RootStartupReady}
+	if startErr != nil {
+		code := contract.ErrorInternal
+		var typed *contract.Error
+		if errors.As(startErr, &typed) {
+			code = typed.Code
+		}
+		status = process.RootStartupStatus{Status: process.RootStartupFailure, Code: code}
+	}
+	return errors.Join(process.EncodeRootStartupStatus(writer, status), writer.Close())
 }
 
 func productionChildRunner(ctx context.Context, bootstrap process.Bootstrap, reporter *process.Reporter) error {

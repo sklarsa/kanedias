@@ -36,6 +36,7 @@ type Manager struct {
 	// blocked-write lifecycle ownership deterministic in tests.
 	newSpawnToken          func() (string, error)
 	newBootstrapPipe       func() (*os.File, *os.File, error)
+	newRootStatusPipe      func() (*os.File, *os.File, error)
 	writeRootBootstrap     func(io.Writer, []byte) error
 	waitRootBootstrapWrite func(<-chan struct{})
 	rootAbortWait          time.Duration
@@ -171,6 +172,7 @@ func New(opts Options) (*Manager, error) {
 		starter:                osProcessStarter{},
 		newSpawnToken:          generateToken,
 		newBootstrapPipe:       os.Pipe,
+		newRootStatusPipe:      os.Pipe,
 		writeRootBootstrap:     writeRootBootstrap,
 		waitRootBootstrapWrite: waitRootBootstrapWrite,
 		rootAbortWait:          defaultRootAbortWait,

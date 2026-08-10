@@ -269,15 +269,93 @@ func assertDescriptorClosed(t *testing.T, descriptor int) {
 	}
 }
 
-func TestSessionBootstrapFlagIsHiddenAndDefaultsAbsent(t *testing.T) {
+func TestSessionStartupDescriptorsCloseOnRuntimeError(t *testing.T) {
+	bootstrapFD := rootBootstrapReadFD(t)
+	statusRead, statusWrite, err := os.Pipe()
+	if err != nil {
+		t.Fatal(err)
+	}
+	statusFD := int(statusWrite.Fd())
+	sentinel := errors.New("runtime sentinel")
+	service := stubServices()
+	service.loadConfig = func(string) (config.Config, error) { return validSupervisorConfig(), nil }
+	service.runSupervisor = func(_ context.Context, _ config.Config, options SessionOptions, _ io.Writer) error {
+		if options.RootStatus == nil {
+			t.Fatal("root status writer was not forwarded")
+		}
+		return sentinel
+	}
+	root := newRootCommand(service, testProxyOptions())
+	root.SetOut(io.Discard)
+	root.SetErr(io.Discard)
+	root.SetArgs([]string{"session", "--socket", "/tmp/root.sock", "--bootstrap-fd", strconv.Itoa(bootstrapFD), "--status-fd", strconv.Itoa(statusFD)})
+	if err := root.Execute(); !errors.Is(err, sentinel) {
+		t.Fatalf("Execute error = %v, want %v", err, sentinel)
+	}
+	assertDescriptorClosed(t, bootstrapFD)
+	assertDescriptorClosed(t, statusFD)
+	_ = statusRead.Close()
+}
+
+func TestSessionStartupDescriptorsCloseOnBootstrapDecodeError(t *testing.T) {
+	bootstrapRead, bootstrapWrite, err := os.Pipe()
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err := bootstrapWrite.WriteString(`{"unknown":true}`); err != nil {
+		t.Fatal(err)
+	}
+	_ = bootstrapWrite.Close()
+	statusRead, statusWrite, err := os.Pipe()
+	if err != nil {
+		t.Fatal(err)
+	}
+	bootstrapFD, statusFD := int(bootstrapRead.Fd()), int(statusWrite.Fd())
+	root := newRootCommand(stubServices(), testProxyOptions())
+	root.SetOut(io.Discard)
+	root.SetErr(io.Discard)
+	root.SetArgs([]string{"session", "--socket", "/tmp/root.sock", "--bootstrap-fd", strconv.Itoa(bootstrapFD), "--status-fd", strconv.Itoa(statusFD)})
+	if err := root.Execute(); err == nil {
+		t.Fatal("invalid bootstrap succeeded")
+	}
+	assertDescriptorClosed(t, bootstrapFD)
+	assertDescriptorClosed(t, statusFD)
+	_ = statusRead.Close()
+}
+
+func TestSessionStatusDescriptorValidation(t *testing.T) {
+	for _, test := range []struct {
+		name        string
+		bootstrapFD int
+		statusFD    int
+		want        string
+	}{
+		{name: "below fd4", bootstrapFD: 8, statusFD: 3, want: "at least 4"},
+		{name: "same as bootstrap", bootstrapFD: 8, statusFD: 8, want: "distinct"},
+	} {
+		t.Run(test.name, func(t *testing.T) {
+			root := newRootCommand(stubServices(), testProxyOptions())
+			root.SetOut(io.Discard)
+			root.SetErr(io.Discard)
+			root.SetArgs([]string{"session", "--socket", "/tmp/root.sock", "--bootstrap-fd", strconv.Itoa(test.bootstrapFD), "--status-fd", strconv.Itoa(test.statusFD)})
+			if err := root.Execute(); err == nil || !strings.Contains(err.Error(), test.want) {
+				t.Fatalf("Execute error = %v, want %q", err, test.want)
+			}
+		})
+	}
+}
+
+func TestSessionBootstrapAndStatusFlagsAreHiddenAndDefaultAbsent(t *testing.T) {
 	root := newRootCommand(stubServices(), testProxyOptions())
 	command, _, err := root.Find([]string{"session"})
 	if err != nil {
 		t.Fatal(err)
 	}
-	flag := command.Flags().Lookup("bootstrap-fd")
-	if flag == nil || flag.DefValue != "-1" || !flag.Hidden {
-		t.Fatalf("--bootstrap-fd = %#v, want hidden default -1", flag)
+	for _, name := range []string{"bootstrap-fd", "status-fd"} {
+		flag := command.Flags().Lookup(name)
+		if flag == nil || flag.DefValue != "-1" || !flag.Hidden {
+			t.Fatalf("--%s = %#v, want hidden default -1", name, flag)
+		}
 	}
 }
 
