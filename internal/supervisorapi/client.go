@@ -5,6 +5,7 @@ import (
 	"bytes"
 	"context"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"io"
 	"mime"
@@ -15,6 +16,7 @@ import (
 	"sync"
 	"time"
 
+	"github.com/sklarsa/kanedias/internal/eventmailbox"
 	"github.com/sklarsa/kanedias/internal/supervisor"
 	"github.com/sklarsa/kanedias/internal/supervisor/contract"
 	"github.com/sklarsa/kanedias/internal/supervisor/pirpc"
@@ -37,6 +39,7 @@ type DescendantClient struct {
 	client       *http.Client
 	transport    *http.Transport
 	unaryTimeout time.Duration
+	eventLimits  eventmailbox.Limits
 }
 
 // NewClient constructs a concrete *DescendantClient for the manager's private
@@ -52,7 +55,16 @@ func NewClient(socketPath string) (*DescendantClient, error) {
 			return (&net.Dialer{}).DialContext(ctx, "unix", socketPath)
 		},
 	}
-	return &DescendantClient{socketPath: socketPath, client: &http.Client{Transport: transport}, transport: transport, unaryTimeout: defaultUnaryTimeout}, nil
+	return &DescendantClient{
+		socketPath:   socketPath,
+		client:       &http.Client{Transport: transport},
+		transport:    transport,
+		unaryTimeout: defaultUnaryTimeout,
+		eventLimits: eventmailbox.Limits{
+			MaxEvents: supervisor.DefaultEventRingCapacity,
+			MaxBytes:  supervisor.DefaultEventRingByteCapacity,
+		},
+	}, nil
 }
 
 func NewDescendantClient(socketPath string) (supervisor.DescendantClient, error) {
@@ -207,19 +219,49 @@ func (client *DescendantClient) Subscribe(ctx context.Context) (supervisor.Subsc
 		return supervisor.Subscription{}, contract.NewError(contract.ErrorChildUnavailable, "child event stream is unavailable")
 	}
 
-	events := make(chan supervisor.EventEnvelope, 1)
-	var closeOnce sync.Once
+	mailbox, err := eventmailbox.New[supervisor.EventEnvelope](client.eventLimits)
+	if err != nil {
+		_ = response.Body.Close()
+		cancel()
+		return supervisor.Subscription{}, contract.NewError(contract.ErrorChildUnavailable, "configure child event mailbox: "+err.Error())
+	}
+
+	var networkCloseOnce sync.Once
+	closeNetwork := func() {
+		networkCloseOnce.Do(func() {
+			cancel()
+			_ = response.Body.Close()
+		})
+	}
 	var errMu sync.Mutex
 	var streamErr error
-	setStreamErr := func(err error) {
+	ownerCanceled := false
+	finishWire := func(err error, abort bool) {
 		errMu.Lock()
-		streamErr = err
+		ownerWon := ownerCanceled || ctx.Err() != nil
+		if !ownerWon {
+			streamErr = err
+		}
 		errMu.Unlock()
+
+		closeNetwork()
+		if ownerWon || abort {
+			mailbox.Abort()
+			return
+		}
+		mailbox.Close()
 	}
-	closeStream := func() { closeOnce.Do(func() { cancel(); _ = response.Body.Close() }) }
+	var subscriptionCloseOnce sync.Once
+	closeSubscription := func() {
+		subscriptionCloseOnce.Do(func() {
+			errMu.Lock()
+			ownerCanceled = true
+			errMu.Unlock()
+			closeNetwork()
+			mailbox.Abort()
+		})
+	}
 	go func() {
-		defer close(events)
-		defer closeStream()
 		scanner := bufio.NewScanner(response.Body)
 		scanner.Buffer(make([]byte, 64*1024), maxDescendantSSELineBytes)
 		var data strings.Builder
@@ -231,16 +273,14 @@ func (client *DescendantClient) Subscribe(ctx context.Context) (supervisor.Subsc
 				}
 				var event supervisor.EventEnvelope
 				if err := json.Unmarshal([]byte(data.String()), &event); err != nil {
-					setStreamErr(contract.NewError(contract.ErrorChildUnavailable, "decode child event stream: "+err.Error()))
+					finishWire(contract.NewError(contract.ErrorChildUnavailable, "decode child event stream: "+err.Error()), false)
 					return
 				}
 				data.Reset()
-				select {
-				case events <- event:
-				case <-streamCtx.Done():
-					return
-				default:
-					setStreamErr(contract.NewError(contract.ErrorChildUnavailable, "child event consumer exceeded bounded capacity"))
+				if err := mailbox.Send(event, supervisor.RetainedEventBytes(event)); err != nil {
+					if errors.Is(err, eventmailbox.ErrFull) {
+						finishWire(contract.NewError(contract.ErrorChildUnavailable, "child event consumer exceeded bounded capacity"), true)
+					}
 					return
 				}
 				continue
@@ -248,22 +288,24 @@ func (client *DescendantClient) Subscribe(ctx context.Context) (supervisor.Subsc
 			if strings.HasPrefix(line, "data:") {
 				value := strings.TrimSpace(strings.TrimPrefix(line, "data:"))
 				if err := appendDescendantSSEData(&data, value, maxDescendantSSEEventBytes); err != nil {
-					setStreamErr(contract.NewError(contract.ErrorChildUnavailable, err.Error()))
+					finishWire(contract.NewError(contract.ErrorChildUnavailable, err.Error()), false)
 					return
 				}
 			}
 		}
 		if streamCtx.Err() != nil {
+			closeNetwork()
+			mailbox.Abort()
 			return
 		}
 		if err := scanner.Err(); err != nil {
-			setStreamErr(contract.NewError(contract.ErrorChildUnavailable, "read child event stream: "+err.Error()))
+			finishWire(contract.NewError(contract.ErrorChildUnavailable, "read child event stream: "+err.Error()), false)
 			return
 		}
-		setStreamErr(cleanDescendantEventEOF{err: contract.NewError(contract.ErrorChildUnavailable, "child event stream ended unexpectedly")})
+		finishWire(cleanDescendantEventEOF{err: contract.NewError(contract.ErrorChildUnavailable, "child event stream ended unexpectedly")}, false)
 	}()
 	return supervisor.Subscription{
-		Replay: []supervisor.EventEnvelope{}, Events: events, Close: closeStream,
+		Replay: []supervisor.EventEnvelope{}, Events: mailbox.Events(), Close: closeSubscription,
 		Err: func() error { errMu.Lock(); defer errMu.Unlock(); return streamErr },
 	}, nil
 }

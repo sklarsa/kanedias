@@ -98,7 +98,7 @@ func TestEventBrokerMailboxDisconnectsBeforeByteBudgetOverflow(t *testing.T) {
 	defer slow.Close()
 
 	first := broker.PublishLocal("root", "pi", json.RawMessage(`{"payload":"`+strings.Repeat("x", 48)+`"}`))
-	if retainedEventBytes(first) > 120 {
+	if RetainedEventBytes(first) > 120 {
 		t.Fatal("test event unexpectedly exceeds mailbox budget")
 	}
 	broker.mu.Lock()

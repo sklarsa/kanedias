@@ -16,6 +16,7 @@ import (
 	"testing"
 	"time"
 
+	"github.com/sklarsa/kanedias/internal/eventmailbox"
 	"github.com/sklarsa/kanedias/internal/supervisor"
 	"github.com/sklarsa/kanedias/internal/supervisor/contract"
 	"github.com/sklarsa/kanedias/internal/supervisor/pirpc"
@@ -712,22 +713,24 @@ func TestDescendantSSEAcceptsPiSizedEnvelopeAndSurfacesStreamErrors(t *testing.T
 	}
 }
 
-func TestDescendantSSEDisconnectsStalledConsumerAtBoundedCapacity(t *testing.T) {
-	path := filepath.Join(t.TempDir(), "stalled.sock")
+func TestDescendantSSEPreservesOrdinaryBurst(t *testing.T) {
+	path := filepath.Join(t.TempDir(), "burst.sock")
 	ctx, cancel := context.WithCancel(context.Background())
-	defer cancel()
 	release := make(chan struct{})
+	written := make(chan struct{})
 	serverDone := make(chan error, 1)
 	go func() {
-		serverDone <- ServeUnix(ctx, path, http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
+		serverDone <- ServeUnix(ctx, path, http.HandlerFunc(func(w http.ResponseWriter, request *http.Request) {
 			w.Header().Set("Content-Type", "text/event-stream")
 			w.WriteHeader(http.StatusOK)
 			w.(http.Flusher).Flush()
 			<-release
-			for seq := 1; seq <= 2; seq++ {
+			for seq := 1; seq <= 256; seq++ {
 				_, _ = fmt.Fprintf(w, "data: {\"seq\":%d,\"sessionId\":\"child\",\"sourceSeq\":%d,\"kind\":\"pi\",\"payload\":{}}\n\n", seq, seq)
 				w.(http.Flusher).Flush()
 			}
+			close(written)
+			<-request.Context().Done()
 		}))
 	}()
 	waitForSocket(t, path)
@@ -740,21 +743,119 @@ func TestDescendantSSEDisconnectsStalledConsumerAtBoundedCapacity(t *testing.T) 
 		t.Fatal(err)
 	}
 	close(release)
+	select {
+	case <-written:
+	case <-time.After(time.Second):
+		t.Fatal("server did not write descendant event burst")
+	}
+	for want := uint64(1); want <= 256; want++ {
+		select {
+		case event, open := <-sub.Events:
+			if !open {
+				t.Fatalf("event stream closed before sequence %d: %v", want, sub.Err())
+			}
+			if event.Seq != want {
+				t.Fatalf("event sequence = %d, want %d", event.Seq, want)
+			}
+		case <-time.After(time.Second):
+			t.Fatalf("timed out waiting for sequence %d", want)
+		}
+	}
+	if sub.Err() != nil {
+		t.Fatalf("ordinary burst produced stream error: %v", sub.Err())
+	}
+	sub.Close()
+	cancel()
+	if err := <-serverDone; err != nil {
+		t.Fatal(err)
+	}
+}
+
+func TestDescendantSSEDisconnectsStalledConsumerAtBoundedCapacity(t *testing.T) {
+	path := filepath.Join(t.TempDir(), "stalled.sock")
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+	release := make(chan struct{})
+	serverDone := make(chan error, 1)
+	go func() {
+		serverDone <- ServeUnix(ctx, path, http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
+			w.Header().Set("Content-Type", "text/event-stream")
+			w.WriteHeader(http.StatusOK)
+			w.(http.Flusher).Flush()
+			<-release
+			for seq := 1; seq <= 3; seq++ {
+				_, _ = fmt.Fprintf(w, "data: {\"seq\":%d,\"sessionId\":\"child\",\"sourceSeq\":%d,\"kind\":\"pi\",\"payload\":{}}\n\n", seq, seq)
+				w.(http.Flusher).Flush()
+			}
+		}))
+	}()
+	waitForSocket(t, path)
+	client, err := NewClient(path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	client.eventLimits = eventmailbox.Limits{MaxEvents: 2, MaxBytes: 1024}
+	sub, err := client.Subscribe(context.Background())
+	if err != nil {
+		t.Fatal(err)
+	}
+	close(release)
 	deadline := time.Now().Add(time.Second)
 	for sub.Err() == nil && time.Now().Before(deadline) {
 		time.Sleep(time.Millisecond)
 	}
-	if sub.Err() == nil || !strings.Contains(sub.Err().Error(), "event consumer") {
-		t.Fatalf("stream error = %v, want stalled consumer failure", sub.Err())
+	var typed *contract.Error
+	if !errors.As(sub.Err(), &typed) || typed.Code != contract.ErrorChildUnavailable || !strings.Contains(sub.Err().Error(), "event consumer") {
+		t.Fatalf("stream error = %v, want child_unavailable stalled consumer failure", sub.Err())
 	}
-	first, open := <-sub.Events
-	if !open || first.Seq != 1 {
-		t.Fatalf("first queued event = %#v, open=%t", first, open)
-	}
-	if _, open = <-sub.Events; open {
-		t.Fatal("stalled descendant event channel remained open")
+	select {
+	case _, open := <-sub.Events:
+		if open {
+			t.Fatal("stalled descendant event channel remained open after overflow")
+		}
+	case <-time.After(time.Second):
+		t.Fatal("stalled descendant event channel did not close promptly")
 	}
 	sub.Close()
+	cancel()
+	if err := <-serverDone; err != nil {
+		t.Fatal(err)
+	}
+}
+
+func TestDescendantSSECleanEOFDrainsAcceptedEvents(t *testing.T) {
+	path := filepath.Join(t.TempDir(), "drain.sock")
+	ctx, cancel := context.WithCancel(context.Background())
+	serverDone := make(chan error, 1)
+	go func() {
+		serverDone <- ServeUnix(ctx, path, http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
+			w.Header().Set("Content-Type", "text/event-stream")
+			w.WriteHeader(http.StatusOK)
+			for seq := 1; seq <= 3; seq++ {
+				_, _ = fmt.Fprintf(w, "data: {\"seq\":%d,\"sessionId\":\"child\",\"sourceSeq\":%d,\"kind\":\"pi\",\"payload\":{}}\n\n", seq, seq)
+			}
+		}))
+	}()
+	waitForSocket(t, path)
+	client, err := NewClient(path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	sub, err := client.Subscribe(context.Background())
+	if err != nil {
+		t.Fatal(err)
+	}
+	var sequences []uint64
+	for event := range sub.Events {
+		sequences = append(sequences, event.Seq)
+	}
+	if len(sequences) != 3 || sequences[0] != 1 || sequences[1] != 2 || sequences[2] != 3 {
+		t.Fatalf("drained sequences = %v, want [1 2 3]", sequences)
+	}
+	var typed *contract.Error
+	if sub.Err == nil || !errors.As(sub.Err(), &typed) || typed.Code != contract.ErrorChildUnavailable {
+		t.Fatalf("clean EOF error = %v, want child_unavailable", sub.Err())
+	}
 	cancel()
 	if err := <-serverDone; err != nil {
 		t.Fatal(err)

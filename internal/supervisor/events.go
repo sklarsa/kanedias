@@ -227,10 +227,10 @@ func (broker *EventBroker) retainLocked(event EventEnvelope) EventEnvelope {
 	event.Seq = broker.nextSeq
 	if broker.ringCap > 0 || broker.byteCap > 0 {
 		broker.ring = append(broker.ring, event)
-		broker.ringBytes += retainedEventBytes(event)
+		broker.ringBytes += RetainedEventBytes(event)
 		for (broker.ringCap > 0 && len(broker.ring) > broker.ringCap) ||
 			(broker.byteCap > 0 && broker.ringBytes > broker.byteCap) {
-			broker.ringBytes -= retainedEventBytes(broker.ring[0])
+			broker.ringBytes -= RetainedEventBytes(broker.ring[0])
 			broker.ring[0] = EventEnvelope{}
 			broker.ring = broker.ring[1:]
 		}
@@ -238,7 +238,8 @@ func (broker *EventBroker) retainLocked(event EventEnvelope) EventEnvelope {
 	return event
 }
 
-func retainedEventBytes(event EventEnvelope) int {
+// RetainedEventBytes reports the bytes retained for an event envelope.
+func RetainedEventBytes(event EventEnvelope) int {
 	return len(event.SessionID) + len(event.Kind) + len(event.Payload) + 24
 }
 
@@ -325,7 +326,7 @@ func (mailbox *eventMailbox) send(event EventEnvelope) bool {
 	if mailbox.maxEvents > 0 && len(mailbox.sizes) >= mailbox.maxEvents {
 		return false
 	}
-	eventBytes := retainedEventBytes(event)
+	eventBytes := RetainedEventBytes(event)
 	if mailbox.maxBytes > 0 && mailbox.totalBytes+eventBytes > mailbox.maxBytes {
 		return false
 	}
