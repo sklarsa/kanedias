@@ -44,6 +44,88 @@ func TestValidateLifecycleModelPolicyRequiresLocalRootAndWorkers(t *testing.T) {
 	}
 }
 
+func TestValidateLifecycleFinalEventsRequiresOrderedSingleGenerationSettlements(t *testing.T) {
+	events := []supervisor.EventEnvelope{
+		lifecyclePiEnvelope(1, "root", `{"type":"agent_start"}`),
+		lifecyclePiEnvelope(2, "child", `{"type":"agent_start"}`),
+		lifecyclePiEnvelope(3, "child", `{"type":"agent_settled"}`),
+		lifecyclePiEnvelope(4, "root", `{"type":"agent_settled"}`),
+	}
+	if err := validateLifecycleFinalEvents(events); err != nil {
+		t.Fatalf("valid final events: %v", err)
+	}
+
+	for _, test := range []struct {
+		name string
+		edit func([]supervisor.EventEnvelope) []supervisor.EventEnvelope
+	}{
+		{name: "broker sequence regression", edit: func(events []supervisor.EventEnvelope) []supervisor.EventEnvelope {
+			events[2].Seq = events[1].Seq
+			return events
+		}},
+		{name: "source sequence regression", edit: func(events []supervisor.EventEnvelope) []supervisor.EventEnvelope {
+			events[3].SourceSeq = events[0].SourceSeq
+			return events
+		}},
+		{name: "duplicate source identity", edit: func(events []supervisor.EventEnvelope) []supervisor.EventEnvelope {
+			events[3].SessionID = events[0].SessionID
+			events[3].SourceSeq = events[0].SourceSeq
+			return events
+		}},
+		{name: "missing settlement", edit: func(events []supervisor.EventEnvelope) []supervisor.EventEnvelope {
+			return events[:len(events)-1]
+		}},
+		{name: "extra settlement", edit: func(events []supervisor.EventEnvelope) []supervisor.EventEnvelope {
+			return append(events, supervisor.EventEnvelope{Seq: 5, SessionID: "root", SourceSeq: 5, Kind: "pi", Payload: json.RawMessage(`{"type":"agent_settled"}`)})
+		}},
+	} {
+		t.Run(test.name, func(t *testing.T) {
+			cloned := make([]supervisor.EventEnvelope, len(events))
+			for index, event := range events {
+				cloned[index] = cloneLifecycleEnvelope(event)
+			}
+			if err := validateLifecycleFinalEvents(test.edit(cloned)); err == nil {
+				t.Fatal("invalid final events were accepted")
+			}
+		})
+	}
+}
+
+func TestValidateLifecycleLastAssistantTextRequiresExactTypedSuccess(t *testing.T) {
+	valid := map[string]any{
+		"type": "response", "command": "get_last_assistant_text", "success": true,
+		"data": map[string]any{"text": "final text"},
+	}
+	if text, err := validateLifecycleLastAssistantText(valid); err != nil || text != "final text" {
+		t.Fatalf("valid final assistant text = %q, %v", text, err)
+	}
+	for _, response := range []map[string]any{
+		{"type": "event", "command": "get_last_assistant_text", "success": true, "data": map[string]any{"text": "x"}},
+		{"type": "response", "command": "get_state", "success": true, "data": map[string]any{"text": "x"}},
+		{"type": "response", "command": "get_last_assistant_text", "success": false, "data": map[string]any{"text": "x"}},
+		{"type": "response", "command": "get_last_assistant_text", "success": true, "data": map[string]any{}},
+		{"type": "response", "command": "get_last_assistant_text", "success": true, "data": map[string]any{"text": 7}},
+	} {
+		if _, err := validateLifecycleLastAssistantText(response); err == nil {
+			t.Fatalf("invalid final assistant response was accepted: %#v", response)
+		}
+	}
+}
+
+func TestLifecycleActionsRemainNormalizedAndPrivate(t *testing.T) {
+	action := lifecycleAction{Sequence: 1, Operation: "abort", TargetSessionID: "child", Outcome: "accepted", HTTPStatus: http.StatusAccepted, ErrorCode: contract.ErrorChildAborted}
+	encoded, err := json.Marshal(action)
+	if err != nil {
+		t.Fatal(err)
+	}
+	text := string(encoded)
+	for _, forbidden := range []string{"body", "url", "credential", "rawError", "modelOutput", "secret-value", "https://"} {
+		if strings.Contains(text, forbidden) {
+			t.Fatalf("normalized lifecycle action contains forbidden data class %q: %s", forbidden, text)
+		}
+	}
+}
+
 func TestValidateLifecycleSettlementTotalsRequiresExactAbsoluteCountsAfterDrain(t *testing.T) {
 	events := []supervisor.EventEnvelope{
 		lifecyclePiEnvelope(1, "root", `{"type":"agent_settled"}`),
@@ -142,6 +224,10 @@ func TestValidateLifecycleModelToolEventsRequiresExactParallelSuccess(t *testing
 		{name: "unmatched delegate terminal", edit: func(events []supervisor.EventEnvelope) []supervisor.EventEnvelope {
 			return append(events, lifecyclePiEnvelope(7, "root", `{"type":"tool_execution_end","toolCallId":"extra","toolName":"delegate_session","isError":false}`))
 		}},
+		{name: "conflicting tool name", edit: func(events []supervisor.EventEnvelope) []supervisor.EventEnvelope {
+			events[3].Payload = json.RawMessage(strings.Replace(string(events[3].Payload), `"toolName":"delegate_session"`, `"toolName":"read"`, 1))
+			return events
+		}},
 		{name: "absent details", edit: func(events []supervisor.EventEnvelope) []supervisor.EventEnvelope {
 			events[3].Payload = json.RawMessage(strings.Replace(string(events[3].Payload), `,"details":{"kind":"read","workerType":"reviewer","sessionId":"child-two","output":"MARKER_TWO"}`, "", 1))
 			return events
@@ -198,7 +284,7 @@ func TestValidateLifecycleNaturalChildEventsRejectsDuplicateTerminalEvent(t *tes
 }
 
 func lifecyclePiEnvelope(seq uint64, sessionID, payload string) supervisor.EventEnvelope {
-	return supervisor.EventEnvelope{Seq: seq, SessionID: sessionID, Kind: "pi", Payload: json.RawMessage(payload)}
+	return supervisor.EventEnvelope{Seq: seq, SessionID: sessionID, SourceSeq: seq, Kind: "pi", Payload: json.RawMessage(payload)}
 }
 
 // validateLifecycleModelPolicy resolves the whole session model policy and
@@ -238,6 +324,30 @@ type lifecycleChildCall struct {
 	done  chan lifecycleHTTPResult
 }
 
+// lifecycleAction is deliberately normalized: it records only control class,
+// target identity, public status/code, and outcome. It has no field capable of
+// retaining a request body, URL, credential, raw error, or model output.
+type lifecycleAction struct {
+	Sequence        int                `json:"sequence"`
+	Operation       string             `json:"operation"`
+	TargetSessionID string             `json:"targetSessionId"`
+	Outcome         string             `json:"outcome"`
+	HTTPStatus      int                `json:"httpStatus,omitempty"`
+	ErrorCode       contract.ErrorCode `json:"errorCode,omitempty"`
+}
+
+type lifecycleTreeEvidence struct {
+	Available         bool                     `json:"available"`
+	RootStopped       bool                     `json:"rootStopped"`
+	RootSocketPresent bool                     `json:"rootSocketPresent"`
+	Tree              *supervisor.NodeSnapshot `json:"tree,omitempty"`
+}
+
+type lifecycleBoundaryEvidence struct {
+	Tree      lifecycleTreeEvidence
+	Resources resourceSnapshot
+}
+
 // lifecycleEventJournal is the sole consumer of a stream's event channel. It
 // appends cloned envelopes under a mutex, closes done when the stream closes,
 // and returns deep copies from snapshot so queries never alias journal state.
@@ -257,6 +367,14 @@ type lifecycleRoot struct {
 	stream  *sseCapture
 	journal *lifecycleEventJournal
 	stalled net.Conn
+
+	mu              sync.Mutex
+	actions         []lifecycleAction
+	childPIDs       map[int]struct{}
+	preControl      *lifecycleBoundaryEvidence
+	postControl     *lifecycleBoundaryEvidence
+	final           *lifecycleBoundaryEvidence
+	immutableEvents map[string][]supervisor.EventEnvelope
 }
 
 // newLifecycleEventJournal starts a goroutine that drains stream.events as its
@@ -303,6 +421,83 @@ func (journal *lifecycleEventJournal) countPi(sessionID, eventType, toolName str
 		}
 	}
 	return count
+}
+
+// validateLifecycleFinalEvents requires strict broker ordering, strict
+// per-session source ordering, unique source identities, and exactly one
+// settlement for each observed agent-start generation.
+func validateLifecycleFinalEvents(events []supervisor.EventEnvelope) error {
+	var brokerSeq uint64
+	sourceSeq := make(map[string]uint64)
+	seenSources := make(map[string]struct{}, len(events))
+	starts := make(map[string]int)
+	settled := make(map[string]int)
+	for index, event := range events {
+		if event.Seq == 0 || (index > 0 && event.Seq <= brokerSeq) {
+			return fmt.Errorf("broker sequence at position %d = %d after %d", index, event.Seq, brokerSeq)
+		}
+		brokerSeq = event.Seq
+		if strings.TrimSpace(event.SessionID) == "" || event.SourceSeq == 0 {
+			return fmt.Errorf("event %d has empty source identity: session=%q sourceSeq=%d", event.Seq, event.SessionID, event.SourceSeq)
+		}
+		if prior := sourceSeq[event.SessionID]; prior != 0 && event.SourceSeq <= prior {
+			return fmt.Errorf("session %q source sequence %d is not after %d", event.SessionID, event.SourceSeq, prior)
+		}
+		sourceSeq[event.SessionID] = event.SourceSeq
+		key := fmt.Sprintf("%s\x00%d", event.SessionID, event.SourceSeq)
+		if _, duplicate := seenSources[key]; duplicate {
+			return fmt.Errorf("duplicate event source identity for session %q sequence %d", event.SessionID, event.SourceSeq)
+		}
+		seenSources[key] = struct{}{}
+		if event.Kind != "pi" {
+			continue
+		}
+		var payload struct {
+			Type string `json:"type"`
+		}
+		if json.Unmarshal(event.Payload, &payload) != nil {
+			continue
+		}
+		switch payload.Type {
+		case "agent_start":
+			starts[event.SessionID]++
+		case "agent_settled":
+			settled[event.SessionID]++
+		}
+	}
+	for sessionID, generations := range starts {
+		if generations == 0 || settled[sessionID] != generations {
+			return fmt.Errorf("session %q settlements = %d, want one for each of %d started generations", sessionID, settled[sessionID], generations)
+		}
+	}
+	for sessionID, terminals := range settled {
+		if starts[sessionID] != terminals {
+			return fmt.Errorf("session %q settlements = %d without matching started generations %d", sessionID, terminals, starts[sessionID])
+		}
+	}
+	return nil
+}
+
+func validateLifecycleLastAssistantText(response map[string]any) (string, error) {
+	encoded, err := json.Marshal(response)
+	if err != nil {
+		return "", fmt.Errorf("encode get_last_assistant_text response: %w", err)
+	}
+	var typed struct {
+		Type    string `json:"type"`
+		Command string `json:"command"`
+		Success bool   `json:"success"`
+		Data    *struct {
+			Text *string `json:"text"`
+		} `json:"data"`
+	}
+	if err := json.Unmarshal(encoded, &typed); err != nil {
+		return "", fmt.Errorf("decode get_last_assistant_text response: %w", err)
+	}
+	if typed.Type != "response" || typed.Command != "get_last_assistant_text" || !typed.Success || typed.Data == nil || typed.Data.Text == nil {
+		return "", fmt.Errorf("get_last_assistant_text response envelope is not exact")
+	}
+	return *typed.Data.Text, nil
 }
 
 // validateLifecycleSettlementTotals verifies absolute per-session settlement
@@ -586,7 +781,7 @@ func (h *liveAcceptance) prepareLifecycleConfig() {
 // startLifecycleChildCall tracks a child-create POST in h.async and returns a
 // handle the caller can wait on for the terminal lifecycleHTTPResult. A
 // JSON-safe artifact records status, body text, and the serialized error.
-func (h *liveAcceptance) startLifecycleChildCall(client *http.Client, parentID, label, task string) *lifecycleChildCall {
+func (h *liveAcceptance) startLifecycleChildCall(root *lifecycleRoot, parentID, label, task string) *lifecycleChildCall {
 	request := map[string]any{
 		"workerType": "reviewer",
 		"kind":       "read",
@@ -597,11 +792,23 @@ func (h *liveAcceptance) startLifecycleChildCall(client *http.Client, parentID, 
 	h.async.Add(1)
 	go func() {
 		defer h.async.Done()
-		status, body, err := unixRequest(client, http.MethodPost,
+		status, body, err := unixRequest(root.client, http.MethodPost,
 			"/v1/sessions/"+url.PathEscape(parentID)+"/children", request)
 		h.writeJSON(label+"-child-call-result.json", map[string]any{
 			"status": status, "body": string(body), "error": errorString(err),
 		})
+		outcome := "completed"
+		if err != nil {
+			outcome = "transport_error"
+		} else if status != http.StatusOK {
+			outcome = "rejected"
+		}
+		var code contract.ErrorCode
+		var typed contract.Error
+		if json.Unmarshal(body, &typed) == nil {
+			code = typed.Code
+		}
+		root.recordAction("create_child", parentID, outcome, status, code)
 		call.done <- lifecycleHTTPResult{Status: status, Body: body, Err: err}
 	}()
 	return call
@@ -625,15 +832,19 @@ func (call *lifecycleChildCall) wait(t *testing.T, timeout time.Duration) lifecy
 // close during stopLifecycleRoot.
 func (h *liveAcceptance) startLifecycleRoot(label string) *lifecycleRoot {
 	process, socket, tree, stream, stalled := h.startRoot(label)
-	return &lifecycleRoot{
-		process: process,
-		socket:  socket,
-		tree:    tree,
-		client:  unixHTTPClient(socket),
-		stream:  stream,
-		journal: newLifecycleEventJournal(stream),
-		stalled: stalled,
+	root := &lifecycleRoot{
+		process:         process,
+		socket:          socket,
+		tree:            tree,
+		client:          unixHTTPClient(socket),
+		stream:          stream,
+		journal:         newLifecycleEventJournal(stream),
+		stalled:         stalled,
+		childPIDs:       make(map[int]struct{}),
+		immutableEvents: make(map[string][]supervisor.EventEnvelope),
 	}
+	h.captureLifecycleBoundary(root, "pre-control")
+	return root
 }
 
 // stopLifecycleRoot issues a graceful root DELETE, waits for the process and
@@ -641,12 +852,24 @@ func (h *liveAcceptance) startLifecycleRoot(label string) *lifecycleRoot {
 // connection, verifies the root socket is absent, and polls until every tracked
 // tree session's resources are gone.
 func (h *liveAcceptance) stopLifecycleRoot(root *lifecycleRoot) {
-	status, _, err := unixRequest(root.client, http.MethodDelete, "/v1/sessions/"+root.tree.SessionID, nil)
+	root.mu.Lock()
+	hasPostControl := root.postControl != nil
+	root.mu.Unlock()
+	if !hasPostControl {
+		h.captureLifecycleBoundary(root, "post-control")
+	}
+	h.captureLifecycleBoundary(root, "final")
+	status, err := h.deleteLifecycleSession(root, root.tree.SessionID)
 	if err != nil || status != http.StatusAccepted {
 		h.t.Fatalf("lifecycle root DELETE = %d, %v", status, err)
 	}
+	h.finishStoppedLifecycleRoot(root, "root DELETE")
+	h.assertLifecycleFinalInvariants(root)
+}
+
+func (h *liveAcceptance) finishStoppedLifecycleRoot(root *lifecycleRoot, description string) {
 	if err := h.waitProcess(root.process, 2*time.Minute); err != nil {
-		h.t.Fatalf("lifecycle root exited after DELETE: %v", err)
+		h.t.Fatalf("lifecycle root exited after %s: %v", description, err)
 	}
 	if root.stalled != nil {
 		_ = root.stalled.Close()
@@ -660,8 +883,27 @@ func (h *liveAcceptance) stopLifecycleRoot(root *lifecycleRoot) {
 		h.t.Fatalf("lifecycle root socket remains: %v", err)
 	}
 	h.poll(2*time.Minute, "lifecycle root tree cleanup", func() bool {
-		return h.sessionsAbsent(treeSessionIDs(root.tree))
+		return h.sessionsAbsent(h.sessionIDs())
 	})
+	root.mu.Lock()
+	if root.final != nil {
+		root.final.Tree.RootStopped = true
+		root.final.Tree.RootSocketPresent = pathExists(root.socket)
+		root.final.Resources = h.snapshotResources("lifecycle-final-resources")
+	}
+	root.mu.Unlock()
+}
+
+func (h *liveAcceptance) deleteLifecycleSession(root *lifecycleRoot, sessionID string) (int, error) {
+	status, _, err := unixRequest(root.client, http.MethodDelete, "/v1/sessions/"+url.PathEscape(sessionID), nil)
+	outcome := "accepted"
+	if err != nil {
+		outcome = "transport_error"
+	} else if status != http.StatusAccepted {
+		outcome = "rejected"
+	}
+	root.recordAction("delete_session", sessionID, outcome, status, "")
+	return status, err
 }
 
 // lifecycleRPCCommand routes one command through the root socket and requires
@@ -675,9 +917,20 @@ func (h *liveAcceptance) lifecycleRPCCommand(root *lifecycleRoot, sessionID stri
 	responseType, _ := response["type"].(string)
 	responseCommand, _ := response["command"].(string)
 	if responseType != "response" || responseCommand != commandType || response["success"] != true {
+		root.recordAction(commandType, sessionID, "rejected", 0, "")
 		h.t.Fatalf("lifecycle RPC %q acknowledgement for %s was not exact: %#v", commandType, sessionID, response)
 	}
+	root.recordAction(commandType, sessionID, "accepted", 0, "")
 	return response
+}
+
+func (root *lifecycleRoot) recordAction(operation, target, outcome string, status int, code contract.ErrorCode) {
+	root.mu.Lock()
+	defer root.mu.Unlock()
+	root.actions = append(root.actions, lifecycleAction{
+		Sequence: len(root.actions) + 1, Operation: operation, TargetSessionID: target,
+		Outcome: outcome, HTTPStatus: status, ErrorCode: code,
+	})
 }
 
 // lifecycleGetState decodes the full typed get_state response and validates
@@ -786,6 +1039,16 @@ func (h *liveAcceptance) assertLifecycleSettlementTotals(root *lifecycleRoot, ex
 	}
 }
 
+func (h *liveAcceptance) lifecycleLastAssistantText(root *lifecycleRoot, sessionID string) string {
+	response := h.rpc(root.client, sessionID, map[string]any{"type": "get_last_assistant_text"})
+	text, err := validateLifecycleLastAssistantText(response)
+	if err != nil {
+		h.t.Fatalf("exact final assistant text response for %s: %v", sessionID, err)
+	}
+	root.recordAction("get_last_assistant_text", sessionID, "accepted", 0, "")
+	return text
+}
+
 // assertRootUsable sends a short prompt containing the marker, requires its
 // exact acknowledgement and exactly one new settlement, then checks the final
 // text and typed non-streaming state over the still-open transport.
@@ -793,9 +1056,148 @@ func (h *liveAcceptance) assertRootUsable(root *lifecycleRoot, marker string) {
 	before := root.journal.countPi(root.tree.SessionID, "agent_settled", "")
 	h.lifecycleRPCCommand(root, root.tree.SessionID, map[string]any{"type": "prompt", "message": "Reply with exactly " + marker + "."})
 	h.waitLifecycleSettlement(root, root.tree.SessionID, before, false, "new root settlement after marker prompt")
-	text := h.lastAssistantText(root.client, root.tree.SessionID)
+	text := h.lifecycleLastAssistantText(root, root.tree.SessionID)
 	if !strings.Contains(text, marker) {
 		h.t.Fatalf("root final text %q does not contain marker %q", text, marker)
+	}
+}
+
+func (h *liveAcceptance) captureLifecycleBoundary(root *lifecycleRoot, boundary string) {
+	var tree supervisor.NodeSnapshot
+	treeErr := unixJSON(root.client, http.MethodGet, "/v1/tree", nil, &tree)
+	stopped := false
+	select {
+	case <-root.process.done:
+		stopped = true
+	default:
+	}
+	if treeErr != nil && !stopped {
+		h.t.Fatalf("capture lifecycle %s tree: %v", boundary, treeErr)
+	}
+	var treePointer *supervisor.NodeSnapshot
+	if treeErr == nil {
+		h.trackTree(tree)
+		copy := tree
+		treePointer = &copy
+	}
+	evidence := &lifecycleBoundaryEvidence{
+		Tree: lifecycleTreeEvidence{
+			Available: treePointer != nil, RootStopped: stopped,
+			RootSocketPresent: pathExists(root.socket), Tree: treePointer,
+		},
+		Resources: h.snapshotResources("lifecycle-" + boundary + "-resources"),
+	}
+	root.mu.Lock()
+	switch boundary {
+	case "pre-control":
+		root.preControl = evidence
+	case "post-control":
+		root.postControl = evidence
+	case "final":
+		root.final = evidence
+	default:
+		root.mu.Unlock()
+		h.t.Fatalf("unknown lifecycle boundary %q", boundary)
+		return
+	}
+	root.mu.Unlock()
+}
+
+func (h *liveAcceptance) assertLifecycleFinalInvariants(root *lifecycleRoot) {
+	events := root.journal.snapshot()
+	if err := validateLifecycleFinalEvents(events); err != nil {
+		h.t.Fatalf("final lifecycle event invariants: %v", err)
+	}
+	root.mu.Lock()
+	preControl := root.preControl
+	postControl := root.postControl
+	final := root.final
+	actions := append([]lifecycleAction(nil), root.actions...)
+	childPIDs := make([]int, 0, len(root.childPIDs))
+	for pid := range root.childPIDs {
+		childPIDs = append(childPIDs, pid)
+	}
+	immutable := make(map[string][]supervisor.EventEnvelope, len(root.immutableEvents))
+	for sessionID, frozen := range root.immutableEvents {
+		immutable[sessionID] = append([]supervisor.EventEnvelope(nil), frozen...)
+	}
+	root.mu.Unlock()
+	if preControl == nil || postControl == nil || final == nil {
+		h.t.Fatalf("lifecycle boundary evidence incomplete: pre=%t post=%t final=%t", preControl != nil, postControl != nil, final != nil)
+	}
+	select {
+	case <-root.process.done:
+	default:
+		h.t.Fatalf("owned lifecycle root process %d remains running", root.process.cmd.Process.Pid)
+	}
+	if pathExists(root.socket) {
+		h.t.Fatalf("owned lifecycle root socket remains: %s", root.socket)
+	}
+	for _, sessionID := range h.sessionIDs() {
+		if pathExists(h.recursiveDescendantSocketPath(sessionID)) {
+			h.t.Fatalf("descendant socket remains for session %s", sessionID)
+		}
+	}
+	for _, pid := range childPIDs {
+		if pathExists(filepath.Join("/proc", fmt.Sprint(pid))) {
+			h.t.Fatalf("owned lifecycle child process %d remains", pid)
+		}
+	}
+	for sessionID, frozen := range immutable {
+		current := lifecycleEventsForSession(events, sessionID)
+		if len(current) != len(frozen) {
+			h.t.Fatalf("natural child %s events changed after sibling controls: before=%d after=%d", sessionID, len(frozen), len(current))
+		}
+		for index := range frozen {
+			if frozen[index].Seq != current[index].Seq || frozen[index].SourceSeq != current[index].SourceSeq ||
+				frozen[index].Kind != current[index].Kind || string(frozen[index].Payload) != string(current[index].Payload) {
+				h.t.Fatalf("natural child %s event %d changed after sibling controls", sessionID, index)
+			}
+		}
+	}
+	final.Resources = h.snapshotResources("lifecycle-final-invariant-resources")
+	if !sameResourceNames(h.baseline, final.Resources) {
+		h.t.Fatalf("final lifecycle resources differ from exact baseline: %s", resourceDiff(h.baseline, final.Resources))
+	}
+	h.writeJSON("lifecycle-events.json", events)
+	h.writeJSON("lifecycle-actions.json", actions)
+	h.writeJSON("lifecycle-pre-control-tree.json", preControl.Tree)
+	h.writeJSON("lifecycle-post-control-tree.json", postControl.Tree)
+	h.writeJSON("lifecycle-final-tree.json", final.Tree)
+	h.writeJSON("lifecycle-pre-control-resources.json", preControl.Resources)
+	h.writeJSON("lifecycle-post-control-resources.json", postControl.Resources)
+	h.writeJSON("lifecycle-final-resources.json", final.Resources)
+}
+
+func lifecycleEventsForSession(events []supervisor.EventEnvelope, sessionID string) []supervisor.EventEnvelope {
+	var selected []supervisor.EventEnvelope
+	for _, event := range events {
+		if event.SessionID == sessionID {
+			selected = append(selected, cloneLifecycleEnvelope(event))
+		}
+	}
+	return selected
+}
+
+func (root *lifecycleRoot) freezeLifecycleEvents(sessionID string, events []supervisor.EventEnvelope) {
+	root.mu.Lock()
+	root.immutableEvents[sessionID] = lifecycleEventsForSession(events, sessionID)
+	root.mu.Unlock()
+}
+
+func (h *liveAcceptance) assertLifecycleOwnedProcessesStopped() {
+	h.mu.Lock()
+	processes := append([]*acceptanceProcess(nil), h.processes...)
+	h.mu.Unlock()
+	for _, process := range processes {
+		select {
+		case <-process.done:
+		default:
+			h.t.Fatalf("owned lifecycle process %d remains running", process.cmd.Process.Pid)
+		}
+		if pathExists(filepath.Join("/proc", fmt.Sprint(process.cmd.Process.Pid))) {
+			h.t.Fatalf("owned lifecycle process %d remains present", process.cmd.Process.Pid)
+		}
 	}
 }
 
@@ -832,6 +1234,9 @@ func (h *liveAcceptance) assertLifecycleProxyQuiet() {
 // and success only after every assertion passes.
 func runLifecycleScenario(t *testing.T, label string, run func(*liveAcceptance)) {
 	requireLiveSupervisorAuthorization(t)
+	if os.Getenv("KANEDIAS_E2E_EXTERNAL_PROXY") == "1" {
+		t.Fatalf("lifecycle suite requires an owned proxy; KANEDIAS_E2E_EXTERNAL_PROXY=1 is not supported")
+	}
 	harness := newLiveAcceptance(t)
 	defer harness.close()
 
@@ -840,6 +1245,7 @@ func runLifecycleScenario(t *testing.T, label string, run func(*liveAcceptance))
 	harness.startProxy()
 	run(harness)
 	harness.stopProxy()
+	harness.assertLifecycleOwnedProcessesStopped()
 	harness.assertLifecycleProxyQuiet()
 	harness.assertBaseline("after-" + label)
 	harness.success = true

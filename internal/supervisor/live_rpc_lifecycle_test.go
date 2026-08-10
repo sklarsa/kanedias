@@ -7,7 +7,6 @@ import (
 	"errors"
 	"fmt"
 	"net/http"
-	"net/url"
 	"os"
 	"path/filepath"
 	"strings"
@@ -57,6 +56,12 @@ func TestLiveRPCSteerLifecycle(t *testing.T) {
 func TestLiveRPCRapidControlLifecycle(t *testing.T) {
 	runLifecycleScenario(t, "rapid-control", func(h *liveAcceptance) {
 		h.exerciseLifecycleRapidControl()
+	})
+}
+
+func TestLiveRPCMixedSiblingLifecycle(t *testing.T) {
+	runLifecycleScenario(t, "mixed-siblings", func(h *liveAcceptance) {
+		h.exerciseMixedSiblingOutcomes()
 	})
 }
 
@@ -162,7 +167,7 @@ func lifecycleLeafChild(id string) supervisor.NodeSnapshot {
 func (h *liveAcceptance) exerciseDeterministicChildren() {
 	root := h.startLifecycleRoot("deterministic-children")
 	singleMarker := "KANEDIAS_LIFECYCLE_DIRECT_SINGLE_" + h.prefix
-	singleCall := h.startLifecycleChildCall(root.client, root.tree.SessionID, "direct-single",
+	singleCall := h.startLifecycleChildCall(root, root.tree.SessionID, "direct-single",
 		"Read README.md and go.mod in the repository, then respond with the exact marker "+singleMarker+" and a concise summary of what you read.")
 
 	singleTree := h.waitForLifecycleChildren(root, 1, false, "single bound child")
@@ -178,7 +183,7 @@ func (h *liveAcceptance) exerciseDeterministicChildren() {
 	parallelMarkers := make([]string, 3)
 	for index := range parallelCalls {
 		parallelMarkers[index] = fmt.Sprintf("KANEDIAS_LIFECYCLE_DIRECT_PARALLEL_%d_%s", index, h.prefix)
-		parallelCalls[index] = h.startLifecycleChildCall(root.client, root.tree.SessionID,
+		parallelCalls[index] = h.startLifecycleChildCall(root, root.tree.SessionID,
 			fmt.Sprintf("direct-parallel-%d", index),
 			"Read README.md, go.mod, and at least five Go source files in the repository. Return a concise repository summary containing the exact marker "+parallelMarkers[index]+".")
 	}
@@ -228,7 +233,7 @@ func (h *liveAcceptance) exerciseModelDirectedChildren() {
 	if err := validateLifecycleModelToolEvents(singleEvents, root.tree.SessionID, []string{singleMarker}, []string{singleChild.SessionID}, false); err != nil {
 		h.t.Fatalf("single model-directed tool acceptance: %v", err)
 	}
-	if text := h.lastAssistantText(root.client, root.tree.SessionID); !strings.Contains(text, singleMarker) {
+	if text := h.lifecycleLastAssistantText(root, root.tree.SessionID); !strings.Contains(text, singleMarker) {
 		h.t.Fatalf("single model-directed root final text %q lacks marker %q", text, singleMarker)
 	}
 	h.waitForLifecycleNaturalChildEvents(root, []supervisor.NodeSnapshot{singleChild}, "single model-directed child natural completion")
@@ -263,7 +268,7 @@ func (h *liveAcceptance) exerciseModelDirectedChildren() {
 	if err := validateLifecycleModelToolEvents(parallelEvents, root.tree.SessionID, parallelMarkers, parallelChildIDs, true); err != nil {
 		h.t.Fatalf("parallel model-directed tool acceptance: %v", err)
 	}
-	parallelText := h.lastAssistantText(root.client, root.tree.SessionID)
+	parallelText := h.lifecycleLastAssistantText(root, root.tree.SessionID)
 	for _, marker := range parallelMarkers {
 		if !strings.Contains(parallelText, marker) {
 			h.t.Fatalf("parallel model-directed aggregate text %q lacks marker %q", parallelText, marker)
@@ -278,7 +283,7 @@ func (h *liveAcceptance) exerciseModelDirectedChildren() {
 
 func (h *liveAcceptance) exerciseLifecycleChildStop() {
 	root := h.startLifecycleRoot("child-stop")
-	call := h.startLifecycleChildCall(root.client, root.tree.SessionID, "active-child-stop",
+	call := h.startLifecycleChildCall(root, root.tree.SessionID, "active-child-stop",
 		lifecycleActiveReadTask("KANEDIAS_LIFECYCLE_CHILD_STOP_UNEXPECTED_SUCCESS_"+h.prefix))
 
 	activeTree := h.waitForLifecycleChildren(root, 1, true, "running child before direct stop")
@@ -289,9 +294,9 @@ func (h *liveAcceptance) exerciseLifecycleChildStop() {
 		return root.journal.countPi(child.SessionID, "agent_start", "") >= 1
 	})
 	h.assertLifecycleChildStreaming(root, child.SessionID)
+	h.captureLifecycleBoundary(root, "pre-control")
 
-	status, _, err := unixRequest(root.client, http.MethodDelete,
-		"/v1/sessions/"+url.PathEscape(child.SessionID), nil)
+	status, err := h.deleteLifecycleSession(root, child.SessionID)
 	if err != nil || status != http.StatusAccepted {
 		h.t.Fatalf("active child DELETE = %d, %v", status, err)
 	}
@@ -303,6 +308,7 @@ func (h *liveAcceptance) exerciseLifecycleChildStop() {
 	})
 
 	h.waitForLifecycleChildrenGone(root, []supervisor.NodeSnapshot{child}, childPIDs, "directly stopped child cleanup")
+	h.captureLifecycleBoundary(root, "post-control")
 	h.assertRootUsable(root, "KANEDIAS_LIFECYCLE_CHILD_STOP_ROOT_USABLE_"+h.prefix)
 	h.stopLifecycleRoot(root)
 }
@@ -312,7 +318,7 @@ func (h *liveAcceptance) exerciseLifecycleRootEnd() {
 	calls := make([]*lifecycleChildCall, 3)
 	for index := range calls {
 		marker := fmt.Sprintf("KANEDIAS_LIFECYCLE_ROOT_END_UNEXPECTED_SUCCESS_%d_%s", index, h.prefix)
-		calls[index] = h.startLifecycleChildCall(root.client, root.tree.SessionID,
+		calls[index] = h.startLifecycleChildCall(root, root.tree.SessionID,
 			fmt.Sprintf("root-end-active-%d", index), lifecycleActiveReadTask(marker))
 	}
 
@@ -341,18 +347,18 @@ func (h *liveAcceptance) exerciseLifecycleRootEnd() {
 		"descendantPids":    descendantProcesses,
 		"trackedSessionIds": allSessionIDs,
 	})
+	root.mu.Lock()
+	for _, pid := range descendantProcesses {
+		root.childPIDs[pid] = struct{}{}
+	}
+	root.mu.Unlock()
+	h.captureLifecycleBoundary(root, "pre-control")
 
-	status, _, err := unixRequest(root.client, http.MethodDelete,
-		"/v1/sessions/"+url.PathEscape(root.tree.SessionID), nil)
+	status, err := h.deleteLifecycleSession(root, root.tree.SessionID)
 	if err != nil || status != http.StatusAccepted {
 		h.t.Fatalf("root-end root DELETE = %d, %v", status, err)
 	}
-	if err := h.waitProcess(root.process, 2*time.Minute); err != nil {
-		h.t.Fatalf("root-end root exited after DELETE: %v", err)
-	}
-	if root.stalled != nil {
-		_ = root.stalled.Close()
-	}
+	h.finishStoppedLifecycleRoot(root, "root-end DELETE")
 	for _, call := range calls {
 		h.assertLifecycleStoppedResult(call.wait(h.t, 2*time.Minute))
 	}
@@ -377,6 +383,9 @@ func (h *liveAcceptance) exerciseLifecycleRootEnd() {
 	if status, body, err := unixRequest(root.client, http.MethodGet, "/v1/tree", nil); err == nil {
 		h.t.Fatalf("request through ended root socket unexpectedly succeeded: status=%d body=%q", status, body)
 	}
+	h.captureLifecycleBoundary(root, "post-control")
+	h.captureLifecycleBoundary(root, "final")
+	h.assertLifecycleFinalInvariants(root)
 }
 
 func (h *liveAcceptance) exerciseLifecycleInterrupt() {
@@ -385,12 +394,13 @@ func (h *liveAcceptance) exerciseLifecycleInterrupt() {
 		"type": "prompt", "message": lifecycleActiveReadTask("KANEDIAS_LIFECYCLE_INTERRUPT_ROOT_UNEXPECTED_" + h.prefix),
 	})
 	h.waitLifecycleStreaming(root, root.tree.SessionID, "root running and streaming before interrupt")
+	h.captureLifecycleBoundary(root, "pre-control")
 	rootSettledBefore := root.journal.countPi(root.tree.SessionID, "agent_settled", "")
 	h.lifecycleRPCCommand(root, root.tree.SessionID, map[string]any{"type": "abort"})
 	h.waitLifecycleSettlement(root, root.tree.SessionID, rootSettledBefore, false, "root interrupt settlement and open transport")
 	h.assertRootUsable(root, "KANEDIAS_LIFECYCLE_INTERRUPT_ROOT_USABLE_"+h.prefix)
 
-	childCall := h.startLifecycleChildCall(root.client, root.tree.SessionID, "interrupt-child",
+	childCall := h.startLifecycleChildCall(root, root.tree.SessionID, "interrupt-child",
 		lifecycleActiveReadTask("KANEDIAS_LIFECYCLE_INTERRUPT_CHILD_UNEXPECTED_"+h.prefix))
 	childTree := h.waitForLifecycleChildren(root, 1, true, "running child before interrupt")
 	child := childTree.Children[0]
@@ -402,6 +412,7 @@ func (h *liveAcceptance) exerciseLifecycleInterrupt() {
 	h.assertLifecycleStoppedResult(childCall.wait(h.t, 2*time.Minute))
 	h.waitLifecycleSettlementEvent(root, child.SessionID, childSettledBefore, "interrupted child journal settlement")
 	h.waitForLifecycleChildrenGone(root, []supervisor.NodeSnapshot{child}, childPIDs, "interrupted child cleanup")
+	h.captureLifecycleBoundary(root, "post-control")
 	h.assertRootUsable(root, "KANEDIAS_LIFECYCLE_INTERRUPT_CHILD_ROOT_USABLE_"+h.prefix)
 	h.stopLifecycleRoot(root)
 	h.assertLifecycleSettlementTotals(root, map[string]int{
@@ -417,18 +428,19 @@ func (h *liveAcceptance) exerciseLifecycleSteer() {
 		"type": "prompt", "message": lifecycleActiveReadTask("KANEDIAS_LIFECYCLE_STEER_ROOT_ORIGINAL_" + h.prefix),
 	})
 	h.waitLifecycleStreaming(root, root.tree.SessionID, "root running and streaming before steer")
+	h.captureLifecycleBoundary(root, "pre-control")
 	rootSettledBefore := root.journal.countPi(root.tree.SessionID, "agent_settled", "")
 	h.lifecycleRPCCommand(root, root.tree.SessionID, map[string]any{
 		"type": "steer", "message": "Stop the prior response and include exactly " + rootSteerMarker + ".",
 	})
 	h.waitLifecycleSettlement(root, root.tree.SessionID, rootSettledBefore, false, "steered root settlement and open transport")
-	if text := h.lastAssistantText(root.client, root.tree.SessionID); !strings.Contains(text, rootSteerMarker) {
+	if text := h.lifecycleLastAssistantText(root, root.tree.SessionID); !strings.Contains(text, rootSteerMarker) {
 		h.t.Fatalf("steered root final text %q lacks marker %q", text, rootSteerMarker)
 	}
 	h.assertRootUsable(root, "KANEDIAS_LIFECYCLE_STEER_ROOT_USABLE_"+h.prefix)
 
 	childSteerMarker := "KANEDIAS_LIFECYCLE_STEER_CHILD_" + h.prefix
-	childCall := h.startLifecycleChildCall(root.client, root.tree.SessionID, "steer-child",
+	childCall := h.startLifecycleChildCall(root, root.tree.SessionID, "steer-child",
 		lifecycleActiveReadTask("KANEDIAS_LIFECYCLE_STEER_CHILD_ORIGINAL_"+h.prefix))
 	childTree := h.waitForLifecycleChildren(root, 1, true, "running child before steer")
 	child := childTree.Children[0]
@@ -443,6 +455,7 @@ func (h *liveAcceptance) exerciseLifecycleSteer() {
 	h.assertLifecycleReadResult(result, child.SessionID, childSteerMarker)
 	h.waitForLifecycleNaturalChildEvents(root, []supervisor.NodeSnapshot{child}, "steered child exact terminal events")
 	h.waitForLifecycleChildrenGone(root, []supervisor.NodeSnapshot{child}, childPIDs, "steered child cleanup")
+	h.captureLifecycleBoundary(root, "post-control")
 	h.assertRootUsable(root, "KANEDIAS_LIFECYCLE_STEER_CHILD_ROOT_USABLE_"+h.prefix)
 	h.stopLifecycleRoot(root)
 	h.assertLifecycleSettlementTotals(root, map[string]int{
@@ -458,6 +471,7 @@ func (h *liveAcceptance) exerciseLifecycleRapidControl() {
 		"type": "prompt", "message": lifecycleActiveReadTask("KANEDIAS_LIFECYCLE_RAPID_ORIGINAL_" + h.prefix),
 	})
 	h.waitLifecycleStreaming(root, root.tree.SessionID, "root running and streaming before rapid control")
+	h.captureLifecycleBoundary(root, "pre-control")
 	settledBefore := root.journal.countPi(root.tree.SessionID, "agent_settled", "")
 	h.lifecycleRPCCommand(root, root.tree.SessionID, map[string]any{
 		"type": "steer", "message": "Stop the prior response and include exactly " + priorSteerMarker + ".",
@@ -474,24 +488,133 @@ func (h *liveAcceptance) exerciseLifecycleRapidControl() {
 		"type": "prompt", "message": "Reply with exactly " + followUpMarker + ".",
 	})
 	h.waitLifecycleSettlement(root, root.tree.SessionID, settledAtFollowUp, false, "rapid-control isolated follow-up settlement")
-	text := h.lastAssistantText(root.client, root.tree.SessionID)
+	text := h.lifecycleLastAssistantText(root, root.tree.SessionID)
 	if !strings.Contains(text, followUpMarker) {
 		h.t.Fatalf("rapid-control follow-up text %q lacks marker %q", text, followUpMarker)
 	}
 	if strings.Contains(text, priorSteerMarker) {
 		h.t.Fatalf("rapid-control follow-up text %q retained prior steer marker %q", text, priorSteerMarker)
 	}
+	h.captureLifecycleBoundary(root, "post-control")
 	h.stopLifecycleRoot(root)
 	h.assertLifecycleSettlementTotals(root, map[string]int{
 		root.tree.SessionID: settledBefore + 2,
 	}, "rapid-control scenario settlement totals")
 }
 
-func (h *liveAcceptance) sendLifecycleModelPrompt(root *lifecycleRoot, prompt string) {
-	response := h.rpc(root.client, root.tree.SessionID, map[string]any{"type": "prompt", "message": prompt})
-	if response["success"] != true {
-		h.t.Fatalf("model-directed prompt was not accepted: %#v", response)
+func (h *liveAcceptance) exerciseMixedSiblingOutcomes() {
+	root := h.startLifecycleRoot("mixed-siblings")
+	markers := map[string]string{
+		"natural": "KANEDIAS_LIFECYCLE_MIXED_NATURAL_" + h.prefix,
+		"delete":  "KANEDIAS_LIFECYCLE_MIXED_DELETE_UNEXPECTED_" + h.prefix,
+		"abort":   "KANEDIAS_LIFECYCLE_MIXED_ABORT_UNEXPECTED_" + h.prefix,
 	}
+	calls := map[string]*lifecycleChildCall{
+		"natural": h.startLifecycleChildCall(root, root.tree.SessionID, "mixed-natural",
+			"Without modifying files, read README.md, go.mod, internal/supervisor/node.go, internal/supervisor/local.go, internal/supervisor/result.go, and internal/supervisor/lifecycle.go. Return a detailed comparison containing exactly "+markers["natural"]+". Do not delegate."),
+		"delete": h.startLifecycleChildCall(root, root.tree.SessionID, "mixed-delete",
+			lifecycleActiveReadTask(markers["delete"])),
+		"abort": h.startLifecycleChildCall(root, root.tree.SessionID, "mixed-abort",
+			lifecycleActiveReadTask(markers["abort"])),
+	}
+
+	allTree := h.waitForLifecycleChildren(root, 3, true, "three mixed siblings in one running tree snapshot")
+	if err := validateLifecycleLeafTopology(allTree, 3); err != nil {
+		h.t.Fatalf("mixed sibling topology: %v", err)
+	}
+	h.assertLifecycleChildren(root.tree, allTree.Children)
+	allPIDs := h.captureLifecycleChildPIDs(root, 3, "mixed-siblings")
+	childrenByOutcome := h.identifyLifecycleChildrenByMarker(root, allTree.Children, markers)
+	settledBefore := make(map[string]int, len(childrenByOutcome))
+	for outcome, child := range childrenByOutcome {
+		settledBefore[outcome] = root.journal.countPi(child.SessionID, "agent_settled", "")
+	}
+
+	naturalChild := childrenByOutcome["natural"]
+	naturalResult := calls["natural"].wait(h.t, 8*time.Minute)
+	h.assertLifecycleReadResult(naturalResult, naturalChild.SessionID, markers["natural"])
+	h.waitForLifecycleNaturalChildEvents(root, []supervisor.NodeSnapshot{naturalChild}, "mixed natural child exact terminal events")
+	h.waitForLifecycleChildGone(root, naturalChild.SessionID, "mixed natural child independent disappearance")
+	root.freezeLifecycleEvents(naturalChild.SessionID, root.journal.snapshot())
+
+	for _, outcome := range []string{"delete", "abort"} {
+		h.waitLifecycleStreaming(root, childrenByOutcome[outcome].SessionID, "mixed "+outcome+" child running and streaming immediately before control")
+	}
+	h.captureLifecycleBoundary(root, "pre-control")
+
+	deleteChild := childrenByOutcome["delete"]
+	status, err := h.deleteLifecycleSession(root, deleteChild.SessionID)
+	if err != nil || status != http.StatusAccepted {
+		h.t.Fatalf("mixed sibling DELETE = %d, %v", status, err)
+	}
+	abortChild := childrenByOutcome["abort"]
+	h.lifecycleRPCCommand(root, abortChild.SessionID, map[string]any{"type": "abort"})
+
+	h.assertLifecycleStoppedResult(calls["delete"].wait(h.t, 2*time.Minute))
+	h.waitLifecycleSettlementEvent(root, deleteChild.SessionID, settledBefore["delete"], "mixed DELETE child drained settlement")
+	h.waitForLifecycleChildGone(root, deleteChild.SessionID, "mixed DELETE child independent disappearance")
+	h.assertLifecycleStoppedResult(calls["abort"].wait(h.t, 2*time.Minute))
+	h.waitLifecycleSettlementEvent(root, abortChild.SessionID, settledBefore["abort"], "mixed abort child drained settlement")
+	h.waitForLifecycleChildGone(root, abortChild.SessionID, "mixed abort child independent disappearance")
+
+	h.waitForLifecycleChildrenGone(root, allTree.Children, allPIDs, "mixed sibling identity-specific cleanup")
+	h.captureLifecycleBoundary(root, "post-control")
+	h.assertRootUsable(root, "KANEDIAS_LIFECYCLE_MIXED_ROOT_USABLE_"+h.prefix)
+	h.stopLifecycleRoot(root)
+	h.assertLifecycleSettlementTotals(root, map[string]int{
+		root.tree.SessionID:    1,
+		naturalChild.SessionID: settledBefore["natural"] + 1,
+		deleteChild.SessionID:  settledBefore["delete"] + 1,
+		abortChild.SessionID:   settledBefore["abort"] + 1,
+	}, "mixed sibling settlement totals")
+}
+
+func (h *liveAcceptance) identifyLifecycleChildrenByMarker(root *lifecycleRoot, children []supervisor.NodeSnapshot, markers map[string]string) map[string]supervisor.NodeSnapshot {
+	identified := make(map[string]supervisor.NodeSnapshot, len(markers))
+	for _, child := range children {
+		response := h.lifecycleRPCCommand(root, child.SessionID, map[string]any{"type": "get_messages"})
+		encoded, err := json.Marshal(response["data"])
+		if err != nil {
+			h.t.Fatalf("encode get_messages data for child %s: %v", child.SessionID, err)
+		}
+		matched := ""
+		for outcome, marker := range markers {
+			if strings.Contains(string(encoded), marker) {
+				if matched != "" {
+					h.t.Fatalf("child %s messages contain markers for both %s and %s", child.SessionID, matched, outcome)
+				}
+				matched = outcome
+			}
+		}
+		if matched == "" {
+			h.t.Fatalf("child %s messages contain no mixed-sibling task marker", child.SessionID)
+		}
+		if _, duplicate := identified[matched]; duplicate {
+			h.t.Fatalf("multiple children mapped to mixed-sibling marker %s", matched)
+		}
+		identified[matched] = child
+	}
+	if len(identified) != len(markers) {
+		h.t.Fatalf("identified mixed sibling markers = %d, want %d", len(identified), len(markers))
+	}
+	return identified
+}
+
+func (h *liveAcceptance) waitForLifecycleChildGone(root *lifecycleRoot, sessionID, description string) {
+	h.poll(2*time.Minute, description, func() bool {
+		var current supervisor.NodeSnapshot
+		if unixJSON(root.client, http.MethodGet, "/v1/tree", nil, &current) != nil {
+			return false
+		}
+		if _, present := lifecycleSnapshotByID(current, sessionID); present || !h.sessionsAbsent([]string{sessionID}) {
+			return false
+		}
+		return !pathExists(h.recursiveDescendantSocketPath(sessionID))
+	})
+}
+
+func (h *liveAcceptance) sendLifecycleModelPrompt(root *lifecycleRoot, prompt string) {
+	h.lifecycleRPCCommand(root, root.tree.SessionID, map[string]any{"type": "prompt", "message": prompt})
 }
 
 func (h *liveAcceptance) waitForLifecycleModelChildren(root *lifecycleRoot, eventBoundary, settledBefore, count int, description string) supervisor.NodeSnapshot {
@@ -737,6 +860,11 @@ func (h *liveAcceptance) captureLifecycleChildPIDs(root *lifecycleRoot, count in
 	if len(pids) != count {
 		h.t.Fatalf("%s direct child supervisor PIDs = %v, want exactly %d", label, pids, count)
 	}
+	root.mu.Lock()
+	for _, pid := range pids {
+		root.childPIDs[pid] = struct{}{}
+	}
+	root.mu.Unlock()
 	h.writeJSON(label+"-child-supervisor-pids.json", map[string]any{"rootPid": root.process.cmd.Process.Pid, "childPids": pids})
 	return pids
 }
