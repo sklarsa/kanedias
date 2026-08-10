@@ -34,13 +34,26 @@ func TestValidateLifecycleModelPolicyRequiresLocalRootAndWorkers(t *testing.T) {
 			"reviewer": {Description: "review", ModelType: "local", ThinkingLevel: "off"},
 		},
 	}
-	if err := validateLifecycleModelPolicy(cfg, "local-executor", "Qwen3.6-27B-GGUF"); err != nil {
+	if err := validateLifecycleModelPolicy(cfg, "local-executor", "Qwen3.6-27B-GGUF", "off"); err != nil {
 		t.Fatalf("valid local policy: %v", err)
 	}
+
+	// A catalog-valid same-provider/model worker at a thinking level the local
+	// provider cannot realize must be rejected by name with a thinking mismatch.
+	cfg.Models["local"] = config.ModelDefinition{Provider: "local-executor", Model: "Qwen3.6-27B-GGUF", ThinkingLevels: []string{"off", "xhigh"}, DefaultThinkingLevel: "off"}
+	cfg.Workers["reviewer"] = config.WorkerDefaults{Description: "review", ModelType: "local", ThinkingLevel: "xhigh"}
+	thinkingDrift := validateLifecycleModelPolicy(cfg, "local-executor", "Qwen3.6-27B-GGUF", "off")
+	if thinkingDrift == nil || !strings.Contains(thinkingDrift.Error(), "reviewer") || !strings.Contains(thinkingDrift.Error(), "thinking") {
+		t.Fatalf("same-provider thinking drift error = %v, want reviewer thinking mismatch", thinkingDrift)
+	}
+
+	// A mixed-provider/model worker must be rejected by name.
+	cfg.Models["local"] = config.ModelDefinition{Provider: "local-executor", Model: "Qwen3.6-27B-GGUF", ThinkingLevels: []string{"off"}, DefaultThinkingLevel: "off"}
 	worker := cfg.Workers["reviewer"]
 	worker.ModelType = "paid"
+	worker.ThinkingLevel = "high"
 	cfg.Workers["reviewer"] = worker
-	if err := validateLifecycleModelPolicy(cfg, "local-executor", "Qwen3.6-27B-GGUF"); err == nil || !strings.Contains(err.Error(), "reviewer") {
+	if err := validateLifecycleModelPolicy(cfg, "local-executor", "Qwen3.6-27B-GGUF", "off"); err == nil || !strings.Contains(err.Error(), "reviewer") {
 		t.Fatalf("mixed worker policy error = %v", err)
 	}
 }
@@ -350,21 +363,21 @@ func lifecyclePiEnvelope(seq uint64, sessionID, payload string) supervisor.Event
 
 // validateLifecycleModelPolicy resolves the whole session model policy and
 // requires the root and every configured worker to resolve to one exact
-// provider/model pair. Failures identify the worker by name so a mixed live
-// configuration is diagnosed against the intended local model rather than a
-// silent provider drift.
-func validateLifecycleModelPolicy(cfg config.Config, provider, model string) error {
+// provider/model/thinking triple. Failures identify the worker by name so a mixed
+// live configuration is diagnosed against the intended local model rather than a
+// silent provider or reasoning-effort drift.
+func validateLifecycleModelPolicy(cfg config.Config, provider, model, thinkingLevel string) error {
 	policy, err := cfg.DefaultSessionModelPolicy()
 	if err != nil {
 		return err
 	}
-	if policy.Root.Provider != provider || policy.Root.Model != model {
-		return fmt.Errorf("root model policy %s/%s, want %s/%s", policy.Root.Provider, policy.Root.Model, provider, model)
+	if policy.Root.Provider != provider || policy.Root.Model != model || policy.Root.ThinkingLevel != thinkingLevel {
+		return fmt.Errorf("root model policy %s/%s/%s, want %s/%s/%s", policy.Root.Provider, policy.Root.Model, policy.Root.ThinkingLevel, provider, model, thinkingLevel)
 	}
 	for _, name := range policy.WorkerNames() {
 		worker := policy.Workers[name]
-		if worker.Provider != provider || worker.Model != model {
-			return fmt.Errorf("worker %q model policy %s/%s, want %s/%s", name, worker.Provider, worker.Model, provider, model)
+		if worker.Provider != provider || worker.Model != model || worker.ThinkingLevel != thinkingLevel {
+			return fmt.Errorf("worker %q thinking model policy %s/%s/%s, want %s/%s/%s", name, worker.Provider, worker.Model, worker.ThinkingLevel, provider, model, thinkingLevel)
 		}
 	}
 	return nil
@@ -889,7 +902,7 @@ func (h *liveAcceptance) prepareLifecycleConfig() {
 	}
 	h.configPath = managedConfig
 	h.cfg = managedCfg
-	if err := validateLifecycleModelPolicy(h.cfg, "local-executor", "Qwen3.6-27B-GGUF"); err != nil {
+	if err := validateLifecycleModelPolicy(h.cfg, "local-executor", "Qwen3.6-27B-GGUF", "off"); err != nil {
 		h.t.Fatalf("lifecycle local model policy: %v", err)
 	}
 }

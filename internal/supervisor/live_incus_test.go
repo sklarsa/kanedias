@@ -10,6 +10,7 @@ import (
 	"errors"
 	"fmt"
 	"io"
+	"math"
 	"mime"
 	"net"
 	"net/http"
@@ -88,7 +89,8 @@ func TestPostNewSessionJSONContract(t *testing.T) {
 	}))
 	defer server.Close()
 
-	sessionID, err := postNewSession(server.Client(), server.URL+"/ui/sessions", requestBody)
+	identity := managedRequestIdentity{authority: strings.TrimPrefix(server.URL, "http://"), origin: server.URL}
+	sessionID, err := postNewSession(server.Client(), server.URL+"/ui/sessions", identity, requestBody)
 	if err != nil {
 		t.Fatalf("postNewSession: %v", err)
 	}
@@ -121,9 +123,446 @@ func TestPostNewSessionJSONRejectsInvalidResponses(t *testing.T) {
 				_, _ = io.WriteString(w, tt.body)
 			}))
 			defer server.Close()
-			_, err := postNewSession(server.Client(), server.URL+"/ui/sessions", map[string]any{"root": map[string]any{}})
+			identity := managedRequestIdentity{authority: strings.TrimPrefix(server.URL, "http://"), origin: server.URL}
+			_, err := postNewSession(server.Client(), server.URL+"/ui/sessions", identity, map[string]any{"root": map[string]any{}})
 			if err == nil || !strings.Contains(err.Error(), tt.wantError) {
 				t.Fatalf("error = %v, want containing %q", err, tt.wantError)
+			}
+		})
+	}
+}
+
+func TestParseManagedServerStartupModes(t *testing.T) {
+	tests := []struct {
+		name               string
+		text               string
+		requireSession     bool
+		configuredHostname string
+		wantReady          bool
+		want               managedServerStartup
+	}{
+		{
+			name:               "trusted-ready-configured-hostname",
+			text:               "level=INFO msg=\"server listening\" effective_address=127.0.0.1:45403\nWeb UI: http://steven-desktop:45403/\n",
+			configuredHostname: "steven-desktop",
+			wantReady:          true,
+			want: managedServerStartup{
+				effectiveOrigin:  "http://127.0.0.1:45403",
+				browserOrigin:    "http://steven-desktop:45403",
+				browserAuthority: "steven-desktop:45403",
+			},
+		},
+		{
+			name:      "trusted-ready-empty-hostname",
+			text:      "level=INFO msg=\"server listening\" effective_address=127.0.0.1:45403\nWeb UI: http://127.0.0.1:45403/\n",
+			wantReady: true,
+			want: managedServerStartup{
+				effectiveOrigin:  "http://127.0.0.1:45403",
+				browserOrigin:    "http://127.0.0.1:45403",
+				browserAuthority: "127.0.0.1:45403",
+			},
+		},
+		{
+			name:      "trusted-missing-web-ui",
+			text:      "effective_address=127.0.0.1:45403\n",
+			wantReady: false,
+		},
+		{
+			name:               "authenticated-ready",
+			text:               "effective_address=127.0.0.1:45403\nBootstrap URL: http://steven-desktop:45403/bootstrap?capability=test-token\n",
+			requireSession:     true,
+			configuredHostname: "steven-desktop",
+			wantReady:          true,
+			want: managedServerStartup{
+				effectiveOrigin:  "http://127.0.0.1:45403",
+				browserOrigin:    "http://steven-desktop:45403",
+				browserAuthority: "steven-desktop:45403",
+				bootstrapURL:     "http://steven-desktop:45403/bootstrap?capability=test-token",
+			},
+		},
+		{
+			name:               "authenticated-missing-bootstrap",
+			text:               "effective_address=127.0.0.1:45403\nWeb UI: http://steven-desktop:45403/\n",
+			requireSession:     true,
+			configuredHostname: "steven-desktop",
+			wantReady:          false,
+		},
+	}
+	for _, effectiveAddress := range []string{"not-an-authority", "192.0.2.10:45403"} {
+		name := "malformed-effective-address"
+		if strings.HasPrefix(effectiveAddress, "192.") {
+			name = "non-loopback-effective-address"
+		}
+		for _, requireSession := range []bool{false, true} {
+			text := "effective_address=" + effectiveAddress + "\nWeb UI: http://steven-desktop:45403/\n"
+			if requireSession {
+				text += "Bootstrap URL: http://steven-desktop:45403/bootstrap?capability=test-token\n"
+			}
+			tests = append(tests, struct {
+				name               string
+				text               string
+				requireSession     bool
+				configuredHostname string
+				wantReady          bool
+				want               managedServerStartup
+			}{name: fmt.Sprintf("%s-require-session-%t", name, requireSession), text: text, requireSession: requireSession})
+		}
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			got, ready := parseManagedServerStartup(tt.text, tt.requireSession, tt.configuredHostname)
+			if ready != tt.wantReady {
+				t.Fatalf("ready = %t, want %t; startup = %#v", ready, tt.wantReady, got)
+			}
+			if ready && got != tt.want {
+				t.Fatalf("startup = %#v, want %#v", got, tt.want)
+			}
+		})
+	}
+}
+
+func TestNormalizeManagedBootstrapURLToEffectiveOrigin(t *testing.T) {
+	for _, tt := range []struct {
+		name       string
+		effective  string
+		advertised string
+		want       string
+		wantError  bool
+	}{
+		{name: "absolute", effective: "http://127.0.0.1:45403", advertised: "http://steven-desktop:45403/bootstrap?capability=test-token", want: "http://127.0.0.1:45403/bootstrap?capability=test-token"},
+		{name: "relative", effective: "http://127.0.0.1:45403", advertised: "/bootstrap?capability=test-token", want: "http://127.0.0.1:45403/bootstrap?capability=test-token"},
+		{name: "rejects HTTPS", effective: "https://127.0.0.1:45403", advertised: "/bootstrap", wantError: true},
+		{name: "rejects non-loopback host", effective: "http://192.0.2.10:45403", advertised: "/bootstrap", wantError: true},
+		{name: "rejects userinfo", effective: "http://user@127.0.0.1:45403", advertised: "/bootstrap", wantError: true},
+		{name: "rejects path", effective: "http://127.0.0.1:45403/base", advertised: "/bootstrap", wantError: true},
+		{name: "rejects slash path", effective: "http://127.0.0.1:45403/", advertised: "/bootstrap", wantError: true},
+		{name: "rejects query", effective: "http://127.0.0.1:45403?x=1", advertised: "/bootstrap", wantError: true},
+		{name: "rejects fragment", effective: "http://127.0.0.1:45403#fragment", advertised: "/bootstrap", wantError: true},
+	} {
+		t.Run(tt.name, func(t *testing.T) {
+			got, err := normalizeManagedBootstrapURL(tt.effective, tt.advertised)
+			if tt.wantError {
+				if err == nil {
+					t.Fatalf("normalizeManagedBootstrapURL() = %q, want error", got)
+				}
+				return
+			}
+			if err != nil || got != tt.want {
+				t.Fatalf("normalizeManagedBootstrapURL() = %q, %v; want %q", got, err, tt.want)
+			}
+		})
+	}
+}
+
+func TestManagedServerConnectionAuthenticatedAuthority(t *testing.T) {
+	var mu sync.Mutex
+	requests := make([]string, 0, 4)
+	var browserAuthority, browserOrigin string
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		mu.Lock()
+		requests = append(requests, r.Method+" "+r.URL.RequestURI())
+		mu.Unlock()
+		if r.Host != browserAuthority {
+			t.Errorf("Host = %q, want %q", r.Host, browserAuthority)
+		}
+		switch r.URL.Path {
+		case "/bootstrap":
+			if r.URL.RawQuery != "capability=test-token" {
+				t.Errorf("bootstrap query = %q, want capability=test-token", r.URL.RawQuery)
+			}
+			http.SetCookie(w, &http.Cookie{Name: "session", Value: "authenticated", Path: "/"})
+			w.Header().Set("Location", "/")
+			w.WriteHeader(http.StatusSeeOther)
+		case "/":
+			if cookie, err := r.Cookie("session"); err != nil || cookie.Value != "authenticated" {
+				t.Errorf("GET / cookie = %v, %v; want authenticated", cookie, err)
+			}
+			w.WriteHeader(http.StatusOK)
+		case "/ui/sessions":
+			assertManagedAuthenticatedWrite(t, r, browserAuthority, browserOrigin)
+			w.Header().Set("Content-Type", "application/json")
+			w.WriteHeader(http.StatusCreated)
+			_, _ = io.WriteString(w, `{"sessionId":"created-session"}`)
+		case "/ui/sessions/created-session/steer":
+			assertManagedAuthenticatedWrite(t, r, browserAuthority, browserOrigin)
+			w.WriteHeader(http.StatusOK)
+			_, _ = io.WriteString(w, "Command sent.")
+		default:
+			http.NotFound(w, r)
+		}
+	}))
+	defer server.Close()
+
+	effectiveURL, err := url.Parse(server.URL)
+	if err != nil {
+		t.Fatal(err)
+	}
+	_, port, err := net.SplitHostPort(effectiveURL.Host)
+	if err != nil {
+		t.Fatal(err)
+	}
+	browserAuthority = net.JoinHostPort("steven-desktop", port)
+	browserOrigin = "http://" + browserAuthority
+	runDir := t.TempDir()
+	logText := fmt.Sprintf("effective_address=%s\nBootstrap URL: %s/bootstrap?capability=test-token\n", effectiveURL.Host, browserOrigin)
+	if err := os.WriteFile(filepath.Join(runDir, "managed-server.log"), []byte(logText), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	h := &liveAcceptance{t: t, runDir: runDir}
+	connection := h.connectManagedServer(&acceptanceProcess{}, true, "steven-desktop")
+	identity := connection.requestIdentity()
+	if _, err := postNewSession(connection.client, connection.effectiveOrigin+"/ui/sessions", identity, map[string]any{}); err != nil {
+		t.Fatal(err)
+	}
+	h.postDatastar(connection.client, connection.effectiveOrigin+"/ui/sessions/created-session/steer", identity, map[string]any{})
+
+	mu.Lock()
+	defer mu.Unlock()
+	want := []string{"GET /bootstrap?capability=test-token", "GET /", "POST /ui/sessions", "POST /ui/sessions/created-session/steer"}
+	if !reflect.DeepEqual(requests, want) {
+		t.Fatalf("requests = %#v, want %#v", requests, want)
+	}
+}
+
+func TestManagedServerConnectionTrustedNoBootstrap(t *testing.T) {
+	var bootstrapRequests int
+	var effectiveAuthority, effectiveOrigin string
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if r.URL.Path == "/bootstrap" {
+			bootstrapRequests++
+			t.Error("trusted connection made a bootstrap request")
+			return
+		}
+		if r.Host != effectiveAuthority {
+			t.Errorf("Host = %q, want %q", r.Host, effectiveAuthority)
+		}
+		switch r.URL.Path {
+		case "/":
+			w.WriteHeader(http.StatusOK)
+		case "/ui/sessions/trusted/steer":
+			if got := r.Header.Get("Origin"); got != effectiveOrigin {
+				t.Errorf("Origin = %q, want %q", got, effectiveOrigin)
+			}
+			w.WriteHeader(http.StatusOK)
+			_, _ = io.WriteString(w, "Command sent.")
+		default:
+			http.NotFound(w, r)
+		}
+	}))
+	defer server.Close()
+
+	effectiveURL, err := url.Parse(server.URL)
+	if err != nil {
+		t.Fatal(err)
+	}
+	effectiveAuthority = effectiveURL.Host
+	effectiveOrigin = server.URL
+	runDir := t.TempDir()
+	logText := fmt.Sprintf("effective_address=%s\nWeb UI: %s/\n", effectiveURL.Host, server.URL)
+	if err := os.WriteFile(filepath.Join(runDir, "managed-server.log"), []byte(logText), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	h := &liveAcceptance{t: t, runDir: runDir}
+	connection := h.connectManagedServer(&acceptanceProcess{}, false, "steven-desktop")
+	h.postDatastar(connection.client, connection.effectiveOrigin+"/ui/sessions/trusted/steer", connection.requestIdentity(), map[string]any{})
+	if bootstrapRequests != 0 {
+		t.Fatalf("bootstrap requests = %d, want 0", bootstrapRequests)
+	}
+}
+
+func assertManagedAuthenticatedWrite(t *testing.T, r *http.Request, authority, origin string) {
+	t.Helper()
+	cookie, err := r.Cookie("session")
+	if err != nil || cookie.Value != "authenticated" {
+		t.Errorf("write cookie = %v, %v; want authenticated", cookie, err)
+	}
+	if r.Host != authority {
+		t.Errorf("Host = %q, want %q", r.Host, authority)
+	}
+	if got := r.Header.Get("Origin"); got != origin {
+		t.Errorf("Origin = %q, want %q", got, origin)
+	}
+}
+
+func TestFleetStreamContainsExactlyEvaluatesIndividualPatches(t *testing.T) {
+	roots := []managedRoot{
+		{SessionID: "root-one"},
+		{SessionID: "root-two"},
+	}
+	event := func() string {
+		return "event: datastar-patch-elements\n" +
+			"data: <div id=\"fleet-panel\"><details open data-root=\"root-one\"><details data-root=\"root-two\"></div>\n\n"
+	}
+
+	// Two complete, valid replacement snapshots: the full stream contains each
+	// expected marker twice, yet each individual patch contains it exactly once.
+	repeated := event() + event()
+	if matched, err := fleetStreamContainsExactly(strings.NewReader(repeated), roots); err != nil || !matched {
+		t.Fatalf("repeated valid stream: matched=%v err=%v, want true nil", matched, err)
+	}
+
+	cases := []struct {
+		name  string
+		input string
+	}{
+		{
+			name:  "missing expected root",
+			input: "event: datastar-patch-elements\ndata: <div id=\"fleet-panel\"><details data-root=\"root-one\"></div>\n\n",
+		},
+		{
+			name: "duplicate expected marker within patch",
+			input: "event: datastar-patch-elements\n" +
+				"data: <div id=\"fleet-panel\"><details data-root=\"root-one\"><details data-root=\"root-one\"><details data-root=\"root-two\"></div>\n\n",
+		},
+		{
+			name: "unexpected root",
+			input: "event: datastar-patch-elements\n" +
+				"data: <div id=\"fleet-panel\"><details data-root=\"root-one\"><details data-root=\"root-two\"><details data-root=\"root-extra\"></div>\n\n",
+		},
+	}
+	for _, tt := range cases {
+		t.Run(tt.name, func(t *testing.T) {
+			if matched, err := fleetStreamContainsExactly(strings.NewReader(tt.input), roots); err != nil || matched {
+				t.Fatalf("matched=%v err=%v, want false nil", matched, err)
+			}
+		})
+	}
+}
+
+// managedDescendantTreeWithChild builds a root tree with exactly one child in
+// the given lifecycle for the hermetic descendant-selection tests.
+func managedDescendantTreeWithChild(lifecycle string) supervisor.NodeSnapshot {
+	child := supervisor.NodeSnapshot{
+		SessionID:       "child-one",
+		PiSessionID:     "pi-child",
+		SessionFile:     "/workspace/.pi/child.jsonl",
+		ParentSessionID: "root",
+		RootSessionID:   "root",
+		Kind:            contract.ChildKindRead,
+		Context:         contract.ContextFresh,
+		WorkerType:      "reviewer",
+		Model:           contract.ModelProfile{Provider: "local-executor", Model: "Qwen3.6-27B-GGUF", ThinkingLevel: "off"},
+		Lifecycle:       lifecycle,
+	}
+	return supervisor.NodeSnapshot{SessionID: "root", RootSessionID: "root", Children: []supervisor.NodeSnapshot{child}}
+}
+
+func TestManagedDescendantFromTreeRequiresOneRunningBoundReadChild(t *testing.T) {
+	valid := managedDescendantTreeWithChild(string(supervisor.LifecycleRunning))
+	if got, ok := managedDescendantFromTree(valid); !ok || got.SessionID != "child-one" {
+		t.Fatalf("running bound read child: ok=%v child=%#v, want true child-one", ok, got)
+	}
+
+	cases := []struct {
+		name string
+		edit func(*supervisor.NodeSnapshot)
+	}{
+		{name: "no children", edit: func(tree *supervisor.NodeSnapshot) { tree.Children = nil }},
+		{name: "multiple children", edit: func(tree *supervisor.NodeSnapshot) {
+			tree.Children = append(tree.Children, supervisor.NodeSnapshot{SessionID: "child-two"})
+		}},
+		{name: "unbound child", edit: func(tree *supervisor.NodeSnapshot) { tree.Children[0].PiSessionID = "" }},
+		{name: "wrong kind", edit: func(tree *supervisor.NodeSnapshot) { tree.Children[0].Kind = contract.ChildKindWrite }},
+		{name: "wrong context", edit: func(tree *supervisor.NodeSnapshot) { tree.Children[0].Context = contract.ContextFork }},
+		{name: "ready lifecycle", edit: func(tree *supervisor.NodeSnapshot) { tree.Children[0].Lifecycle = string(supervisor.LifecycleReady) }},
+		{name: "completed lifecycle", edit: func(tree *supervisor.NodeSnapshot) {
+			tree.Children[0].Lifecycle = string(supervisor.LifecycleCompleted)
+		}},
+		{name: "failed lifecycle", edit: func(tree *supervisor.NodeSnapshot) { tree.Children[0].Lifecycle = string(supervisor.LifecycleFailed) }},
+	}
+	for _, tt := range cases {
+		t.Run(tt.name, func(t *testing.T) {
+			tree := managedDescendantTreeWithChild(string(supervisor.LifecycleRunning))
+			tt.edit(&tree)
+			if got, ok := managedDescendantFromTree(tree); ok {
+				t.Fatalf("invalid tree accepted: child=%#v", got)
+			}
+		})
+	}
+}
+
+func TestFleetStreamContainsSessionEvaluatesIndividualPatches(t *testing.T) {
+	withChild := func(marker string) string {
+		return "event: datastar-patch-elements\n" +
+			"data: <div id=\"fleet-panel\">" + marker + "</div>\n\n"
+	}
+	childRow := `<div class="row" data-session-id="child-one"></div>`
+
+	// First patch lacks the child, the second contains it exactly once.
+	delayed := withChild("") + withChild(childRow)
+	if matched, err := fleetStreamContainsSession(strings.NewReader(delayed), "child-one"); err != nil || !matched {
+		t.Fatalf("delayed projection stream: matched=%v err=%v, want true nil", matched, err)
+	}
+
+	dup := withChild(childRow + childRow)
+	if matched, err := fleetStreamContainsSession(strings.NewReader(dup), "child-one"); err != nil || matched {
+		t.Fatalf("duplicate marker: matched=%v err=%v, want false nil", matched, err)
+	}
+
+	missing := withChild(`<div data-session-id="other"></div>`)
+	if matched, err := fleetStreamContainsSession(strings.NewReader(missing), "child-one"); err != nil || matched {
+		t.Fatalf("missing marker: matched=%v err=%v, want false nil", matched, err)
+	}
+
+	prefix := "event: datastar-patch-elements-extra\n" +
+		"data: <div data-session-id=\"child-one\"></div>\n\n"
+	if matched, err := fleetStreamContainsSession(strings.NewReader(prefix), "child-one"); err != nil || matched {
+		t.Fatalf("prefix collision event type: matched=%v err=%v, want false nil", matched, err)
+	}
+
+	if matched, err := fleetStreamContainsSession(strings.NewReader(withChild(childRow)), ""); err == nil || matched {
+		t.Fatalf("empty session ID: matched=%v err=%v, want error and false", matched, err)
+	}
+}
+
+func TestManagedSessionControlStateRequiresExactSuccessfulState(t *testing.T) {
+	decode := func(raw string) map[string]any {
+		t.Helper()
+		var m map[string]any
+		if err := json.Unmarshal([]byte(raw), &m); err != nil {
+			t.Fatalf("decode test state: %v", err)
+		}
+		return m
+	}
+
+	valid := []struct {
+		name        string
+		raw         string
+		wantStream  bool
+		wantPending int
+	}{
+		{name: "idle zero pending", raw: `{"success":true,"data":{"isStreaming":false,"pendingMessageCount":0}}`, wantStream: false, wantPending: 0},
+		{name: "streaming zero pending", raw: `{"success":true,"data":{"isStreaming":true,"pendingMessageCount":0}}`, wantStream: true, wantPending: 0},
+	}
+	for _, tt := range valid {
+		t.Run(tt.name, func(t *testing.T) {
+			stream, pending, ok := managedSessionControlState(decode(tt.raw))
+			if !ok || stream != tt.wantStream || pending != tt.wantPending {
+				t.Fatalf("valid state ok=%v stream=%v pending=%d, want ok=true stream=%v pending=%d", ok, stream, pending, tt.wantStream, tt.wantPending)
+			}
+		})
+	}
+
+	reject := []struct {
+		name, raw string
+	}{
+		{name: "success false", raw: `{"success":false,"data":{"isStreaming":false,"pendingMessageCount":0}}`},
+		{name: "missing data", raw: `{"success":true}`},
+		{name: "data not object", raw: `{"success":true,"data":[1]}`},
+		{name: "missing streaming", raw: `{"success":true,"data":{"pendingMessageCount":0}}`},
+		{name: "streaming not boolean", raw: `{"success":true,"data":{"isStreaming":"yes","pendingMessageCount":0}}`},
+		{name: "missing pending", raw: `{"success":true,"data":{"isStreaming":false}}`},
+		{name: "fractional pending", raw: `{"success":true,"data":{"isStreaming":false,"pendingMessageCount":1.5}}`},
+		{name: "negative pending", raw: `{"success":true,"data":{"isStreaming":false,"pendingMessageCount":-1}}`},
+		{name: "non-numeric pending", raw: `{"success":true,"data":{"isStreaming":false,"pendingMessageCount":"3"}}`},
+		{name: "null pending", raw: `{"success":true,"data":{"isStreaming":false,"pendingMessageCount":null}}`},
+		{name: "unrelated shape", raw: `{"command":"get_state"}`},
+	}
+	for _, tt := range reject {
+		t.Run(tt.name, func(t *testing.T) {
+			if stream, pending, ok := managedSessionControlState(decode(tt.raw)); ok {
+				t.Fatalf("invalid state accepted: ok=%v stream=%v pending=%d", ok, stream, pending)
 			}
 		})
 	}
@@ -322,8 +761,9 @@ thinking_level = "high"
 				raw, _ := os.ReadFile(generated)
 				t.Fatalf("generated config fails validation: %v\n%s", err, raw)
 			}
-			// Every worker must be redirected to the requested provider/model while retaining
-			// its administrator-owned description and configured thinking level.
+			// Every worker must be redirected to the requested provider/model with the
+			// exact effective non-reasoning thinking level (off) while retaining its
+			// administrator-owned description.
 			for _, name := range loaded.WorkerNames() {
 				want := cfg.Workers[name]
 				worker, err := loaded.ResolveWorker(name)
@@ -336,9 +776,32 @@ thinking_level = "high"
 				if worker.Description != want.Description {
 					t.Fatalf("worker %s description = %q, want %q", name, worker.Description, want.Description)
 				}
-				if worker.ThinkingLevel != want.ThinkingLevel {
-					t.Fatalf("worker %s thinking = %q, want %q", name, worker.ThinkingLevel, want.ThinkingLevel)
+				if worker.ThinkingLevel != e2eLocalThinkingLevel {
+					t.Fatalf("worker %s thinking = %q, want %q", name, worker.ThinkingLevel, e2eLocalThinkingLevel)
 				}
+			}
+
+			// The generated target model definition (the reused matching model or the
+			// newly added one) must advertise exactly the local non-reasoning level and
+			// default, never a broadened set that would let catalog validation claim
+			// unsupported reasoning effort.
+			var target *config.ModelDefinition
+			for name, def := range loaded.Models {
+				if def.Provider == tt.provider && def.Model == tt.model {
+					copy := def
+					target = &copy
+					_ = name
+					break
+				}
+			}
+			if target == nil {
+				t.Fatalf("generated config has no model %s/%s", tt.provider, tt.model)
+			}
+			if len(target.ThinkingLevels) != 1 || target.ThinkingLevels[0] != e2eLocalThinkingLevel {
+				t.Fatalf("target model thinking_levels = %v, want [%s]", target.ThinkingLevels, e2eLocalThinkingLevel)
+			}
+			if target.DefaultThinkingLevel != e2eLocalThinkingLevel {
+				t.Fatalf("target model default_thinking_level = %q, want %q", target.DefaultThinkingLevel, e2eLocalThinkingLevel)
 			}
 		})
 	}
@@ -1186,7 +1649,7 @@ func (h *liveAcceptance) spawnManagedChild(client *http.Client, rootID, label st
 		"workerType": "reviewer",
 		"kind":       "read",
 		"context":    "fresh",
-		"task":       "Reply with exactly KANEDIAS_E2E_MANAGED_DESCENDANT_OK.",
+		"task":       lifecycleActiveReadTask("KANEDIAS_E2E_MANAGED_DESCENDANT_OK"),
 	}
 	h.async.Add(1)
 	go func() {
@@ -1999,6 +2462,13 @@ func errorString(err error) string {
 // Server-managed supervisor acceptance helpers
 // ---------------------------------------------------------------------------
 
+// e2eLocalThinkingLevel is the exact effective thinking level the local E2E
+// provider/model realizes. assets/pi-models.json declares local-executor/
+// Qwen3.6-27B-GGUF as non-reasoning, so Pi reports thinking "off". Every E2E
+// redirection to that provider/model must select exactly this level so the
+// supervisor's exact binding check never rejects a child before the task runs.
+const e2eLocalThinkingLevel = "off"
+
 // managedRoot holds the identity of a server-spawned root discovered after
 // server startup. SocketPath ends in .root.sock; PID is the supervisor's OS PID.
 type managedRoot struct {
@@ -2074,6 +2544,10 @@ func (h *liveAcceptance) runServerManaged() {
 	if err != nil {
 		h.t.Fatalf("load managed server configuration: %v", err)
 	}
+	resolvedServer, err := managedCfg.Server.Resolve()
+	if err != nil {
+		h.t.Fatalf("resolve managed server configuration: %v", err)
+	}
 	launchConfiguration, err := manager.NewLaunchConfiguration(managedCfg)
 	if err != nil {
 		h.t.Fatalf("build managed server launch configuration: %v", err)
@@ -2083,28 +2557,28 @@ func (h *liveAcceptance) runServerManaged() {
 	// Start the server. It spawns roots via SpawnRoot on POST /ui/sessions.
 	server := h.startProcess("managed-server", h.binary, "--config", managedConfig, "server", "--listen", "127.0.0.1:0")
 
-	// Derive the server listen address from the log (the binary logs "server listening"
-	// and "Bootstrap URL:" to stderr). Bootstrap the HTTP client with a cookie jar.
-	serverOrigin, client := h.bootstrapManagedServer(server)
+	// Derive the effective listener and browser identity from the server log,
+	// then connect according to the resolved authentication mode.
+	connection := h.connectManagedServer(server, resolvedServer.RequireSession, resolvedServer.Hostname)
 
 	// POST New Session twice with the complete configured default launch request.
 	for range 2 {
-		if _, err := postNewSession(client, serverOrigin+"/ui/sessions", defaultLaunchRequest); err != nil {
+		if _, err := postNewSession(connection.client, connection.effectiveOrigin+"/ui/sessions", connection.requestIdentity(), defaultLaunchRequest); err != nil {
 			h.t.Fatalf("POST managed New Session: %v", err)
 		}
 	}
 
 	// Discover both roots by scanning the socket directory.
-	roots := h.waitForManagedRoots(rootSocketDir, serverOrigin, server, 2)
+	roots := h.waitForManagedRoots(rootSocketDir, connection.effectiveOrigin, server, 2)
 	h.t.Logf("managed roots discovered: %v", roots)
 
 	// Answer each root's controlled blocking-question fixture through the server,
 	// then steer it so the event buffer advances before restart.
 	for _, root := range roots {
 		h.trackSession(root.SessionID)
-		h.answerManagedQuestion(client, serverOrigin, root.SessionID, "deterministic-answer")
-		h.postDatastar(client, serverOrigin+"/ui/sessions/"+url.PathEscape(root.SessionID)+"/steer",
-			map[string]any{"message": "Reply with exactly MANAGED_ROOT_OK."})
+		h.answerManagedQuestion(connection, root.SessionID, "deterministic-answer")
+		h.postDatastar(connection.client, connection.effectiveOrigin+"/ui/sessions/"+url.PathEscape(root.SessionID)+"/steer",
+			connection.requestIdentity(), map[string]any{"message": "Reply with exactly MANAGED_ROOT_OK."})
 	}
 
 	// --- Non-destructive server restart ---
@@ -2117,12 +2591,16 @@ func (h *liveAcceptance) runServerManaged() {
 
 	// Start a second server instance on the same config.
 	restarted := h.startProcess("managed-server-restart", h.binary, "--config", managedConfig, "server", "--listen", "127.0.0.1:0")
-	restartedOrigin, restartedClient := h.bootstrapManagedServer(restarted)
+	restartedConnection := h.connectManagedServer(restarted, resolvedServer.RequireSession, resolvedServer.Hostname)
 
 	// Assert both roots appear exactly once in the restarted fleet.
-	h.assertFleetContainsExactly(restartedClient, restartedOrigin, roots)
+	h.assertFleetContainsExactly(restartedConnection.client, restartedConnection.effectiveOrigin, roots)
 
 	// --- Exercise real controls and cleanup ---
+	// Prove server-routed active interrupt on a stable root (roots[1]) while its
+	// queue is empty, before descendant creation. roots[0] owns the descendant below.
+	h.exerciseManagedRootInterrupt(restartedConnection, roots[1])
+
 	// Have the first root create a controlled descendant deterministically through
 	// the root supervisor's /v1/sessions/{id}/children seam (the same seam that
 	// delegate_session — and pi-subagents' child spawn — uses), instead of steering
@@ -2134,19 +2612,26 @@ func (h *liveAcceptance) runServerManaged() {
 	h.trackSession(descendant.SessionID)
 	h.t.Logf("managed descendant discovered: session=%s", descendant.SessionID)
 
-	// Steer, interrupt, then answer the descendant's controlled question.
-	h.postDatastar(restartedClient, actionURL(restartedOrigin, descendant.SessionID, "steer"),
-		map[string]any{"message": "Focus on the acceptance marker."})
-	h.postDatastar(restartedClient, actionURL(restartedOrigin, descendant.SessionID, "interrupt"),
-		map[string]any{})
-	h.answerManagedQuestion(restartedClient, restartedOrigin, descendant.SessionID, "deterministic-answer")
+	// Wait for the restarted manager to atomically commit the descendant's tree
+	// and route before addressing it through the server, so the first action is
+	// not rejected for an unprojected descendant.
+	h.assertFleetContainsSession(restartedConnection.client, restartedConnection.effectiveOrigin, descendant.SessionID)
+
+	// Steer, then answer the descendant's controlled question. Active interrupt is
+	// proven separately on roots[1]; a queued steer immediately followed by abort
+	// on the same transient descendant would wait for queued work and is not part
+	// of this acceptance (see TestLiveRPCRapidControlLifecycle).
+	restartedIdentity := restartedConnection.requestIdentity()
+	h.postDatastar(restartedConnection.client, actionURL(restartedConnection.effectiveOrigin, descendant.SessionID, "steer"),
+		restartedIdentity, map[string]any{"message": "Focus on the acceptance marker."})
+	h.answerManagedQuestion(restartedConnection, descendant.SessionID, "deterministic-answer")
 
 	// Stop the descendant without stopping the root.
-	h.postDatastar(restartedClient, actionURL(restartedOrigin, descendant.SessionID, "stop"), map[string]any{})
+	h.postDatastar(restartedConnection.client, actionURL(restartedConnection.effectiveOrigin, descendant.SessionID, "stop"), restartedIdentity, map[string]any{})
 
 	// Stop both roots via the server UI.
 	for _, root := range roots {
-		h.postDatastar(restartedClient, actionURL(restartedOrigin, root.SessionID, "stop"), map[string]any{})
+		h.postDatastar(restartedConnection.client, actionURL(restartedConnection.effectiveOrigin, root.SessionID, "stop"), restartedIdentity, map[string]any{})
 	}
 
 	// Stop actions are asynchronous; wait until every session's Incus resources are
@@ -2197,41 +2682,27 @@ func (h *liveAcceptance) writeManagedConfig(rootSocketDir, sessionLogDir string)
 	eventsTable["max_events"] = int64(256)
 	eventsTable["max_bytes"] = int64(4 << 20)
 
-	// Redirect every worker to a free local model when requested, preserving
-	// each worker's administrator-owned description and thinking level. The new
-	// catalog schema requires workers to reference a model type rather than a raw
-	// provider/model, so the override points each worker at a model definition
-	// that matches the requested provider/model: either an existing model of the
-	// same provider/model (whose supported thinking levels are broadened to keep
-	// every configured worker thinking level and its default valid) or a newly
-	// added model. A single model type is added at most once, so validation's
-	// unique provider/model rule is never violated.
+	// Redirect every worker to a free local model when requested. The new catalog
+	// schema requires workers to reference a model type rather than a raw
+	// provider/model, and the local E2E provider/model realizes only the exact
+	// effective non-reasoning thinking level (off), so every redirected worker is
+	// normalized to provider/model/off and the shared target model advertises
+	// exactly that level/default. Each worker's administrator-owned description is
+	// retained; thinking is deliberately overridden because the local provider
+	// cannot realize remote reasoning effort. A single model type is reused/added
+	// at most once, so validation's unique provider/model rule is never violated.
 	if provider := strings.TrimSpace(os.Getenv("KANEDIAS_E2E_WORKER_PROVIDER")); provider != "" {
 		if model := strings.TrimSpace(os.Getenv("KANEDIAS_E2E_WORKER_MODEL")); model != "" {
-			// Union of every worker's configured thinking levels plus a safe
-			// fallback so the redirected model supports all of them.
-			levels := map[string]struct{}{}
-			for _, profile := range h.cfg.Workers {
-				if profile.ThinkingLevel != "" {
-					levels[profile.ThinkingLevel] = struct{}{}
-				}
-			}
-			if len(levels) == 0 {
-				levels["high"] = struct{}{}
-			}
-
 			modelsTable := table(document, "models")
 			modelType := ""
 			for existing, def := range h.cfg.Models {
 				if def.Provider == provider && def.Model == model {
 					if overrideModel, ok := modelsTable[existing].(map[string]any); ok {
-						// Reuse the matching model. Broaden, not replace, its levels
-						// so its configured default thinking level stays valid.
-						for _, level := range def.ThinkingLevels {
-							levels[level] = struct{}{}
-						}
+						// Reuse the matching model but advertise exactly the local
+						// non-reasoning level/default, never a broadened set.
 						modelType = existing
-						overrideModel["thinking_levels"] = sortedKeys(levels)
+						overrideModel["thinking_levels"] = []string{e2eLocalThinkingLevel}
+						overrideModel["default_thinking_level"] = e2eLocalThinkingLevel
 					}
 					break
 				}
@@ -2242,8 +2713,8 @@ func (h *liveAcceptance) writeManagedConfig(rootSocketDir, sessionLogDir string)
 					"label":                  "E2E override",
 					"provider":               provider,
 					"model":                  model,
-					"thinking_levels":        sortedKeys(levels),
-					"default_thinking_level": sortedKeys(levels)[0],
+					"thinking_levels":        []string{e2eLocalThinkingLevel},
+					"default_thinking_level": e2eLocalThinkingLevel,
 				}
 			}
 
@@ -2252,7 +2723,7 @@ func (h *liveAcceptance) writeManagedConfig(rootSocketDir, sessionLogDir string)
 				w := table(workersTable, name)
 				w["description"] = profile.Description
 				w["model_type"] = modelType
-				w["thinking_level"] = profile.ThinkingLevel
+				w["thinking_level"] = e2eLocalThinkingLevel
 			}
 		}
 	}
@@ -2268,16 +2739,6 @@ func (h *liveAcceptance) writeManagedConfig(rootSocketDir, sessionLogDir string)
 	return dest
 }
 
-// sortedKeys returns the sorted string keys of a set.
-func sortedKeys(set map[string]struct{}) []string {
-	keys := make([]string, 0, len(set))
-	for key := range set {
-		keys = append(keys, key)
-	}
-	sort.Strings(keys)
-	return keys
-}
-
 // uniqueModelType returns a model type slug that does not collide with any model
 // already present in the generated document.
 func uniqueModelType(base string, modelsTable map[string]any) string {
@@ -2290,72 +2751,140 @@ func uniqueModelType(base string, modelsTable map[string]any) string {
 	}
 }
 
-// waitForBootstrapURL polls the process log file until the "Bootstrap URL:"
-// line appears and returns the full URL including the server's origin.
-// The format is: "Bootstrap URL: /bootstrap?capability=<token>"
-func (h *liveAcceptance) waitForBootstrapURL(logPath string) (origin, bootstrapURL string) {
-	const prefix = "Bootstrap URL: "
-	const listenPrefix = "effective_address="
-	var foundOrigin, foundBootstrap string
-	h.poll(2*time.Minute, "bootstrap URL and effective address in log "+logPath, func() bool {
+type managedServerStartup struct {
+	effectiveOrigin  string
+	browserOrigin    string
+	browserAuthority string
+	bootstrapURL     string
+}
+
+func parseManagedServerStartup(text string, requireSession bool, configuredHostname string) (managedServerStartup, bool) {
+	const effectivePrefix = "effective_address="
+	var effectiveAddress, webUI, bootstrapURL string
+	for _, line := range strings.Split(text, "\n") {
+		if idx := strings.Index(line, effectivePrefix); idx >= 0 {
+			value := line[idx+len(effectivePrefix):]
+			if end := strings.IndexAny(value, " \t\r"); end >= 0 {
+				value = value[:end]
+			}
+			effectiveAddress = strings.TrimSpace(value)
+		}
+		if idx := strings.Index(line, "Web UI:"); idx >= 0 {
+			webUI = strings.TrimSpace(line[idx+len("Web UI:"):])
+		}
+		if idx := strings.Index(line, "Bootstrap URL:"); idx >= 0 {
+			bootstrapURL = strings.TrimSpace(line[idx+len("Bootstrap URL:"):])
+		}
+	}
+
+	host, port, err := net.SplitHostPort(effectiveAddress)
+	ip := net.ParseIP(host)
+	if err != nil || ip == nil || !ip.IsLoopback() || port == "" {
+		return managedServerStartup{}, false
+	}
+	effectiveAuthority := net.JoinHostPort(host, port)
+	browserHost := configuredHostname
+	if browserHost == "" {
+		browserHost = host
+	}
+	browserAuthority := net.JoinHostPort(browserHost, port)
+	startup := managedServerStartup{
+		effectiveOrigin:  "http://" + effectiveAuthority,
+		browserOrigin:    "http://" + browserAuthority,
+		browserAuthority: browserAuthority,
+	}
+	if requireSession {
+		if bootstrapURL == "" {
+			return managedServerStartup{}, false
+		}
+		startup.bootstrapURL = bootstrapURL
+		return startup, true
+	}
+	if webUI == "" {
+		return managedServerStartup{}, false
+	}
+	return startup, true
+}
+
+func normalizeManagedBootstrapURL(effectiveOrigin, advertised string) (string, error) {
+	effective, err := url.Parse(effectiveOrigin)
+	if err != nil {
+		return "", fmt.Errorf("parse effective origin: %w", err)
+	}
+	if effective.Scheme != "http" || effective.User != nil || effective.Opaque != "" ||
+		effective.Path != "" || effective.RawPath != "" || effective.RawQuery != "" ||
+		effective.ForceQuery || effective.Fragment != "" {
+		return "", fmt.Errorf("invalid effective origin %q", effectiveOrigin)
+	}
+	host, port, err := net.SplitHostPort(effective.Host)
+	ip := net.ParseIP(host)
+	if err != nil || ip == nil || !ip.IsLoopback() || port == "" {
+		return "", fmt.Errorf("effective origin is not a loopback IP authority: %q", effective.Host)
+	}
+	effective.Scheme = "http"
+	effective.Host = net.JoinHostPort(host, port)
+
+	bootstrap, err := url.Parse(advertised)
+	if err != nil {
+		return "", fmt.Errorf("parse advertised bootstrap URL: %w", err)
+	}
+	resolved := effective.ResolveReference(bootstrap)
+	resolved.Scheme = effective.Scheme
+	resolved.Host = effective.Host
+	return resolved.String(), nil
+}
+
+func (h *liveAcceptance) waitForManagedServerStartup(logPath string, requireSession bool, configuredHostname string) managedServerStartup {
+	var startup managedServerStartup
+	h.poll(2*time.Minute, "managed server startup in log "+logPath, func() bool {
 		data, err := os.ReadFile(logPath)
 		if err != nil {
 			return false
 		}
-		text := string(data)
-		if foundBootstrap == "" {
-			idx := strings.Index(text, prefix)
-			if idx != -1 {
-				rest := strings.TrimSpace(text[idx+len(prefix):])
-				if nl := strings.IndexByte(rest, '\n'); nl != -1 {
-					rest = rest[:nl]
-				}
-				foundBootstrap = strings.TrimSpace(rest)
-			}
-		}
-		if foundOrigin == "" {
-			// Extract effective_address from slog text output, e.g.:
-			//   level=INFO msg="server listening" effective_address=127.0.0.1:PORT
-			idx := strings.Index(text, listenPrefix)
-			if idx != -1 {
-				rest := text[idx+len(listenPrefix):]
-				// Value ends at whitespace or end of line.
-				end := strings.IndexAny(rest, " \t\r\n")
-				if end == -1 {
-					end = len(rest)
-				}
-				addr := strings.TrimSpace(rest[:end])
-				if addr != "" {
-					foundOrigin = "http://" + addr
-				}
-			}
-		}
-		return foundBootstrap != "" && foundOrigin != ""
+		var ready bool
+		startup, ready = parseManagedServerStartup(string(data), requireSession, configuredHostname)
+		return ready
 	})
-	return foundOrigin, foundBootstrap
+	return startup
 }
 
-// bootstrapManagedServer waits for the server process log to contain the
-// bootstrap URL, performs the bootstrap exchange, and returns an authenticated
-// HTTP client together with the server's origin (e.g. "http://127.0.0.1:PORT").
-func (h *liveAcceptance) bootstrapManagedServer(server *acceptanceProcess) (string, *http.Client) {
-	// Derive the log path from the process label (startProcess writes to label+".log").
-	// The process was started with label "managed-server" or "managed-server-restart".
+type managedServerConnection struct {
+	client           *http.Client
+	requireSession   bool
+	effectiveOrigin  string
+	browserOrigin    string
+	browserAuthority string
+}
+
+type managedRequestIdentity struct {
+	authority string
+	origin    string
+}
+
+func (c managedServerConnection) requestIdentity() managedRequestIdentity {
+	if c.requireSession {
+		return managedRequestIdentity{authority: c.browserAuthority, origin: c.browserOrigin}
+	}
+	parsed, _ := url.Parse(c.effectiveOrigin)
+	return managedRequestIdentity{authority: parsed.Host, origin: parsed.Scheme + "://" + parsed.Host}
+}
+
+// connectManagedServer waits for the selected server log and establishes a
+// mode-aware client whose cookie jar remains keyed to the effective loopback URL.
+func (h *liveAcceptance) connectManagedServer(server *acceptanceProcess, requireSession bool, configuredHostname string) managedServerConnection {
 	var logPath string
 	for _, candidate := range []string{"managed-server-restart.log", "managed-server.log"} {
 		p := filepath.Join(h.runDir, candidate)
 		if _, err := os.Stat(p); err == nil {
-			// Pick the most recently modified one that belongs to this process.
 			logPath = p
 			break
 		}
 	}
 	if logPath == "" {
-		h.t.Fatal("bootstrapManagedServer: could not locate server log file")
+		h.t.Fatal("connectManagedServer: could not locate server log file")
 	}
 
-	origin, bootstrapPath := h.waitForBootstrapURL(logPath)
-
+	startup := h.waitForManagedServerStartup(logPath, requireSession, configuredHostname)
 	jar, err := cookiejar.New(nil)
 	if err != nil {
 		h.t.Fatal(err)
@@ -2368,33 +2897,50 @@ func (h *liveAcceptance) bootstrapManagedServer(server *acceptanceProcess) (stri
 		},
 	}
 
-	// Exchange the bootstrap token.
-	bootstrapFull := origin + bootstrapPath
-	resp, err := httpClient.Get(bootstrapFull)
-	if err != nil {
-		h.t.Fatalf("bootstrap GET %s: %v", bootstrapFull, err)
+	if requireSession {
+		bootstrapURL, err := normalizeManagedBootstrapURL(startup.effectiveOrigin, startup.bootstrapURL)
+		if err != nil {
+			h.t.Fatalf("normalize managed bootstrap URL: %v", err)
+		}
+		req, err := http.NewRequest(http.MethodGet, bootstrapURL, nil)
+		if err != nil {
+			h.t.Fatalf("build bootstrap GET %s: %v", bootstrapURL, err)
+		}
+		req.Host = startup.browserAuthority
+		resp, err := httpClient.Do(req)
+		if err != nil {
+			h.t.Fatalf("bootstrap GET %s: %v", bootstrapURL, err)
+		}
+		_ = resp.Body.Close()
+		if resp.StatusCode != http.StatusSeeOther {
+			h.t.Fatalf("bootstrap status = %d, want 303", resp.StatusCode)
+		}
 	}
-	_ = resp.Body.Close()
-	if resp.StatusCode != http.StatusSeeOther {
-		h.t.Fatalf("bootstrap status = %d, want 303", resp.StatusCode)
-	}
-	// Follow the redirect to / to ensure cookie is set.
-	indexResp, err := httpClient.Get(origin + "/")
+
+	indexReq, err := http.NewRequest(http.MethodGet, startup.effectiveOrigin+"/", nil)
 	if err != nil {
-		h.t.Fatalf("GET / after bootstrap: %v", err)
+		h.t.Fatalf("build managed GET /: %v", err)
+	}
+	if requireSession {
+		indexReq.Host = startup.browserAuthority
+	}
+	indexResp, err := httpClient.Do(indexReq)
+	if err != nil {
+		h.t.Fatalf("managed GET /: %v", err)
 	}
 	_ = indexResp.Body.Close()
 	if indexResp.StatusCode != http.StatusOK {
 		h.t.Fatalf("GET / status = %d, want 200", indexResp.StatusCode)
 	}
 
-	// Reset the server log after bootstrap so that a subsequent call to
-	// bootstrapManagedServer (for the restarted server) finds the new URL.
-	// We achieve this by removing the stale log and letting startProcess create
-	// a fresh one for the restarted label.
-	_ = server // used by caller to stop the process; no additional action needed.
-
-	return origin, httpClient
+	_ = server
+	return managedServerConnection{
+		client:           httpClient,
+		requireSession:   requireSession,
+		effectiveOrigin:  startup.effectiveOrigin,
+		browserOrigin:    startup.browserOrigin,
+		browserAuthority: startup.browserAuthority,
+	}
 }
 
 const maxNewSessionResponseBytes = 64 << 10
@@ -2402,23 +2948,18 @@ const maxNewSessionResponseBytes = 64 << 10
 // postNewSession sends the direct JSON New Session contract with the browser's
 // same-origin write-boundary headers. It accepts only the endpoint's exact 201
 // response and strictly decodes a bounded, nonempty session ID.
-func postNewSession(client *http.Client, fullURL string, body any) (string, error) {
+func postNewSession(client *http.Client, fullURL string, identity managedRequestIdentity, body any) (string, error) {
 	encoded, err := json.Marshal(body)
 	if err != nil {
 		return "", fmt.Errorf("marshal body: %w", err)
 	}
-	parsed, err := url.Parse(fullURL)
-	if err != nil {
-		return "", fmt.Errorf("parse URL %q: %w", fullURL, err)
-	}
-	origin := parsed.Scheme + "://" + parsed.Host
 	req, err := http.NewRequest(http.MethodPost, fullURL, bytes.NewReader(encoded))
 	if err != nil {
 		return "", fmt.Errorf("new request: %w", err)
 	}
-	req.Host = parsed.Host
+	req.Host = identity.authority
 	req.Header.Set("Content-Type", "application/json")
-	req.Header.Set("Origin", origin)
+	req.Header.Set("Origin", identity.origin)
 	req.Header.Set("Sec-Fetch-Site", "same-origin")
 
 	resp, err := client.Do(req)
@@ -2461,23 +3002,18 @@ func postNewSession(client *http.Client, fullURL string, body any) (string, erro
 
 // postDatastar sends a write-boundary-compliant POST to a server action URL.
 // It sets Origin, Sec-Fetch-Site, and Content-Type exactly as the browser would.
-func (h *liveAcceptance) postDatastar(client *http.Client, fullURL string, body any) {
+func (h *liveAcceptance) postDatastar(client *http.Client, fullURL string, identity managedRequestIdentity, body any) {
 	encoded, err := json.Marshal(body)
 	if err != nil {
 		h.t.Fatalf("postDatastar: marshal body: %v", err)
 	}
-	parsed, err := url.Parse(fullURL)
-	if err != nil {
-		h.t.Fatalf("postDatastar: parse URL %q: %v", fullURL, err)
-	}
-	origin := parsed.Scheme + "://" + parsed.Host
 	req, err := http.NewRequest(http.MethodPost, fullURL, bytes.NewReader(encoded))
 	if err != nil {
 		h.t.Fatalf("postDatastar: new request: %v", err)
 	}
-	req.Host = parsed.Host
+	req.Host = identity.authority
 	req.Header.Set("Content-Type", "application/json")
-	req.Header.Set("Origin", origin)
+	req.Header.Set("Origin", identity.origin)
 	req.Header.Set("Sec-Fetch-Site", "same-origin")
 
 	resp, err := client.Do(req)
@@ -2593,8 +3129,197 @@ func (h *liveAcceptance) assertProcessAlive(pid int) {
 	}
 }
 
-// assertFleetContainsExactly polls the server fleet endpoint until all expected
-// root session IDs appear and no duplicates exist.
+// fleetStreamContainsPatch scans a Datastar SSE fleet response and evaluates one
+// complete replacement snapshot at a time against match. The manager publishes a
+// fleet revision after every configured root snapshot, so a healthy response can
+// contain several valid full fleet-panel replacement events; the matcher must be
+// judged per complete event rather than across the whole stream.
+func fleetStreamContainsPatch(r io.Reader, match func(string) bool) (bool, error) {
+	scanner := bufio.NewScanner(r)
+	scanner.Buffer(make([]byte, 64*1024), 1<<20) // bounded 1 MiB per token
+	var current strings.Builder
+	isFleetEvent := false
+	for scanner.Scan() {
+		line := scanner.Text()
+		if line == "" {
+			// Blank line terminates the current SSE event.
+			if isFleetEvent && match(current.String()) {
+				return true, nil
+			}
+			current.Reset()
+			isFleetEvent = false
+			continue
+		}
+		if line == fleetSSEEventType {
+			isFleetEvent = true
+		}
+		current.WriteString(line)
+		current.WriteString("\n")
+	}
+	if err := scanner.Err(); err != nil {
+		return false, err
+	}
+	// A final event may omit its trailing blank line at EOF.
+	if isFleetEvent && current.Len() > 0 && match(current.String()) {
+		return true, nil
+	}
+	return false, nil
+}
+
+// fleetSSEEventType is the exact Datastar event type that carries fleet-panel
+// replacement patches. Exact equality (not prefix) fails closed against a
+// collision event whose type merely begins with the same bytes.
+const fleetSSEEventType = "event: datastar-patch-elements"
+
+// fleetStreamContainsExactly scans a Datastar SSE fleet response and validates
+// one complete replacement snapshot at a time.
+func fleetStreamContainsExactly(r io.Reader, roots []managedRoot) (bool, error) {
+	return fleetStreamContainsPatch(r, func(event string) bool { return fleetPatchMatches(event, roots) })
+}
+
+// fleetStreamContainsSession scans a Datastar SSE fleet response and reports
+// whether one complete patch contains the given session row marker exactly once.
+func fleetStreamContainsSession(r io.Reader, sessionID string) (bool, error) {
+	if sessionID == "" {
+		return false, errors.New("session ID must not be empty")
+	}
+	marker := `data-session-id="` + sessionID + `"`
+	return fleetStreamContainsPatch(r, func(event string) bool {
+		return strings.Count(event, marker) == 1
+	})
+}
+
+// fleetPatchMatches reports whether one complete fleet-panel patch contains the
+// exact expected root set. The top-level <details> emits data-root once per root;
+// counting the total markers plus each expected marker independently rejects
+// missing, duplicated, and unexpected roots within a single snapshot.
+func fleetPatchMatches(event string, roots []managedRoot) bool {
+	const marker = `data-root="`
+	if strings.Count(event, marker) != len(roots) {
+		return false
+	}
+	for _, root := range roots {
+		if strings.Count(event, marker+root.SessionID+`"`) != 1 {
+			return false
+		}
+	}
+	return true
+}
+
+// managedDescendantFromTree selects the single direct read/fresh child of a root
+// tree when it is bound and observably running. This is stricter than the general
+// controllable-child check because the managed control sequence requires active
+// work, not merely a ready transport.
+func managedDescendantFromTree(tree supervisor.NodeSnapshot) (supervisor.NodeSnapshot, bool) {
+	if len(tree.Children) != 1 {
+		return supervisor.NodeSnapshot{}, false
+	}
+	child := tree.Children[0]
+	if !isControllableChildSnapshot(child, contract.ChildKindRead, contract.ContextFresh) {
+		return supervisor.NodeSnapshot{}, false
+	}
+	if child.Lifecycle != string(supervisor.LifecycleRunning) {
+		return supervisor.NodeSnapshot{}, false
+	}
+	return child, true
+}
+
+// managedSessionControlState extracts the exact isStreaming and pendingMessageCount
+// fields from a raw JSON get_state response map. It requires success=true, an
+// object data, a boolean isStreaming, and a finite nonnegative integral
+// pendingMessageCount representable as int. It never stringifies or retains the
+// private response content in a failure/diagnostic form.
+func managedSessionControlState(response map[string]any) (streaming bool, pending int, ok bool) {
+	if response == nil {
+		return false, 0, false
+	}
+	success, isBool := response["success"].(bool)
+	if !isBool || !success {
+		return false, 0, false
+	}
+	data, isObj := response["data"].(map[string]any)
+	if !isObj {
+		return false, 0, false
+	}
+	streaming, isStream := data["isStreaming"].(bool)
+	if !isStream {
+		return false, 0, false
+	}
+	count, countOK := managedPendingCountFloat(data["pendingMessageCount"])
+	const maxIntAsFloat = float64(1 << 62)
+	if !countOK || count < 0 || count != math.Trunc(count) || count > maxIntAsFloat {
+		return false, 0, false
+	}
+	return streaming, int(count), true
+}
+
+// managedPendingCountFloat coerces a JSON-decoded numeric value to float64 when
+// it is a finite numeric type, reporting ok=false for nil, strings, bools, and
+// other non-numeric shapes.
+func managedPendingCountFloat(raw interface{}) (float64, bool) {
+	switch value := raw.(type) {
+	case float64:
+		return value, true
+	case json.Number:
+		f, err := value.Float64()
+		if err != nil {
+			return 0, false
+		}
+		return f, true
+	case int:
+		return float64(value), true
+	case int64:
+		return float64(value), true
+	case uint64:
+		return float64(value), true
+	default:
+		return 0, false
+	}
+}
+
+// waitManagedSessionControlState polls the direct supervisor until get_state
+// reports exactly the requested isStreaming and pendingMessageCount values. It
+// never logs the raw response and never retries a control action.
+func (h *liveAcceptance) waitManagedSessionControlState(client *http.Client, sessionID string, wantStreaming bool, wantPending int, description string) {
+	h.poll(2*time.Minute, description, func() bool {
+		var response map[string]any
+		if unixJSON(client, http.MethodPost, "/v1/sessions/"+sessionID+"/rpc", map[string]any{"type": "get_state"}, &response) != nil {
+			return false
+		}
+		streaming, pending, ok := managedSessionControlState(response)
+		return ok && streaming == wantStreaming && pending == wantPending
+	})
+}
+
+// exerciseManagedRootInterrupt proves server-routed interrupt of an actively
+// streaming managed root without queued work. It waits for the root to be idle
+// with zero pending messages, sends exactly one server steer while idle (so the
+// manager emits a Pi prompt, not a queued steer), waits for streaming with zero
+// pending messages, sends exactly one server interrupt, then waits for idle with
+// zero pending messages. No control action is retried. This is the split coverage
+// that avoids conflating an ordinary managed-control interrupt with the dedicated
+// rapid-control queue semantics (deep descendant interrupt remains covered by
+// TestLiveRPCInterruptLifecycle; queued steer-to-abort by TestLiveRPCRapidControlLifecycle).
+func (h *liveAcceptance) exerciseManagedRootInterrupt(connection managedServerConnection, root managedRoot) {
+	direct := unixHTTPClient(root.SocketPath)
+	h.trackSession(root.SessionID)
+
+	h.waitManagedSessionControlState(direct, root.SessionID, false, 0, "managed root "+root.SessionID+" idle before interrupt")
+
+	identity := connection.requestIdentity()
+	h.postDatastar(connection.client, actionURL(connection.effectiveOrigin, root.SessionID, "steer"),
+		identity, map[string]any{"message": lifecycleActiveReadTask("KANEDIAS_E2E_MANAGED_ROOT_INTERRUPT")})
+
+	h.waitManagedSessionControlState(direct, root.SessionID, true, 0, "managed root "+root.SessionID+" streaming with empty queue before interrupt")
+
+	h.postDatastar(connection.client, actionURL(connection.effectiveOrigin, root.SessionID, "interrupt"),
+		identity, map[string]any{})
+
+	h.waitManagedSessionControlState(direct, root.SessionID, false, 0, "managed root "+root.SessionID+" idle after interrupt")
+}
+
+// assertFleetContainsExactly polls the server fleet endpoint until one complete
+// SSE snapshot contains exactly the expected root set.
 func (h *liveAcceptance) assertFleetContainsExactly(client *http.Client, serverOrigin string, roots []managedRoot) {
 	h.poll(30*time.Second, "restarted fleet contains all managed roots", func() bool {
 		ctx, cancel := context.WithTimeout(h.ctx, 5*time.Second)
@@ -2607,27 +3332,36 @@ func (h *liveAcceptance) assertFleetContainsExactly(client *http.Client, serverO
 		if err != nil {
 			return false
 		}
-		var buf bytes.Buffer
-		scanner := bufio.NewScanner(resp.Body)
-		for scanner.Scan() {
-			buf.WriteString(scanner.Text())
-		}
-		_ = resp.Body.Close()
-		body := buf.String()
-		for _, root := range roots {
-			// data-root is emitted once on the top-level <details>; counting that
-			// stable marker avoids false positives from repeated text/data fields.
-			marker := `data-root="` + root.SessionID + `"`
-			if strings.Count(body, marker) != 1 {
-				return false
-			}
-		}
-		return true
+		defer resp.Body.Close()
+		matched, err := fleetStreamContainsExactly(resp.Body, roots)
+		return matched && err == nil
 	})
 }
 
-// waitForManagedDescendant polls the root socket until a descendant session
-// appears in the tree and returns the first child's snapshot.
+// assertFleetContainsSession polls the server fleet endpoint until one complete
+// SSE snapshot contains the given descendant's data-session-id row marker exactly
+// once. Seeing the descendant row proves the manager atomically committed both the
+// descendant's tree and its route, so a subsequent server action can reach it.
+func (h *liveAcceptance) assertFleetContainsSession(client *http.Client, serverOrigin, sessionID string) {
+	h.poll(30*time.Second, "managed descendant in restarted fleet "+sessionID, func() bool {
+		ctx, cancel := context.WithTimeout(h.ctx, 5*time.Second)
+		defer cancel()
+		req, err := http.NewRequestWithContext(ctx, http.MethodGet, serverOrigin+"/ui/fleet", nil)
+		if err != nil {
+			return false
+		}
+		resp, err := client.Do(req)
+		if err != nil {
+			return false
+		}
+		defer resp.Body.Close()
+		matched, err := fleetStreamContainsSession(resp.Body, sessionID)
+		return matched && err == nil
+	})
+}
+
+// waitForManagedDescendant polls the root socket until the root tree contains
+// exactly one running, bound read/fresh descendant and returns it.
 func (h *liveAcceptance) waitForManagedDescendant(rootSocketPath, rootSessionID string) supervisor.NodeSnapshot {
 	var child supervisor.NodeSnapshot
 	uc := unixHTTPClient(rootSocketPath)
@@ -2636,11 +3370,12 @@ func (h *liveAcceptance) waitForManagedDescendant(rootSocketPath, rootSessionID 
 		if unixJSON(uc, http.MethodGet, "/v1/tree", nil, &tree) != nil {
 			return false
 		}
-		if len(tree.Children) == 0 {
+		got, ok := managedDescendantFromTree(tree)
+		if !ok {
 			return false
 		}
-		child = tree.Children[0]
-		return child.SessionID != ""
+		child = got
+		return true
 	})
 	return child
 }
@@ -2662,7 +3397,7 @@ func (h *liveAcceptance) presentControlledQuestion(client *http.Client, sessionI
 	h.rpc(client, sessionID, map[string]any{"type": "prompt", "message": "/present_e2e_question"})
 }
 
-func (h *liveAcceptance) answerManagedQuestion(client *http.Client, serverOrigin, sessionID, answer string) {
+func (h *liveAcceptance) answerManagedQuestion(connection managedServerConnection, sessionID, answer string) {
 	// Resolve the managed root socket that owns this session, then deterministically
 	// trigger the controlled question through it.
 	sockPath := h.managedSocketForSession(sessionID)
@@ -2691,8 +3426,8 @@ func (h *liveAcceptance) answerManagedQuestion(client *http.Client, serverOrigin
 		}
 		return false
 	})
-	h.postDatastar(client, serverOrigin+"/ui/sessions/"+url.PathEscape(sessionID)+"/questions/"+url.PathEscape(question.ID),
-		map[string]any{"value": answer})
+	h.postDatastar(connection.client, connection.effectiveOrigin+"/ui/sessions/"+url.PathEscape(sessionID)+"/questions/"+url.PathEscape(question.ID),
+		connection.requestIdentity(), map[string]any{"value": answer})
 }
 
 // managedSocketForSession returns the managed root socket path whose tree contains
