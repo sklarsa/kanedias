@@ -58,6 +58,9 @@ func unsupportedImageError(err error) error {
 // materializing files on disk. It does not return until the complete multipart
 // stream has been validated.
 func decodeMessageRequest(w http.ResponseWriter, r *http.Request) (messageRequest, error) {
+	if r.ContentLength > maxMessageMultipartBytes {
+		return messageRequest{}, classifyMultipartReadError(&http.MaxBytesError{Limit: maxMessageMultipartBytes})
+	}
 	r.Body = http.MaxBytesReader(w, r.Body, maxMessageMultipartBytes)
 	reader, err := r.MultipartReader()
 	if err != nil {
@@ -70,6 +73,9 @@ func decodeMessageRequest(w http.ResponseWriter, r *http.Request) (messageReques
 	for {
 		part, nextErr := reader.NextPart()
 		if errors.Is(nextErr, io.EOF) {
+			if _, drainErr := io.Copy(io.Discard, r.Body); drainErr != nil {
+				return messageRequest{}, classifyMultipartReadError(drainErr)
+			}
 			break
 		}
 		if nextErr != nil {

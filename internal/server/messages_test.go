@@ -286,6 +286,68 @@ func TestMessageEndpointAcceptsValidUpload(t *testing.T) {
 	}
 }
 
+func TestMessageEndpointRejectsOverLimitEpilogue(t *testing.T) {
+	tmpDir := t.TempDir()
+	t.Setenv("TMPDIR", tmpDir)
+	contentType, prefix := multipartMessage(t, "hello")
+	body := append(append([]byte(nil), prefix...), bytes.Repeat([]byte("e"), maxMessageMultipartBytes-len(prefix)+1)...)
+	wantBody := `{"accepted":false,"error":"The image attachment limits were exceeded."}`
+
+	for _, test := range []struct {
+		name          string
+		contentLength int64
+		chunked       bool
+	}{
+		{name: "known content length", contentLength: int64(len(body))},
+		{name: "unknown content length", contentLength: -1, chunked: true},
+	} {
+		t.Run(test.name, func(t *testing.T) {
+			fleet := newStreamFakeFleet()
+			handler, cookie := mustNewHandlerWithFleetAuth(t, fleet)
+			r := httptest.NewRequest(http.MethodPost, "/ui/sessions/session-1/messages", bytes.NewReader(body))
+			r.Host = effectiveAddrForTests
+			r.Header.Set("Content-Type", contentType)
+			r.ContentLength = test.contentLength
+			if test.chunked {
+				r.TransferEncoding = []string{"chunked"}
+			}
+			r.AddCookie(cookie)
+			response := httptest.NewRecorder()
+			handler.ServeHTTP(response, r)
+
+			if response.Code != http.StatusRequestEntityTooLarge || response.Body.String() != wantBody {
+				t.Fatalf("response = %d %q, want %d %q", response.Code, response.Body.String(), http.StatusRequestEntityTooLarge, wantBody)
+			}
+			if fleet.sentMessage.sessionID != "" {
+				t.Fatalf("manager called for over-limit epilogue: %#v", fleet.sentMessage)
+			}
+		})
+	}
+
+	entries, err := os.ReadDir(tmpDir)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(entries) != 0 {
+		t.Fatalf("over-limit epilogue handling created temporary files: %v", entries)
+	}
+}
+
+func TestMessageEndpointAcceptsBoundedEpilogue(t *testing.T) {
+	fleet := newStreamFakeFleet()
+	handler, cookie := mustNewHandlerWithFleetAuth(t, fleet)
+	contentType, prefix := multipartMessage(t, "hello")
+	body := append(append([]byte(nil), prefix...), []byte("small legal multipart epilogue")...)
+
+	response := serveMultipartMessage(t, handler, cookie, "session-1", contentType, body)
+	if response.Code != http.StatusAccepted || response.Body.String() != `{"accepted":true}` {
+		t.Fatalf("response = %d %q", response.Code, response.Body.String())
+	}
+	if fleet.sentMessage.sessionID != "session-1" || fleet.sentMessage.message != "hello" {
+		t.Fatalf("sent message = %#v", fleet.sentMessage)
+	}
+}
+
 func TestMessageEndpointMapsDecodeFailures(t *testing.T) {
 	tests := []struct {
 		name        string
