@@ -47,6 +47,7 @@ Recovery continues to run only after the exact admitted child process exits. The
 - Existing TERM/KILL escalation and exact-ticket recovery on a wedged terminal child.
 - Automated process-level, supervisor-level, race, full-suite, lint, build, and live delegation validation.
 - Any narrowly required comments or architecture-document corrections.
+- The approved validation-blocker correction described below, which is required to start a manual root on current `origin/main` and execute the live regression.
 
 ### Out of scope
 
@@ -118,6 +119,12 @@ make build
 ```
 
 Run the narrow live Incus supervisor delegation test or acceptance target that exercises a real read child, terminal acknowledgement, process exit, socket removal, registry removal, and root `/v1/tree` recovery. The live test must use disposable resources and retain diagnostic evidence if environmental prerequisites prevent execution.
+
+## Approved Validation-Blocker Addendum
+
+Live validation against the rebased branch exposed a root-startup regression introduced on current `origin/main`, before child delegation or the liveness fix ran. `newSessionCommand` stores the absent `--status-fd` as a nil `*onceFile`, then assigns that pointer to the `io.WriteCloser` field `SessionOptions.RootStatus`. The resulting interface is non-nil. After a successful root start, `runSupervisorWithBrokerFactory` therefore tries to encode startup status through the nil pointer, panics, and leaves the already-provisioned root resources behind.
+
+Normalize the optional writer at the command boundary: assign `SessionOptions.RootStatus` only when the concrete `*onceFile` is non-nil. Preserve the interface type and the existing idempotent descriptor ownership for real status descriptors. Add a command-level regression proving a direct `session` invocation without `--status-fd` forwards a genuinely nil `RootStatus`, while existing descriptor-forwarding and closure tests preserve the inherited-manager path. This adjacent correction is approved because it is necessary to execute the required live lifecycle validation and prevents a real root-startup resource leak.
 
 ## Alternatives Rejected
 

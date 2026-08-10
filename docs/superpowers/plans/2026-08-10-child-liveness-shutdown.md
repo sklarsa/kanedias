@@ -28,6 +28,8 @@
 - `internal/supervisor/node.go` — creates a child, acknowledges its terminal report, and synchronously reaps it.
 - `internal/supervisor/children_test.go` — supervisor-level regression for bounded post-terminal escalation, recovery, and registry removal.
 - `docs/architecture/session-supervisor.md` — records the pollable liveness and bounded terminal-settlement invariants.
+- `cmd/session.go` — preserves nil semantics for the optional inherited root startup-status writer.
+- `cmd/session_test.go` — covers direct root startup without a status descriptor.
 
 ### Task 1: Make Normal Child Completion Interrupt the Liveness Read
 
@@ -268,9 +270,55 @@ git add internal/supervisor/node.go internal/supervisor/children_test.go docs/ar
 git commit -m "fix: bound terminal child settlement"
 ```
 
+### Task 3: Preserve Optional Root Startup-Status Nil Semantics
+
+**Files:**
+- Modify: `cmd/session_test.go`
+- Modify: `cmd/session.go`
+
+**Interfaces:**
+- Consumes: optional hidden `--status-fd`; `SessionOptions.RootStatus io.WriteCloser`.
+- Produces: a genuinely nil `RootStatus` when no status descriptor is inherited; unchanged ownership and idempotent closure when it is present.
+
+- [ ] **Step 1: Add a direct-session regression**
+
+Add a focused command test that runs `session --socket /tmp/root.sock` without `--status-fd`, captures `SessionOptions`, and requires `options.RootStatus == nil` inside the `runSupervisor` stub.
+
+- [ ] **Step 2: Run the exact test and verify RED**
+
+Run:
+
+```bash
+go test ./cmd -run '^TestSessionWithoutStatusDescriptorPassesNilRootStatus$' -count=1 -v
+```
+
+Expected: FAIL because assigning the nil concrete `*onceFile` to `SessionOptions.RootStatus` creates a non-nil interface.
+
+- [ ] **Step 3: Normalize the optional writer at the command boundary**
+
+Before constructing `SessionOptions`, copy `rootStatus` into an `io.WriteCloser` only when the concrete pointer is non-nil. Pass that normalized interface to `RootStatus`. Do not change the inherited descriptor validation, ownership, close-on-exec, or idempotent-close behavior.
+
+- [ ] **Step 4: Verify focused GREEN and existing descriptor behavior**
+
+Run:
+
+```bash
+go test ./cmd -run 'TestSessionWithoutStatusDescriptorPassesNilRootStatus|TestSessionStartupDescriptorsCloseOnRuntimeError|TestSessionStartupDescriptorsCloseOnBootstrapDecodeError' -count=1 -v
+go test ./cmd -count=1
+```
+
+Expected: PASS.
+
+- [ ] **Step 5: Commit Task 3**
+
+```bash
+git add cmd/session.go cmd/session_test.go docs/superpowers/specs/2026-08-10-child-liveness-shutdown-design.md docs/superpowers/plans/2026-08-10-child-liveness-shutdown.md
+git commit -m "fix: preserve optional root startup status"
+```
+
 ## Final Verification
 
-After both task reviews are clean, run from the final branch state:
+After all task reviews are clean, run from the final branch state:
 
 ```bash
 gofmt -w internal/supervisor/process/liveness.go internal/supervisor/process/process_test.go internal/supervisor/node.go internal/supervisor/children_test.go

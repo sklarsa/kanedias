@@ -131,12 +131,16 @@ func newSessionCommand(service services, configPath func() string) *cobra.Comman
 					return fmt.Errorf("resolve default session model policy: %w", err)
 				}
 			}
+			var rootStatusWriter io.WriteCloser
+			if rootStatus != nil {
+				rootStatusWriter = rootStatus
+			}
 			return service.runSupervisor(cmd.Context(), cfg, SessionOptions{
 				SocketPath: socketPath,
 				ConfigPath: absoluteConfig,
 				Policy:     policy,
 				Workspace:  workspace,
-				RootStatus: rootStatus,
+				RootStatus: rootStatusWriter,
 			}, cmd.OutOrStdout())
 		},
 	}
