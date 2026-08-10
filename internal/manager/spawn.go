@@ -482,6 +482,12 @@ func (m *Manager) commitSpawn(pending *pendingRoot, snapshot supervisor.NodeSnap
 	if err != nil {
 		return "", fmt.Errorf("spawn admission route conflict: %w", err)
 	}
+	// The normalized pending name becomes durable only after successful tree
+	// admission. Set it on the committed handle (which may have been reused by a
+	// concurrent same-socket discovery) under the manager lock.
+	m.mu.Lock()
+	res.handle.name = pending.name
+	m.mu.Unlock()
 	// Transfer client ownership — pending.client is now owned by the committed
 	// handle (unless commitTree reused an existing handle and closed our client).
 	pending.client = nil

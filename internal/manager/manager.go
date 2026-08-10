@@ -15,6 +15,7 @@ import (
 	"time"
 
 	"github.com/sklarsa/kanedias/internal/supervisor"
+	"github.com/sklarsa/kanedias/internal/supervisor/contract"
 	"github.com/sklarsa/kanedias/internal/supervisorapi"
 )
 
@@ -291,6 +292,7 @@ func (m *Manager) Fleet() FleetSnapshot {
 		}
 		roots = append(roots, RootState{
 			RootSessionID:   handle.rootID,
+			Name:            handle.name,
 			Tree:            handle.tree,
 			Stale:           handle.stale,
 			StreamConnected: handle.streamConnected,
@@ -340,6 +342,7 @@ func (m *Manager) Session(sessionID string) (SessionState, error) {
 	}
 	state := SessionState{
 		RootSessionID:   rootID,
+		RootName:        handle.name,
 		Node:            node,
 		RootStale:       handle.stale,
 		StreamConnected: handle.streamConnected,
@@ -350,6 +353,47 @@ func (m *Manager) Session(sessionID string) (SessionState, error) {
 	}
 	m.mu.Unlock()
 	return state, nil
+}
+
+// RenameRoot changes only the manager-owned optional display name for an
+// admitted root. Session IDs remain the immutable routing and action identity.
+func (m *Manager) RenameRoot(sessionID, name string) error {
+	normalized, err := m.launch.resolveName(name)
+	if err != nil {
+		return contractErr(err)
+	}
+
+	m.mu.Lock()
+	rootID, ok := m.routes[sessionID]
+	if !ok {
+		m.mu.Unlock()
+		return errors.Join(errNotFound, contract.NewError(contract.ErrorNotFound, "session not found"))
+	}
+	if sessionID != rootID {
+		m.mu.Unlock()
+		return contract.NewError(contract.ErrorInvalidRequest, "only a root session can be renamed")
+	}
+	var handle *rootHandle
+	for _, candidate := range m.roots {
+		if candidate.rootID == rootID {
+			handle = candidate
+			break
+		}
+	}
+	if handle == nil {
+		m.mu.Unlock()
+		return errors.Join(errNotFound, contract.NewError(contract.ErrorNotFound, "root session not found"))
+	}
+	if handle.name == normalized {
+		m.mu.Unlock()
+		return nil
+	}
+	handle.name = normalized
+	m.mu.Unlock()
+
+	m.bumpFleetRevision()
+	m.bumpSessionRevision()
+	return nil
 }
 
 func findNode(snapshot supervisor.NodeSnapshot, sessionID string) (supervisor.NodeSnapshot, bool) {

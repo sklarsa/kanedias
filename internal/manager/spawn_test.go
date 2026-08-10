@@ -1055,3 +1055,118 @@ func TestAdmittedRootSurvivesManagerClose(t *testing.T) {
 		}
 	}
 }
+
+func TestSpawnRootNameCommitsOnlyAfterSuccessfulAdmission(t *testing.T) {
+	m := fakeManager(nil)
+	pending := &pendingRoot{
+		socketPath: "/tmp/named-spawn.root.sock",
+		identity:   socketIdentity{dev: 7, ino: 1},
+		client:     &fakeClient{snapshot: rootTree("spawned")},
+		rootID:     "spawned",
+		name:       "Normalized Name",
+	}
+	if len(m.roots) != 0 {
+		t.Fatal("pending launch created a handle before admission")
+	}
+
+	rootID, err := m.commitSpawn(pending, rootTree("spawned"))
+	if err != nil {
+		t.Fatalf("commitSpawn: %v", err)
+	}
+	if rootID != "spawned" {
+		t.Fatalf("rootID = %q, want spawned", rootID)
+	}
+	fleet := m.Fleet()
+	if len(fleet.Roots) != 1 || fleet.Roots[0].Name != "Normalized Name" {
+		t.Fatalf("admitted root name = %#v", fleet.Roots)
+	}
+
+	ctx, cancel := context.WithTimeout(context.Background(), time.Second)
+	defer cancel()
+	if err := m.Close(ctx); err != nil {
+		t.Fatal(err)
+	}
+}
+
+func TestSpawnRootFailedAdmissionLeavesNoHandleOrName(t *testing.T) {
+	m := fakeManager(nil)
+	existingChild := childTree("shared", "existing")
+	existingChild.RootSessionID = "existing"
+	existingTree := rootTree("existing", existingChild)
+	normalized, routes, err := validateRootTree(existingTree)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err := m.commitTree(&rootHandle{
+		socketPath: "/tmp/existing.root.sock",
+		rootID:     "existing",
+		identity:   socketIdentity{dev: 8, ino: 1},
+		actionable: true,
+	}, normalized, routes); err != nil {
+		t.Fatal(err)
+	}
+	pending := &pendingRoot{
+		socketPath: "/tmp/rejected.root.sock",
+		identity:   socketIdentity{dev: 8, ino: 2},
+		client:     &fakeClient{},
+		rootID:     "rejected",
+		name:       "Must Not Leak",
+	}
+	rejectedChild := childTree("shared", "rejected")
+	rejectedChild.RootSessionID = "rejected"
+	rejectedTree := rootTree("rejected", rejectedChild)
+	if _, err := m.commitSpawn(pending, rejectedTree); err == nil {
+		t.Fatal("conflicting spawn admission succeeded")
+	}
+	fleet := m.Fleet()
+	if len(fleet.Roots) != 1 || fleet.Roots[0].RootSessionID != "existing" || fleet.Roots[0].Name != "" {
+		t.Fatalf("failed admission leaked handle/name: %#v", fleet.Roots)
+	}
+}
+
+func TestSpawnRootConcurrentSameSocketReuseReceivesName(t *testing.T) {
+	m := fakeManager(nil)
+	pending := &pendingRoot{
+		socketPath: "/tmp/reused-name.root.sock",
+		identity:   socketIdentity{dev: 9, ino: 1},
+		client:     &fakeClient{snapshot: rootTree("spawned")},
+		rootID:     "spawned",
+		name:       "Launch Name",
+	}
+	m.afterCommitSpawnHook = func(committed *rootHandle) {
+		m.mu.Lock()
+		if committed.name != "Launch Name" {
+			t.Errorf("name at reuse window = %q, want Launch Name", committed.name)
+		}
+		m.mu.Unlock()
+		discoveryHandle := &rootHandle{
+			socketPath: committed.socketPath,
+			rootID:     committed.rootID,
+			identity:   committed.identity,
+			actionable: true,
+			client:     &fakeClient{snapshot: rootTree("spawned")},
+		}
+		res, err := m.commitTree(discoveryHandle, rootTree("spawned"), map[string]string{"spawned": "spawned"})
+		if err != nil {
+			t.Errorf("same-socket discovery commit: %v", err)
+			return
+		}
+		if res.handle != committed {
+			t.Error("same-socket discovery did not reuse spawned handle")
+		}
+		m.monitorRoot(res.handle)
+	}
+
+	if _, err := m.commitSpawn(pending, rootTree("spawned")); err != nil {
+		t.Fatalf("commitSpawn: %v", err)
+	}
+	if got := m.Fleet().Roots[0].Name; got != "Launch Name" {
+		t.Fatalf("name after same-socket reuse = %q, want Launch Name", got)
+	}
+
+	ctx, cancel := context.WithTimeout(context.Background(), time.Second)
+	defer cancel()
+	if err := m.Close(ctx); err != nil {
+		t.Fatal(err)
+	}
+}

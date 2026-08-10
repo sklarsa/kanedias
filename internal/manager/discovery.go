@@ -24,7 +24,7 @@ var (
 // rootHandle is the manager's in-memory record for one admitted root socket.
 //
 // Concurrency invariant: every mutable field below (client, identity, rootID,
-// actionable, tree, stale, streamConnected, mirror, monitoring, ctx/cancel) is
+// name, actionable, tree, stale, streamConnected, mirror, monitoring, ctx/cancel) is
 // guarded by Manager.mu. The monitor loops (snapshotLoop/eventLoop) MUST read
 // handle.client — and any other mutable field they touch — only while holding
 // m.mu; they snapshot the pointer under the lock and use the snapshot for the
@@ -35,6 +35,7 @@ var (
 type rootHandle struct {
 	socketPath      string
 	rootID          string
+	name            string
 	identity        socketIdentity
 	tree            supervisor.NodeSnapshot
 	mirror          *eventMirror
