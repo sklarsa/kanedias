@@ -46,6 +46,7 @@ type rootClient interface {
 	StopInstance(context.Context, string, bool) error
 	DeleteInstance(context.Context, string) error
 	GetInstanceState(context.Context, string) (*api.InstanceState, error)
+	Exec(context.Context, string, incusclient.ExecRequest) (string, string, error)
 }
 
 type rootDependencies struct {
@@ -103,6 +104,9 @@ func defaultRootDependencies() rootDependencies {
 
 func (provisioner *IncusRootProvisioner) ProvisionRoot(ctx context.Context, request RootRequest) (_ *Resources, err error) {
 	if err := validateRootModel(request.Model); err != nil {
+		return nil, contract.NewError(contract.ErrorInvalidRequest, err.Error())
+	}
+	if err := request.Workspace.Validate(); err != nil {
 		return nil, contract.NewError(contract.ErrorInvalidRequest, err.Error())
 	}
 	if err := provisioner.config.ValidateLifecycle(); err != nil {
@@ -242,6 +246,7 @@ func (provisioner *IncusRootProvisioner) ProvisionRoot(ctx context.Context, requ
 				"environment.KANEDIAS_PI_MODEL":          request.Model.Model,
 				"environment.KANEDIAS_PI_THINKING":       request.Model.ThinkingLevel,
 				"environment.KANEDIAS_PI_SESSION_FILE":   "",
+				"environment.KANEDIAS_PI_WORKDIR":        request.Workspace.Directory(),
 				"environment.KANEDIAS_SUPERVISOR_SOCKET": guestSupervisorSocket,
 			},
 			Devices: api.DevicesMap{
@@ -279,6 +284,12 @@ func (provisioner *IncusRootProvisioner) ProvisionRoot(ctx context.Context, requ
 		return nil, err
 	}
 	owned.running = true
+
+	// Repair and validate the cloned workspace immediately after start and before
+	// any RPC readiness gate, so Pi only starts in an attested checkout.
+	if err := prepareSessionWorkspace(ctx, client, name, request.Workspace); err != nil {
+		return nil, err
+	}
 
 	address, waitErr := waitForRootRPCAddress(ctx, client, name, provisioner.deps.readinessTimeout, provisioner.deps.retryInterval)
 	if waitErr != nil {

@@ -18,6 +18,7 @@ import (
 	"time"
 
 	"github.com/sklarsa/kanedias/internal/supervisor"
+	"github.com/sklarsa/kanedias/internal/supervisor/contract"
 	"github.com/sklarsa/kanedias/internal/supervisor/process"
 	"golang.org/x/sys/unix"
 )
@@ -85,32 +86,47 @@ type retainingStarter struct {
 
 type closingBootstrapStarter struct{ process *fakeProcess }
 
-func (starter closingBootstrapStarter) Start(spec spawnSpec) (spawnedProcess, error) {
-	if len(spec.ExtraFiles) != 1 {
-		return nil, fmt.Errorf("ExtraFiles = %d, want 1", len(spec.ExtraFiles))
+func duplicateExtraFiles(spec spawnSpec) (*os.File, *os.File, error) {
+	if len(spec.ExtraFiles) != 2 {
+		return nil, nil, fmt.Errorf("ExtraFiles = %d, want 2", len(spec.ExtraFiles))
 	}
-	duplicate, err := unix.Dup(int(spec.ExtraFiles[0].Fd()))
+	bootstrapFD, err := unix.Dup(int(spec.ExtraFiles[0].Fd()))
+	if err != nil {
+		return nil, nil, err
+	}
+	statusFD, err := unix.Dup(int(spec.ExtraFiles[1].Fd()))
+	if err != nil {
+		_ = unix.Close(bootstrapFD)
+		return nil, nil, err
+	}
+	return os.NewFile(uintptr(bootstrapFD), "fake-root-bootstrap"), os.NewFile(uintptr(statusFD), "fake-root-status"), nil
+}
+
+func writeFakeReadyStatus(file *os.File) {
+	_ = errors.Join(process.EncodeRootStartupStatus(file, process.RootStartupStatus{Status: process.RootStartupReady}), file.Close())
+}
+
+func (starter closingBootstrapStarter) Start(spec spawnSpec) (spawnedProcess, error) {
+	bootstrap, status, err := duplicateExtraFiles(spec)
 	if err != nil {
 		return nil, err
 	}
-	if err := unix.Close(duplicate); err != nil {
+	if err := bootstrap.Close(); err != nil {
+		_ = status.Close()
 		return nil, err
 	}
+	writeFakeReadyStatus(status)
 	return starter.process, nil
 }
 
 func (starter *retainingStarter) Start(spec spawnSpec) (spawnedProcess, error) {
-	if len(spec.ExtraFiles) != 1 {
-		err := fmt.Errorf("ExtraFiles = %d, want 1", len(spec.ExtraFiles))
-		starter.started <- err
-		return nil, err
-	}
-	duplicate, err := unix.Dup(int(spec.ExtraFiles[0].Fd()))
+	bootstrap, status, err := duplicateExtraFiles(spec)
 	if err != nil {
 		starter.started <- err
 		return nil, err
 	}
-	starter.inheritedRead = os.NewFile(uintptr(duplicate), "retained-root-bootstrap")
+	starter.inheritedRead = bootstrap
+	writeFakeReadyStatus(status)
 	starter.started <- nil
 	return starter.process, nil
 }
@@ -121,14 +137,11 @@ func (fs *fakeStarter) Start(spec spawnSpec) (spawnedProcess, error) {
 	if fs.err != nil {
 		return nil, fs.err
 	}
-	if len(spec.ExtraFiles) != 1 {
-		return nil, fmt.Errorf("ExtraFiles = %d, want 1", len(spec.ExtraFiles))
-	}
-	duplicate, err := unix.Dup(int(spec.ExtraFiles[0].Fd()))
+	file, status, err := duplicateExtraFiles(spec)
 	if err != nil {
 		return nil, err
 	}
-	file := os.NewFile(uintptr(duplicate), "fake-root-bootstrap")
+	writeFakeReadyStatus(status)
 	go func() {
 		bootstrap, decodeErr := process.DecodeRootBootstrap(file)
 		closeErr := file.Close()
@@ -211,24 +224,41 @@ func TestSpawnRootWithRequestValidatesBeforeSideEffects(t *testing.T) {
 		pipes++
 		return os.Pipe()
 	}
-	invalid := m.launch.DefaultRequest()
-	invalid.Root.ModelType = "not-allowlisted"
-	if _, err := m.SpawnRootWithRequest(context.Background(), invalid); err == nil {
-		t.Fatal("invalid request succeeded")
+
+	unknownModel := m.launch.DefaultRequest()
+	unknownModel.Root.ModelType = "not-allowlisted"
+	badName := m.launch.DefaultRequest()
+	badName.Name = "triage\n" // control character
+	overlongName := m.launch.DefaultRequest()
+	overlongName.Name = strings.Repeat("a", 81)
+	unknownRepo := m.launch.DefaultRequest()
+	unknownRepo.Repository = "owner/not-configured"
+
+	cases := map[string]SessionLaunchRequest{
+		"unknown model":          unknownModel,
+		"control-character name": badName,
+		"overlong name":          overlongName,
+		"unknown repository":     unknownRepo,
 	}
-	if tokens != 0 || pipes != 0 || fs.starts != 0 {
-		t.Fatalf("side effects after invalid request: tokens=%d pipes=%d starts=%d", tokens, pipes, fs.starts)
+	for name, request := range cases {
+		tokens, pipes = 0, 0
+		if _, err := m.SpawnRootWithRequest(context.Background(), request); err == nil {
+			t.Fatalf("%s: invalid request succeeded", name)
+		}
+		if tokens != 0 || pipes != 0 || fs.starts != 0 {
+			t.Fatalf("%s: side effects after invalid request: tokens=%d pipes=%d starts=%d", name, tokens, pipes, fs.starts)
+		}
 	}
 	entries, err := os.ReadDir(logDir)
 	if err != nil {
 		t.Fatal(err)
 	}
 	if len(entries) != 0 {
-		t.Fatalf("invalid request created log files: %v", entries)
+		t.Fatalf("invalid requests created log files: %v", entries)
 	}
 }
 
-func TestSpawnRootWithRequestTransfersResolvedPolicyOnlyThroughFD3(t *testing.T) {
+func TestSpawnRootWithRequestTransfersResolvedPolicyAndStartupDescriptors(t *testing.T) {
 	fs := &fakeStarter{process: newFakeProcess(1236), rootBootstraps: make(chan rootBootstrapResult, 1)}
 	m := fakeManager(nil)
 	m.starter = fs
@@ -239,23 +269,31 @@ func TestSpawnRootWithRequestTransfersResolvedPolicyOnlyThroughFD3(t *testing.T)
 	m.opts.SessionLogDir = logDir
 	m.opts.SpawnTimeout = time.Second
 	m.newSpawnToken = func() (string, error) { return "fixed-token", nil }
-	var parentRead, parentWrite *os.File
+	var parentRead, parentWrite, statusRead, statusWrite *os.File
 	m.newBootstrapPipe = func() (*os.File, *os.File, error) {
 		var pipeErr error
 		parentRead, parentWrite, pipeErr = os.Pipe()
 		return parentRead, parentWrite, pipeErr
 	}
+	m.newRootStatusPipe = func() (*os.File, *os.File, error) {
+		var pipeErr error
+		statusRead, statusWrite, pipeErr = os.Pipe()
+		return statusRead, statusWrite, pipeErr
+	}
 
 	request := m.launch.DefaultRequest()
+	request.Repository = "owner/repo"
 	request.Root = ModelSelection{ModelType: "local-qwen", ThinkingLevel: "off"}
 	for index := range request.Workers {
 		request.Workers[index].ModelType = "local-qwen"
 		request.Workers[index].ThinkingLevel = "off"
 	}
-	wantPolicy, err := m.launch.Resolve(request)
+	resolved, err := m.launch.Resolve(request)
 	if err != nil {
 		t.Fatal(err)
 	}
+	wantPolicy := resolved.Policy
+	wantWorkspace := resolved.Workspace
 	go func() {
 		time.Sleep(20 * time.Millisecond)
 		fs.process.exit(nil)
@@ -270,22 +308,27 @@ func TestSpawnRootWithRequestTransfersResolvedPolicyOnlyThroughFD3(t *testing.T)
 		if !reflect.DeepEqual(result.bootstrap.Policy, wantPolicy) {
 			t.Fatalf("bootstrap policy = %#v, want %#v", result.bootstrap.Policy, wantPolicy)
 		}
+		if result.bootstrap.Workspace != wantWorkspace {
+			t.Fatalf("bootstrap workspace = %#v, want %#v", result.bootstrap.Workspace, wantWorkspace)
+		}
 	case <-time.After(time.Second):
 		t.Fatal("timed out decoding inherited root bootstrap")
 	}
 	assertFileClosed(t, parentRead)
 	assertFileClosed(t, parentWrite)
+	assertFileClosed(t, statusRead)
+	assertFileClosed(t, statusWrite)
 
 	spec := fs.lastSpec
-	wantSuffix := []string{"session", "--socket", filepath.Join(rootDir, "fixed-token.root.sock"), "--bootstrap-fd", "3"}
+	wantSuffix := []string{"session", "--socket", filepath.Join(rootDir, "fixed-token.root.sock"), "--bootstrap-fd", "3", "--status-fd", "4"}
 	if len(spec.Args) < len(wantSuffix) || !reflect.DeepEqual(spec.Args[len(spec.Args)-len(wantSuffix):], wantSuffix) {
 		t.Fatalf("argv = %#v, want suffix %#v", spec.Args, wantSuffix)
 	}
-	if len(spec.ExtraFiles) != 1 {
-		t.Fatalf("ExtraFiles = %d, want 1", len(spec.ExtraFiles))
+	if len(spec.ExtraFiles) != 2 || spec.ExtraFiles[0] != parentRead || spec.ExtraFiles[1] != statusWrite {
+		t.Fatalf("ExtraFiles = %#v, want ordered bootstrap-read(fd3), status-write(fd4)", spec.ExtraFiles)
 	}
 	argv := strings.Join(spec.Args, "\x00")
-	for _, value := range []string{wantPolicy.Root.Provider, wantPolicy.Root.Model, `"provider"`, `"workers"`} {
+	for _, value := range []string{wantPolicy.Root.Provider, wantPolicy.Root.Model, wantWorkspace.Repository, wantWorkspace.Checkout, `"provider"`, `"workers"`, `"workspace"`} {
 		if strings.Contains(argv, value) {
 			t.Fatalf("private policy value %q leaked into argv", value)
 		}
@@ -295,20 +338,44 @@ func TestSpawnRootWithRequestTransfersResolvedPolicyOnlyThroughFD3(t *testing.T)
 	}
 }
 
-func TestSpawnRootClosesBootstrapPipeOnStartFailure(t *testing.T) {
+func TestSpawnRootClosesStartupDescriptorsOnStartFailure(t *testing.T) {
 	fs := &fakeStarter{err: errors.New("start sentinel")}
 	m := configuredSpawnManager(t, fs)
-	var readEnd, writeEnd *os.File
+	var bootstrapRead, bootstrapWrite, statusRead, statusWrite *os.File
 	m.newBootstrapPipe = func() (*os.File, *os.File, error) {
 		var err error
-		readEnd, writeEnd, err = os.Pipe()
-		return readEnd, writeEnd, err
+		bootstrapRead, bootstrapWrite, err = os.Pipe()
+		return bootstrapRead, bootstrapWrite, err
+	}
+	m.newRootStatusPipe = func() (*os.File, *os.File, error) {
+		var err error
+		statusRead, statusWrite, err = os.Pipe()
+		return statusRead, statusWrite, err
 	}
 	if _, err := m.SpawnRoot(context.Background()); err == nil || !strings.Contains(err.Error(), "start sentinel") {
 		t.Fatalf("SpawnRoot error = %v", err)
 	}
-	assertFileClosed(t, readEnd)
-	assertFileClosed(t, writeEnd)
+	for _, file := range []*os.File{bootstrapRead, bootstrapWrite, statusRead, statusWrite} {
+		assertFileClosed(t, file)
+	}
+}
+
+func TestSpawnRootStatusPipeFailureClosesBootstrapDescriptors(t *testing.T) {
+	m := configuredSpawnManager(t, &fakeStarter{process: newFakeProcess(1237)})
+	var bootstrapRead, bootstrapWrite *os.File
+	m.newBootstrapPipe = func() (*os.File, *os.File, error) {
+		var err error
+		bootstrapRead, bootstrapWrite, err = os.Pipe()
+		return bootstrapRead, bootstrapWrite, err
+	}
+	m.newRootStatusPipe = func() (*os.File, *os.File, error) {
+		return nil, nil, errors.New("status pipe sentinel")
+	}
+	if _, err := m.SpawnRoot(context.Background()); err == nil || !strings.Contains(err.Error(), "status pipe sentinel") {
+		t.Fatalf("SpawnRoot error = %v", err)
+	}
+	assertFileClosed(t, bootstrapRead)
+	assertFileClosed(t, bootstrapWrite)
 }
 
 func TestSpawnRootClosesBootstrapPipeOnWriteFailure(t *testing.T) {
@@ -402,10 +469,11 @@ func TestSpawnRootCancellationJoinsBlockedBootstrapWriter(t *testing.T) {
 		t.Fatal(err)
 	}
 	m.launch = launch
-	policy, err := launch.Resolve(launch.DefaultRequest())
+	resolved, err := launch.Resolve(launch.DefaultRequest())
 	if err != nil {
 		t.Fatal(err)
 	}
+	policy := resolved.Policy
 	var encoded bytes.Buffer
 	if err := process.EncodeRootBootstrap(&encoded, process.RootBootstrap{Policy: policy}); err != nil {
 		t.Fatal(err)
@@ -603,6 +671,165 @@ func TestRootSpawnerRealExecSetsSid(t *testing.T) {
 }
 
 // ---- Admission polling tests ----
+
+type probeHookClient struct {
+	*fakeClient
+	hook func()
+}
+
+func (client *probeHookClient) Snapshot(ctx context.Context) (supervisor.NodeSnapshot, error) {
+	if client.hook != nil {
+		client.hook()
+	}
+	return client.fakeClient.Snapshot(ctx)
+}
+
+func TestSpawnRootProbeExitBeforeCommitIsRejected(t *testing.T) {
+	dir := t.TempDir()
+	socketPath := makeRootSocket(t, dir, "probe-exit.root.sock")
+	processFake := newFakeProcess(9201)
+	status := make(chan rootStatusResult, 1)
+	status <- rootStatusResult{status: process.RootStartupStatus{Status: process.RootStartupReady}}
+	client := &probeHookClient{fakeClient: &fakeClient{snapshot: rootTree("probe-exit")}, hook: func() {
+		processFake.exit(exec.ErrNotFound)
+	}}
+	m := fakeManager(func(string) (rootClient, error) { return client, nil })
+	pending := &pendingRoot{socketPath: socketPath, process: processFake, statusResult: status}
+	rootID, err := m.admitRoot(context.Background(), pending)
+	if rootID != "" || err == nil || !errors.Is(err, exec.ErrNotFound) {
+		t.Fatalf("admitRoot = (%q, %v), want post-probe process-exit rejection", rootID, err)
+	}
+	if len(m.roots) != 0 {
+		t.Fatalf("post-probe exited root committed: %#v", m.roots)
+	}
+}
+
+func TestSpawnRootFailureStatusDuringProbeBeforeCommitIsRejected(t *testing.T) {
+	dir := t.TempDir()
+	socketPath := makeRootSocket(t, dir, "probe-status.root.sock")
+	status := make(chan rootStatusResult, 1)
+	client := &probeHookClient{fakeClient: &fakeClient{snapshot: rootTree("probe-status")}, hook: func() {
+		status <- rootStatusResult{status: process.RootStartupStatus{Status: process.RootStartupFailure, Code: contract.ErrorWorkspaceRepositoryUnavailable}}
+	}}
+	m := fakeManager(func(string) (rootClient, error) { return client, nil })
+	pending := &pendingRoot{socketPath: socketPath, process: newFakeProcess(9202), statusResult: status}
+	rootID, err := m.admitRoot(context.Background(), pending)
+	var typed *contract.Error
+	if rootID != "" || !errors.As(err, &typed) || typed.Code != contract.ErrorWorkspaceRepositoryUnavailable {
+		t.Fatalf("admitRoot = (%q, %v), want post-probe typed repository rejection", rootID, err)
+	}
+	if len(m.roots) != 0 {
+		t.Fatalf("post-probe failed root committed: %#v", m.roots)
+	}
+}
+
+func TestSpawnRootRepositoryStatusFailureBeforeProcessExit(t *testing.T) {
+	status := make(chan rootStatusResult, 1)
+	status <- rootStatusResult{status: process.RootStartupStatus{Status: process.RootStartupFailure, Code: contract.ErrorWorkspaceRepositoryUnavailable}}
+	pending := &pendingRoot{process: newFakeProcess(9101), statusResult: status}
+	_, err := fakeManager(nil).admitRoot(context.Background(), pending)
+	var typed *contract.Error
+	if !errors.As(err, &typed) || typed.Code != contract.ErrorWorkspaceRepositoryUnavailable {
+		t.Fatalf("admitRoot error = %v, want typed repository failure", err)
+	}
+}
+
+func TestSpawnRootRepositoryStatusWinsProcessExitRace(t *testing.T) {
+	status := make(chan rootStatusResult, 1)
+	processFake := newFakeProcess(9102)
+	processFake.exit(exec.ErrNotFound)
+	pending := &pendingRoot{process: processFake, statusResult: status}
+	result := make(chan error, 1)
+	go func() {
+		_, err := fakeManager(nil).admitRoot(context.Background(), pending)
+		result <- err
+	}()
+	select {
+	case err := <-result:
+		t.Fatalf("admitRoot returned before the delayed status decode: %v", err)
+	case <-time.After(20 * time.Millisecond):
+	}
+	status <- rootStatusResult{status: process.RootStartupStatus{Status: process.RootStartupFailure, Code: contract.ErrorWorkspaceRepositoryUnavailable}}
+	select {
+	case err := <-result:
+		var typed *contract.Error
+		if !errors.As(err, &typed) || typed.Code != contract.ErrorWorkspaceRepositoryUnavailable {
+			t.Fatalf("admitRoot error = %v, want typed repository failure", err)
+		}
+	case <-time.After(time.Second):
+		t.Fatal("admitRoot did not receive delayed status after process exit")
+	}
+}
+
+func TestSpawnRootReadyStatusThenProcessExitIsGeneric(t *testing.T) {
+	status := make(chan rootStatusResult, 1)
+	status <- rootStatusResult{status: process.RootStartupStatus{Status: process.RootStartupReady}}
+	processFake := newFakeProcess(9103)
+	processFake.exit(exec.ErrNotFound)
+	pending := &pendingRoot{process: processFake, statusResult: status}
+	_, err := fakeManager(nil).admitRoot(context.Background(), pending)
+	var typed *contract.Error
+	if errors.As(err, &typed) {
+		t.Fatalf("ready then exit error = %v, want generic process failure", err)
+	}
+	if !errors.Is(err, exec.ErrNotFound) {
+		t.Fatalf("ready then exit error = %v, want wrapped process failure", err)
+	}
+}
+
+func TestSpawnRootMalformedOrOversizeStatusIsGenericWithoutRawDetail(t *testing.T) {
+	for _, test := range []struct {
+		name   string
+		detail error
+	}{
+		{name: "malformed", detail: errors.New("private malformed bytes")},
+		{name: "oversize", detail: process.ErrRecordTooLarge},
+	} {
+		t.Run(test.name, func(t *testing.T) {
+			status := make(chan rootStatusResult, 1)
+			status <- rootStatusResult{err: test.detail}
+			pending := &pendingRoot{process: newFakeProcess(9104), statusResult: status}
+			_, err := fakeManager(nil).admitRoot(context.Background(), pending)
+			var typed *contract.Error
+			if errors.As(err, &typed) {
+				t.Fatalf("invalid status error = %v, want generic failure", err)
+			}
+			if err == nil || strings.Contains(err.Error(), test.detail.Error()) {
+				t.Fatalf("invalid status error leaked raw detail: %v", err)
+			}
+		})
+	}
+}
+
+func TestSpawnRootSuccessfulAdmissionClosesStatusDescriptors(t *testing.T) {
+	dir := t.TempDir()
+	socketPath := makeRootSocket(t, dir, "status-success.root.sock")
+	client := &fakeClient{snapshot: rootTree("status-success")}
+	m := fakeManager(func(string) (rootClient, error) { return client, nil })
+	statusRead, statusWrite, err := os.Pipe()
+	if err != nil {
+		t.Fatal(err)
+	}
+	pending := &pendingRoot{socketPath: socketPath, process: newFakeProcess(9105), statusRead: statusRead}
+	pending.startRootStatusDecoder()
+	if err := process.EncodeRootStartupStatus(statusWrite, process.RootStartupStatus{Status: process.RootStartupReady}); err != nil {
+		t.Fatal(err)
+	}
+	if err := statusWrite.Close(); err != nil {
+		t.Fatal(err)
+	}
+	rootID, err := m.admitRoot(context.Background(), pending)
+	if err != nil || rootID != "status-success" {
+		t.Fatalf("admitRoot = (%q, %v), want successful admission", rootID, err)
+	}
+	assertFileClosed(t, statusRead)
+	assertFileClosed(t, statusWrite)
+	closeCtx, cancel := context.WithTimeout(context.Background(), time.Second)
+	defer cancel()
+	if err := m.Close(closeCtx); err != nil {
+		t.Fatal(err)
+	}
+}
 
 func TestSpawnRootAdmissionTimeout(t *testing.T) {
 	fs := &fakeStarter{process: newFakeProcess(9999)}
@@ -826,5 +1053,250 @@ func TestAdmittedRootSurvivesManagerClose(t *testing.T) {
 		if call == "Stop" {
 			t.Fatal("Close() called Stop on admitted root — must not")
 		}
+	}
+}
+
+func TestSpawnRootNameCommitsOnlyAfterSuccessfulAdmission(t *testing.T) {
+	m := fakeManager(nil)
+	pending := &pendingRoot{
+		socketPath: "/tmp/named-spawn.root.sock",
+		identity:   socketIdentity{dev: 7, ino: 1},
+		client:     &fakeClient{snapshot: rootTree("spawned")},
+		rootID:     "spawned",
+		name:       "Normalized Name",
+	}
+	if len(m.roots) != 0 {
+		t.Fatal("pending launch created a handle before admission")
+	}
+
+	rootID, err := m.commitSpawn(pending, rootTree("spawned"))
+	if err != nil {
+		t.Fatalf("commitSpawn: %v", err)
+	}
+	if rootID != "spawned" {
+		t.Fatalf("rootID = %q, want spawned", rootID)
+	}
+	fleet := m.Fleet()
+	if len(fleet.Roots) != 1 || fleet.Roots[0].Name != "Normalized Name" {
+		t.Fatalf("admitted root name = %#v", fleet.Roots)
+	}
+
+	ctx, cancel := context.WithTimeout(context.Background(), time.Second)
+	defer cancel()
+	if err := m.Close(ctx); err != nil {
+		t.Fatal(err)
+	}
+}
+
+func TestSpawnAdmissionPublishesRoutesAndLaunchNameAtomically(t *testing.T) {
+	m := fakeManager(nil)
+	pending := &pendingRoot{
+		socketPath: "/tmp/atomic-name.root.sock",
+		identity:   socketIdentity{dev: 7, ino: 2},
+		client:     &fakeClient{snapshot: rootTree("spawned")},
+		rootID:     "spawned",
+		name:       "Visible At Admission",
+	}
+	m.afterCommitSpawnHook = func(_ *rootHandle) {
+		state, err := m.Session("spawned")
+		if err != nil {
+			t.Errorf("admitted route was unavailable: %v", err)
+			return
+		}
+		if state.RootName != "Visible At Admission" {
+			t.Errorf("admitted route exposed root name %q, want launch name", state.RootName)
+		}
+	}
+
+	if _, err := m.commitSpawn(pending, rootTree("spawned")); err != nil {
+		t.Fatalf("commitSpawn: %v", err)
+	}
+	ctx, cancel := context.WithTimeout(context.Background(), time.Second)
+	defer cancel()
+	if err := m.Close(ctx); err != nil {
+		t.Fatal(err)
+	}
+}
+
+func TestConcurrentRenameDuringSpawnAdmissionIsNeverOverwritten(t *testing.T) {
+	for _, test := range []struct {
+		name   string
+		rename string
+		want   string
+	}{
+		{name: "rename", rename: "User Name", want: "User Name"},
+		{name: "clear", rename: "", want: ""},
+	} {
+		t.Run(test.name, func(t *testing.T) {
+			m := fakeManager(nil)
+			admitted := make(chan struct{})
+			release := make(chan struct{})
+			m.afterCommitSpawnHook = func(_ *rootHandle) {
+				close(admitted)
+				<-release
+			}
+			pending := &pendingRoot{
+				socketPath: "/tmp/concurrent-rename.root.sock",
+				identity:   socketIdentity{dev: 7, ino: 4},
+				client:     &fakeClient{snapshot: rootTree("spawned")},
+				rootID:     "spawned",
+				name:       "Pending Launch Name",
+			}
+			spawned := make(chan error, 1)
+			go func() {
+				_, err := m.commitSpawn(pending, rootTree("spawned"))
+				spawned <- err
+			}()
+			select {
+			case <-admitted:
+			case <-time.After(time.Second):
+				t.Fatal("spawn admission hook was not reached")
+			}
+			if err := m.RenameRoot("spawned", test.rename); err != nil {
+				t.Fatalf("concurrent RenameRoot: %v", err)
+			}
+			close(release)
+			if err := <-spawned; err != nil {
+				t.Fatalf("commitSpawn: %v", err)
+			}
+			if got := m.Fleet().Roots[0].Name; got != test.want {
+				t.Fatalf("name after concurrent spawn completion = %q, want %q", got, test.want)
+			}
+			ctx, cancel := context.WithTimeout(context.Background(), time.Second)
+			defer cancel()
+			if err := m.Close(ctx); err != nil {
+				t.Fatal(err)
+			}
+		})
+	}
+}
+
+func TestSpawnSameSocketReuseDoesNotOverwriteTouchedName(t *testing.T) {
+	for _, test := range []struct {
+		name   string
+		rename string
+		want   string
+	}{
+		{name: "rename", rename: "User Name", want: "User Name"},
+		{name: "clear", rename: "", want: ""},
+	} {
+		t.Run(test.name, func(t *testing.T) {
+			m := fakeManager(nil)
+			identity := socketIdentity{dev: 7, ino: 3}
+			discovered := &rootHandle{
+				socketPath: "/tmp/touched-name.root.sock",
+				rootID:     "spawned",
+				identity:   identity,
+				actionable: true,
+				client:     &fakeClient{snapshot: rootTree("spawned")},
+			}
+			if _, err := m.commitTree(discovered, rootTree("spawned"), map[string]string{"spawned": "spawned"}); err != nil {
+				t.Fatal(err)
+			}
+			if err := m.RenameRoot("spawned", test.rename); err != nil {
+				t.Fatal(err)
+			}
+			pending := &pendingRoot{
+				socketPath: discovered.socketPath,
+				identity:   identity,
+				client:     &fakeClient{snapshot: rootTree("spawned")},
+				rootID:     "spawned",
+				name:       "Pending Launch Name",
+			}
+			if _, err := m.commitSpawn(pending, rootTree("spawned")); err != nil {
+				t.Fatalf("commitSpawn: %v", err)
+			}
+			if got := m.Fleet().Roots[0].Name; got != test.want {
+				t.Fatalf("name after same-socket reuse = %q, want touched value %q", got, test.want)
+			}
+			ctx, cancel := context.WithTimeout(context.Background(), time.Second)
+			defer cancel()
+			if err := m.Close(ctx); err != nil {
+				t.Fatal(err)
+			}
+		})
+	}
+}
+
+func TestSpawnRootFailedAdmissionLeavesNoHandleOrName(t *testing.T) {
+	m := fakeManager(nil)
+	existingChild := childTree("shared", "existing")
+	existingChild.RootSessionID = "existing"
+	existingTree := rootTree("existing", existingChild)
+	normalized, routes, err := validateRootTree(existingTree)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err := m.commitTree(&rootHandle{
+		socketPath: "/tmp/existing.root.sock",
+		rootID:     "existing",
+		identity:   socketIdentity{dev: 8, ino: 1},
+		actionable: true,
+	}, normalized, routes); err != nil {
+		t.Fatal(err)
+	}
+	pending := &pendingRoot{
+		socketPath: "/tmp/rejected.root.sock",
+		identity:   socketIdentity{dev: 8, ino: 2},
+		client:     &fakeClient{},
+		rootID:     "rejected",
+		name:       "Must Not Leak",
+	}
+	rejectedChild := childTree("shared", "rejected")
+	rejectedChild.RootSessionID = "rejected"
+	rejectedTree := rootTree("rejected", rejectedChild)
+	if _, err := m.commitSpawn(pending, rejectedTree); err == nil {
+		t.Fatal("conflicting spawn admission succeeded")
+	}
+	fleet := m.Fleet()
+	if len(fleet.Roots) != 1 || fleet.Roots[0].RootSessionID != "existing" || fleet.Roots[0].Name != "" {
+		t.Fatalf("failed admission leaked handle/name: %#v", fleet.Roots)
+	}
+}
+
+func TestSpawnRootConcurrentSameSocketReuseReceivesName(t *testing.T) {
+	m := fakeManager(nil)
+	pending := &pendingRoot{
+		socketPath: "/tmp/reused-name.root.sock",
+		identity:   socketIdentity{dev: 9, ino: 1},
+		client:     &fakeClient{snapshot: rootTree("spawned")},
+		rootID:     "spawned",
+		name:       "Launch Name",
+	}
+	m.afterCommitSpawnHook = func(committed *rootHandle) {
+		m.mu.Lock()
+		if committed.name != "Launch Name" {
+			t.Errorf("name at reuse window = %q, want Launch Name", committed.name)
+		}
+		m.mu.Unlock()
+		discoveryHandle := &rootHandle{
+			socketPath: committed.socketPath,
+			rootID:     committed.rootID,
+			identity:   committed.identity,
+			actionable: true,
+			client:     &fakeClient{snapshot: rootTree("spawned")},
+		}
+		res, err := m.commitTree(discoveryHandle, rootTree("spawned"), map[string]string{"spawned": "spawned"})
+		if err != nil {
+			t.Errorf("same-socket discovery commit: %v", err)
+			return
+		}
+		if res.handle != committed {
+			t.Error("same-socket discovery did not reuse spawned handle")
+		}
+		m.monitorRoot(res.handle)
+	}
+
+	if _, err := m.commitSpawn(pending, rootTree("spawned")); err != nil {
+		t.Fatalf("commitSpawn: %v", err)
+	}
+	if got := m.Fleet().Roots[0].Name; got != "Launch Name" {
+		t.Fatalf("name after same-socket reuse = %q, want Launch Name", got)
+	}
+
+	ctx, cancel := context.WithTimeout(context.Background(), time.Second)
+	defer cancel()
+	if err := m.Close(ctx); err != nil {
+		t.Fatal(err)
 	}
 }

@@ -166,7 +166,7 @@ func TestCorePiSettingsExcludeOperatorRegistrations(t *testing.T) {
 	}
 }
 
-func TestPiEnvironmentBridgeWritesAllowlistedEnvironment(t *testing.T) {
+func TestPiEnvironmentBridgeWorkdirWritesAllowlistedEnvironment(t *testing.T) {
 	dir := t.TempDir()
 	bridgePath := filepath.Join(dir, "kanedias-pi-env")
 	if err := os.WriteFile(bridgePath, piEnvironmentBridge, 0o700); err != nil {
@@ -179,6 +179,7 @@ func TestPiEnvironmentBridgeWritesAllowlistedEnvironment(t *testing.T) {
 		"KANEDIAS_E2E_RUN_ID=e2e-run",
 		"KANEDIAS_SUPERVISOR_SOCKET=/run/kanedias/supervisor.sock",
 		"KANEDIAS_PI_SESSION_FILE=",
+		"KANEDIAS_PI_WORKDIR=/workspace/repos/repository",
 		"KANEDIAS_PI_THINKING=xhigh",
 		"KANEDIAS_PI_MODEL=model",
 		"KANEDIAS_PI_PROVIDER=provider",
@@ -223,6 +224,7 @@ func TestPiEnvironmentBridgeWritesAllowlistedEnvironment(t *testing.T) {
 		`KANEDIAS_PI_MODEL="model"`,
 		`KANEDIAS_PI_THINKING="xhigh"`,
 		`KANEDIAS_PI_SESSION_FILE=""`,
+		`KANEDIAS_PI_WORKDIR="/workspace/repos/repository"`,
 		`KANEDIAS_SUPERVISOR_SOCKET="/run/kanedias/supervisor.sock"`,
 		`KANEDIAS_E2E_RUN_ID="e2e-run"`,
 	}, "\n") + "\n"
@@ -319,7 +321,7 @@ func TestPiEnvironmentBridgeProductionRuntimeIsRootControlled(t *testing.T) {
 	}
 }
 
-func TestPiEnvironmentBridgeRejectsInvalidInputWithoutReplacingDestination(t *testing.T) {
+func TestPiEnvironmentBridgeWorkdirRejectsInvalidInputWithoutReplacingDestination(t *testing.T) {
 	required := []string{
 		"KANEDIAS_SESSION_ID=session-123",
 		"KANEDIAS_SESSION_KIND=root",
@@ -336,6 +338,7 @@ func TestPiEnvironmentBridgeRejectsInvalidInputWithoutReplacingDestination(t *te
 	}{
 		{name: "missing required value", entries: required[1:]},
 		{name: "newline in value", entries: append(append([]string(nil), required...), "KANEDIAS_WORKER_TYPE=bad\nvalue")},
+		{name: "newline in workdir", entries: append(append([]string(nil), required...), "KANEDIAS_PI_WORKDIR=/workspace/repos/bad\nvalue")},
 	}
 	for _, tt := range tests {
 		t.Run(tt.name, func(t *testing.T) {
@@ -370,7 +373,12 @@ func TestPiEnvironmentBridgeRejectsInvalidInputWithoutReplacingDestination(t *te
 
 func TestPiRPCLauncherBuildsFreshAndForkArgumentsWithoutEval(t *testing.T) {
 	dir := t.TempDir()
+	workspaceRoot := filepath.Join(dir, "workspace")
+	if err := os.Mkdir(workspaceRoot, 0o700); err != nil {
+		t.Fatal(err)
+	}
 	launcher := strings.Replace(string(piRPCLauncher), `source "$NVM_DIR/nvm.sh"`, ":", 1)
+	launcher = strings.Replace(launcher, "workspace_root=/workspace", "workspace_root="+workspaceRoot, 1)
 	launcherPath := filepath.Join(dir, "launcher")
 	if err := os.WriteFile(launcherPath, []byte(launcher), 0o700); err != nil {
 		t.Fatal(err)
@@ -403,6 +411,90 @@ func TestPiRPCLauncherBuildsFreshAndForkArgumentsWithoutEval(t *testing.T) {
 				t.Fatalf("args = %#v, want %#v", got, tt.want)
 			}
 		})
+	}
+}
+
+func TestPiRPCLauncherWorkdirDefenseChangesDirectoryWithoutChangingArguments(t *testing.T) {
+	dir := t.TempDir()
+	workspaceRoot := filepath.Join(dir, "workspace")
+	checkout := filepath.Join(workspaceRoot, "repos", "repository")
+	if err := os.MkdirAll(checkout, 0o700); err != nil {
+		t.Fatal(err)
+	}
+	launcher := strings.Replace(string(piRPCLauncher), `source "$NVM_DIR/nvm.sh"`, ":", 1)
+	launcher = strings.Replace(launcher, "workspace_root=/workspace", "workspace_root="+workspaceRoot, 1)
+	launcherPath := filepath.Join(dir, "launcher")
+	if err := os.WriteFile(launcherPath, []byte(launcher), 0o700); err != nil {
+		t.Fatal(err)
+	}
+	marker := filepath.Join(dir, "pi-invoked")
+	piPath := filepath.Join(dir, "pi")
+	if err := os.WriteFile(piPath, []byte("#!/bin/sh\ntouch \"$PI_INVOKED_MARKER\"\npwd -P\nprintf '%s\\n' \"$@\"\n"), 0o700); err != nil {
+		t.Fatal(err)
+	}
+	baseEnv := []string{
+		"PATH=" + dir + ":/usr/bin:/bin",
+		"KANEDIAS_SESSION_ID=root-1",
+		"KANEDIAS_SESSION_KIND=root",
+		"KANEDIAS_PI_PROVIDER=provider",
+		"KANEDIAS_PI_MODEL=model",
+		"PI_INVOKED_MARKER=" + marker,
+	}
+	wantArgs := []string{"--mode", "rpc", "-e", "/opt/kanedias/pi-extension/src/index.ts", "--provider", "provider", "--model", "model"}
+	for _, tt := range []struct {
+		name    string
+		workdir string
+		wantCWD string
+		valid   bool
+	}{
+		{name: "absent defaults to workspace root", wantCWD: workspaceRoot, valid: true},
+		{name: "selected checkout", workdir: checkout, wantCWD: checkout, valid: true},
+		{name: "outside workspace root", workdir: dir},
+		{name: "nested checkout name", workdir: filepath.Join(checkout, "nested")},
+		{name: "missing directory", workdir: filepath.Join(workspaceRoot, "repos", "missing")},
+		{name: "symlink", workdir: filepath.Join(workspaceRoot, "repos", "link")},
+	} {
+		t.Run(tt.name, func(t *testing.T) {
+			_ = os.Remove(marker)
+			if tt.name == "nested checkout name" {
+				if err := os.MkdirAll(tt.workdir, 0o700); err != nil {
+					t.Fatal(err)
+				}
+			}
+			if tt.name == "symlink" {
+				if err := os.Symlink(checkout, tt.workdir); err != nil {
+					t.Fatal(err)
+				}
+			}
+			command := exec.Command(launcherPath)
+			command.Env = append([]string(nil), baseEnv...)
+			if tt.workdir != "" {
+				command.Env = append(command.Env, "KANEDIAS_PI_WORKDIR="+tt.workdir)
+			}
+			output, err := command.CombinedOutput()
+			if !tt.valid {
+				if err == nil {
+					t.Fatalf("launcher succeeded for unsafe workdir; output: %s", output)
+				}
+				if _, statErr := os.Stat(marker); !errors.Is(statErr, os.ErrNotExist) {
+					t.Fatalf("Pi invocation marker stat error = %v, want not exist", statErr)
+				}
+				return
+			}
+			if err != nil {
+				t.Fatalf("launcher failed: %v\n%s", err, output)
+			}
+			lines := strings.Split(strings.TrimSpace(string(output)), "\n")
+			if len(lines) == 0 || lines[0] != tt.wantCWD {
+				t.Fatalf("Pi cwd output = %#v, want first line %q", lines, tt.wantCWD)
+			}
+			if !reflect.DeepEqual(lines[1:], wantArgs) {
+				t.Fatalf("Pi args = %#v, want unchanged %#v", lines[1:], wantArgs)
+			}
+		})
+	}
+	if strings.Contains(launcher, "eval") {
+		t.Fatal("launcher introduced eval")
 	}
 }
 

@@ -45,6 +45,7 @@ type RootRequest struct {
 	SessionID      string
 	SocketPath     string
 	Model          config.ModelProfile
+	Workspace      config.WorkspaceStart
 	RunAttribution string
 }
 
@@ -56,6 +57,7 @@ type ChildRequest struct {
 	SourceVolume   string
 	HostSocketPath string
 	Worker         config.WorkerProfile
+	Workspace      config.WorkspaceStart
 	Contract       contract.CreateChildRequest
 	RunAttribution string
 }

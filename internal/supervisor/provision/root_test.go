@@ -11,6 +11,8 @@ import (
 
 	"github.com/lxc/incus/v7/shared/api"
 	"github.com/sklarsa/kanedias/internal/config"
+	"github.com/sklarsa/kanedias/internal/incusclient"
+	"github.com/sklarsa/kanedias/internal/supervisor/contract"
 )
 
 type recordingRootClient struct {
@@ -21,6 +23,8 @@ type recordingRootClient struct {
 	stopErr       error
 	deleteInstErr error
 	deleteVolErr  error
+	execErr       error
+	execResults   map[string]execResult
 	request       api.InstancesPost
 	volumePut     api.StorageVolumePut
 	lateVolume    bool
@@ -95,6 +99,15 @@ func (client *recordingRootClient) DeleteInstance(context.Context, string) error
 	client.calls = append(client.calls, "delete-instance")
 	return client.deleteInstErr
 }
+func (client *recordingRootClient) Exec(_ context.Context, _ string, request incusclient.ExecRequest) (string, string, error) {
+	client.calls = append(client.calls, "exec "+strings.Join(request.Command, " "))
+	if client.execErr != nil {
+		return "", "", client.execErr
+	}
+	result := client.execResults[commandKey(request.Command)]
+	return result.stdout, result.stderr, result.err
+}
+
 func (client *recordingRootClient) GetInstanceState(context.Context, string) (*api.InstanceState, error) {
 	client.calls = append(client.calls, "get-state")
 	if client.lateInstance && !client.instanceReady {
@@ -184,7 +197,8 @@ func TestRootProvisionerCreatesSocketProxyBeforeStarting(t *testing.T) {
 		"environment.KANEDIAS_SESSION_ID": "root-1", "environment.KANEDIAS_SESSION_KIND": "root",
 		"environment.KANEDIAS_WORKER_TYPE": "", "environment.KANEDIAS_PI_PROVIDER": "openai-codex",
 		"environment.KANEDIAS_PI_MODEL": "gpt-5.6-sol", "environment.KANEDIAS_PI_THINKING": "high",
-		"environment.KANEDIAS_PI_SESSION_FILE": "", "environment.KANEDIAS_SUPERVISOR_SOCKET": "/run/kanedias/supervisor.sock",
+		"environment.KANEDIAS_PI_SESSION_FILE": "", "environment.KANEDIAS_PI_WORKDIR": "/workspace",
+		"environment.KANEDIAS_SUPERVISOR_SOCKET": "/run/kanedias/supervisor.sock",
 	}
 	for key, value := range wantEnvironment {
 		if client.request.Config[key] != value {
@@ -315,6 +329,119 @@ func TestRootProvisionerAwaitsSubmittedStartBeforeCleanupProbe(t *testing.T) {
 	calls := strings.Join(client.calls, ",")
 	if !strings.Contains(calls, "start-instance,await-operation,get-state,get-state,stop-instance,delete-instance,delete-volume") {
 		t.Fatalf("late start cleanup order = %s", calls)
+	}
+}
+
+func TestRootProvisionerRejectsInvalidWorkspaceBeforeConnecting(t *testing.T) {
+	client := &recordingRootClient{}
+	connectCalls := 0
+	deps := testRootDependencies(client)
+	deps.connect = func(context.Context) (rootClient, error) {
+		connectCalls++
+		return client, nil
+	}
+	request := validRootRequest()
+	request.Workspace = config.WorkspaceStart{Repository: "owner/repo", Checkout: "other"}
+	resources, err := newRootProvisioner(rootTestConfig(), deps).ProvisionRoot(context.Background(), request)
+	var contractErr *contract.Error
+	if resources != nil || !errors.As(err, &contractErr) || contractErr.Code != contract.ErrorInvalidRequest {
+		t.Fatalf("ProvisionRoot() = (%v, %v), want invalid workspace request", resources, err)
+	}
+	if connectCalls != 0 || len(client.calls) != 0 {
+		t.Fatalf("invalid workspace connected to Incus: connect=%d calls=%v", connectCalls, client.calls)
+	}
+}
+
+func TestRootProvisionerSetsWorkdirAndValidatesRepositoryBeforeReadiness(t *testing.T) {
+	client := &recordingRootClient{execResults: validCheckoutClient().results}
+	request := validRootRequest()
+	request.Workspace = config.WorkspaceStart{Repository: "owner/repo", Checkout: "repo"}
+	_, err := newRootProvisioner(rootTestConfig(), testRootDependencies(client)).ProvisionRoot(context.Background(), request)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if got := client.request.Config["environment.KANEDIAS_PI_WORKDIR"]; got != "/workspace/repos/repo" {
+		t.Fatalf("root workdir environment = %q, want /workspace/repos/repo", got)
+	}
+	assertOrderedCalls(t, client.calls,
+		"start-instance",
+		"exec test ! -L /workspace/repos/repo",
+		"exec realpath -e -- /workspace/repos/repo",
+		"exec runuser -u kanedias -- env HOME=/home/kanedias USER=kanedias LOGNAME=kanedias git -C /workspace/repos/repo rev-parse --show-toplevel",
+		"get-state",
+	)
+}
+
+func TestRootProvisionerCleansRepositoryValidationFailure(t *testing.T) {
+	primary := errors.New("selected checkout missing")
+	commands := checkoutValidationCommands()
+	client := &recordingRootClient{execResults: validCheckoutClient().results}
+	client.execResults[commandKey(commands[1])] = execResult{err: primary}
+	request := validRootRequest()
+	request.Workspace = config.WorkspaceStart{Repository: "owner/repo", Checkout: "repo"}
+	resources, err := newRootProvisioner(rootTestConfig(), testRootDependencies(client)).ProvisionRoot(context.Background(), request)
+	var contractErr *contract.Error
+	if resources != nil || !errors.Is(err, primary) || !errors.As(err, &contractErr) || contractErr.Code != contract.ErrorWorkspaceRepositoryUnavailable {
+		t.Fatalf("ProvisionRoot() = (%v, %v), want typed repository error with underlying failure", resources, err)
+	}
+	assertOrderedCalls(t, client.calls,
+		"start-instance",
+		"exec test -d /workspace/repos/repo",
+		"stop-instance",
+		"delete-instance",
+		"delete-volume",
+	)
+}
+
+func TestRootProvisionerRepairsClonedWorkspaceBeforeReadiness(t *testing.T) {
+	client := &recordingRootClient{}
+	_, err := newRootProvisioner(rootTestConfig(), testRootDependencies(client)).ProvisionRoot(context.Background(), validRootRequest())
+	if err != nil {
+		t.Fatal(err)
+	}
+	assertOrderedCalls(t, client.calls,
+		"start-instance",
+		"exec chown kanedias:kanedias /workspace",
+		"exec chmod 0755 /workspace",
+		"exec install -d -o kanedias -g kanedias -m 0755 /workspace/repos",
+		"exec chown kanedias:kanedias /workspace/repos",
+		"exec chmod 0755 /workspace/repos",
+		"get-state",
+	)
+}
+
+func TestRootProvisionerCleansUnsafeRepositoryRootFailure(t *testing.T) {
+	primary := errors.New("repository root is a symlink to /host/private")
+	client := &recordingRootClient{execResults: map[string]execResult{
+		commandKey([]string{"test", "!", "-L", "/workspace/repos"}): {err: primary},
+	}}
+	provisioner := newRootProvisioner(rootTestConfig(), testRootDependencies(client))
+
+	resources, err := provisioner.ProvisionRoot(context.Background(), validRootRequest())
+	if resources != nil || !errors.Is(err, primary) {
+		t.Fatalf("ProvisionRoot() = (%v, %v), want nil resources and unsafe repository-root error", resources, err)
+	}
+	calls := strings.Join(client.calls, ",")
+	if !strings.Contains(calls, "start-instance,exec test ! -L /workspace/repos,stop-instance,delete-instance,delete-volume") {
+		t.Fatalf("unsafe repository-root cleanup order = %s", calls)
+	}
+	for _, call := range client.calls {
+		if strings.HasPrefix(call, "exec install ") || strings.HasPrefix(call, "exec chown ") || strings.HasPrefix(call, "exec chmod ") {
+			t.Fatalf("unsafe repository root reached privileged mutation: %s", call)
+		}
+	}
+}
+
+func assertOrderedCalls(t *testing.T, calls []string, want ...string) {
+	t.Helper()
+	next := 0
+	for _, call := range calls {
+		if next < len(want) && call == want[next] {
+			next++
+		}
+	}
+	if next != len(want) {
+		t.Fatalf("calls missing ordered item %q at index %d\ncalls:\n%s", want[next], next, strings.Join(calls, "\n"))
 	}
 }
 

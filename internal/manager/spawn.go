@@ -11,10 +11,12 @@ import (
 	"os"
 	"os/exec"
 	"path/filepath"
+	"sync"
 	"syscall"
 	"time"
 
 	"github.com/sklarsa/kanedias/internal/supervisor"
+	"github.com/sklarsa/kanedias/internal/supervisor/contract"
 	"github.com/sklarsa/kanedias/internal/supervisor/process"
 )
 
@@ -130,14 +132,41 @@ func (osProcessStarter) Start(spec spawnSpec) (spawnedProcess, error) {
 	return started, nil
 }
 
+type rootStatusResult struct {
+	status process.RootStartupStatus
+	err    error
+}
+
 // pendingRoot tracks a root that is awaiting admission.
 type pendingRoot struct {
-	socketPath string
-	identity   socketIdentity
-	logPath    string
-	process    spawnedProcess
-	client     rootClient
-	rootID     string // set after first successful snapshot
+	socketPath   string
+	identity     socketIdentity
+	logPath      string
+	process      spawnedProcess
+	client       rootClient
+	rootID       string // set after first successful snapshot
+	name         string // normalized optional display name, resolved before spawn
+	statusRead   *os.File
+	statusResult <-chan rootStatusResult
+	statusOnce   sync.Once
+}
+
+func (pending *pendingRoot) closeRootStatus() {
+	pending.statusOnce.Do(func() {
+		if pending.statusRead != nil {
+			_ = pending.statusRead.Close()
+		}
+	})
+}
+
+func (pending *pendingRoot) startRootStatusDecoder() {
+	result := make(chan rootStatusResult, 1)
+	pending.statusResult = result
+	go func() {
+		status, err := process.DecodeRootStartupStatus(pending.statusRead)
+		pending.closeRootStatus()
+		result <- rootStatusResult{status: status, err: err}
+	}()
 }
 
 // probe fetches a snapshot from the pending root and validates the socket
@@ -190,12 +219,12 @@ func (m *Manager) SpawnRoot(ctx context.Context) (string, error) {
 // SpawnRootWithRequest validates an allowlisted launch request before creating
 // any spawn artifact, then transfers the resolved policy through inherited fd 3.
 func (m *Manager) SpawnRootWithRequest(ctx context.Context, request SessionLaunchRequest) (string, error) {
-	policy, err := m.launch.Resolve(request)
+	resolved, err := m.launch.Resolve(request)
 	if err != nil {
 		return "", err
 	}
 	var encoded bytes.Buffer
-	if err := process.EncodeRootBootstrap(&encoded, process.RootBootstrap{Policy: policy}); err != nil {
+	if err := process.EncodeRootBootstrap(&encoded, process.RootBootstrap{Policy: resolved.Policy, Workspace: resolved.Workspace}); err != nil {
 		return "", fmt.Errorf("manager: encode root bootstrap: %w", err)
 	}
 
@@ -243,18 +272,33 @@ func (m *Manager) SpawnRootWithRequest(ctx context.Context, request SessionLaunc
 		_ = bootstrapRead.Close()
 		_ = bootstrapWrite.Close()
 	}
+	newStatusPipe := m.newRootStatusPipe
+	if newStatusPipe == nil {
+		newStatusPipe = os.Pipe
+	}
+	statusRead, statusWrite, err := newStatusPipe()
+	if err != nil {
+		closeBootstrap()
+		_ = devNull.Close()
+		_ = logFile.Close()
+		_ = os.Remove(logPath)
+		return "", fmt.Errorf("manager: create root status pipe: %w", err)
+	}
+	pending := &pendingRoot{socketPath: socketPath, logPath: logPath, name: resolved.Name, statusRead: statusRead}
 
 	spec := spawnSpec{
 		Path: m.opts.SessionBinary,
 		Args: []string{
 			m.opts.SessionBinary,
 			"--config", m.opts.ConfigPath,
-			"session", "--socket", socketPath, "--bootstrap-fd", fmt.Sprint(process.RootBootstrapFD),
+			"session", "--socket", socketPath,
+			"--bootstrap-fd", fmt.Sprint(process.RootBootstrapFD),
+			"--status-fd", fmt.Sprint(process.RootStatusFD),
 		},
 		Env:        os.Environ(),
 		Stdin:      devNull,
 		Output:     logFile,
-		ExtraFiles: []*os.File{bootstrapRead},
+		ExtraFiles: []*os.File{bootstrapRead, statusWrite},
 		SysProcAttr: &syscall.SysProcAttr{
 			Setsid: true,
 		},
@@ -262,13 +306,17 @@ func (m *Manager) SpawnRootWithRequest(ctx context.Context, request SessionLaunc
 
 	spawned, err := m.starter.Start(spec)
 	_ = bootstrapRead.Close()
+	_ = statusWrite.Close()
 	_ = logFile.Close()
 	_ = devNull.Close()
 	if err != nil {
 		_ = bootstrapWrite.Close()
+		pending.closeRootStatus()
 		_ = os.Remove(logPath)
 		return "", fmt.Errorf("manager: start root process: %w", err)
 	}
+	pending.process = spawned
+	pending.startRootStatusDecoder()
 
 	writeDone := make(chan struct{})
 	var writeErr error
@@ -280,6 +328,7 @@ func (m *Manager) SpawnRootWithRequest(ctx context.Context, request SessionLaunc
 	case <-writeDone:
 		if writeErr != nil {
 			closeBootstrap()
+			pending.closeRootStatus()
 			primary := fmt.Errorf("manager: send root bootstrap: %w", writeErr)
 			return "", m.observeRootBootstrapAbort(spawned, primary)
 		}
@@ -287,12 +336,12 @@ func (m *Manager) SpawnRootWithRequest(ctx context.Context, request SessionLaunc
 		_ = bootstrapWrite.Close()
 		m.waitRootBootstrapWrite(writeDone)
 		closeBootstrap()
+		pending.closeRootStatus()
 		primary := errors.Join(ctx.Err(), writeErr)
 		return "", m.observeRootBootstrapAbort(spawned, primary)
 	}
 	closeBootstrap()
 
-	pending := &pendingRoot{socketPath: socketPath, logPath: logPath, process: spawned}
 	rootID, err := m.admitRoot(ctx, pending)
 	if err != nil {
 		go m.cleanupFailedSpawn(pending)
@@ -303,6 +352,7 @@ func (m *Manager) SpawnRootWithRequest(ctx context.Context, request SessionLaunc
 
 // admitRoot polls the pending root until it becomes admissible or gives up.
 func (m *Manager) admitRoot(ctx context.Context, pending *pendingRoot) (string, error) {
+	defer pending.closeRootStatus()
 	spawnTimeout := m.opts.SpawnTimeout
 	if spawnTimeout <= 0 {
 		spawnTimeout = defaultSpawnTimeout
@@ -315,8 +365,13 @@ func (m *Manager) admitRoot(ctx context.Context, pending *pendingRoot) (string, 
 
 	for {
 		select {
+		case result := <-pending.statusResult:
+			pending.statusResult = nil
+			if err := m.rootStatusAdmissionError(result); err != nil {
+				return "", err
+			}
 		case <-pending.process.Done():
-			return "", fmt.Errorf("root exited before admission: %w", pending.process.WaitErr())
+			return "", m.rootExitAdmissionError(pending)
 		case <-admissionCtx.Done():
 			return "", admissionCtx.Err()
 		case <-probe.C:
@@ -354,10 +409,59 @@ func (m *Manager) admitRoot(ctx context.Context, pending *pendingRoot) (string, 
 			if !admissible(snapshot) {
 				continue
 			}
+			// The probe can block while the root exits or its startup decoder
+			// reports failure. Observe both again before making the snapshot
+			// durable, and drain status whenever process completion is visible.
+			if err := m.observeRootBeforeCommit(pending); err != nil {
+				return "", err
+			}
 			// Atomic commit.
 			return m.commitSpawn(pending, snapshot)
 		}
 	}
+}
+
+func (m *Manager) observeRootBeforeCommit(pending *pendingRoot) error {
+	select {
+	case result := <-pending.statusResult:
+		pending.statusResult = nil
+		if err := m.rootStatusAdmissionError(result); err != nil {
+			return err
+		}
+	default:
+	}
+	select {
+	case <-pending.process.Done():
+		return m.rootExitAdmissionError(pending)
+	default:
+		return nil
+	}
+}
+
+func (m *Manager) rootExitAdmissionError(pending *pendingRoot) error {
+	if pending.statusResult != nil {
+		result := <-pending.statusResult
+		pending.statusResult = nil
+		if err := m.rootStatusAdmissionError(result); err != nil {
+			return err
+		}
+	}
+	return fmt.Errorf("root exited before admission: %w", pending.process.WaitErr())
+}
+
+func (m *Manager) rootStatusAdmissionError(result rootStatusResult) error {
+	if result.err != nil {
+		m.opts.Logger.Warn("root startup status decode failed", "err", result.err)
+		return errors.New("manager: root startup status unavailable")
+	}
+	if result.status.Status != process.RootStartupFailure {
+		return nil
+	}
+	message := "root failed to start"
+	if result.status.Code == contract.ErrorWorkspaceRepositoryUnavailable {
+		message = "selected workspace repository is unavailable"
+	}
+	return contract.NewError(result.status.Code, message)
 }
 
 // commitSpawn validates and atomically commits a pending root into the fleet.
@@ -374,7 +478,7 @@ func (m *Manager) commitSpawn(pending *pendingRoot, snapshot supervisor.NodeSnap
 		actionable: true,
 		client:     pending.client,
 	}
-	res, err := m.commitTree(handle, normalized, candidate)
+	res, err := m.commitSpawnTree(handle, normalized, candidate, pending.name)
 	if err != nil {
 		return "", fmt.Errorf("spawn admission route conflict: %w", err)
 	}
@@ -385,9 +489,8 @@ func (m *Manager) commitSpawn(pending *pendingRoot, snapshot supervisor.NodeSnap
 	// client outside the lock (MGR-A).
 	m.drainAndCloseDisplaced(res.displaced)
 
-	// Test seam (MGR-D): lets a test deterministically inject a concurrent
-	// discovery that reuses+starts monitoring res.handle in the window between
-	// our commitTree and our monitorRoot. nil in production.
+	// The launch name and routes are visible together before this existing
+	// post-admission, pre-monitor concurrency test seam runs.
 	if m.afterCommitSpawnHook != nil {
 		m.afterCommitSpawnHook(res.handle)
 	}

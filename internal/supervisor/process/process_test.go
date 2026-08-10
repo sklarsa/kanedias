@@ -33,6 +33,7 @@ func validBootstrap(t *testing.T) Bootstrap {
 		SessionID: "child-1", ParentID: "parent-1", RootID: "root-1",
 		SocketPath:     filepath.Join(t.TempDir(), "child.sock"),
 		SourceInstance: "session-parent-1", SourceVolume: "workspace-parent-1",
+		Workspace: config.WorkspaceStart{Repository: "owner/repo", Checkout: "repo"},
 		Policy: config.SessionModelPolicy{
 			Root: config.ModelProfile{Provider: "local-executor", Model: "root-model", ThinkingLevel: "off"},
 			Workers: map[string]config.WorkerProfile{
@@ -84,8 +85,12 @@ func TestSpawnerOwnsIndependentPolicyClone(t *testing.T) {
 	mutated := bootstrap.Policy.Workers["reviewer"]
 	mutated.Model = "mutated-after-spawn"
 	bootstrap.Policy.Workers["reviewer"] = mutated
+	bootstrap.Workspace = config.WorkspaceStart{Repository: "other/project", Checkout: "project"}
 	if child.bootstrap.Policy.Workers["reviewer"].Model == mutated.Model {
 		t.Fatal("spawned child state aliases caller policy map")
+	}
+	if child.bootstrap.Workspace != (config.WorkspaceStart{Repository: "owner/repo", Checkout: "repo"}) {
+		t.Fatalf("spawned child workspace = %#v, want original", child.bootstrap.Workspace)
 	}
 }
 
@@ -99,7 +104,7 @@ func TestBootstrapStrictDecodeAndValidation(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	if got.SessionID != bootstrap.SessionID || got.Request.Task != bootstrap.Request.Task || !reflect.DeepEqual(got.Policy, bootstrap.Policy) {
+	if got.SessionID != bootstrap.SessionID || got.Request.Task != bootstrap.Request.Task || got.Workspace != bootstrap.Workspace || !reflect.DeepEqual(got.Policy, bootstrap.Policy) {
 		t.Fatalf("decoded bootstrap = %#v", got)
 	}
 	if len(got.Policy.Workers) != 2 {
@@ -119,6 +124,36 @@ func TestBootstrapStrictDecodeAndValidation(t *testing.T) {
 	}
 	if _, err := DecodeBootstrap(strings.NewReader(strings.Repeat(" ", MaxRecordBytes+1))); !errors.Is(err, ErrRecordTooLarge) {
 		t.Fatalf("oversize error = %v, want ErrRecordTooLarge", err)
+	}
+}
+
+func TestBootstrapWorkspaceDefaultAndValidation(t *testing.T) {
+	zero := validBootstrap(t)
+	zero.Workspace = config.WorkspaceStart{}
+	var wire bytes.Buffer
+	if err := EncodeBootstrap(&wire, zero); err != nil {
+		t.Fatalf("zero workspace encode: %v", err)
+	}
+	got, err := DecodeBootstrap(&wire)
+	if err != nil {
+		t.Fatalf("zero workspace decode: %v", err)
+	}
+	if got.Workspace != (config.WorkspaceStart{}) {
+		t.Fatalf("zero workspace = %#v", got.Workspace)
+	}
+
+	for _, workspace := range []config.WorkspaceStart{
+		{Repository: "owner/repo", Checkout: "other"},
+		{Repository: "owner/repo", Checkout: "../repo"},
+	} {
+		bootstrap := validBootstrap(t)
+		bootstrap.Workspace = workspace
+		if err := EncodeBootstrap(&bytes.Buffer{}, bootstrap); err == nil {
+			t.Fatalf("EncodeBootstrap accepted invalid workspace %#v", workspace)
+		}
+		if _, err := DecodeBootstrap(bytes.NewReader(mustJSON(t, bootstrap))); err == nil {
+			t.Fatalf("DecodeBootstrap accepted invalid workspace %#v", workspace)
+		}
 	}
 }
 
@@ -474,6 +509,146 @@ func TestSuccessfulTerminalReportRemainsProvisionalUntilRealProcessExit(t *testi
 	}
 	if err := child.Wait(); err != nil {
 		t.Fatal(err)
+	}
+	if err := child.CloseReports(); err != nil {
+		t.Fatal(err)
+	}
+}
+
+func TestChildProvisionFailureWireMessageOmitsInternalDiagnostics(t *testing.T) {
+	const (
+		publicMessage = "selected workspace repository is unavailable"
+		commandDetail = "execute test -d /workspace/repos/repo"
+		stderrDetail  = "fatal: selected checkout is missing"
+		cleanupDetail = "delete owned child volume: permission denied"
+	)
+	if os.Getenv("KANEDIAS_CHILD_FAILURE_MESSAGE_HELPER") == "1" {
+		runErr := errors.Join(
+			contract.NewError(contract.ErrorWorkspaceRepositoryUnavailable, publicMessage),
+			fmt.Errorf("%s: %s", commandDetail, stderrDetail),
+			errors.New(cleanupDetail),
+		)
+		returned := RunInheritedChild(context.Background(), BootstrapFD, LivenessFD, ReportFD, TerminalAckFD, func(context.Context, Bootstrap, *Reporter) error {
+			return runErr
+		})
+		if returned == nil || !strings.Contains(returned.Error(), commandDetail) || !strings.Contains(returned.Error(), stderrDetail) || !strings.Contains(returned.Error(), cleanupDetail) {
+			t.Fatalf("RunInheritedChild() error = %v, want complete internal diagnostics", returned)
+		}
+		return
+	}
+
+	bootstrap := validBootstrap(t)
+	script := filepath.Join(t.TempDir(), "helper.sh")
+	contents := "#!/bin/sh\nexec \"$KANEDIAS_CHILD_FAILURE_TEST_BINARY\" -test.run '^TestChildProvisionFailureWireMessageOmitsInternalDiagnostics$'\n"
+	if err := os.WriteFile(script, []byte(contents), 0o700); err != nil {
+		t.Fatal(err)
+	}
+	t.Setenv("KANEDIAS_CHILD_FAILURE_MESSAGE_HELPER", "1")
+	t.Setenv("KANEDIAS_CHILD_FAILURE_TEST_BINARY", os.Args[0])
+	child, err := (Spawner{Executable: script, ProbeInterval: time.Millisecond}).Spawn(context.Background(), bootstrap)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer func() { _ = child.Kill() }()
+	ctx, cancel := context.WithTimeout(context.Background(), 3*time.Second)
+	defer cancel()
+	failure := child.WaitReady(ctx)
+	var typed *contract.Error
+	if !errors.As(failure, &typed) || typed.Code != contract.ErrorWorkspaceRepositoryUnavailable {
+		t.Fatalf("WaitReady() error = %v, want typed workspace repository failure", failure)
+	}
+	if typed.Message != publicMessage {
+		t.Fatalf("public failure message = %q, want exactly %q", typed.Message, publicMessage)
+	}
+	for _, forbidden := range []string{commandDetail, stderrDetail, cleanupDetail} {
+		if strings.Contains(failure.Error(), forbidden) {
+			t.Fatalf("public failure %q exposed internal detail %q", failure, forbidden)
+		}
+	}
+	if err := child.CloseLiveness(); err != nil {
+		t.Fatal(err)
+	}
+	if err := child.CloseTerminalAck(); err != nil {
+		t.Fatal(err)
+	}
+	select {
+	case <-child.Done():
+	case <-ctx.Done():
+		t.Fatal("child did not exit after liveness close")
+	}
+	if err := child.Wait(); err != nil {
+		t.Fatalf("helper process failed to retain internal run error: %v", err)
+	}
+	if err := child.CloseReports(); err != nil {
+		t.Fatal(err)
+	}
+}
+
+func TestUntypedChildStartupFailureWireMessageOmitsInternalDiagnostics(t *testing.T) {
+	const (
+		publicMessage  = "internal supervisor error"
+		commandDetail  = "chown kanedias:kanedias /workspace/repos"
+		pathDetail     = "/workspace/repos -> /host/private"
+		stderrDetail   = "operation not permitted"
+		resourceDetail = "delete owned child volume workspace-child-1 failed"
+	)
+	if os.Getenv("KANEDIAS_UNTYPED_CHILD_FAILURE_HELPER") == "1" {
+		runErr := errors.Join(
+			fmt.Errorf("execute %s: %s: %s", commandDetail, pathDetail, stderrDetail),
+			errors.New(resourceDetail),
+		)
+		returned := RunInheritedChild(context.Background(), BootstrapFD, LivenessFD, ReportFD, TerminalAckFD, func(context.Context, Bootstrap, *Reporter) error {
+			return runErr
+		})
+		for _, detail := range []string{commandDetail, pathDetail, stderrDetail, resourceDetail} {
+			if returned == nil || !strings.Contains(returned.Error(), detail) {
+				t.Fatalf("RunInheritedChild() error = %v, want complete internal detail %q", returned, detail)
+			}
+		}
+		return
+	}
+
+	bootstrap := validBootstrap(t)
+	script := filepath.Join(t.TempDir(), "helper.sh")
+	contents := "#!/bin/sh\nexec \"$KANEDIAS_UNTYPED_CHILD_FAILURE_TEST_BINARY\" -test.run '^TestUntypedChildStartupFailureWireMessageOmitsInternalDiagnostics$'\n"
+	if err := os.WriteFile(script, []byte(contents), 0o700); err != nil {
+		t.Fatal(err)
+	}
+	t.Setenv("KANEDIAS_UNTYPED_CHILD_FAILURE_HELPER", "1")
+	t.Setenv("KANEDIAS_UNTYPED_CHILD_FAILURE_TEST_BINARY", os.Args[0])
+	child, err := (Spawner{Executable: script, ProbeInterval: time.Millisecond}).Spawn(context.Background(), bootstrap)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer func() { _ = child.Kill() }()
+	ctx, cancel := context.WithTimeout(context.Background(), 3*time.Second)
+	defer cancel()
+	failure := child.WaitReady(ctx)
+	var typed *contract.Error
+	if !errors.As(failure, &typed) || typed.Code != contract.ErrorInternal {
+		t.Fatalf("WaitReady() error = %v, want typed internal failure", failure)
+	}
+	if typed.Message != publicMessage {
+		t.Fatalf("public failure message = %q, want exactly %q", typed.Message, publicMessage)
+	}
+	for _, forbidden := range []string{commandDetail, pathDetail, stderrDetail, resourceDetail} {
+		if strings.Contains(failure.Error(), forbidden) {
+			t.Fatalf("public failure %q exposed internal detail %q", failure, forbidden)
+		}
+	}
+	if err := child.CloseLiveness(); err != nil {
+		t.Fatal(err)
+	}
+	if err := child.CloseTerminalAck(); err != nil {
+		t.Fatal(err)
+	}
+	select {
+	case <-child.Done():
+	case <-ctx.Done():
+		t.Fatal("child did not exit after liveness close")
+	}
+	if err := child.Wait(); err != nil {
+		t.Fatalf("helper process failed to retain internal run error: %v", err)
 	}
 	if err := child.CloseReports(); err != nil {
 		t.Fatal(err)

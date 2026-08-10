@@ -38,6 +38,11 @@ func (adapter childRootProvisionAdapter) Destroy(ctx context.Context, resources 
 
 type eventBrokerFactory func(supervisor.EventBrokerOptions) (*supervisor.EventBroker, error)
 
+func rootSupervisorDependencies(options SessionOptions, dependencies supervisor.Dependencies) supervisor.Dependencies {
+	dependencies.Workspace = options.Workspace
+	return dependencies
+}
+
 type productionChildRuntime struct {
 	newChildProvisioner     func(context.Context, config.Config) (provision.ChildProvisioner, func(), error)
 	newDirectChildRecoverer func(context.Context, config.Config) (provision.DirectChildRecoverer, func(), error)
@@ -78,12 +83,22 @@ func runSupervisor(ctx context.Context, cfg config.Config, opts SessionOptions, 
 	return runSupervisorWithBrokerFactory(ctx, cfg, opts, out, supervisor.NewEventBrokerWithOptions)
 }
 
-func runSupervisorWithBrokerFactory(ctx context.Context, cfg config.Config, options SessionOptions, output io.Writer, factory eventBrokerFactory) error {
+func runSupervisorWithBrokerFactory(ctx context.Context, cfg config.Config, options SessionOptions, output io.Writer, factory eventBrokerFactory) (resultErr error) {
+	rootStatus := options.RootStatus
+	defer func() {
+		if rootStatus != nil {
+			resultErr = errors.Join(resultErr, rootStatus.Close())
+		}
+	}()
+
 	policy := options.Policy.Clone()
 	if err := policy.Validate(); err != nil {
 		return fmt.Errorf("validate session model policy: %w", err)
 	}
 	options.Policy = policy
+	if err := options.Workspace.Validate(); err != nil {
+		return fmt.Errorf("validate workspace start: %w", err)
+	}
 	if err := cfg.ValidateSupervisor(); err != nil {
 		return err
 	}
@@ -133,7 +148,7 @@ func runSupervisorWithBrokerFactory(ctx context.Context, cfg config.Config, opti
 		return err
 	}
 	defer directRecoverer.Close()
-	node, err := supervisor.NewRoot(identity, supervisor.Dependencies{
+	node, err := supervisor.NewRoot(identity, rootSupervisorDependencies(options, supervisor.Dependencies{
 		Provisioner: provision.NewRootProvisioner(cfg),
 		DialRPC:     dialPiRPC,
 		ModelPolicy: policy,
@@ -146,7 +161,7 @@ func runSupervisorWithBrokerFactory(ctx context.Context, cfg config.Config, opti
 		CloseListener:        closeListener,
 		HandoffVerifier:      handoffVerifier,
 		RunAttribution:       os.Getenv("KANEDIAS_E2E_RUN_ID"),
-	}, broker)
+	}), broker)
 	if err != nil {
 		return err
 	}
@@ -160,8 +175,21 @@ func runSupervisorWithBrokerFactory(ctx context.Context, cfg config.Config, opti
 	runtimeCtx, cancelRuntime := context.WithCancel(ctx)
 	defer cancelRuntime()
 	go func() { <-unixServer.Done(); cancelRuntime() }()
-	if err := node.Start(runtimeCtx); err != nil {
-		return errors.Join(err, unixServer.Err())
+	startErr := node.Start(runtimeCtx)
+	if rootStatus != nil {
+		reportErr := reportRootStartup(rootStatus, startErr)
+		rootStatus = nil
+		if reportErr != nil {
+			if startErr == nil {
+				cleanupCtx, cancel := context.WithTimeout(context.WithoutCancel(ctx), supervisorCleanupTimeout)
+				defer cancel()
+				return errors.Join(reportErr, node.Stop(cleanupCtx, supervisor.StopReasonRPCFailure))
+			}
+			return errors.Join(startErr, unixServer.Err(), reportErr)
+		}
+	}
+	if startErr != nil {
+		return errors.Join(startErr, unixServer.Err())
 	}
 	if output != nil {
 		_ = json.NewEncoder(output).Encode(node.Snapshot())
@@ -179,6 +207,19 @@ func runSupervisorWithBrokerFactory(ctx context.Context, cfg config.Config, opti
 		defer cancel()
 		return errors.Join(unixServer.Err(), node.Stop(cleanupCtx, supervisor.StopReasonRPCFailure))
 	}
+}
+
+func reportRootStartup(writer io.WriteCloser, startErr error) error {
+	status := process.RootStartupStatus{Status: process.RootStartupReady}
+	if startErr != nil {
+		code := contract.ErrorInternal
+		var typed *contract.Error
+		if errors.As(startErr, &typed) {
+			code = typed.Code
+		}
+		status = process.RootStartupStatus{Status: process.RootStartupFailure, Code: code}
+	}
+	return errors.Join(process.EncodeRootStartupStatus(writer, status), writer.Close())
 }
 
 func productionChildRunner(ctx context.Context, bootstrap process.Bootstrap, reporter *process.Reporter) error {
@@ -202,6 +243,9 @@ func productionChildRunnerWithBrokerFactory(ctx context.Context, bootstrap proce
 }
 
 func productionChildRunnerWithRuntime(ctx context.Context, bootstrap process.Bootstrap, reporter *process.Reporter, factory eventBrokerFactory, runtime productionChildRuntime) (resultErr error) {
+	if err := bootstrap.Workspace.Validate(); err != nil {
+		return contract.NewError(contract.ErrorInvalidRequest, "inherited workspace start is invalid: "+err.Error())
+	}
 	configPath := os.Getenv("KANEDIAS_CONFIG")
 	if configPath == "" || !filepath.IsAbs(configPath) || filepath.Clean(configPath) != configPath {
 		return contract.NewError(contract.ErrorInvalidRequest, "KANEDIAS_CONFIG must name an absolute clean path")
@@ -249,7 +293,7 @@ func productionChildRunnerWithRuntime(ctx context.Context, bootstrap process.Boo
 	adapter := childRootProvisionAdapter{provisioner: childProvisioner, request: provision.ChildRequest{
 		SessionID: bootstrap.SessionID, ParentID: bootstrap.ParentID, RootID: bootstrap.RootID,
 		SourceInstance: bootstrap.SourceInstance, SourceVolume: bootstrap.SourceVolume,
-		HostSocketPath: bootstrap.SocketPath, Worker: resolvedWorker, Contract: bootstrap.Request,
+		HostSocketPath: bootstrap.SocketPath, Worker: resolvedWorker, Workspace: bootstrap.Workspace, Contract: bootstrap.Request,
 		RunAttribution: bootstrap.RunAttribution,
 	}}
 
@@ -272,6 +316,7 @@ func productionChildRunnerWithRuntime(ctx context.Context, bootstrap process.Boo
 	}
 	node, err := supervisor.NewChild(identity, supervisor.Dependencies{
 		Provisioner: adapter, DialRPC: runtime.dialRPC, ModelPolicy: policy,
+		Workspace:            bootstrap.Workspace,
 		SocketPath:           bootstrap.SocketPath,
 		SpawnChild:           spawnChild,
 		DescendantClient:     runtime.descendantClient,

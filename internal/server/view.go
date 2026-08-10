@@ -30,9 +30,17 @@ type indexView struct {
 // sessionModalView is the launch configuration rendered into the closed dialog.
 type sessionModalView struct {
 	Enabled      bool
+	Repositories []repositoryOptionView
 	RootModels   []modelOptionView
 	RootThinking []thinkingOptionView
 	Workers      []workerOptionView
+}
+
+// repositoryOptionView exposes only the configured slug. Repository paths and
+// credentials never enter the template projection; /workspace is the fixed
+// browser default.
+type repositoryOptionView struct {
+	Slug string
 }
 
 // modelOptionView intentionally exposes only allowlisted browser-facing model
@@ -65,12 +73,18 @@ func newIndexView(options manager.SessionLaunchOptions) indexView {
 	sort.Slice(models, func(i, j int) bool { return models[i].ModelType < models[j].ModelType })
 	workers := append([]manager.WorkerLaunchOption(nil), options.Workers...)
 	sort.Slice(workers, func(i, j int) bool { return workers[i].WorkerType < workers[j].WorkerType })
+	repositories := append([]manager.RepositoryLaunchOption(nil), options.Repositories...)
+	sort.Slice(repositories, func(i, j int) bool { return repositories[i].Slug < repositories[j].Slug })
 
 	modal := sessionModalView{
 		Enabled:      true,
+		Repositories: make([]repositoryOptionView, 0, len(repositories)),
 		RootModels:   newModelOptionViews(models, options.Root.ModelType),
 		RootThinking: thinkingOptionsFor(models, options.Root.ModelType, options.Root.ThinkingLevel),
 		Workers:      make([]workerOptionView, 0, len(workers)),
+	}
+	for _, repository := range repositories {
+		modal.Repositories = append(modal.Repositories, repositoryOptionView{Slug: repository.Slug})
 	}
 	for i, worker := range workers {
 		modal.Workers = append(modal.Workers, workerOptionView{
@@ -124,6 +138,7 @@ type fleetView struct {
 // rootView is the template data for one admitted root.
 type rootView struct {
 	RootSessionID   string
+	DisplayName     string
 	Lifecycle       string
 	Stale           bool
 	StreamConnected bool
@@ -173,6 +188,10 @@ type detailView struct {
 	WorkerType      string
 	Lifecycle       string
 	RootSessionID   string
+	RootName        string
+	RootDisplayName string
+	DisplayLabel    string
+	IsRoot          bool
 	RootStale       bool
 	StreamConnected bool
 	Incomplete      bool
@@ -309,6 +328,23 @@ func newFleetView(snap manager.FleetSnapshot) fleetView {
 	return fleetView{Roots: roots, Issues: issues}
 }
 
+func displayRootName(name, rootID string) string {
+	if name != "" {
+		return name
+	}
+	return rootID
+}
+
+func sessionDisplayLabel(state manager.SessionState) string {
+	if state.Node.SessionID == state.RootSessionID {
+		return displayRootName(state.RootName, state.RootSessionID)
+	}
+	if state.Node.WorkerType != "" {
+		return state.Node.WorkerType
+	}
+	return state.Node.SessionID
+}
+
 func newRootView(r manager.RootState) rootView {
 	gapText := ""
 	if r.Gap != nil {
@@ -318,6 +354,7 @@ func newRootView(r manager.RootState) rootView {
 	children := nodeChildren(r.Tree.Children)
 	return rootView{
 		RootSessionID:   r.RootSessionID,
+		DisplayName:     displayRootName(r.Name, r.RootSessionID),
 		Lifecycle:       r.Tree.Lifecycle,
 		Stale:           r.Stale,
 		StreamConnected: r.StreamConnected,
@@ -401,6 +438,10 @@ func newDetailView(state manager.SessionState, stats statsView) detailView {
 		WorkerType:      state.Node.WorkerType,
 		Lifecycle:       state.Node.Lifecycle,
 		RootSessionID:   state.RootSessionID,
+		RootName:        state.RootName,
+		RootDisplayName: displayRootName(state.RootName, state.RootSessionID),
+		DisplayLabel:    sessionDisplayLabel(state),
+		IsRoot:          state.Node.SessionID != "" && state.Node.SessionID == state.RootSessionID,
 		RootStale:       state.RootStale,
 		StreamConnected: state.StreamConnected,
 		Incomplete:      state.Incomplete,

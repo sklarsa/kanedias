@@ -3,6 +3,9 @@ package manager
 import (
 	"fmt"
 	"sort"
+	"strings"
+	"unicode"
+	"unicode/utf8"
 
 	"github.com/sklarsa/kanedias/internal/config"
 	"github.com/sklarsa/kanedias/internal/supervisor/contract"
@@ -27,10 +30,29 @@ type WorkerModelSelection struct {
 
 // SessionLaunchRequest is the complete allowlisted root-creation request. It
 // must name every configured worker role exactly once; missing, duplicate, and
-// unknown roles are rejected.
+// unknown roles are rejected. Name is optional presentation metadata and
+// Repository is either empty or an exact configured owner/repository slug.
 type SessionLaunchRequest struct {
-	Root    ModelSelection         `json:"root"`
-	Workers []WorkerModelSelection `json:"workers"`
+	Name       string                 `json:"name"`
+	Repository string                 `json:"repository"`
+	Root       ModelSelection         `json:"root"`
+	Workers    []WorkerModelSelection `json:"workers"`
+}
+
+// RepositoryLaunchOption is the read-only, browser-facing view of one
+// configured workspace repository. It exposes only the slug—never a URL,
+// filesystem path, credential, or arbitrary clone source.
+type RepositoryLaunchOption struct {
+	Slug string `json:"slug"`
+}
+
+// ResolvedSessionLaunch is the immutable, validated result of resolving an
+// allowlisted launch request: a normalized optional name, the selected
+// workspace start, and the resolved model policy.
+type ResolvedSessionLaunch struct {
+	Name      string
+	Workspace config.WorkspaceStart
+	Policy    config.SessionModelPolicy
 }
 
 // ModelLaunchOption is the read-only, browser-facing view of one model type.
@@ -53,12 +75,14 @@ type WorkerLaunchOption struct {
 }
 
 // SessionLaunchOptions is the complete read-only launch view served to the
-// browser: sorted model options, the default root selection, and sorted worker
-// rows with their descriptions and default selections.
+// browser: sorted model options, the default root selection, sorted worker
+// rows with their descriptions and default selections, and the sorted
+// configured repository slugs.
 type SessionLaunchOptions struct {
-	Models  []ModelLaunchOption  `json:"models"`
-	Root    ModelSelection       `json:"root"`
-	Workers []WorkerLaunchOption `json:"workers"`
+	Models       []ModelLaunchOption      `json:"models"`
+	Root         ModelSelection           `json:"root"`
+	Workers      []WorkerLaunchOption     `json:"workers"`
+	Repositories []RepositoryLaunchOption `json:"repositories"`
 }
 
 // LaunchConfiguration is the immutable, allowlisted launch catalog plus the
@@ -66,11 +90,13 @@ type SessionLaunchOptions struct {
 // config.SessionModelPolicy without ever exposing raw provider/model or
 // description values.
 type LaunchConfiguration struct {
-	modelDefs   map[string]config.ModelDefinition
-	modelOrder  []string
-	workerDefs  map[string]config.WorkerDefaults
-	workerOrder []string
-	defaultRoot ModelSelection
+	modelDefs       map[string]config.ModelDefinition
+	modelOrder      []string
+	workerDefs      map[string]config.WorkerDefaults
+	workerOrder     []string
+	defaultRoot     ModelSelection
+	repositories    []RepositoryLaunchOption
+	workspaceBySlug map[string]config.WorkspaceStart
 }
 
 // NewLaunchConfiguration derives the immutable launch catalog from a validated
@@ -82,9 +108,10 @@ func NewLaunchConfiguration(cfg config.Config) (LaunchConfiguration, error) {
 	}
 
 	lc := LaunchConfiguration{
-		modelDefs:  make(map[string]config.ModelDefinition, len(cfg.Models)),
-		modelOrder: make([]string, 0, len(cfg.Models)),
-		workerDefs: make(map[string]config.WorkerDefaults, len(cfg.Workers)),
+		modelDefs:       make(map[string]config.ModelDefinition, len(cfg.Models)),
+		modelOrder:      make([]string, 0, len(cfg.Models)),
+		workerDefs:      make(map[string]config.WorkerDefaults, len(cfg.Workers)),
+		workspaceBySlug: make(map[string]config.WorkspaceStart),
 	}
 	for name, def := range cfg.Models {
 		def.ThinkingLevels = append([]string(nil), def.ThinkingLevels...)
@@ -115,18 +142,41 @@ func NewLaunchConfiguration(cfg config.Config) (LaunchConfiguration, error) {
 			return LaunchConfiguration{}, fmt.Errorf("worker %q default: %w", name, err)
 		}
 	}
+
+	// Derive the immutable repository launch catalog from configured
+	// workspace.repos. Invalid configured repositories fail construction rather
+	// than at request time. The parsed result is slug-sorted and immutable.
+	repos, err := config.ParseWorkspaceRepositories(cfg.Workspace.Repos)
+	if err != nil {
+		return LaunchConfiguration{}, fmt.Errorf("resolve workspace repositories: %w", err)
+	}
+	lc.repositories = make([]RepositoryLaunchOption, 0, len(repos))
+	for _, repo := range repos {
+		lc.repositories = append(lc.repositories, RepositoryLaunchOption{Slug: repo.Slug})
+		lc.workspaceBySlug[repo.Slug] = config.WorkspaceStart{Repository: repo.Slug, Checkout: repo.Checkout}
+	}
 	return lc, nil
 }
 
 // Resolve validates an allowlisted request against the fixed catalog and worker
-// role set, then returns an independent (cloned) resolved policy.
-func (lc LaunchConfiguration) Resolve(request SessionLaunchRequest) (config.SessionModelPolicy, error) {
+// role set, then returns an immutable resolved launch state. The name and
+// repository are normalized/validated first; the model policy is assembled
+// after, and every input failure is a typed invalid request.
+func (lc LaunchConfiguration) Resolve(request SessionLaunchRequest) (ResolvedSessionLaunch, error) {
+	name, err := lc.resolveName(request.Name)
+	if err != nil {
+		return ResolvedSessionLaunch{}, contractErr(err)
+	}
+	workspace, err := lc.resolveWorkspace(request.Repository)
+	if err != nil {
+		return ResolvedSessionLaunch{}, contractErr(err)
+	}
 	root, err := lc.resolveModelProfile(request.Root.ModelType, request.Root.ThinkingLevel)
 	if err != nil {
-		return config.SessionModelPolicy{}, contractErr(err)
+		return ResolvedSessionLaunch{}, contractErr(err)
 	}
 	if len(request.Workers) != len(lc.workerDefs) {
-		return config.SessionModelPolicy{}, contractErr(fmt.Errorf("launch request must include every worker exactly once"))
+		return ResolvedSessionLaunch{}, contractErr(fmt.Errorf("launch request must include every worker exactly once"))
 	}
 
 	policy := config.SessionModelPolicy{
@@ -136,19 +186,19 @@ func (lc LaunchConfiguration) Resolve(request SessionLaunchRequest) (config.Sess
 	seen := make(map[string]struct{}, len(request.Workers))
 	for _, sel := range request.Workers {
 		if sel.WorkerType == "" {
-			return config.SessionModelPolicy{}, contractErr(fmt.Errorf("launch request worker type is required"))
+			return ResolvedSessionLaunch{}, contractErr(fmt.Errorf("launch request worker type is required"))
 		}
 		if _, dup := seen[sel.WorkerType]; dup {
-			return config.SessionModelPolicy{}, contractErr(fmt.Errorf("launch request includes duplicate worker %q", sel.WorkerType))
+			return ResolvedSessionLaunch{}, contractErr(fmt.Errorf("launch request includes duplicate worker %q", sel.WorkerType))
 		}
 		seen[sel.WorkerType] = struct{}{}
 		def, ok := lc.workerDefs[sel.WorkerType]
 		if !ok {
-			return config.SessionModelPolicy{}, contractErr(fmt.Errorf("launch request includes unknown worker %q", sel.WorkerType))
+			return ResolvedSessionLaunch{}, contractErr(fmt.Errorf("launch request includes unknown worker %q", sel.WorkerType))
 		}
 		profile, err := lc.resolveModelProfile(sel.ModelType, sel.ThinkingLevel)
 		if err != nil {
-			return config.SessionModelPolicy{}, contractErr(err)
+			return ResolvedSessionLaunch{}, contractErr(err)
 		}
 		policy.Workers[sel.WorkerType] = config.WorkerProfile{
 			Description:   def.Description,
@@ -159,13 +209,46 @@ func (lc LaunchConfiguration) Resolve(request SessionLaunchRequest) (config.Sess
 	}
 	for _, name := range lc.workerOrder {
 		if _, ok := seen[name]; !ok {
-			return config.SessionModelPolicy{}, contractErr(fmt.Errorf("launch request is missing worker %q", name))
+			return ResolvedSessionLaunch{}, contractErr(fmt.Errorf("launch request is missing worker %q", name))
 		}
 	}
 	if err := policy.Validate(); err != nil {
-		return config.SessionModelPolicy{}, contractErr(err)
+		return ResolvedSessionLaunch{}, contractErr(err)
 	}
-	return policy.Clone(), nil
+	return ResolvedSessionLaunch{Name: name, Workspace: workspace, Policy: policy.Clone()}, nil
+}
+
+// resolveName trims surrounding whitespace and validates the optional display
+// name: at most 80 Unicode code points and no control characters. An empty (or
+// whitespace-only) name resolves to the empty default.
+func (lc LaunchConfiguration) resolveName(name string) (string, error) {
+	for _, r := range name {
+		if unicode.IsControl(r) {
+			return "", fmt.Errorf("session name contains a control character")
+		}
+	}
+	name = strings.TrimSpace(name)
+	if name == "" {
+		return "", nil
+	}
+	if utf8.RuneCountInString(name) > 80 {
+		return "", fmt.Errorf("session name must be at most 80 characters")
+	}
+	return name, nil
+}
+
+// resolveWorkspace resolves an optional repository slug into the immutable
+// configured workspace start. An empty selection is the /workspace default;
+// any other value must exactly match a configured slug.
+func (lc LaunchConfiguration) resolveWorkspace(repository string) (config.WorkspaceStart, error) {
+	if repository == "" {
+		return config.WorkspaceStart{}, nil
+	}
+	start, ok := lc.workspaceBySlug[repository]
+	if !ok {
+		return config.WorkspaceStart{}, fmt.Errorf("unknown repository %q", repository)
+	}
+	return start, nil
 }
 
 // resolveModelProfile resolves an allowlisted model type ID and thinking level
@@ -217,7 +300,9 @@ func (lc LaunchConfiguration) LaunchOptions() SessionLaunchOptions {
 			ThinkingLevel: lc.workerDefaultThinking(name),
 		})
 	}
-	return SessionLaunchOptions{Models: models, Root: lc.defaultRoot, Workers: workers}
+	repositories := make([]RepositoryLaunchOption, len(lc.repositories))
+	copy(repositories, lc.repositories)
+	return SessionLaunchOptions{Models: models, Root: lc.defaultRoot, Workers: workers, Repositories: repositories}
 }
 
 // DefaultRequest returns the configured default launch request with copied

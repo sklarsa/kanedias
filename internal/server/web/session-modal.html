@@ -8,6 +8,17 @@
     <p id="new-session-help">Choose the root model profile and defaults for every subagent role.</p>
 
     <fieldset{{if not .Enabled}} disabled{{end}}>
+      <legend>Session details</legend>
+      <label for="session-name">Session name <span class="optional">optional</span></label>
+      <input id="session-name" type="text" maxlength="80" autocomplete="off" data-session-name>
+      <label for="start-repository">Starting repository</label>
+      <select id="start-repository" data-start-repository>
+        <option value="" selected>/workspace</option>
+        {{range .Repositories}}<option value="{{.Slug}}">{{.Slug}}</option>{{end}}
+      </select>
+    </fieldset>
+
+    <fieldset{{if not .Enabled}} disabled{{end}}>
       <legend>Root model profile</legend>
       <label for="root-model">Model</label>
       <select id="root-model" name="root-model" data-root-model>

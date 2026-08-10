@@ -48,4 +48,18 @@ args+=(--provider "$provider" --model "$model")
 if [[ -n $thinking ]]; then
     args+=(--thinking "$thinking")
 fi
+
+workspace_root=/workspace
+workdir=${KANEDIAS_PI_WORKDIR:-$workspace_root}
+case "$workdir" in
+    "$workspace_root") ;;
+    "$workspace_root"/repos/*)
+        checkout=${workdir#"$workspace_root"/repos/}
+        [[ -n $checkout && $checkout != */* ]] || { echo "invalid Pi working directory" >&2; exit 1; }
+        ;;
+    *) echo "invalid Pi working directory" >&2; exit 1 ;;
+esac
+[[ -d $workdir && ! -L $workdir ]] || { echo "Pi working directory is unavailable" >&2; exit 1; }
+[[ $(realpath -e -- "$workdir") == "$workdir" ]] || { echo "Pi working directory is unsafe" >&2; exit 1; }
+cd -- "$workdir"
 exec pi "${args[@]}"

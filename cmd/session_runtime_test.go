@@ -2,6 +2,7 @@ package cmd
 
 import (
 	"bufio"
+	"bytes"
 	"context"
 	"encoding/json"
 	"errors"
@@ -36,6 +37,54 @@ func validSupervisorConfig() config.Config {
 		Workers: map[string]config.WorkerDefaults{"worker": {
 			Description: "work", ModelType: "gpt-5-6-sol",
 		}},
+	}
+}
+
+type recordingRootStatusWriter struct {
+	bytes.Buffer
+	closes int
+}
+
+func (writer *recordingRootStatusWriter) Close() error {
+	writer.closes++
+	return nil
+}
+
+func TestSessionStartupStatusReportsNodeStartOutcomeExactlyOnce(t *testing.T) {
+	tests := []struct {
+		name     string
+		startErr error
+		want     process.RootStartupStatus
+	}{
+		{name: "ready", want: process.RootStartupStatus{Status: process.RootStartupReady}},
+		{name: "repository failure", startErr: errors.Join(contract.NewError(contract.ErrorWorkspaceRepositoryUnavailable, "public"), errors.New("private detail")), want: process.RootStartupStatus{Status: process.RootStartupFailure, Code: contract.ErrorWorkspaceRepositoryUnavailable}},
+		{name: "internal failure", startErr: errors.New("plain failure"), want: process.RootStartupStatus{Status: process.RootStartupFailure, Code: contract.ErrorInternal}},
+	}
+	for _, test := range tests {
+		t.Run(test.name, func(t *testing.T) {
+			writer := &recordingRootStatusWriter{}
+			if err := reportRootStartup(writer, test.startErr); err != nil {
+				t.Fatal(err)
+			}
+			if writer.closes != 1 {
+				t.Fatalf("status closes = %d, want 1", writer.closes)
+			}
+			got, err := process.DecodeRootStartupStatus(bytes.NewReader(writer.Bytes()))
+			if err != nil {
+				t.Fatal(err)
+			}
+			if got != test.want {
+				t.Fatalf("status = %#v, want %#v", got, test.want)
+			}
+		})
+	}
+}
+
+func TestRootWorkspaceStartReachesSupervisorDependencies(t *testing.T) {
+	workspace := config.WorkspaceStart{Repository: "owner/repo", Checkout: "repo"}
+	dependencies := rootSupervisorDependencies(SessionOptions{Workspace: workspace}, supervisor.Dependencies{})
+	if dependencies.Workspace != workspace {
+		t.Fatalf("dependencies workspace = %#v, want %#v", dependencies.Workspace, workspace)
 	}
 }
 
@@ -82,6 +131,27 @@ func TestRunSupervisorDefaultEventLimitsWhenUnconfigured(t *testing.T) {
 	})
 	if !errors.Is(err, sentinel) {
 		t.Fatalf("error = %v", err)
+	}
+}
+
+func TestRunSupervisorRejectsInvalidWorkspaceStartBeforeConfigAndBroker(t *testing.T) {
+	called := false
+	policy, err := validSupervisorConfig().DefaultSessionModelPolicy()
+	if err != nil {
+		t.Fatal(err)
+	}
+	err = runSupervisorWithBrokerFactory(context.Background(), config.Config{}, SessionOptions{
+		SocketPath: filepath.Join(t.TempDir(), "root.sock"), ConfigPath: "/tmp/config.toml", Policy: policy,
+		Workspace: config.WorkspaceStart{Repository: "owner/repo", Checkout: "other"},
+	}, io.Discard, func(supervisor.EventBrokerOptions) (*supervisor.EventBroker, error) {
+		called = true
+		return nil, nil
+	})
+	if err == nil || !strings.Contains(err.Error(), "workspace start") {
+		t.Fatalf("workspace validation error = %v", err)
+	}
+	if called {
+		t.Fatal("broker factory called before workspace validation")
 	}
 }
 
@@ -233,6 +303,16 @@ max_bytes = 1024
 	}
 }
 
+func TestProductionChildWorkspaceStartRejectsInvalidBeforeConfig(t *testing.T) {
+	t.Setenv("KANEDIAS_CONFIG", "")
+	bootstrap := runtimePolicyBootstrap(t)
+	bootstrap.Workspace = config.WorkspaceStart{Repository: "owner/repo", Checkout: "../repo"}
+	err := productionChildRunnerWithRuntime(context.Background(), bootstrap, nil, supervisor.NewEventBrokerWithOptions, defaultProductionChildRuntime())
+	if err == nil || !strings.Contains(err.Error(), "workspace start") {
+		t.Fatalf("workspace validation error = %v", err)
+	}
+}
+
 func TestProductionChildRunnerRejectsInvalidInfrastructureBeforeBroker(t *testing.T) {
 	content := `[network]
 ipv4 = "10.76.111.1/24"
@@ -294,13 +374,15 @@ model_type = "irrelevant"
 	}
 }
 
-func TestProductionChildRunnerConstructsNestedNodeWithInheritedPolicy(t *testing.T) {
+func TestProductionChildWorkspaceInheritanceIgnoresChangedRepositoryDefaults(t *testing.T) {
 	content := `[network]
 ipv4 = "10.76.111.1/24"
 [base_image]
 name = "sandbox"
 source = "images:"
 image = "debian/13"
+[workspace]
+repos = ["changed/default"]
 [models.INVALID_NAME]
 provider = ""
 model = ""
@@ -319,7 +401,9 @@ model_type = "missing-current-worker-default"
 	}
 	t.Setenv("KANEDIAS_CONFIG", path)
 	bootstrap := runtimePolicyBootstrap(t)
+	bootstrap.Workspace = config.WorkspaceStart{Repository: "owner/repo", Checkout: "repo"}
 	originalPolicy := bootstrap.Policy.Clone()
+	originalWorkspace := bootstrap.Workspace
 	provisioner := &recordingRuntimeChildProvisioner{}
 	var nested []process.Bootstrap
 
@@ -354,9 +438,13 @@ model_type = "missing-current-worker-default"
 		if !reflect.DeepEqual(nested[0].Policy, originalPolicy) {
 			t.Fatalf("nested policy = %#v, want original %#v", nested[0].Policy, originalPolicy)
 		}
+		if nested[0].Workspace != originalWorkspace {
+			t.Fatalf("nested workspace = %#v, want inherited %#v", nested[0].Workspace, originalWorkspace)
+		}
 		mutated := nested[0].Policy.Workers["reviewer"]
 		mutated.Provider, mutated.Model = "mutated-provider", "mutated-model"
 		nested[0].Policy.Workers["reviewer"] = mutated
+		nested[0].Workspace = config.WorkspaceStart{Repository: "changed/default", Checkout: "default"}
 		_, _ = node.CreateChild(ctx, bootstrap.SessionID, request)
 		if len(nested) != 2 || !reflect.DeepEqual(nested[1].Policy, originalPolicy) {
 			t.Fatalf("second nested policy = %#v, want non-aliased original %#v", nested, originalPolicy)
@@ -370,6 +458,12 @@ model_type = "missing-current-worker-default"
 	}
 	if got, want := provisioner.request.Worker, originalPolicy.Workers[bootstrap.Request.WorkerType]; got != want {
 		t.Fatalf("provisioned worker = %#v, want inherited %#v", got, want)
+	}
+	if got := provisioner.request.Workspace; got != originalWorkspace {
+		t.Fatalf("child provision workspace = %#v, want inherited %#v", got, originalWorkspace)
+	}
+	if len(nested) != 2 || nested[1].Workspace != originalWorkspace {
+		t.Fatalf("grandchild workspace = %#v, want immutable inherited %#v", nested, originalWorkspace)
 	}
 	if len(nested[1].Policy.Workers) != len(originalPolicy.Workers) {
 		t.Fatalf("nested workers = %#v, want every role %#v", nested[1].Policy.Workers, originalPolicy.Workers)

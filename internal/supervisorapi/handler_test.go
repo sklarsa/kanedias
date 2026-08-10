@@ -4,6 +4,7 @@ import (
 	"context"
 	"encoding/json"
 	"errors"
+	"fmt"
 	"io"
 	"net"
 	"net/http"
@@ -172,6 +173,60 @@ func TestHandlerCreateChildStrictlyDecodesAndBlocksForTerminalResult(t *testing.
 	unknown := jsonRequest(t, handler, http.MethodPost, "/v1/sessions/self/children", `{"workerType":"reviewer","kind":"read","context":"fresh","task":"review","model":"forbidden"}`)
 	if unknown.Code != http.StatusBadRequest || !strings.Contains(unknown.Body.String(), `"code":"invalid_request"`) {
 		t.Fatalf("unknown field response = %d %s", unknown.Code, unknown.Body.String())
+	}
+}
+
+func TestHandlerChildProvisionFailureOmitsInternalDiagnostics(t *testing.T) {
+	const publicMessage = "selected workspace repository is unavailable"
+	service := &fakeService{err: errors.Join(
+		contract.NewError(contract.ErrorWorkspaceRepositoryUnavailable, publicMessage),
+		errors.New("execute test -d /workspace/repos/repo: fatal: selected checkout is missing"),
+		errors.New("delete owned child volume: permission denied"),
+	)}
+	response := jsonRequest(t, NewHandler(service), http.MethodPost, "/v1/sessions/self/children", `{"workerType":"reviewer","kind":"read","context":"fresh","task":"review"}`)
+	if response.Code != http.StatusServiceUnavailable {
+		t.Fatalf("status = %d body=%s, want 503", response.Code, response.Body.String())
+	}
+	var public contract.Error
+	if err := json.Unmarshal(response.Body.Bytes(), &public); err != nil {
+		t.Fatal(err)
+	}
+	if public.Code != contract.ErrorWorkspaceRepositoryUnavailable || public.Message != publicMessage {
+		t.Fatalf("public error = %#v, want exact typed generic failure", public)
+	}
+	for _, forbidden := range []string{"execute test", "fatal:", "delete owned child volume", "permission denied"} {
+		if strings.Contains(response.Body.String(), forbidden) {
+			t.Fatalf("public response %q exposed internal detail %q", response.Body.String(), forbidden)
+		}
+	}
+}
+
+func TestHandlerUntypedChildOwnershipFailureUsesFixedInternalCopy(t *testing.T) {
+	private := []string{
+		"chown kanedias:kanedias /workspace/repos",
+		"/workspace/repos -> /host/private",
+		"operation not permitted",
+		"delete owned child volume workspace-child-1 failed",
+	}
+	service := &fakeService{err: errors.Join(
+		fmt.Errorf("execute %s: %s: %s", private[0], private[1], private[2]),
+		errors.New(private[3]),
+	)}
+	response := jsonRequest(t, NewHandler(service), http.MethodPost, "/v1/sessions/self/children", `{"workerType":"reviewer","kind":"read","context":"fresh","task":"review"}`)
+	if response.Code != http.StatusInternalServerError {
+		t.Fatalf("status = %d body=%s, want 500", response.Code, response.Body.String())
+	}
+	var public contract.Error
+	if err := json.Unmarshal(response.Body.Bytes(), &public); err != nil {
+		t.Fatal(err)
+	}
+	if public.Code != contract.ErrorInternal || public.Message != "internal supervisor error" {
+		t.Fatalf("public error = %#v, want fixed internal copy", public)
+	}
+	for _, forbidden := range private {
+		if strings.Contains(response.Body.String(), forbidden) {
+			t.Fatalf("public response %q exposed internal detail %q", response.Body.String(), forbidden)
+		}
 	}
 }
 

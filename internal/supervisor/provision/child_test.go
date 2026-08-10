@@ -44,6 +44,8 @@ type recordingChildClient struct {
 	updateErr       error
 	startErr        error
 	startErrs       []error
+	execErr         error
+	execResults     map[string]execResult
 	calls           []string
 	instancePut     *api.InstancePut
 	volumePut       *api.StorageVolumePut
@@ -145,6 +147,14 @@ func (f *recordingChildClient) StartInstance(_ context.Context, name string) err
 	}
 	return err
 }
+func (f *recordingChildClient) Exec(_ context.Context, _ string, request incusclient.ExecRequest) (string, string, error) {
+	f.calls = append(f.calls, "exec "+strings.Join(request.Command, " "))
+	if f.execErr != nil {
+		return "", "", f.execErr
+	}
+	result := f.execResults[commandKey(request.Command)]
+	return result.stdout, result.stderr, result.err
+}
 func (f *recordingChildClient) StopInstance(_ context.Context, name string, force bool) error {
 	f.calls = append(f.calls, fmt.Sprintf("stop %s force=%v", name, force))
 	f.child.Status = "Stopped"
@@ -222,6 +232,94 @@ func TestNewIncusChildProvisionerRequiresCompleteOptions(t *testing.T) {
 	}
 }
 
+func TestChildProvisionerRejectsInvalidWorkspaceBeforeAllocating(t *testing.T) {
+	client := newRecordingChildClient()
+	request := validChildRequest()
+	request.Workspace = config.WorkspaceStart{Repository: "owner/repo", Checkout: "other"}
+	resources, err := newTestChildProvisioner(t, client).ProvisionChild(context.Background(), request)
+	if resources != nil || err == nil {
+		t.Fatalf("ProvisionChild() = (%v, %v), want invalid workspace", resources, err)
+	}
+	if len(client.calls) != 0 {
+		t.Fatalf("invalid workspace performed remote calls: %v", client.calls)
+	}
+}
+
+func TestChildProvisionerSetsWorkdirAndValidatesInheritedRepositoryBeforeRPC(t *testing.T) {
+	for _, contextKind := range []contract.ContextMode{contract.ContextFresh, contract.ContextFork} {
+		t.Run(string(contextKind), func(t *testing.T) {
+			client := newRecordingChildClient()
+			client.execResults = validCheckoutClient().results
+			request := validChildRequest()
+			request.Workspace = config.WorkspaceStart{Repository: "owner/repo", Checkout: "repo"}
+			request.Contract.Context = contextKind
+			if contextKind == contract.ContextFork {
+				request.Contract.Fork = &contract.ForkSpec{SessionFile: "/workspace/.pi/session.jsonl", PiSessionID: "pi-1", LeafEntryID: "leaf-1"}
+			}
+			_, err := newTestChildProvisioner(t, client).ProvisionChild(context.Background(), request)
+			if err != nil {
+				t.Fatal(err)
+			}
+			if got := client.instancePut.Config["environment.KANEDIAS_PI_WORKDIR"]; got != request.Workspace.Directory() {
+				t.Fatalf("child workdir environment = %q, want %q", got, request.Workspace.Directory())
+			}
+			assertOrderedCalls(t, client.calls,
+				"start session-child-1",
+				"exec test ! -L /workspace/repos/repo",
+				"exec realpath -e -- /workspace/repos/repo",
+				"exec runuser -u kanedias -- env HOME=/home/kanedias USER=kanedias LOGNAME=kanedias git -C /workspace/repos/repo rev-parse --show-toplevel",
+				"wait rpc session-child-1",
+			)
+		})
+	}
+}
+
+func TestChildProvisionerCleansRepositoryValidationFailure(t *testing.T) {
+	primary := errors.New("selected checkout missing")
+	commands := checkoutValidationCommands()
+	client := newRecordingChildClient()
+	client.execResults = validCheckoutClient().results
+	client.execResults[commandKey(commands[1])] = execResult{err: primary}
+	request := validChildRequest()
+	request.Workspace = config.WorkspaceStart{Repository: "owner/repo", Checkout: "repo"}
+	resources, err := newTestChildProvisioner(t, client).ProvisionChild(context.Background(), request)
+	var contractErr *contract.Error
+	if resources != nil || !errors.Is(err, primary) || !errors.As(err, &contractErr) || contractErr.Code != contract.ErrorWorkspaceRepositoryUnavailable {
+		t.Fatalf("ProvisionChild() = (%v, %v), want typed repository error with underlying failure", resources, err)
+	}
+	assertOrderedCalls(t, client.calls,
+		"start session-child-1",
+		"exec test -d /workspace/repos/repo",
+		"stop session-child-1 force=true",
+		"delete instance session-child-1",
+		"delete volume workspace-child-1",
+	)
+}
+
+func TestChildProvisionerCleansUnsafeRepositoryRootFailure(t *testing.T) {
+	primary := errors.New("repository root is a symlink to /host/private")
+	client := newRecordingChildClient()
+	client.execResults = map[string]execResult{
+		commandKey([]string{"test", "!", "-L", "/workspace/repos"}): {err: primary},
+	}
+	resources, err := newTestChildProvisioner(t, client).ProvisionChild(context.Background(), validChildRequest())
+	if resources != nil || !errors.Is(err, primary) {
+		t.Fatalf("ProvisionChild() = (%v, %v), want unsafe repository-root error", resources, err)
+	}
+	assertOrderedCalls(t, client.calls,
+		"start session-child-1",
+		"exec test ! -L /workspace/repos",
+		"stop session-child-1 force=true",
+		"delete instance session-child-1",
+		"delete volume workspace-child-1",
+	)
+	for _, call := range client.calls {
+		if strings.HasPrefix(call, "exec install ") || strings.HasPrefix(call, "exec chown ") || strings.HasPrefix(call, "exec chmod ") {
+			t.Fatalf("unsafe repository root reached privileged mutation: %s", call)
+		}
+	}
+}
+
 func TestProvisionChildFollowsFailClosedOrderAndReplacesInheritedState(t *testing.T) {
 	client := newRecordingChildClient()
 	provisioner := newTestChildProvisioner(t, client)
@@ -271,7 +369,8 @@ func TestProvisionChildFollowsFailClosedOrderAndReplacesInheritedState(t *testin
 		"environment.KANEDIAS_SESSION_ID": "child-1", "environment.KANEDIAS_SESSION_KIND": "read",
 		"environment.KANEDIAS_WORKER_TYPE": "reviewer", "environment.KANEDIAS_PI_PROVIDER": "anthropic",
 		"environment.KANEDIAS_PI_MODEL": "claude-sonnet-4", "environment.KANEDIAS_PI_THINKING": "high",
-		"environment.KANEDIAS_PI_SESSION_FILE": "", "environment.KANEDIAS_SUPERVISOR_SOCKET": "/run/kanedias/supervisor.sock",
+		"environment.KANEDIAS_PI_SESSION_FILE": "", "environment.KANEDIAS_PI_WORKDIR": "/workspace",
+		"environment.KANEDIAS_SUPERVISOR_SOCKET": "/run/kanedias/supervisor.sock",
 	}
 	if got := kanediasEnvironment(client.instancePut.Config); !reflect.DeepEqual(got, wantEnvironment) {
 		t.Errorf("fresh Kanedias environment = %#v, want exact allowlist %#v", got, wantEnvironment)
@@ -327,6 +426,7 @@ func TestProvisionChildSetsExactForkEnvironmentAllowlist(t *testing.T) {
 		"environment.KANEDIAS_PI_MODEL": "claude-sonnet-4", "environment.KANEDIAS_PI_THINKING": "high",
 		"environment.KANEDIAS_SUPERVISOR_SOCKET": "/run/kanedias/supervisor.sock",
 		"environment.KANEDIAS_PI_SESSION_FILE":   "/workspace/.pi/child.jsonl",
+		"environment.KANEDIAS_PI_WORKDIR":        "/workspace",
 	}
 	if got := kanediasEnvironment(client.instancePut.Config); !reflect.DeepEqual(got, want) {
 		t.Fatalf("fork Kanedias environment = %#v, want exact allowlist %#v", got, want)

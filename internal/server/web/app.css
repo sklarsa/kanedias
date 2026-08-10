@@ -346,6 +346,31 @@ details[open] > summary .twisty{ transform:rotate(90deg); }
 }
 .det-title-row{ display:flex; align-items:baseline; gap:14px; flex-wrap:wrap; }
 .det-title-row h1{ font-size:20px; margin:0; }
+.session-name-editor{ margin-top:5px; color:var(--ink-dim); }
+.session-name-editor summary{
+  width:max-content; cursor:pointer; color:var(--brass-bright);
+  font-size:11px; letter-spacing:.08em;
+}
+.session-name-editor form{
+  display:flex; align-items:end; gap:8px; flex-wrap:wrap;
+  margin-top:8px; padding:9px; border:1px solid var(--brass-line);
+  background:var(--bg-sunk);
+}
+.session-name-editor label{
+  display:grid; gap:4px; color:var(--ink-dim); font-size:10px;
+  letter-spacing:.1em; text-transform:uppercase;
+}
+.session-name-editor input{
+  width:min(360px,70vw); padding:7px 9px; color:var(--ink);
+  background:var(--bg-panel); border:1px solid var(--brass-line);
+  font:12px var(--mono); text-transform:none; letter-spacing:normal;
+}
+.session-name-actions{ display:flex; gap:6px; }
+.session-name-actions button{
+  min-height:32px; padding:6px 11px; cursor:pointer;
+  color:var(--ink); background:var(--bg-panel); border:1px solid var(--brass-line);
+}
+.session-name-actions button[type="submit"]{ color:var(--brass-bright); border-color:var(--brass); }
 
 /* THE RING-DIAL INSTRUMENT */
 .instrument{
@@ -776,7 +801,8 @@ details[open] > summary .twisty{ transform:rotate(90deg); }
   letter-spacing:.08em;
   text-transform:uppercase;
 }
-#new-session-modal select{
+#new-session-modal select,
+#new-session-modal input[type="text"]{
   min-width:0;
   width:100%;
   padding:9px 34px 9px 10px;
@@ -786,7 +812,17 @@ details[open] > summary .twisty{ transform:rotate(90deg); }
   background:var(--bg-sunk);
   font:13px var(--mono);
 }
-#new-session-modal select:disabled{
+#new-session-modal input[type="text"]{
+  padding-right:10px;
+}
+#new-session-modal .optional{
+  color:var(--ink-faint);
+  font-size:10px;
+  letter-spacing:0;
+  text-transform:none;
+}
+#new-session-modal select:disabled,
+#new-session-modal input[type="text"]:disabled{
   opacity:.68;
   color:var(--ink-dim);
   cursor:not-allowed;
@@ -862,11 +898,13 @@ details[open] > summary .twisty{ transform:rotate(90deg); }
   background:var(--amber-glow);
 }
 #new-session-modal button:disabled,
-#new-session-modal select:disabled{
+#new-session-modal select:disabled,
+#new-session-modal input[type="text"]:disabled{
   cursor:not-allowed;
 }
 #new-session-modal button:focus-visible,
 #new-session-modal select:focus-visible,
+#new-session-modal input[type="text"]:focus-visible,
 #new-session-modal summary:focus-visible{
   outline:2px solid var(--brass-bright);
   outline-offset:2px;
@@ -931,6 +969,7 @@ details[open] > summary .twisty{ transform:rotate(90deg); }
   }
   #new-session-modal fieldset{ grid-template-columns:1fr; gap:7px; }
   #new-session-modal select,
+  #new-session-modal input[type="text"],
   #new-session-modal button,
   #new-session-modal summary{ min-height:44px; }
   #new-session-modal .modal-close{ min-width:44px; }

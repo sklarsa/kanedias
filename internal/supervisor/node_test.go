@@ -17,6 +17,7 @@ import (
 
 	"github.com/sklarsa/kanedias/internal/config"
 	"github.com/sklarsa/kanedias/internal/supervisor/contract"
+	"github.com/sklarsa/kanedias/internal/supervisor/process"
 	"github.com/sklarsa/kanedias/internal/supervisor/provision"
 )
 
@@ -827,6 +828,50 @@ func TestRootNodeChangedPiIdentityIsTerminalAndCleansResources(t *testing.T) {
 	if fake.destroyed != 1 {
 		t.Fatalf("Destroy called %d times, want once", fake.destroyed)
 	}
+}
+
+func TestNodeWorkspaceStartInheritance(t *testing.T) {
+	workspace := config.WorkspaceStart{Repository: "owner/repo", Checkout: "repo"}
+
+	t.Run("provision request", func(t *testing.T) {
+		path, listener := boundSocket(t)
+		host, peer := net.Pipe()
+		t.Cleanup(func() { _ = peer.Close() })
+		fake := &fakeRootProvisioner{resources: &provision.Resources{SessionID: "root-1", Instance: "instance", Volume: "volume", RPCAddr: "rpc"}}
+		node, err := NewRoot(testRootIdentity(t), Dependencies{
+			Provisioner: fake, SocketPath: path, Workspace: workspace,
+			DialRPC:       func(context.Context, string) (io.ReadWriteCloser, error) { return host, nil },
+			ModelPolicy:   testModelPolicy(),
+			CloseListener: func(context.Context) error { return listener.Close() },
+		}, nil)
+		if err != nil {
+			t.Fatal(err)
+		}
+		startPiPeer(t, peer, nil)
+		if err := node.Start(context.Background()); err != nil {
+			t.Fatal(err)
+		}
+		if fake.request.Workspace != workspace {
+			t.Fatalf("root provision workspace = %#v, want %#v", fake.request.Workspace, workspace)
+		}
+		if err := node.Stop(context.Background(), StopReasonRequested); err != nil {
+			t.Fatal(err)
+		}
+	})
+
+	t.Run("child bootstrap", func(t *testing.T) {
+		var captured process.Bootstrap
+		node := childCreationNode(t, func(_ context.Context, bootstrap process.Bootstrap) (ChildProcess, error) {
+			captured = bootstrap
+			return nil, errors.New("captured bootstrap")
+		}, func(string) (DescendantClient, error) { return nil, errors.New("unexpected client") })
+		node.deps.Workspace = workspace
+		node.deps.NewSessionID = func() (string, error) { return "child-workspace", nil }
+		_, _ = node.CreateChild(context.Background(), "root-1", readRequest())
+		if captured.Workspace != workspace {
+			t.Fatalf("child bootstrap workspace = %#v, want %#v", captured.Workspace, workspace)
+		}
+	})
 }
 
 func TestRootNodeStartJoinsBindingAndCleanupErrors(t *testing.T) {

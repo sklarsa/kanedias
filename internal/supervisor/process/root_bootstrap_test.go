@@ -22,7 +22,10 @@ func validRootPolicy() config.SessionModelPolicy {
 }
 
 func TestRootBootstrapStrictBoundedPolicy(t *testing.T) {
-	bootstrap := RootBootstrap{Policy: validRootPolicy()}
+	bootstrap := RootBootstrap{
+		Policy:    validRootPolicy(),
+		Workspace: config.WorkspaceStart{Repository: "owner/repo", Checkout: "repo"},
+	}
 	var wire bytes.Buffer
 	if err := EncodeRootBootstrap(&wire, bootstrap); err != nil {
 		t.Fatal(err)
@@ -31,7 +34,7 @@ func TestRootBootstrapStrictBoundedPolicy(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	if !reflect.DeepEqual(got.Policy, bootstrap.Policy) {
+	if !reflect.DeepEqual(got.Policy, bootstrap.Policy) || got.Workspace != bootstrap.Workspace {
 		t.Fatalf("got %#v", got)
 	}
 
@@ -48,6 +51,55 @@ func TestRootBootstrapStrictBoundedPolicy(t *testing.T) {
 	}
 	if _, err := DecodeRootBootstrap(strings.NewReader(strings.Repeat(" ", MaxRecordBytes+1))); !errors.Is(err, ErrRecordTooLarge) {
 		t.Fatalf("oversize error = %v, want %v", err, ErrRecordTooLarge)
+	}
+}
+
+func TestRootBootstrapWorkspaceValidationAndIndependence(t *testing.T) {
+	zero := RootBootstrap{Policy: validRootPolicy()}
+	var zeroWire bytes.Buffer
+	if err := EncodeRootBootstrap(&zeroWire, zero); err != nil {
+		t.Fatalf("zero workspace encode: %v", err)
+	}
+	gotZero, err := DecodeRootBootstrap(&zeroWire)
+	if err != nil {
+		t.Fatalf("zero workspace decode: %v", err)
+	}
+	if gotZero.Workspace != (config.WorkspaceStart{}) {
+		t.Fatalf("zero workspace = %#v", gotZero.Workspace)
+	}
+
+	for _, workspace := range []config.WorkspaceStart{
+		{Repository: "owner/repo", Checkout: "other"},
+		{Repository: "owner/repo", Checkout: "../repo"},
+	} {
+		bootstrap := RootBootstrap{Policy: validRootPolicy(), Workspace: workspace}
+		if err := EncodeRootBootstrap(&bytes.Buffer{}, bootstrap); err == nil {
+			t.Fatalf("EncodeRootBootstrap accepted invalid workspace %#v", workspace)
+		}
+		if _, err := DecodeRootBootstrap(bytes.NewReader(mustJSON(t, bootstrap))); err == nil {
+			t.Fatalf("DecodeRootBootstrap accepted invalid workspace %#v", workspace)
+		}
+	}
+
+	bootstrap := RootBootstrap{
+		Policy:    validRootPolicy(),
+		Workspace: config.WorkspaceStart{Repository: "owner/repo", Checkout: "repo"},
+	}
+	var wire bytes.Buffer
+	if err := EncodeRootBootstrap(&wire, bootstrap); err != nil {
+		t.Fatal(err)
+	}
+	bootstrap.Workspace = config.WorkspaceStart{Repository: "other/project", Checkout: "project"}
+	decoded, err := DecodeRootBootstrap(&wire)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if decoded.Workspace != (config.WorkspaceStart{Repository: "owner/repo", Checkout: "repo"}) {
+		t.Fatalf("decoded workspace changed with caller: %#v", decoded.Workspace)
+	}
+	decoded.Workspace.Checkout = "mutated"
+	if bootstrap.Workspace.Checkout == decoded.Workspace.Checkout {
+		t.Fatal("decoded workspace aliases caller value")
 	}
 }
 

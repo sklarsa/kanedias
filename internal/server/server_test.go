@@ -598,6 +598,9 @@ func (f *fakeFleetManager) LaunchOptions() manager.SessionLaunchOptions {
 func (f *fakeFleetManager) SpawnRootWithRequest(context.Context, manager.SessionLaunchRequest) (string, error) {
 	return "", errors.New("not implemented")
 }
+func (f *fakeFleetManager) RenameRoot(string, string) error {
+	return errors.New("not implemented")
+}
 func (f *fakeFleetManager) Steer(context.Context, string, string) error {
 	return errors.New("not implemented")
 }

@@ -5,8 +5,8 @@ import (
 	"fmt"
 	"io"
 	"strings"
-	"unicode"
 
+	"github.com/sklarsa/kanedias/internal/config"
 	"github.com/sklarsa/kanedias/internal/incusclient"
 )
 
@@ -17,25 +17,16 @@ type repository struct {
 }
 
 func parseRepositories(slugs []string) ([]repository, error) {
-	repositories := make([]repository, 0, len(slugs))
-	destinations := make(map[string]struct{}, len(slugs))
-	for _, slug := range slugs {
-		parts := strings.Split(slug, "/")
-		if len(parts) != 2 || parts[0] == "" || parts[1] == "" || strings.IndexFunc(slug, unicode.IsSpace) >= 0 {
-			return nil, fmt.Errorf("invalid GitHub repository slug: %s", slug)
-		}
-		name := parts[1]
-		if name == "." || name == ".." {
-			return nil, fmt.Errorf("invalid GitHub repository slug: %s", slug)
-		}
-		if _, exists := destinations[name]; exists {
-			return nil, fmt.Errorf("duplicate repository destination: %s", name)
-		}
-		destinations[name] = struct{}{}
+	configured, err := config.ParseWorkspaceRepositories(slugs)
+	if err != nil {
+		return nil, err
+	}
+	repositories := make([]repository, 0, len(configured))
+	for _, item := range configured {
 		repositories = append(repositories, repository{
-			slug: slug,
-			name: name,
-			url:  "https://github.com/" + slug + ".git",
+			slug: item.Slug,
+			name: item.Checkout,
+			url:  "https://github.com/" + item.Slug + ".git",
 		})
 	}
 	return repositories, nil
@@ -46,16 +37,25 @@ var managedCommandPrefix = []string{
 	"env", "HOME=" + managedHome, "USER=" + managedUser, "LOGNAME=" + managedUser,
 }
 
-func prepareRepositoryRoot(ctx context.Context, incus client, instance string, stdout, stderr io.Writer) error {
+func prepareWorkspaceRoot(ctx context.Context, incus client, instance string, stdout, stderr io.Writer) error {
 	if err := exec(ctx, incus, instance, stdout, stderr, []string{"test", "!", "-L", workspacePath + "/repos"}); err != nil {
 		return fmt.Errorf("refusing symlinked repository root: %s/repos: %w", workspacePath, err)
 	}
-	if err := exec(ctx, incus, instance, stdout, stderr, []string{"test", "!", "-e", workspacePath + "/repos", "-o", "-d", workspacePath + "/repos"}); err != nil {
-		return fmt.Errorf("repository root is not a directory: %s/repos: %w", workspacePath, err)
+	// Enforce durable ownership and mode with explicit root argument arrays so an
+	// existing (already-mounted) seeded directory is repaired, not only created.
+	commands := [][]string{
+		{"chown", managedUser + ":" + managedUser, workspacePath},
+		{"chmod", "0755", workspacePath},
+		{"install", "-d", "-o", managedUser, "-g", managedUser, "-m", "0755", workspacePath + "/repos"},
+		{"chown", managedUser + ":" + managedUser, workspacePath + "/repos"},
+		{"chmod", "0755", workspacePath + "/repos"},
 	}
-	return exec(ctx, incus, instance, stdout, stderr, []string{
-		"install", "-d", "-o", managedUser, "-g", managedUser, workspacePath + "/repos",
-	})
+	for _, command := range commands {
+		if err := exec(ctx, incus, instance, stdout, stderr, command); err != nil {
+			return err
+		}
+	}
+	return nil
 }
 
 func syncRepositories(ctx context.Context, incus client, instance string, repositories []repository, stdout, stderr io.Writer) error {

@@ -37,6 +37,7 @@ type childIncusClient interface {
 	UpdateInstance(context.Context, string, api.InstancePut, string) error
 	UpdateStorageVolume(context.Context, string, string, api.StorageVolumePut, string) error
 	StartInstance(context.Context, string) error
+	Exec(context.Context, string, incusclient.ExecRequest) (string, string, error)
 	StopInstance(context.Context, string, bool) error
 	DeleteInstance(context.Context, string) error
 	DeleteStorageVolume(context.Context, string, string) error
@@ -115,6 +116,9 @@ func NewIncusChildProvisioner(client childIncusClient, options ChildProvisionOpt
 }
 
 func (p *IncusChildProvisioner) ProvisionChild(ctx context.Context, request ChildRequest) (resources *Resources, resultErr error) {
+	if err := request.Workspace.Validate(); err != nil {
+		return nil, contract.NewError(contract.ErrorInvalidRequest, err.Error())
+	}
 	instanceName := "session-" + request.SessionID
 	volumeName := "workspace-" + request.SessionID
 	if err := validateChildRequestNames(request, instanceName, volumeName); err != nil {
@@ -303,6 +307,9 @@ func (p *IncusChildProvisioner) ProvisionChild(ctx context.Context, request Chil
 		return nil, fmt.Errorf("start child instance %q: %w", instanceName, startErr)
 	}
 	if err := p.step("start child instance"); err != nil {
+		return nil, err
+	}
+	if err := prepareSessionWorkspace(ctx, p.client, instanceName, request.Workspace); err != nil {
 		return nil, err
 	}
 	resources.RPCAddr, err = p.options.WaitRPC(ctx, instanceName)
@@ -500,6 +507,7 @@ func applyChildConfig(config api.ConfigMap, request ChildRequest, volumeName str
 	config["environment.KANEDIAS_PI_THINKING"] = request.Worker.ThinkingLevel
 	config["environment.KANEDIAS_SUPERVISOR_SOCKET"] = guestSupervisorSocket
 	config["environment.KANEDIAS_PI_SESSION_FILE"] = ""
+	config["environment.KANEDIAS_PI_WORKDIR"] = request.Workspace.Directory()
 	if request.RunAttribution != "" {
 		config["environment.KANEDIAS_E2E_RUN_ID"] = request.RunAttribution
 	}

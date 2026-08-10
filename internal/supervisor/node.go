@@ -24,6 +24,7 @@ type Dependencies struct {
 	Provisioner            provision.RootProvisioner
 	DialRPC                func(context.Context, string) (io.ReadWriteCloser, error)
 	ModelPolicy            config.SessionModelPolicy
+	Workspace              config.WorkspaceStart
 	SocketPath             string
 	SpawnChild             ChildSpawner
 	DescendantClient       DescendantClientFactory
@@ -162,6 +163,7 @@ func (node *Node) Start(ctx context.Context) error {
 		SessionID:      identity.SessionID,
 		SocketPath:     node.deps.SocketPath,
 		Model:          node.deps.ModelPolicy.Root,
+		Workspace:      node.deps.Workspace,
 		RunAttribution: node.deps.RunAttribution,
 	})
 	node.mu.Lock()
@@ -341,7 +343,8 @@ func (node *Node) CreateChild(ctx context.Context, parent string, request contra
 	bootstrap := process.Bootstrap{
 		SessionID: childID, ParentID: identity.SessionID, RootID: identity.RootID,
 		SocketPath: childSocket, SourceInstance: resources.Instance, SourceVolume: resources.Volume,
-		Policy: node.deps.ModelPolicy.Clone(), Request: request, RunAttribution: node.deps.RunAttribution,
+		Policy: node.deps.ModelPolicy.Clone(), Workspace: node.deps.Workspace,
+		Request: request, RunAttribution: node.deps.RunAttribution,
 	}
 	child, err := node.deps.SpawnChild(spawnCtx, bootstrap)
 	if err != nil {

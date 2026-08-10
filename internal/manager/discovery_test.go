@@ -748,3 +748,39 @@ func TestCommitTreeConflictIsAtomic(t *testing.T) {
 		t.Error("commitTree closed the caller's fresh client on conflict — caller would double-close")
 	}
 }
+
+func TestRootNameDiscoveryCreatedHandleIsEmpty(t *testing.T) {
+	dir := t.TempDir()
+	socketPath := filepath.Join(dir, "discovered.root.sock")
+	listener, err := net.ListenUnix("unix", &net.UnixAddr{Name: socketPath, Net: "unix"})
+	if err != nil {
+		t.Fatal(err)
+	}
+	listener.SetUnlinkOnClose(false)
+	if err := listener.Close(); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.Chmod(socketPath, 0o600); err != nil {
+		t.Fatal(err)
+	}
+	identity, err := inspectRootSocket(socketPath, os.Lstat, os.Geteuid())
+	if err != nil {
+		t.Fatal(err)
+	}
+	client := &fakeClient{snapshot: rootTree("discovered")}
+	m := fakeManager(func(string) (rootClient, error) { return client, nil })
+	var issues []DiscoveryIssue
+	if changed := m.probeRoot(context.Background(), socketPath, identity, &issues); !changed {
+		t.Fatalf("probeRoot did not admit discovery handle; issues=%#v", issues)
+	}
+	fleet := m.Fleet()
+	if len(fleet.Roots) != 1 || fleet.Roots[0].Name != "" {
+		t.Fatalf("discovery root projection = %#v, want empty custom name", fleet.Roots)
+	}
+
+	ctx, cancel := context.WithTimeout(context.Background(), time.Second)
+	defer cancel()
+	if err := m.Close(ctx); err != nil {
+		t.Fatal(err)
+	}
+}

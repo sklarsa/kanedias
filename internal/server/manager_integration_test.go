@@ -499,6 +499,13 @@ func newSelectedRouteFixture(t *testing.T) *selectedRouteFixture {
 	socketPath := filepath.Join(base, "r", "selected.root.sock")
 	service := newPersistentRootService(rootID)
 	service.tree.Lifecycle = string(supervisor.LifecycleRunning)
+	service.tree.Children = []supervisor.NodeSnapshot{{
+		SessionID: "selected-child", ParentSessionID: rootID, RootSessionID: rootID,
+		PiSessionID: "pi-selected-child", SessionFile: "/sessions/selected-child.jsonl",
+		WorkerType: "reviewer", Kind: contract.ChildKindRead, Context: contract.ContextFresh,
+		Lifecycle: string(supervisor.LifecycleRunning), Questions: []supervisor.QuestionSummary{},
+		Children: []supervisor.NodeSnapshot{},
+	}}
 	rootCtx, rootCancel := context.WithCancel(context.Background())
 	rootDone := make(chan error, 1)
 	go func() {
@@ -572,8 +579,13 @@ type capabilityStreamProbe struct {
 
 func startCapabilityStreamProbe(t *testing.T, fixture *selectedRouteFixture) *capabilityStreamProbe {
 	t.Helper()
+	return startSessionStreamProbe(t, fixture, fixture.rootID)
+}
+
+func startSessionStreamProbe(t *testing.T, fixture *selectedRouteFixture, sessionID string) *capabilityStreamProbe {
+	t.Helper()
 	ctx, cancel := context.WithCancel(context.Background())
-	signals := url.QueryEscape(fmt.Sprintf(`{"selectedSessionId":%q}`, fixture.rootID))
+	signals := url.QueryEscape(fmt.Sprintf(`{"selectedSessionId":%q}`, sessionID))
 	req, err := http.NewRequestWithContext(ctx, http.MethodGet, fixture.httpServer.URL+"/ui/session?datastar="+signals, nil)
 	if err != nil {
 		cancel()
@@ -594,6 +606,52 @@ func startCapabilityStreamProbe(t *testing.T, fixture *selectedRouteFixture) *ca
 		changed: make(chan struct{}, 1),
 		done:    make(chan error, 1),
 	}
+	go func() {
+		buffer := make([]byte, 4096)
+		for {
+			n, readErr := resp.Body.Read(buffer)
+			if n > 0 {
+				probe.mu.Lock()
+				_, _ = probe.body.Write(buffer[:n])
+				probe.mu.Unlock()
+				select {
+				case probe.changed <- struct{}{}:
+				default:
+				}
+			}
+			if readErr != nil {
+				probe.done <- readErr
+				return
+			}
+		}
+	}()
+	t.Cleanup(func() {
+		cancel()
+		_ = resp.Body.Close()
+	})
+	return probe
+}
+
+func startFleetStreamProbe(t *testing.T, fixture *selectedRouteFixture) *capabilityStreamProbe {
+	t.Helper()
+	ctx, cancel := context.WithCancel(context.Background())
+	req, err := http.NewRequestWithContext(ctx, http.MethodGet, fixture.httpServer.URL+"/ui/fleet", nil)
+	if err != nil {
+		cancel()
+		t.Fatalf("new fleet stream request: %v", err)
+	}
+	req.AddCookie(fixture.cookie)
+	resp, err := fixture.httpServer.Client().Do(req)
+	if err != nil {
+		cancel()
+		t.Fatalf("open fleet stream: %v", err)
+	}
+	if resp.StatusCode != http.StatusOK {
+		cancel()
+		_ = resp.Body.Close()
+		t.Fatalf("fleet stream status = %d, want 200", resp.StatusCode)
+	}
+	probe := &capabilityStreamProbe{changed: make(chan struct{}, 1), done: make(chan error, 1)}
 	go func() {
 		buffer := make([]byte, 4096)
 		for {
@@ -679,6 +737,51 @@ func hasFinalEmptySessionPatch(body string) bool {
 		!strings.Contains(tail, `data-can-stop="true"`) &&
 		strings.Contains(tail, `id="question-panel"`) &&
 		strings.Contains(tail, `id="activity-panel"`)
+}
+
+func TestRenameRootRevisionUpdatesFleetAndSelectedChildDetail(t *testing.T) {
+	fixture := newSelectedRouteFixture(t)
+	fleetProbe := startFleetStreamProbe(t, fixture)
+	childProbe := startSessionStreamProbe(t, fixture, "selected-child")
+	fleetProbe.waitFor(t, "initial immutable root ID", 3*time.Second, func(body string) bool {
+		return strings.Contains(body, `data-session-id="selected-running-root"`)
+	})
+	childProbe.waitFor(t, "initial immutable child ID", 3*time.Second, func(body string) bool {
+		return strings.Contains(body, `<div class="k">Session</div><div class="v num">selected-child</div>`)
+	})
+
+	name := `Release <Root>`
+	body, err := json.Marshal(map[string]string{"name": name})
+	if err != nil {
+		t.Fatal(err)
+	}
+	req, err := http.NewRequest(http.MethodPost, fixture.httpServer.URL+"/ui/sessions/"+fixture.rootID+"/name", bytes.NewReader(body))
+	if err != nil {
+		t.Fatal(err)
+	}
+	req.Host = effectiveAddrForTests
+	req.Header.Set("Content-Type", "application/json")
+	req.Header.Set("Origin", "http://"+effectiveAddrForTests)
+	req.Header.Set("Sec-Fetch-Site", "same-origin")
+	req.AddCookie(fixture.cookie)
+	response, err := fixture.httpServer.Client().Do(req)
+	if err != nil {
+		t.Fatalf("rename root: %v", err)
+	}
+	responseBody, _ := io.ReadAll(response.Body)
+	_ = response.Body.Close()
+	if response.StatusCode != http.StatusOK || !strings.Contains(string(responseBody), "deck-status") {
+		t.Fatalf("rename status = %d, body = %s", response.StatusCode, responseBody)
+	}
+
+	escaped := `Release &lt;Root&gt;`
+	fleetProbe.waitFor(t, "renamed escaped fleet row", 3*time.Second, func(body string) bool {
+		return strings.Contains(body, escaped) && strings.Contains(body, `data-session-id="selected-running-root"`)
+	})
+	childProbe.waitFor(t, "renamed escaped child breadcrumb", 3*time.Second, func(body string) bool {
+		return strings.Contains(body, escaped) &&
+			strings.Contains(body, `<div class="k">Session</div><div class="v num">selected-child</div>`)
+	})
 }
 
 func TestSelectedRunningRouteAbruptRemovalStreamsDisabledCapabilities(t *testing.T) {

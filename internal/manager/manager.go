@@ -15,6 +15,7 @@ import (
 	"time"
 
 	"github.com/sklarsa/kanedias/internal/supervisor"
+	"github.com/sklarsa/kanedias/internal/supervisor/contract"
 	"github.com/sklarsa/kanedias/internal/supervisorapi"
 )
 
@@ -36,6 +37,7 @@ type Manager struct {
 	// blocked-write lifecycle ownership deterministic in tests.
 	newSpawnToken          func() (string, error)
 	newBootstrapPipe       func() (*os.File, *os.File, error)
+	newRootStatusPipe      func() (*os.File, *os.File, error)
 	writeRootBootstrap     func(io.Writer, []byte) error
 	waitRootBootstrapWrite func(<-chan struct{})
 	rootAbortWait          time.Duration
@@ -53,7 +55,7 @@ type Manager struct {
 	fleetRevision   uint64
 	sessionRevision uint64
 	// afterCommitSpawnHook, if non-nil, is invoked inside commitSpawn between
-	// commitTree and monitorRoot. Test-only seam for the MGR-D interleaving; nil
+	// atomic route/name admission and monitorRoot. Test-only seam for the MGR-D interleaving; nil
 	// in production.
 	afterCommitSpawnHook func(committed *rootHandle)
 
@@ -171,6 +173,7 @@ func New(opts Options) (*Manager, error) {
 		starter:                osProcessStarter{},
 		newSpawnToken:          generateToken,
 		newBootstrapPipe:       os.Pipe,
+		newRootStatusPipe:      os.Pipe,
 		writeRootBootstrap:     writeRootBootstrap,
 		waitRootBootstrapWrite: waitRootBootstrapWrite,
 		rootAbortWait:          defaultRootAbortWait,
@@ -289,6 +292,7 @@ func (m *Manager) Fleet() FleetSnapshot {
 		}
 		roots = append(roots, RootState{
 			RootSessionID:   handle.rootID,
+			Name:            handle.name,
 			Tree:            handle.tree,
 			Stale:           handle.stale,
 			StreamConnected: handle.streamConnected,
@@ -338,6 +342,7 @@ func (m *Manager) Session(sessionID string) (SessionState, error) {
 	}
 	state := SessionState{
 		RootSessionID:   rootID,
+		RootName:        handle.name,
 		Node:            node,
 		RootStale:       handle.stale,
 		StreamConnected: handle.streamConnected,
@@ -348,6 +353,51 @@ func (m *Manager) Session(sessionID string) (SessionState, error) {
 	}
 	m.mu.Unlock()
 	return state, nil
+}
+
+// RenameRoot changes only the manager-owned optional display name for an
+// admitted root. Session IDs remain the immutable routing and action identity.
+func (m *Manager) RenameRoot(sessionID, name string) error {
+	normalized, err := m.launch.resolveName(name)
+	if err != nil {
+		return contractErr(err)
+	}
+
+	m.mu.Lock()
+	rootID, ok := m.routes[sessionID]
+	if !ok {
+		m.mu.Unlock()
+		return errors.Join(errNotFound, contract.NewError(contract.ErrorNotFound, "session not found"))
+	}
+	if sessionID != rootID {
+		m.mu.Unlock()
+		return contract.NewError(contract.ErrorInvalidRequest, "only a root session can be renamed")
+	}
+	var handle *rootHandle
+	for _, candidate := range m.roots {
+		if candidate.rootID == rootID {
+			handle = candidate
+			break
+		}
+	}
+	if handle == nil {
+		m.mu.Unlock()
+		return errors.Join(errNotFound, contract.NewError(contract.ErrorNotFound, "root session not found"))
+	}
+	// Record valid user intent even when the requested value already matches.
+	// In particular, clearing an as-yet unnamed concurrently discovered handle
+	// must prevent pending launch admission from restoring its launch name.
+	handle.nameTouched = true
+	if handle.name == normalized {
+		m.mu.Unlock()
+		return nil
+	}
+	handle.name = normalized
+	m.mu.Unlock()
+
+	m.bumpFleetRevision()
+	m.bumpSessionRevision()
+	return nil
 }
 
 func findNode(snapshot supervisor.NodeSnapshot, sessionID string) (supervisor.NodeSnapshot, bool) {

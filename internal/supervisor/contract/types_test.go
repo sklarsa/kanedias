@@ -130,6 +130,7 @@ func TestContractErrorHTTPStatusMappings(t *testing.T) {
 		{ErrorUnknownWorkerType, http.StatusBadRequest},
 		{ErrorForbiddenRPC, http.StatusConflict},
 		{ErrorProxyUnavailable, http.StatusBadGateway},
+		{ErrorWorkspaceRepositoryUnavailable, http.StatusServiceUnavailable},
 		{ErrorProvisioningFailed, http.StatusInternalServerError},
 		{ErrorChildFailed, http.StatusBadGateway},
 		{ErrorChildAborted, http.StatusConflict},

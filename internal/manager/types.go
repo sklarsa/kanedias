@@ -41,6 +41,7 @@ type DiscoveryIssue struct {
 // RootState is the public projection of one admitted root tree.
 type RootState struct {
 	RootSessionID   string
+	Name            string
 	Tree            supervisor.NodeSnapshot
 	Stale           bool
 	StreamConnected bool
@@ -92,6 +93,7 @@ type ActivityItem struct {
 // SessionState is the public projection of one session within a root tree.
 type SessionState struct {
 	RootSessionID   string
+	RootName        string
 	Node            supervisor.NodeSnapshot
 	RootStale       bool
 	StreamConnected bool
