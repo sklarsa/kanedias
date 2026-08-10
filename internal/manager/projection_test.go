@@ -160,8 +160,9 @@ func assertOpenAssistantItem(t *testing.T, items []ActivityItem, wantText string
 
 func TestProjectActivityCountsUserMessageImagesWithoutRetainingPayload(t *testing.T) {
 	const (
-		secretA = "SECRET_BASE64_A"
-		secretB = "SECRET_BASE64_B"
+		secretA      = "SECRET_BASE64_A"
+		secretB      = "SECRET_BASE64_B"
+		imageDataURL = "data:image/png;base64," + secretA
 	)
 	projector := newActivityProjector()
 	projector.Apply(piEvent(7, "s", "message_end", map[string]any{
@@ -169,7 +170,7 @@ func TestProjectActivityCountsUserMessageImagesWithoutRetainingPayload(t *testin
 			"role": "user",
 			"content": []any{
 				map[string]any{"type": "text", "text": "inspect"},
-				map[string]any{"type": "image", "mimeType": "image/png", "data": secretA},
+				map[string]any{"type": "image", "mimeType": "image/png", "data": imageDataURL},
 				map[string]any{"type": "image", "mimeType": "image/jpeg", "data": secretB},
 			},
 		},
@@ -187,7 +188,7 @@ func TestProjectActivityCountsUserMessageImagesWithoutRetainingPayload(t *testin
 	if err != nil {
 		t.Fatal(err)
 	}
-	for _, leaked := range []string{secretA, secretB, "image/png", "image/jpeg"} {
+	for _, leaked := range []string{imageDataURL, "data:image", secretA, secretB, "image/png", "image/jpeg"} {
 		if strings.Contains(string(projected), leaked) {
 			t.Fatalf("projected activity retained image payload %q: %s", leaked, projected)
 		}
