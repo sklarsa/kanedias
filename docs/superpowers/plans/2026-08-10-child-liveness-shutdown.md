@@ -405,6 +405,17 @@ git add internal/supervisor/live_incus_test.go docs/superpowers/specs/2026-08-10
 git commit -m "test: prepare recursive acceptance checkout"
 ```
 
+### Task 7: Add a Narrow Live Child-Liveness Gate
+
+**Files:**
+- Modify: `internal/supervisor/live_incus_test.go`
+- Modify: `docs/superpowers/specs/2026-08-10-child-liveness-shutdown-design.md`
+
+- [ ] Add an explicitly authorized live test that builds the reviewed checkout, starts the owned proxy and one manual root, executes `exerciseFreshRead`, gracefully stops the root, verifies root resource/socket disappearance, and restores the exact baseline.
+- [ ] Keep the monolithic recursive test unchanged for writer/nested stress, but do not let failures in those later phases obscure the liveness-specific result.
+- [ ] Run the tagged hermetic package and the narrow authorized test with the disposable local-worker configuration.
+- [ ] Commit as `test: isolate live child liveness acceptance`.
+
 ## Final Verification
 
 After all task reviews are clean, run from the final branch state:

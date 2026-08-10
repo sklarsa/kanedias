@@ -391,6 +391,15 @@ func TestLiveRecursiveSupervisorAcceptance(t *testing.T) {
 	harness.run()
 }
 
+// TestLiveChildLivenessShutdownAcceptance isolates the terminal child path so
+// unrelated writer and nested-cascade stress cannot obscure its result.
+func TestLiveChildLivenessShutdownAcceptance(t *testing.T) {
+	requireLiveSupervisorAuthorization(t)
+	harness := newLiveAcceptance(t)
+	defer harness.close()
+	harness.runChildLivenessShutdown()
+}
+
 // TestLiveServerManagedSupervisorAcceptance proves the full server-managed
 // supervisor lifecycle: spawn, buffering, server restart, rediscovery, Pi
 // control, descendant stop, root stop, and exact Incus cleanup.
@@ -598,6 +607,29 @@ func newLiveAcceptance(t *testing.T) *liveAcceptance {
 		"config": configPath, "pool": pool, "baseline": h.baseline,
 	})
 	return h
+}
+
+func (h *liveAcceptance) runChildLivenessShutdown() {
+	h.buildReviewedCheckout()
+	h.startProxy()
+
+	rootProcess, socket, root, stream, stalled := h.startRoot("liveness")
+	defer stalled.Close()
+	h.exerciseFreshRead(root, socket, stream)
+
+	status, _, err := unixRequest(unixHTTPClient(socket), http.MethodDelete, "/v1/sessions/"+root.SessionID, nil)
+	if err != nil || status != http.StatusAccepted {
+		h.t.Fatalf("liveness root DELETE = %d, %v", status, err)
+	}
+	if err := h.waitProcess(rootProcess, 2*time.Minute); err != nil {
+		h.t.Fatalf("liveness root exited after DELETE: %v", err)
+	}
+	h.assertSessionAbsent(root.SessionID)
+	if _, err := os.Stat(socket); !errors.Is(err, os.ErrNotExist) {
+		h.t.Fatalf("liveness root socket remains: %v", err)
+	}
+	h.assertBaseline("after-child-liveness-shutdown")
+	h.success = true
 }
 
 func (h *liveAcceptance) run() {

@@ -118,7 +118,7 @@ make lint
 make build
 ```
 
-Run the narrow live Incus supervisor delegation test or acceptance target that exercises a real read child, terminal acknowledgement, process exit, socket removal, registry removal, and root `/v1/tree` recovery. The live test must use disposable resources and retain diagnostic evidence if environmental prerequisites prevent execution.
+Run the narrow live Incus supervisor delegation test or acceptance target that exercises a real read child, terminal acknowledgement, process exit, socket removal, registry removal, and root `/v1/tree` recovery. The isolated gate must also stop its root gracefully and restore the exact Incus baseline, without depending on later writer or nested-cascade stress. The live test must use disposable resources and retain diagnostic evidence if environmental prerequisites prevent execution.
 
 ## Approved Validation-Blocker Addendum
 
