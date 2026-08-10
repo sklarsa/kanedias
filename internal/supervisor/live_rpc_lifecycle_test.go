@@ -192,6 +192,35 @@ func TestLifecycleMarkerIsConciseExactAndRunScoped(t *testing.T) {
 	}
 }
 
+func TestLifecyclePostAbortProbeExplicitlySupersedesPriorTask(t *testing.T) {
+	marker := "KANEDIAS_LIFECYCLE_POST_ABORT_e2e-run"
+	prompt := lifecyclePostAbortProbe(marker)
+
+	if count := strings.Count(prompt, marker); count != 1 {
+		t.Fatalf("post-abort probe contains marker %d times, want exactly 1: %q", count, prompt)
+	}
+	for _, required := range []string{
+		"aborted",
+		"must not be resumed",
+		"Do not call any tools",
+		"only the marker",
+	} {
+		if !strings.Contains(prompt, required) {
+			t.Fatalf("post-abort probe lacks fixed instruction %q: %q", required, prompt)
+		}
+	}
+}
+
+// lifecyclePostAbortProbe builds the strict post-abort usability probe. It
+// states the prior request was aborted and must not be resumed, prohibits tool
+// calls, and constrains the response to exactly the byte-exact marker. The
+// marker appears exactly once so a strict strings.Contains final-text check
+// still proves the exact run identity.
+func lifecyclePostAbortProbe(marker string) string {
+	return "The previous request was aborted and must not be resumed. Do not call any tools. " +
+		"Reply with only the marker " + marker + " and nothing else."
+}
+
 // lifecycleDeterministicMarker builds a concise exact run-scoped provenance
 // marker for deterministic direct children only. kind is a compact two-letter
 // direct code (DS for direct single, DP for direct parallel) and index is the
@@ -438,7 +467,7 @@ func (h *liveAcceptance) exerciseLifecycleInterrupt() {
 	rootSettledBefore := root.journal.countPi(root.tree.SessionID, "agent_settled", "")
 	h.lifecycleRPCCommand(root, root.tree.SessionID, map[string]any{"type": "abort"})
 	h.waitLifecycleSettlement(root, root.tree.SessionID, rootSettledBefore, false, "root interrupt settlement and open transport")
-	h.assertRootUsable(root, "KANEDIAS_LIFECYCLE_INTERRUPT_ROOT_USABLE_"+h.prefix)
+	h.assertLifecycleRootUsableAfterAbort(root, "KANEDIAS_LIFECYCLE_INTERRUPT_ROOT_USABLE_"+h.prefix)
 
 	childCall := h.startLifecycleChildCall(root, root.tree.SessionID, "interrupt-child",
 		lifecycleActiveReadTask("KANEDIAS_LIFECYCLE_INTERRUPT_CHILD_UNEXPECTED_"+h.prefix))

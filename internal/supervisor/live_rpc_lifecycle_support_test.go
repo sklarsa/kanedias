@@ -1321,12 +1321,26 @@ func (h *liveAcceptance) lifecycleLastAssistantText(root *lifecycleRoot, session
 	return text
 }
 
-// assertRootUsable sends a short prompt containing the marker, requires its
+// assertRootUsable sends the generic short prompt containing the marker, then
+// delegates to the shared prompt-accepting settlement/final-text/state helper.
+// Every non-abort caller retains this generic wrapper.
+func (h *liveAcceptance) assertRootUsable(root *lifecycleRoot, marker string) {
+	h.assertRootUsablePrompt(root, marker, "Reply with exactly "+marker+".")
+}
+
+// assertLifecycleRootUsableAfterAbort proves the root remains usable after a
+// Pi abort by sending the explicit supersede-the-prior-task probe. It is used
+// only after a root abort, never for generic usability.
+func (h *liveAcceptance) assertLifecycleRootUsableAfterAbort(root *lifecycleRoot, marker string) {
+	h.assertRootUsablePrompt(root, marker, lifecyclePostAbortProbe(marker))
+}
+
+// assertRootUsablePrompt sends a prompt containing the marker, requires its
 // exact acknowledgement and exactly one new settlement, then checks the final
 // text and typed non-streaming state over the still-open transport.
-func (h *liveAcceptance) assertRootUsable(root *lifecycleRoot, marker string) {
+func (h *liveAcceptance) assertRootUsablePrompt(root *lifecycleRoot, marker, prompt string) {
 	before := root.journal.countPi(root.tree.SessionID, "agent_settled", "")
-	h.lifecycleRPCCommand(root, root.tree.SessionID, map[string]any{"type": "prompt", "message": "Reply with exactly " + marker + "."})
+	h.lifecycleRPCCommand(root, root.tree.SessionID, map[string]any{"type": "prompt", "message": prompt})
 	h.waitLifecycleSettlement(root, root.tree.SessionID, before, false, "new root settlement after marker prompt")
 	text := h.lifecycleLastAssistantText(root, root.tree.SessionID)
 	if !strings.Contains(text, marker) {
