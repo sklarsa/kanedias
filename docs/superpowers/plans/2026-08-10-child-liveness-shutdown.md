@@ -376,6 +376,35 @@ git add internal/supervisor/live_incus_test.go docs/superpowers/specs/2026-08-10
 git commit -m "test: wait for bound live child snapshots"
 ```
 
+### Task 6: Prepare the Disposable Writer Checkout in Live Acceptance
+
+**Files:**
+- Modify: `internal/supervisor/live_incus_test.go`
+- Modify: `docs/superpowers/specs/2026-08-10-child-liveness-shutdown-design.md`
+
+- [ ] **Step 1: Add and run the workspace regression**
+
+Add a focused test deriving `WorkspaceStart{Repository: "sklarsa/kanedias-testing", Checkout: "kanedias-testing"}` and `/workspace/repos/kanedias-testing` from the configured slug. Observe RED before adding the derivation helper.
+
+- [ ] **Step 2: Keep the manual root's default workspace**
+
+Do not bootstrap a selected workspace that is absent from the seed volume: production correctly treats `WorkspaceStart` as validated selection rather than cloning. Continue exercising the direct root path with no bootstrap/status descriptors and socket polling for readiness.
+
+- [ ] **Step 3: Materialize the run-local writer checkout**
+
+Immediately before the writer phase, derive the canonical checkout, detect an existing `.git` directory, or clone the already-preflighted disposable remote as the managed `kanedias` user into the root's copied workspace volume. Run checkout Git inspection under the same managed-user environment. The forked child inherits the checkout; the seed remains untouched. Preserve origin preflight and all handoff verification.
+
+- [ ] **Step 4: Verify focused GREEN and rerun live acceptance**
+
+Run the workspace helper regression, tagged hermetic supervisor package, and full authorized recursive acceptance.
+
+- [ ] **Step 5: Commit Task 6**
+
+```bash
+git add internal/supervisor/live_incus_test.go docs/superpowers/specs/2026-08-10-child-liveness-shutdown-design.md docs/superpowers/plans/2026-08-10-child-liveness-shutdown.md
+git commit -m "test: prepare recursive acceptance checkout"
+```
+
 ## Final Verification
 
 After all task reviews are clean, run from the final branch state:

@@ -129,6 +129,17 @@ func TestPostNewSessionJSONRejectsInvalidResponses(t *testing.T) {
 	}
 }
 
+func TestWorkspaceStartForRepositoryUsesCanonicalCheckout(t *testing.T) {
+	workspace, err := workspaceStartForRepository("sklarsa/kanedias-testing")
+	if err != nil {
+		t.Fatal(err)
+	}
+	want := config.WorkspaceStart{Repository: "sklarsa/kanedias-testing", Checkout: "kanedias-testing"}
+	if workspace != want || workspace.Directory() != "/workspace/repos/kanedias-testing" {
+		t.Fatalf("workspace = %#v at %q, want %#v at canonical checkout", workspace, workspace.Directory(), want)
+	}
+}
+
 func TestControllableChildSnapshotRequiresBindingAndActiveLifecycle(t *testing.T) {
 	child := supervisor.NodeSnapshot{Kind: contract.ChildKindRead, Context: contract.ContextFresh, Lifecycle: string(supervisor.LifecycleStarting)}
 	if isControllableChildSnapshot(child, contract.ChildKindRead, contract.ContextFresh) {
@@ -841,6 +852,14 @@ func (h *liveAcceptance) exerciseQuestionFixture(root supervisor.NodeSnapshot, s
 	h.writeJSON("question-fixture.json", map[string]any{"question": question, "answer": "deterministic-answer", "duplicateStatus": status})
 }
 
+func workspaceStartForRepository(repository string) (config.WorkspaceStart, error) {
+	repositories, err := config.ParseWorkspaceRepositories([]string{repository})
+	if err != nil {
+		return config.WorkspaceStart{}, err
+	}
+	return config.WorkspaceStart{Repository: repositories[0].Slug, Checkout: repositories[0].Checkout}, nil
+}
+
 func isControllableChildSnapshot(child supervisor.NodeSnapshot, kind contract.ChildKind, childContext contract.ContextMode) bool {
 	if child.Kind != kind || child.Context != childContext || child.PiSessionID == "" || child.SessionFile == "" ||
 		child.Model.Provider == "" || child.Model.Model == "" || child.Model.ThinkingLevel == "" {
@@ -896,17 +915,30 @@ func (h *liveAcceptance) exerciseFreshRead(root supervisor.NodeSnapshot, socket 
 	h.snapshotTree("fresh-read-complete", client)
 }
 
+func (h *liveAcceptance) ensureWorkspaceCheckout(instance string, workspace config.WorkspaceStart) {
+	checkout := workspace.Directory()
+	if _, _, err := h.client.Exec(h.ctx, instance, incusclient.ExecRequest{Command: []string{"test", "-d", filepath.Join(checkout, ".git")}}); err == nil {
+		return
+	}
+	h.execManagedInstance(instance, "gh", "repo", "clone", h.remote, checkout, "--", "--recurse-submodules")
+}
+
 func (h *liveAcceptance) exerciseForkedWrite(root supervisor.NodeSnapshot, socket string) {
 	client := unixHTTPClient(socket)
 	rootInstance := h.instanceForSession(root.SessionID)
-	checkout := "/workspace/repos/" + h.repository
-	checkoutOrigin := h.execInstance(rootInstance, "git", "-C", checkout, "config", "--get", "remote.origin.url")
+	workspace, err := workspaceStartForRepository(h.repository)
+	if err != nil {
+		h.t.Fatal(err)
+	}
+	checkout := workspace.Directory()
+	h.ensureWorkspaceCheckout(rootInstance, workspace)
+	checkoutOrigin := h.execManagedInstance(rootInstance, "git", "-C", checkout, "config", "--get", "remote.origin.url")
 	if err := preflightCheckoutOrigin(h.ctx, h.repository, h.remote, checkoutOrigin, resolveGitRemoteHEAD); err != nil {
 		h.t.Fatalf("actual writer checkout origin rejected before model prompt or push: %v", err)
 	}
 	beforeSize := h.execInstance(rootInstance, "stat", "-c", "%s", root.SessionFile)
 	beforeHash := strings.Fields(h.execInstance(rootInstance, "sha256sum", root.SessionFile))[0]
-	base := h.execInstance(rootInstance, "git", "-C", checkout, "rev-parse", "HEAD")
+	base := h.execManagedInstance(rootInstance, "git", "-C", checkout, "rev-parse", "HEAD")
 	branch := "kanedias-e2e/" + h.prefix
 	marker := "KANEDIAS_E2E_WRITE_" + h.prefix
 	body, err := os.ReadFile(filepath.Join(h.repoRoot, "internal", "supervisor", "testdata", "write-task.md"))
@@ -1471,6 +1503,11 @@ func (h *liveAcceptance) volumeForSession(sessionID string) string {
 	}
 	h.t.Fatalf("no custom volume has exact session metadata %q", sessionID)
 	return ""
+}
+
+func (h *liveAcceptance) execManagedInstance(instance string, command ...string) string {
+	prefix := []string{"runuser", "-u", "kanedias", "--", "env", "HOME=/home/kanedias", "USER=kanedias", "LOGNAME=kanedias"}
+	return h.execInstance(instance, append(prefix, command...)...)
 }
 
 func (h *liveAcceptance) execInstance(instance string, command ...string) string {
