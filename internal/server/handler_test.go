@@ -805,6 +805,44 @@ func TestAstrolabeGroupsNestedSubagentsUnderParents(t *testing.T) {
 	}
 }
 
+func TestFleetRowsBindSelectedSessionClass(t *testing.T) {
+	templates, err := parseTemplates(webFiles)
+	if err != nil {
+		t.Fatalf("parseTemplates: %v", err)
+	}
+
+	snap := manager.FleetSnapshot{
+		Roots: []manager.RootState{
+			{
+				RootSessionID: "root-1",
+				Tree: supervisor.NodeSnapshot{
+					SessionID: "root-1",
+					Lifecycle: "active",
+					Children: []supervisor.NodeSnapshot{
+						{
+							SessionID:  "parent-1",
+							WorkerType: "worker",
+							Lifecycle:  "active",
+							Children: []supervisor.NodeSnapshot{
+								{SessionID: "leaf-1", WorkerType: "reviewer", Lifecycle: "completed"},
+							},
+						},
+					},
+				},
+			},
+		},
+	}
+	rendered, err := renderTemplate(templates, templateFleet, newFleetView(snap))
+	if err != nil {
+		t.Fatalf("render fleet.html: %v", err)
+	}
+
+	const binding = `data-class:sel="$selectedSessionId === el.dataset.sessionId"`
+	if got := strings.Count(rendered, binding); got != 3 {
+		t.Fatalf("selected-session class bindings = %d, want 3 (root, parent worker, leaf worker)\n%s", got, rendered)
+	}
+}
+
 // streamFakeFleet is a controllable fake fleet manager for SSE stream tests.
 type streamFakeFleet struct {
 	mu             sync.Mutex
