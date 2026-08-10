@@ -417,21 +417,30 @@ func TestSessionInheritedFDsAreMarkedCloseOnExec(t *testing.T) {
 
 func TestSessionStatusDescriptorValidation(t *testing.T) {
 	for _, test := range []struct {
-		name        string
-		bootstrapFD int
-		statusFD    int
-		want        string
+		name string
+		args func(t *testing.T) (bootstrapFD, statusFD int, owned []int)
+		want string
 	}{
-		{name: "below fd4", bootstrapFD: 8, statusFD: 3, want: "at least 4"},
-		{name: "same as bootstrap", bootstrapFD: 8, statusFD: 8, want: "distinct"},
+		{name: "below fd4", want: "at least 4", args: func(t *testing.T) (int, int, []int) {
+			bootstrapFD := duplicateSessionTestDescriptor(t)
+			return bootstrapFD, 0, []int{bootstrapFD}
+		}},
+		{name: "same as bootstrap", want: "distinct", args: func(t *testing.T) (int, int, []int) {
+			sharedFD := duplicateSessionTestDescriptor(t)
+			return sharedFD, sharedFD, []int{sharedFD}
+		}},
 	} {
 		t.Run(test.name, func(t *testing.T) {
+			bootstrapFD, statusFD, owned := test.args(t)
 			root := newRootCommand(stubServices(), testProxyOptions())
 			root.SetOut(io.Discard)
 			root.SetErr(io.Discard)
-			root.SetArgs([]string{"session", "--socket", "/tmp/root.sock", "--bootstrap-fd", strconv.Itoa(test.bootstrapFD), "--status-fd", strconv.Itoa(test.statusFD)})
+			root.SetArgs([]string{"session", "--socket", "/tmp/root.sock", "--bootstrap-fd", strconv.Itoa(bootstrapFD), "--status-fd", strconv.Itoa(statusFD)})
 			if err := root.Execute(); err == nil || !strings.Contains(err.Error(), test.want) {
 				t.Fatalf("Execute error = %v, want %q", err, test.want)
+			}
+			for _, descriptor := range owned {
+				assertDescriptorClosed(t, descriptor)
 			}
 		})
 	}
