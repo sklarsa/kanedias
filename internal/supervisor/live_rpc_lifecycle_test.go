@@ -164,9 +164,49 @@ func lifecycleLeafChild(id string) supervisor.NodeSnapshot {
 	return supervisor.NodeSnapshot{SessionID: id, ParentSessionID: "root", RootSessionID: "root"}
 }
 
+func TestLifecycleMarkerIsConciseExactAndRunScoped(t *testing.T) {
+	cases := []struct {
+		name      string
+		kind      string
+		index     int
+		runPrefix string
+		want      string
+	}{
+		{name: "direct single", kind: "DS", index: 0, runPrefix: "e2e-run", want: "KDS_DS_e2e-run"},
+		{name: "direct parallel index two", kind: "DP", index: 2, runPrefix: "e2e-run", want: "KDS_DP_2_e2e-run"},
+		{name: "direct parallel index zero", kind: "DP", index: 0, runPrefix: "run-9", want: "KDS_DP_0_run-9"},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			got := lifecycleDeterministicMarker(tc.kind, tc.index, tc.runPrefix)
+			if got != tc.want {
+				t.Fatalf("deterministic marker = %q, want exact %q", got, tc.want)
+			}
+			if strings.ContainsAny(got, " \t\n") {
+				t.Fatalf("deterministic marker %q contains whitespace", got)
+			}
+			if !strings.HasSuffix(got, tc.runPrefix) {
+				t.Fatalf("deterministic marker %q does not retain the complete run prefix %q", got, tc.runPrefix)
+			}
+		})
+	}
+}
+
+// lifecycleDeterministicMarker builds a concise exact run-scoped provenance
+// marker for deterministic direct children only. kind is a compact two-letter
+// direct code (DS for direct single, DP for direct parallel) and index is the
+// unique parallel index. The entire supplied run prefix is retained so strict
+// byte-exact output containment still proves the exact run identity.
+func lifecycleDeterministicMarker(kind string, index int, runPrefix string) string {
+	if kind == "DS" {
+		return "KDS_" + kind + "_" + runPrefix
+	}
+	return fmt.Sprintf("KDS_%s_%d_%s", kind, index, runPrefix)
+}
+
 func (h *liveAcceptance) exerciseDeterministicChildren() {
 	root := h.startLifecycleRoot("deterministic-children")
-	singleMarker := "KANEDIAS_LIFECYCLE_DIRECT_SINGLE_" + h.prefix
+	singleMarker := lifecycleDeterministicMarker("DS", 0, h.prefix)
 	singleCall := h.startLifecycleChildCall(root, root.tree.SessionID, "direct-single",
 		"Read README.md and go.mod in the repository, then respond with the exact marker "+singleMarker+" and a concise summary of what you read.")
 
@@ -182,7 +222,7 @@ func (h *liveAcceptance) exerciseDeterministicChildren() {
 	parallelCalls := make([]*lifecycleChildCall, 3)
 	parallelMarkers := make([]string, 3)
 	for index := range parallelCalls {
-		parallelMarkers[index] = fmt.Sprintf("KANEDIAS_LIFECYCLE_DIRECT_PARALLEL_%d_%s", index, h.prefix)
+		parallelMarkers[index] = lifecycleDeterministicMarker("DP", index, h.prefix)
 		parallelCalls[index] = h.startLifecycleChildCall(root, root.tree.SessionID,
 			fmt.Sprintf("direct-parallel-%d", index),
 			"Read README.md, go.mod, and at least five Go source files in the repository. Return a concise repository summary containing the exact marker "+parallelMarkers[index]+".")
