@@ -9,7 +9,7 @@ import (
 )
 
 const (
-	WorkspaceRoot            = "/workspace"
+	WorkspaceRoot             = "/workspace"
 	WorkspaceRepositoriesRoot = "/workspace/repos"
 )
 
