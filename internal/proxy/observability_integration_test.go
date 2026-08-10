@@ -189,7 +189,7 @@ func TestObservedProxySanitizesMITMInternalErrors(t *testing.T) {
 		t.Fatal("MITM upstream failure unexpectedly succeeded")
 	}
 	logOutput := logs.String()
-	if !strings.Contains(logOutput, `"msg":"proxy internal warning"`) || !strings.Contains(logOutput, `"error_class":"internal"`) {
+	if !strings.Contains(logOutput, `"msg":"proxy internal warning"`) || !strings.Contains(logOutput, `"error_class":"upstream_read"`) {
 		t.Fatalf("sanitized goproxy warning missing: %s", logOutput)
 	}
 	if strings.Contains(logOutput, "secret-error-token") {
