@@ -914,6 +914,71 @@ func validateLifecycleModelToolEvents(events []supervisor.EventEnvelope, rootID 
 	return nil
 }
 
+// lifecycleDeterministicReadTask builds the bounded child task used by the
+// deterministic direct-single and direct-parallel read children. It requires
+// reading exactly one repository file (README.md), asks for one concise
+// repository-identification sentence, retains the complete supplied marker
+// exactly once, and forbids modification, delegation, and any other-file
+// inspection so the local model cannot grow context across a multi-file survey.
+func lifecycleDeterministicReadTask(marker string) string {
+	return "Read exactly one repository file: README.md. Do not modify or create any files, do not call delegate_session, and do not inspect any other file. Then reply with a single concise sentence identifying the repository, containing exactly the marker " + marker + "."
+}
+
+// validateLifecycleReadToolEvents requires every nonempty distinct child ID to
+// have at least one Pi tool_execution_start whose toolName is "read", and
+// rejects any delegate_session tool start by those tracked children. It ignores
+// root and unrelated-session events and parses only type and toolName, so it
+// never inspects or retains tool arguments or output. Duplicate or empty
+// expected child IDs and an empty expected set are rejected.
+func validateLifecycleReadToolEvents(events []supervisor.EventEnvelope, childIDs []string) error {
+	expected := make(map[string]struct{}, len(childIDs))
+	for _, id := range childIDs {
+		if id == "" {
+			return fmt.Errorf("expected child session ID is empty")
+		}
+		if _, duplicate := expected[id]; duplicate {
+			return fmt.Errorf("duplicate expected child session ID %q", id)
+		}
+		expected[id] = struct{}{}
+	}
+	if len(expected) == 0 {
+		return fmt.Errorf("no expected child session IDs supplied")
+	}
+
+	readStarts := make(map[string]int, len(expected))
+	for _, event := range events {
+		if event.Kind != "pi" {
+			continue
+		}
+		if _, tracked := expected[event.SessionID]; !tracked {
+			// Ignore root and unrelated-session events.
+			continue
+		}
+		var payload struct {
+			Type     string `json:"type"`
+			ToolName string `json:"toolName"`
+		}
+		if json.Unmarshal(event.Payload, &payload) != nil {
+			continue
+		}
+		if payload.Type != "tool_execution_start" {
+			continue
+		}
+		switch payload.ToolName {
+		case "read":
+			readStarts[event.SessionID]++
+		case "delegate_session":
+			return fmt.Errorf("tracked child %q started a delegate_session tool", event.SessionID)
+		}
+	}
+	for id := range expected {
+		if readStarts[id] < 1 {
+			return fmt.Errorf("tracked child %q has no Pi read tool_execution_start", id)
+		}
+	}
+	return nil
+}
+
 // validateLifecycleNaturalChildEvents requires one successful assistant
 // message terminal and one (non-duplicated) settlement for every observed child.
 func validateLifecycleNaturalChildEvents(events []supervisor.EventEnvelope, childIDs []string) error {

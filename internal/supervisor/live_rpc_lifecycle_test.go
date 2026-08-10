@@ -254,6 +254,71 @@ func TestLifecycleInterruptControlProbeRequiresExactQuestion(t *testing.T) {
 	}
 }
 
+func TestLifecycleDeterministicReadTaskRequiresBoundedRealToolEvidence(t *testing.T) {
+	marker := "KDS_DS_e2e-run"
+	task := lifecycleDeterministicReadTask(marker)
+	if strings.TrimSpace(task) == "" {
+		t.Fatal("bounded read task is empty")
+	}
+	if !strings.Contains(task, "README.md") {
+		t.Fatal("bounded read task does not require reading README.md")
+	}
+	if count := strings.Count(task, marker); count != 1 {
+		t.Fatalf("bounded read task contains marker %d times, want exactly 1", count)
+	}
+	for _, banned := range []string{"go.mod", "internal/", "at least five", "lifecycle responsibility"} {
+		if strings.Contains(task, banned) {
+			t.Fatalf("bounded read task retains prior multi-file workload fragment %q: %q", banned, task)
+		}
+	}
+	for _, forbidden := range []string{"modify", "create", "delegate", "other file"} {
+		if !strings.Contains(task, forbidden) {
+			t.Fatalf("bounded read task does not forbid %q: %q", forbidden, task)
+		}
+	}
+	if !strings.Contains(task, "concise") {
+		t.Fatalf("bounded read task does not request a concise repository-identification sentence: %q", task)
+	}
+
+	readEvidence := []supervisor.EventEnvelope{
+		lifecyclePiEnvelope(1, "child-a", `{"type":"tool_execution_start","toolName":"read"}`),
+		lifecyclePiEnvelope(2, "child-b", `{"type":"tool_execution_start","toolName":"read"}`),
+		lifecyclePiEnvelope(3, "child-a", `{"type":"tool_execution_start","toolName":"read"}`),
+		lifecyclePiEnvelope(4, "root", `{"type":"tool_execution_start","toolName":"read"}`),
+		lifecyclePiEnvelope(5, "unrelated", `{"type":"tool_execution_start","toolName":"read"}`),
+	}
+	if err := validateLifecycleReadToolEvents(readEvidence, []string{"child-a", "child-b"}); err != nil {
+		t.Fatalf("valid read-tool evidence: %v", err)
+	}
+
+	missing := []supervisor.EventEnvelope{
+		lifecyclePiEnvelope(1, "child-a", `{"type":"tool_execution_start","toolName":"read"}`),
+		lifecyclePiEnvelope(2, "child-b", `{"type":"tool_execution_end","toolName":"read"}`),
+	}
+	if err := validateLifecycleReadToolEvents(missing, []string{"child-a", "child-b"}); err == nil {
+		t.Fatal("missing child read evidence was accepted")
+	}
+
+	delegate := []supervisor.EventEnvelope{
+		lifecyclePiEnvelope(1, "child-a", `{"type":"tool_execution_start","toolName":"read"}`),
+		lifecyclePiEnvelope(2, "child-b", `{"type":"tool_execution_start","toolName":"read"}`),
+		lifecyclePiEnvelope(3, "child-b", `{"type":"tool_execution_start","toolName":"delegate_session"}`),
+	}
+	if err := validateLifecycleReadToolEvents(delegate, []string{"child-a", "child-b"}); err == nil {
+		t.Fatal("tracked child delegate_session start was accepted")
+	}
+
+	if err := validateLifecycleReadToolEvents(readEvidence, []string{"child-a", "child-a"}); err == nil {
+		t.Fatal("duplicate expected child id was accepted")
+	}
+	if err := validateLifecycleReadToolEvents(readEvidence, []string{"child-a", ""}); err == nil {
+		t.Fatal("empty expected child id was accepted")
+	}
+	if err := validateLifecycleReadToolEvents(readEvidence, nil); err == nil {
+		t.Fatal("empty expected child set was accepted")
+	}
+}
+
 // lifecycleDeterministicMarker builds a concise exact run-scoped provenance
 // marker for deterministic direct children only. kind is a compact two-letter
 // direct code (DS for direct single, DP for direct parallel) and index is the
@@ -270,7 +335,7 @@ func (h *liveAcceptance) exerciseDeterministicChildren() {
 	root := h.startLifecycleRoot("deterministic-children")
 	singleMarker := lifecycleDeterministicMarker("DS", 0, h.prefix)
 	singleCall := h.startLifecycleChildCall(root, root.tree.SessionID, "direct-single",
-		"Read README.md and go.mod in the repository, then respond with the exact marker "+singleMarker+" and a concise summary of what you read.")
+		lifecycleDeterministicReadTask(singleMarker))
 
 	singleTree := h.waitForLifecycleChildren(root, 1, false, "single bound child")
 	singleChild := singleTree.Children[0]
@@ -279,6 +344,9 @@ func (h *liveAcceptance) exerciseDeterministicChildren() {
 	singleResult := singleCall.wait(h.t, 8*time.Minute)
 	h.assertLifecycleReadResult(singleResult, singleChild.SessionID, singleMarker)
 	h.waitForLifecycleChildrenGone(root, []supervisor.NodeSnapshot{singleChild}, singlePIDs, "single child natural completion")
+	if err := validateLifecycleReadToolEvents(root.journal.snapshot(), []string{singleChild.SessionID}); err != nil {
+		h.t.Fatalf("single bound child read-tool evidence: %v", err)
+	}
 	h.assertRootUsable(root, "KANEDIAS_LIFECYCLE_DIRECT_SINGLE_ROOT_USABLE_"+h.prefix)
 
 	parallelCalls := make([]*lifecycleChildCall, 3)
@@ -287,7 +355,7 @@ func (h *liveAcceptance) exerciseDeterministicChildren() {
 		parallelMarkers[index] = lifecycleDeterministicMarker("DP", index, h.prefix)
 		parallelCalls[index] = h.startLifecycleChildCall(root, root.tree.SessionID,
 			fmt.Sprintf("direct-parallel-%d", index),
-			"Read README.md, go.mod, and at least five Go source files in the repository. Return a concise repository summary containing the exact marker "+parallelMarkers[index]+".")
+			lifecycleDeterministicReadTask(parallelMarkers[index]))
 	}
 
 	parallelTree := h.waitForLifecycleChildren(root, 3, false, "three parallel bound children in one tree snapshot")
@@ -310,6 +378,13 @@ func (h *liveAcceptance) exerciseDeterministicChildren() {
 		resultIDs[readResult.SessionID] = struct{}{}
 	}
 	h.waitForLifecycleChildrenGone(root, parallelTree.Children, parallelPIDs, "parallel child natural completion")
+	parallelChildIDs := make([]string, 0, len(parallelTree.Children))
+	for _, child := range parallelTree.Children {
+		parallelChildIDs = append(parallelChildIDs, child.SessionID)
+	}
+	if err := validateLifecycleReadToolEvents(root.journal.snapshot(), parallelChildIDs); err != nil {
+		h.t.Fatalf("parallel bound child read-tool evidence: %v", err)
+	}
 	h.assertRootUsable(root, "KANEDIAS_LIFECYCLE_DIRECT_PARALLEL_ROOT_USABLE_"+h.prefix)
 	h.stopLifecycleRoot(root)
 }
