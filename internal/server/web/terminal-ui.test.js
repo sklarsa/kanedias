@@ -230,23 +230,6 @@ test("submit falls back to enabled Steer without optimistic clear", () => {
   assert.equal(disabled.input.value, "queued");
 });
 
-test("picker staging resets its value so the same file can be selected again", () => {
-  const file = {name: "same.png", type: "image/png", size: 1};
-  const input = {files: [file], value: "C:\\fakepath\\same.png"};
-  const staged = [];
-  const controller = {stageFiles(files) { staged.push(Array.from(files)); }};
-
-  ui.stagePickedFiles(input, controller);
-  assert.deepEqual(staged, [[file]]);
-  assert.equal(input.value, "");
-
-  input.files = [file];
-  input.value = "C:\\fakepath\\same.png";
-  ui.stagePickedFiles(input, controller);
-  assert.deepEqual(staged, [[file], [file]]);
-  assert.equal(input.value, "");
-});
-
 test("Ctrl-A selects the complete deck input", () => {
   const fixture = fakeSubmitDocument(false);
   fixture.input.value = "select this directive";

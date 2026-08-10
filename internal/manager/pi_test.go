@@ -55,6 +55,14 @@ func TestDecodePiResponseRejectsWrongCommand(t *testing.T) {
 	}
 }
 
+func TestDecodePiResponseRejectsMissingExpectedCommand(t *testing.T) {
+	raw := json.RawMessage(`{"type":"response","success":true}`)
+	_, err := decodePiResponse[any](raw, "expected")
+	if err == nil {
+		t.Fatal("accepted missing expected command")
+	}
+}
+
 // ---- Steer: streaming vs. idle dispatch ----
 
 // piControlClient is a rootClient that records the exact sequence of CallRPC
@@ -170,14 +178,34 @@ func TestSendMessageStreamingIncludesNativeImages(t *testing.T) {
 		t.Fatal(err)
 	}
 	var command struct {
-		Type   string
-		Images []struct{ Data string }
+		Type, Message string
+		Images        []struct{ Type, Data, MIMEType string }
 	}
 	if err := json.Unmarshal(client.callLog[1].payload, &command); err != nil {
 		t.Fatal(err)
 	}
-	if command.Type != "steer" || len(command.Images) != 1 {
+	if command.Type != "steer" || command.Message != "redirect" || len(command.Images) != 1 ||
+		command.Images[0].Type != "image" || command.Images[0].MIMEType != "image/png" ||
+		command.Images[0].Data != base64.StdEncoding.EncodeToString(image.Data) {
 		t.Fatalf("command = %#v", command)
+	}
+}
+
+func TestSendMessageCanonicalizesJPEGAlias(t *testing.T) {
+	data := append([]byte("\xff\xd8\xff\xe0JFIF\x00"), make([]byte, 32)...)
+	image := attachments.Image{MIMEType: "image/jpg", Data: data}
+	client := imageCapablePIControlClient(false)
+	m := piManagerWithSession("root", client, rootTree("root"))
+
+	if err := m.SendMessage(context.Background(), "root", "inspect", []attachments.Image{image}); err != nil {
+		t.Fatal(err)
+	}
+	var command piMessageCommand
+	if err := json.Unmarshal(client.callLog[1].payload, &command); err != nil {
+		t.Fatal(err)
+	}
+	if got := command.Images[0].MIMEType; got != "image/jpeg" {
+		t.Fatalf("MIMEType = %q, want image/jpeg", got)
 	}
 }
 
@@ -259,14 +287,37 @@ func TestSendMessageAcceptsTextAndImageModelInput(t *testing.T) {
 func TestSendMessageValidatesImagesBeforeNetworkIO(t *testing.T) {
 	client := imageCapablePIControlClient(false)
 	m := piManagerWithSession("root", client, rootTree("root"))
+	valid := testPNG(t, 1)
 	invalid := attachments.Image{MIMEType: "image/png", Data: []byte("not an image")}
 
-	err := m.SendMessage(context.Background(), "root", "inspect", []attachments.Image{invalid})
+	err := m.SendMessage(context.Background(), "root", "inspect", []attachments.Image{valid, invalid})
 	if !errors.Is(err, attachments.ErrUnsupportedFormat) {
 		t.Fatalf("SendMessage() error = %v, want %v", err, attachments.ErrUnsupportedFormat)
 	}
 	if len(client.callLog) != 0 {
 		t.Fatalf("invalid images caused %d RPC calls", len(client.callLog))
+	}
+}
+
+func TestSendMessageRejectsMissingPromptOrSteerCommand(t *testing.T) {
+	for _, streaming := range []bool{false, true} {
+		t.Run(map[bool]string{false: "prompt", true: "steer"}[streaming], func(t *testing.T) {
+			client := imageCapablePIControlClient(streaming)
+			client.response = func(idx int, _ string, _ json.RawMessage) (json.RawMessage, error) {
+				if idx == 0 {
+					streamingJSON := "false"
+					if streaming {
+						streamingJSON = "true"
+					}
+					return json.RawMessage(`{"type":"response","command":"get_state","success":true,"data":{"isStreaming":` + streamingJSON + `,"model":{"input":["image"]}}}`), nil
+				}
+				return json.RawMessage(`{"type":"response","success":true}`), nil
+			}
+			m := piManagerWithSession("root", client, rootTree("root"))
+			if err := m.SendMessage(context.Background(), "root", "inspect", []attachments.Image{testPNG(t, 1)}); err == nil {
+				t.Fatal("accepted success response without command")
+			}
+		})
 	}
 }
 

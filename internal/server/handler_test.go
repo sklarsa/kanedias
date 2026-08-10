@@ -672,6 +672,19 @@ func TestActivityUsesMarkdownClassification(t *testing.T) {
 	}
 }
 
+func TestImageAttachmentLabelBoundaries(t *testing.T) {
+	for _, test := range []struct {
+		count int
+		want  string
+	}{
+		{count: -1, want: ""}, {count: 0, want: ""}, {count: 1, want: "1 image attached"}, {count: 2, want: "2 images attached"},
+	} {
+		if got := imageAttachmentLabel(test.count); got != test.want {
+			t.Fatalf("imageAttachmentLabel(%d) = %q, want %q", test.count, got, test.want)
+		}
+	}
+}
+
 func TestActivityAttachmentLabelsAreSafe(t *testing.T) {
 	const (
 		secretA = "SECRET_BASE64_A"

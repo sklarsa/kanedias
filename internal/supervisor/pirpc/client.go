@@ -55,7 +55,7 @@ type Client struct {
 func NewClient(conn io.ReadWriteCloser) *Client {
 	client := &Client{
 		conn:      conn,
-		events:    make(chan Event, 128),
+		events:    make(chan Event, 1),
 		done:      make(chan struct{}),
 		readDone:  make(chan struct{}),
 		writeGate: make(chan struct{}, 1),
@@ -207,6 +207,9 @@ func (client *Client) readLoop() {
 		select {
 		case client.events <- Event{Seq: sequence, Type: envelope.Type, Raw: raw}:
 		case <-client.done:
+			return
+		default:
+			_ = client.terminate(errors.New("Pi RPC event consumer exceeded bounded capacity"))
 			return
 		}
 	}

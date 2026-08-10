@@ -20,6 +20,7 @@ const (
 
 	invalidMessageUpload = "The message upload was not valid."
 	imageLimitsExceeded  = "The image attachment limits were exceeded."
+	directiveTooLarge    = "The directive must be 64 KiB or smaller."
 	unsupportedImage     = "Only PNG, JPEG, GIF, and WebP images are supported."
 )
 
@@ -48,6 +49,10 @@ func invalidMessageError(err error) error {
 
 func messageLimitError(err error) error {
 	return &messageDecodeError{Status: http.StatusRequestEntityTooLarge, Message: imageLimitsExceeded, Err: err}
+}
+
+func directiveLimitError(err error) error {
+	return &messageDecodeError{Status: http.StatusRequestEntityTooLarge, Message: directiveTooLarge, Err: err}
 }
 
 func unsupportedImageError(err error) error {
@@ -99,7 +104,7 @@ func decodeMessageRequest(w http.ResponseWriter, r *http.Request) (messageReques
 				return messageRequest{}, classifyMultipartReadError(closeErr)
 			}
 			if len(data) > attachments.MaxMessageBytes {
-				return messageRequest{}, messageLimitError(attachments.ErrImagesTooLarge)
+				return messageRequest{}, directiveLimitError(errors.New("directive exceeds byte limit"))
 			}
 			seenMessage = true
 			request.Message = string(data)
@@ -175,7 +180,7 @@ func makeMessageHandler(fleet fleetManager, logger *slog.Logger) http.HandlerFun
 				writeMessageJSON(w, http.StatusConflict, false, "The selected model does not support image input.")
 				return
 			}
-			logger.Error("send message failed", "method", r.Method, "path", r.URL.Path, "sessionID", sessionID, "error", err)
+			logger.Error("send message failed", "category", "manager_rejection", "method", r.Method, "path", r.URL.Path, "sessionID", sessionID)
 			writeMessageJSON(w, http.StatusServiceUnavailable, false, "The message could not be sent.")
 			return
 		}

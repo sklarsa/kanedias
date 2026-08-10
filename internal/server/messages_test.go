@@ -270,6 +270,41 @@ func serveMultipartMessage(t *testing.T, handler http.Handler, cookie *http.Cook
 	return w
 }
 
+func TestMessageEndpointExactBoundaries(t *testing.T) {
+	tests := []struct {
+		name       string
+		message    string
+		images     []multipartFixture
+		wantStatus int
+		wantBody   string
+	}{
+		{name: "directive exact", message: strings.Repeat("m", attachments.MaxMessageBytes), wantStatus: http.StatusAccepted, wantBody: `{"accepted":true}`},
+		{name: "directive over", message: strings.Repeat("m", attachments.MaxMessageBytes+1), wantStatus: http.StatusRequestEntityTooLarge, wantBody: `{"accepted":false,"error":"The directive must be 64 KiB or smaller."}`},
+		{name: "image exact", message: "inspect", images: []multipartFixture{{"exact.png", pngImage(attachments.MaxImageBytes)}}, wantStatus: http.StatusAccepted, wantBody: `{"accepted":true}`},
+		{name: "image over", message: "inspect", images: []multipartFixture{{"over.png", pngImage(attachments.MaxImageBytes + 1)}}, wantStatus: http.StatusRequestEntityTooLarge, wantBody: `{"accepted":false,"error":"The image attachment limits were exceeded."}`},
+		{name: "aggregate exact", message: "inspect", images: []multipartFixture{{"one.png", pngImage(attachments.MaxImageBytes)}, {"two.png", pngImage(attachments.MaxImageBytes)}, {"three.png", pngImage(attachments.MaxTotalBytes - 2*attachments.MaxImageBytes)}}, wantStatus: http.StatusAccepted, wantBody: `{"accepted":true}`},
+		{name: "aggregate over", message: "inspect", images: []multipartFixture{{"one.png", pngImage(attachments.MaxImageBytes)}, {"two.png", pngImage(attachments.MaxImageBytes)}, {"three.png", pngImage(attachments.MaxTotalBytes - 2*attachments.MaxImageBytes + 1)}}, wantStatus: http.StatusRequestEntityTooLarge, wantBody: `{"accepted":false,"error":"The image attachment limits were exceeded."}`},
+		{name: "empty image", message: "inspect", images: []multipartFixture{{"empty.png", nil}}, wantStatus: http.StatusUnsupportedMediaType, wantBody: `{"accepted":false,"error":"Only PNG, JPEG, GIF, and WebP images are supported."}`},
+	}
+	for _, test := range tests {
+		t.Run(test.name, func(t *testing.T) {
+			fleet := newStreamFakeFleet()
+			handler, cookie := mustNewHandlerWithFleetAuth(t, fleet)
+			contentType, body := multipartMessage(t, test.message, test.images...)
+			response := serveMultipartMessage(t, handler, cookie, "session-1", contentType, body)
+			if response.Code != test.wantStatus || response.Body.String() != test.wantBody {
+				t.Fatalf("response = %d %q, want %d %q", response.Code, response.Body.String(), test.wantStatus, test.wantBody)
+			}
+			if test.wantStatus == http.StatusAccepted && fleet.sentMessage.sessionID != "session-1" {
+				t.Fatalf("accepted request did not dispatch: %#v", fleet.sentMessage)
+			}
+			if test.wantStatus != http.StatusAccepted && fleet.sentMessage.sessionID != "" {
+				t.Fatalf("rejected request dispatched: %#v", fleet.sentMessage)
+			}
+		})
+	}
+}
+
 func TestMessageEndpointAcceptsValidUpload(t *testing.T) {
 	fleet := newStreamFakeFleet()
 	handler, cookie := mustNewHandlerWithFleetAuth(t, fleet)
@@ -409,8 +444,15 @@ func TestMessageEndpointMapsManagerFailuresWithoutLeak(t *testing.T) {
 			if strings.Contains(response.Body.String(), test.err.Error()) {
 				t.Fatalf("response leaked manager error: %q", response.Body.String())
 			}
-			if test.wantStatus == http.StatusServiceUnavailable && !strings.Contains(logs.String(), test.err.Error()) {
-				t.Fatalf("log omitted manager failure: %q", logs.String())
+			if strings.Contains(logs.String(), test.err.Error()) || strings.Contains(logs.String(), "private upstream failure") {
+				t.Fatalf("log leaked manager failure: %q", logs.String())
+			}
+			if test.wantStatus == http.StatusServiceUnavailable {
+				for _, marker := range []string{"category=manager_rejection", "method=POST", "path=/ui/sessions/session-1/messages", "sessionID=session-1"} {
+					if !strings.Contains(logs.String(), marker) {
+						t.Fatalf("log omitted %q context: %q", marker, logs.String())
+					}
+				}
 			}
 			if strings.Contains(logs.String(), filename) || strings.Contains(logs.String(), payloadMarker) {
 				t.Fatalf("log leaked multipart data or filename: %q", logs.String())

@@ -92,6 +92,54 @@ func TestEventBrokerReplayIsImmutableCopy(t *testing.T) {
 	}
 }
 
+func TestEventBrokerMailboxDisconnectsBeforeByteBudgetOverflow(t *testing.T) {
+	broker := newEventBrokerWithByteCapacity(8, 128, 120)
+	slow := broker.Subscribe()
+	defer slow.Close()
+
+	first := broker.PublishLocal("root", "pi", json.RawMessage(`{"payload":"`+strings.Repeat("x", 48)+`"}`))
+	if retainedEventBytes(first) > 120 {
+		t.Fatal("test event unexpectedly exceeds mailbox budget")
+	}
+	broker.mu.Lock()
+	var mailbox *eventMailbox
+	for _, candidate := range broker.subs {
+		mailbox = candidate
+	}
+	broker.mu.Unlock()
+	if mailbox == nil {
+		t.Fatal("slow subscriber was not registered")
+	}
+	mailbox.mu.Lock()
+	if mailbox.queuedBytes > 120 {
+		t.Fatalf("queued bytes = %d, want <= 120", mailbox.queuedBytes)
+	}
+	mailbox.mu.Unlock()
+
+	broker.PublishLocal("root", "pi", json.RawMessage(`{"payload":"`+strings.Repeat("y", 48)+`"}`))
+	broker.mu.Lock()
+	remaining := len(broker.subs)
+	broker.mu.Unlock()
+	if remaining != 0 {
+		t.Fatalf("slow subscribers = %d, want detached", remaining)
+	}
+	delivered := 0
+	for {
+		select {
+		case _, open := <-slow.Events:
+			if !open {
+				if delivered > 1 {
+					t.Fatalf("delivered %d queued events beyond byte budget", delivered)
+				}
+				return
+			}
+			delivered++
+		case <-time.After(time.Second):
+			t.Fatal("slow subscriber did not close after byte overflow")
+		}
+	}
+}
+
 func TestEventBrokerOverflowDisconnectsOnlySlowSubscriber(t *testing.T) {
 	broker := newEventBroker(4, 1)
 	slow := broker.Subscribe()
@@ -435,9 +483,7 @@ func TestEventBrokerWithOptionsRejectsNegative(t *testing.T) {
 	}
 }
 
-func TestEventBrokerOversizedEventIsDeliveredLiveNotRetained(t *testing.T) {
-	// byte cap of 10 — any real payload exceeds it; event must still get a sequence
-	// and arrive live, but the ring must stay within budget.
+func TestEventBrokerOversizedEventIsNotRetainedAndDisconnectsStalledSubscriber(t *testing.T) {
 	broker, err := NewEventBrokerWithOptions(EventBrokerOptions{MaxBytes: 10})
 	if err != nil {
 		t.Fatal(err)
@@ -449,14 +495,13 @@ func TestEventBrokerOversizedEventIsDeliveredLiveNotRetained(t *testing.T) {
 	if envelope.Seq == 0 {
 		t.Fatalf("oversized event has no sequence number")
 	}
-
 	select {
-	case event := <-sub.Events:
-		if event.Seq != envelope.Seq {
-			t.Fatalf("live event Seq = %d, want %d", event.Seq, envelope.Seq)
+	case _, open := <-sub.Events:
+		if open {
+			t.Fatal("oversized event was queued beyond the subscriber byte budget")
 		}
 	case <-time.After(time.Second):
-		t.Fatal("oversized event was not delivered live")
+		t.Fatal("stalled subscriber was not disconnected")
 	}
 
 	replay := broker.Subscribe()

@@ -608,6 +608,31 @@ func TestClientCloseClosesUnderlyingConnectionExactlyOnce(t *testing.T) {
 	}
 }
 
+func TestClientDisconnectsStalledEventConsumerAtByteBoundedCapacity(t *testing.T) {
+	clientConn, peer := net.Pipe()
+	client := NewClient(clientConn)
+	defer func() { _ = peer.Close() }()
+
+	if cap(client.events) != 1 {
+		t.Fatalf("event channel capacity = %d, want one maximum record", cap(client.events))
+	}
+	writeDone := make(chan error, 1)
+	go func() {
+		_, err := io.WriteString(peer, `{"type":"message_update","payload":"one"}`+"\n"+
+			`{"type":"message_update","payload":"two"}`+"\n")
+		writeDone <- err
+	}()
+	select {
+	case <-client.Done():
+		if client.Err() == nil || !strings.Contains(client.Err().Error(), "event consumer") {
+			t.Fatalf("client error = %v, want stalled event consumer", client.Err())
+		}
+	case <-time.After(time.Second):
+		t.Fatal("stalled event consumer did not terminate transport")
+	}
+	<-writeDone
+}
+
 func TestClientCloseUnblocksEventBackpressure(t *testing.T) {
 	clientConn, peer := net.Pipe()
 	client := NewClient(clientConn)
@@ -615,7 +640,7 @@ func TestClientCloseUnblocksEventBackpressure(t *testing.T) {
 
 	writeDone := make(chan error, 1)
 	go func() {
-		for range 129 {
+		for range 2 {
 			if _, err := io.WriteString(peer, `{"type":"message_update"}`+"\n"); err != nil {
 				writeDone <- err
 				return
@@ -624,7 +649,7 @@ func TestClientCloseUnblocksEventBackpressure(t *testing.T) {
 		writeDone <- nil
 	}()
 
-	// Let the reader fill its event mailbox and block on the next event.
+	// Let the reader fill its bounded event mailbox and terminate on overflow.
 	time.Sleep(20 * time.Millisecond)
 	closeDone := make(chan error, 1)
 	go func() { closeDone <- client.Close() }()

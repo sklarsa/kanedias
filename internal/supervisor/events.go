@@ -40,6 +40,7 @@ type EventBroker struct {
 	ringBytes   int
 	byteCap     int
 	mailCap     int
+	mailByteCap int
 	nextSeq     uint64
 	sourceSeq   map[string]uint64
 	nextSubID   uint64
@@ -49,9 +50,14 @@ type EventBroker struct {
 }
 
 type eventMailbox struct {
-	mu     sync.Mutex
-	events chan EventEnvelope
-	closed bool
+	mu          sync.Mutex
+	events      chan EventEnvelope
+	wake        chan struct{}
+	queue       []EventEnvelope
+	queuedBytes int
+	maxEvents   int
+	maxBytes    int
+	closed      bool
 }
 
 type eventSubscriber struct {
@@ -100,10 +106,15 @@ func newEventBrokerWithByteCapacity(ringCapacity, mailboxCapacity, byteCapacity 
 	if byteCapacity < 0 {
 		byteCapacity = 0
 	}
+	mailboxByteCapacity := byteCapacity
+	if mailboxByteCapacity == 0 {
+		mailboxByteCapacity = DefaultEventRingByteCapacity
+	}
 	return &EventBroker{
 		ringCap:     ringCapacity,
 		byteCap:     byteCapacity,
 		mailCap:     mailboxCapacity,
+		mailByteCap: mailboxByteCapacity,
 		sourceSeq:   make(map[string]uint64),
 		subs:        make(map[uint64]*eventMailbox),
 		cloneReplay: cloneEnvelopes,
@@ -168,7 +179,7 @@ func (broker *EventBroker) Subscribe() Subscription {
 	replaySnapshot := append([]EventEnvelope(nil), broker.ring...)
 	broker.nextSubID++
 	id := broker.nextSubID
-	mailbox := &eventMailbox{events: make(chan EventEnvelope, broker.mailCap)}
+	mailbox := newEventMailbox(broker.mailCap, broker.mailByteCap)
 	broker.subs[id] = mailbox
 	broker.mu.Unlock()
 	broker.publishMu.Unlock()
@@ -284,17 +295,59 @@ func (broker *EventBroker) removeSubscriber(id uint64, mailbox *eventMailbox) {
 	mailbox.close()
 }
 
+func newEventMailbox(maxEvents, maxBytes int) *eventMailbox {
+	mailbox := &eventMailbox{
+		events:    make(chan EventEnvelope),
+		wake:      make(chan struct{}, 1),
+		maxEvents: maxEvents,
+		maxBytes:  maxBytes,
+	}
+	go mailbox.run()
+	return mailbox
+}
+
 func (mailbox *eventMailbox) send(event EventEnvelope) bool {
 	mailbox.mu.Lock()
 	defer mailbox.mu.Unlock()
 	if mailbox.closed {
 		return false
 	}
-	select {
-	case mailbox.events <- event:
-		return true
-	default:
+	eventBytes := retainedEventBytes(event)
+	if (mailbox.maxEvents > 0 && len(mailbox.queue) >= mailbox.maxEvents) ||
+		(mailbox.maxBytes > 0 && mailbox.queuedBytes+eventBytes > mailbox.maxBytes) {
 		return false
+	}
+	mailbox.queue = append(mailbox.queue, event)
+	mailbox.queuedBytes += eventBytes
+	select {
+	case mailbox.wake <- struct{}{}:
+	default:
+	}
+	return true
+}
+
+func (mailbox *eventMailbox) run() {
+	defer close(mailbox.events)
+	for {
+		mailbox.mu.Lock()
+		if len(mailbox.queue) == 0 {
+			if mailbox.closed {
+				mailbox.mu.Unlock()
+				return
+			}
+			mailbox.mu.Unlock()
+			<-mailbox.wake
+			continue
+		}
+		event := mailbox.queue[0]
+		mailbox.mu.Unlock()
+
+		mailbox.events <- event
+		mailbox.mu.Lock()
+		mailbox.queuedBytes -= retainedEventBytes(mailbox.queue[0])
+		mailbox.queue[0] = EventEnvelope{}
+		mailbox.queue = mailbox.queue[1:]
+		mailbox.mu.Unlock()
 	}
 }
 
@@ -305,7 +358,10 @@ func (mailbox *eventMailbox) close() {
 		return
 	}
 	mailbox.closed = true
-	close(mailbox.events)
+	select {
+	case mailbox.wake <- struct{}{}:
+	default:
+	}
 }
 
 func cloneEnvelopes(events []EventEnvelope) []EventEnvelope {

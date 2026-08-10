@@ -623,6 +623,36 @@ func TestServeUnixRemovesStaleOwnedSocket(t *testing.T) {
 	}
 }
 
+func TestAppendDescendantSSEDataEnforcesAggregateBoundary(t *testing.T) {
+	for _, test := range []struct {
+		name   string
+		parts  []string
+		limit  int
+		wantOK bool
+	}{
+		{name: "exact total", parts: []string{strings.Repeat("x", maxDescendantSSEEventBytes)}, limit: maxDescendantSSEEventBytes, wantOK: true},
+		{name: "total plus one", parts: []string{strings.Repeat("x", maxDescendantSSEEventBytes), "y"}, limit: maxDescendantSSEEventBytes, wantOK: false},
+		{name: "many small lines", parts: []string{"a", "b", "c", "d", "e", "f"}, limit: 10, wantOK: false},
+	} {
+		t.Run(test.name, func(t *testing.T) {
+			var data strings.Builder
+			var err error
+			for _, part := range test.parts {
+				err = appendDescendantSSEData(&data, part, test.limit)
+				if err != nil {
+					break
+				}
+			}
+			if (err == nil) != test.wantOK {
+				t.Fatalf("error = %v, builder bytes = %d", err, data.Len())
+			}
+			if data.Len() > test.limit {
+				t.Fatalf("builder bytes = %d, exceeded %d", data.Len(), test.limit)
+			}
+		})
+	}
+}
+
 func TestDescendantSSEAcceptsPiSizedEnvelopeAndSurfacesStreamErrors(t *testing.T) {
 	path := filepath.Join(t.TempDir(), "child.sock")
 	large := json.RawMessage(`{"text":"` + strings.Repeat("x", 2<<20) + `"}`)
@@ -678,6 +708,55 @@ func TestDescendantSSEAcceptsPiSizedEnvelopeAndSurfacesStreamErrors(t *testing.T
 	}
 	badCancel()
 	if err := <-badDone; err != nil {
+		t.Fatal(err)
+	}
+}
+
+func TestDescendantSSEDisconnectsStalledConsumerAtBoundedCapacity(t *testing.T) {
+	path := filepath.Join(t.TempDir(), "stalled.sock")
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+	release := make(chan struct{})
+	serverDone := make(chan error, 1)
+	go func() {
+		serverDone <- ServeUnix(ctx, path, http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
+			w.Header().Set("Content-Type", "text/event-stream")
+			w.WriteHeader(http.StatusOK)
+			w.(http.Flusher).Flush()
+			<-release
+			for seq := 1; seq <= 2; seq++ {
+				_, _ = fmt.Fprintf(w, "data: {\"seq\":%d,\"sessionId\":\"child\",\"sourceSeq\":%d,\"kind\":\"pi\",\"payload\":{}}\n\n", seq, seq)
+				w.(http.Flusher).Flush()
+			}
+		}))
+	}()
+	waitForSocket(t, path)
+	client, err := NewClient(path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	sub, err := client.Subscribe(context.Background())
+	if err != nil {
+		t.Fatal(err)
+	}
+	close(release)
+	deadline := time.Now().Add(time.Second)
+	for sub.Err() == nil && time.Now().Before(deadline) {
+		time.Sleep(time.Millisecond)
+	}
+	if sub.Err() == nil || !strings.Contains(sub.Err().Error(), "event consumer") {
+		t.Fatalf("stream error = %v, want stalled consumer failure", sub.Err())
+	}
+	first, open := <-sub.Events
+	if !open || first.Seq != 1 {
+		t.Fatalf("first queued event = %#v, open=%t", first, open)
+	}
+	if _, open = <-sub.Events; open {
+		t.Fatal("stalled descendant event channel remained open")
+	}
+	sub.Close()
+	cancel()
+	if err := <-serverDone; err != nil {
 		t.Fatal(err)
 	}
 }

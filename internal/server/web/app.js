@@ -21,6 +21,17 @@
     var fleetObserver = null;
     var capabilityObserver = null;
     var controller;
+    var previewKey = null;
+    var restoreFocusSessionID = "";
+    var pendingRemovalIndex = null;
+    var statuses = new Map();
+    var listenerCleanups = [];
+    var destroyed = false;
+
+    function listen(target, type, listener) {
+      target.addEventListener(type, listener);
+      listenerCleanups.push(function () { target.removeEventListener(type, listener); });
+    }
 
     tray.classList.add("image-attachment-tray");
     tray.setAttribute("aria-label", "Image attachments");
@@ -32,7 +43,8 @@
     }
 
     function canEditSelectedDraft() {
-      return !!selectedSessionID &&
+      var detail = documentObject.getElementById("detail-panel");
+      return !!selectedSessionID && !!detail && detail.getAttribute("data-session-id") === selectedSessionID &&
         terminalUI.detailCapability(documentObject, "steer") &&
         !controller.draft(selectedSessionID).busy;
     }
@@ -40,52 +52,81 @@
     function syncEditControls() {
       terminalUI.syncDeckState(documentObject);
       var canEdit = canEditSelectedDraft();
-      input.disabled = !canEdit;
+      terminalUI.setActionControlState(input, canEdit);
+      terminalUI.setActionControlState(steerButton, canEdit);
+      terminalUI.setActionControlState(attachButton, canEdit);
+      terminalUI.setActionControlState(fileInput, canEdit);
       var removeButtons = tray.querySelectorAll("[data-remove-image]");
       for (var i = 0; i < removeButtons.length; i++) removeButtons[i].disabled = !canEdit;
+      if (!canEdit) {
+        dragDepth = 0;
+        deck.classList.remove("drop-active");
+      }
     }
 
     function renderDraft(snapshot) {
-      if (!snapshot || snapshot.sessionID !== selectedSessionID) return;
+      if (!snapshot) return;
+      if (snapshot.busy && snapshot.sessionID === selectedSessionID && documentObject.activeElement === input) {
+        restoreFocusSessionID = snapshot.sessionID;
+      }
+      if (!snapshot.busy && restoreFocusSessionID === snapshot.sessionID && snapshot.sessionID !== selectedSessionID) {
+        restoreFocusSessionID = "";
+      }
+      if (snapshot.sessionID !== selectedSessionID) return;
       if (input.value !== snapshot.text) input.value = snapshot.text;
 
-      while (tray.firstChild) tray.removeChild(tray.firstChild);
-      snapshot.images.forEach(function (image) {
-        var card = documentObject.createElement("div");
-        card.className = "image-attachment-card";
+      var nextPreviewKey = snapshot.images.map(function (image) { return image.id; }).join(",");
+      if (nextPreviewKey !== previewKey) {
+        while (tray.firstChild) tray.removeChild(tray.firstChild);
+        snapshot.images.forEach(function (image) {
+          var card = documentObject.createElement("div");
+          card.className = "image-attachment-card";
 
-        var preview = documentObject.createElement("img");
-        preview.src = image.url;
-        preview.alt = "";
-        card.appendChild(preview);
+          var preview = documentObject.createElement("img");
+          preview.src = image.url;
+          preview.alt = "";
+          card.appendChild(preview);
 
-        var metadata = documentObject.createElement("span");
-        metadata.className = "image-attachment-meta";
-        var filename = documentObject.createElement("span");
-        filename.className = "image-attachment-name";
-        filename.textContent = image.name;
-        var size = documentObject.createElement("span");
-        size.className = "image-attachment-size";
-        size.textContent = formatBytes(image.size);
-        metadata.appendChild(filename);
-        metadata.appendChild(size);
-        card.appendChild(metadata);
+          var metadata = documentObject.createElement("span");
+          metadata.className = "image-attachment-meta";
+          var filename = documentObject.createElement("span");
+          filename.className = "image-attachment-name";
+          filename.textContent = image.name;
+          var size = documentObject.createElement("span");
+          size.className = "image-attachment-size";
+          size.textContent = formatBytes(image.size);
+          metadata.appendChild(filename);
+          metadata.appendChild(size);
+          card.appendChild(metadata);
 
-        var remove = documentObject.createElement("button");
-        remove.type = "button";
-        remove.className = "image-attachment-remove";
-        remove.setAttribute("data-remove-image", String(image.id));
-        remove.setAttribute("aria-label", "Remove " + image.name);
-        remove.textContent = "×";
-        remove.disabled = !canEditSelectedDraft();
-        card.appendChild(remove);
-        tray.appendChild(card);
-      });
+          var remove = documentObject.createElement("button");
+          remove.type = "button";
+          remove.className = "image-attachment-remove";
+          remove.setAttribute("data-remove-image", String(image.id));
+          remove.setAttribute("aria-label", "Remove " + image.name);
+          remove.textContent = "×";
+          remove.disabled = !canEditSelectedDraft();
+          card.appendChild(remove);
+          tray.appendChild(card);
+        });
+        previewKey = nextPreviewKey;
+      }
 
       tray.hidden = snapshot.images.length === 0;
       appShell.classList.toggle("has-image-draft", snapshot.images.length > 0);
       deck.setAttribute("aria-busy", snapshot.busy ? "true" : "false");
       syncEditControls();
+      if (pendingRemovalIndex !== null) {
+        var adjacent = tray.querySelectorAll("[data-remove-image]");
+        var target = adjacent[pendingRemovalIndex] || adjacent[pendingRemovalIndex - 1] ||
+          (!attachButton.disabled ? attachButton : input);
+        pendingRemovalIndex = null;
+        if (target && typeof target.focus === "function") target.focus();
+      }
+      if (!snapshot.busy && restoreFocusSessionID === snapshot.sessionID) {
+        restoreFocusSessionID = "";
+        if (!input.disabled) input.focus();
+      }
     }
 
     controller = windowObject.KanediasImageAttachments.createController({
@@ -95,6 +136,7 @@
       revokeObjectURL: windowObject.URL.revokeObjectURL.bind(windowObject.URL),
       onChange: renderDraft,
       onStatus: function (message, sessionID) {
+        if (sessionID) statuses.set(sessionID, message);
         if (sessionID === "" || sessionID === selectedSessionID) deckStatus.textContent = message;
       }
     });
@@ -105,7 +147,11 @@
         var detail = documentObject.getElementById("detail-panel");
         if (detail) detail.setAttribute("data-can-steer", "false");
       }
+      dragDepth = 0;
+      deck.classList.remove("drop-active");
       selectedSessionID = sessionID || "";
+      previewKey = null;
+      deckStatus.textContent = statuses.get(selectedSessionID) || "";
       renderDraft(controller.selectSession(selectedSessionID));
     }
 
@@ -115,19 +161,19 @@
         if (!capturedSessionID) controller.submit("");
         return;
       }
-      controller.setText(input.value);
+      if (!controller.setText(input.value)) return;
       controller.submit(capturedSessionID);
     }
 
-    input.addEventListener("input", function () {
+    listen(input, "input", function () {
       if (canEditSelectedDraft()) controller.setText(input.value);
     });
 
-    attachButton.addEventListener("click", function () {
+    listen(attachButton, "click", function () {
       if (canEditSelectedDraft()) fileInput.click();
     });
 
-    fileInput.addEventListener("change", function () {
+    listen(fileInput, "change", function () {
       try {
         if (canEditSelectedDraft()) controller.stageFiles(fileInput.files);
       } finally {
@@ -135,12 +181,13 @@
       }
     });
 
-    input.addEventListener("paste", function (event) {
+    listen(input, "paste", function (event) {
       var items = event.clipboardData && event.clipboardData.items;
       if (!items || !canEditSelectedDraft()) return;
       var images = [];
       for (var i = 0; i < items.length; i++) {
-        if (items[i].kind !== "file" || String(items[i].type || "").indexOf("image/") !== 0) continue;
+        var declaredType = String(items[i].type || "").trim().toLowerCase();
+        if (items[i].kind !== "file" || (declaredType && declaredType.indexOf("image/") !== 0)) continue;
         var image = items[i].getAsFile();
         if (image) images.push(image);
       }
@@ -158,24 +205,24 @@
       return !!dataTransfer.files && dataTransfer.files.length > 0;
     }
 
-    deck.addEventListener("dragenter", function (event) {
+    listen(deck, "dragenter", function (event) {
       if (!hasFiles(event.dataTransfer) || !canEditSelectedDraft()) return;
       event.preventDefault();
       dragDepth++;
       deck.classList.add("drop-active");
     });
-    deck.addEventListener("dragover", function (event) {
+    listen(deck, "dragover", function (event) {
       if (!hasFiles(event.dataTransfer) || !canEditSelectedDraft()) return;
       event.preventDefault();
       if (event.dataTransfer) event.dataTransfer.dropEffect = "copy";
     });
-    deck.addEventListener("dragleave", function (event) {
+    listen(deck, "dragleave", function (event) {
       if (!hasFiles(event.dataTransfer) && dragDepth === 0) return;
       event.preventDefault();
       dragDepth = Math.max(0, dragDepth - 1);
       if (dragDepth === 0) deck.classList.remove("drop-active");
     });
-    deck.addEventListener("drop", function (event) {
+    listen(deck, "drop", function (event) {
       if (!hasFiles(event.dataTransfer)) return;
       event.preventDefault();
       dragDepth = 0;
@@ -183,17 +230,21 @@
       if (canEditSelectedDraft()) controller.stageFiles(event.dataTransfer.files);
     });
 
-    tray.addEventListener("click", function (event) {
+    listen(tray, "click", function (event) {
       var remove = event.target.closest("[data-remove-image]");
       if (!remove || !canEditSelectedDraft()) return;
+      var removeButtons = tray.querySelectorAll("[data-remove-image]");
+      if (documentObject.activeElement === remove) {
+        pendingRemovalIndex = Array.prototype.indexOf.call(removeButtons, remove);
+      }
       controller.removeImage(remove.getAttribute("data-remove-image"));
     });
 
-    steerButton.addEventListener("click", function () {
+    listen(steerButton, "click", function () {
       if (canEditSelectedDraft()) submitSelectedDraft();
     });
 
-    documentObject.addEventListener("click", function (event) {
+    listen(documentObject, "click", function (event) {
       var row = event.target.closest(".row[data-session-id]");
       if (!row) return;
       selectComposerSession(row.dataset.sessionId, true);
@@ -223,17 +274,20 @@
         childList: true,
         subtree: true,
         attributes: true,
-        attributeFilter: ["data-can-steer"]
+        attributeFilter: ["data-can-steer", "data-session-id"]
       });
     }
     syncEditControls();
 
     function destroy() {
+      if (destroyed) return;
+      destroyed = true;
       if (fleetObserver) fleetObserver.disconnect();
       if (capabilityObserver) capabilityObserver.disconnect();
+      while (listenerCleanups.length) listenerCleanups.pop()();
       controller.destroy();
     }
-    windowObject.addEventListener("beforeunload", destroy);
+    listen(windowObject, "beforeunload", destroy);
 
     return {
       controller: controller,
@@ -248,7 +302,7 @@
   return {bindComposer: bindComposer};
 });
 
-if (typeof window !== "undefined" && typeof document !== "undefined") (function () {
+if (typeof module === "undefined" && typeof window !== "undefined" && typeof document !== "undefined") (function () {
   "use strict";
 
   /* -------- Accessible New Session modal -------- */

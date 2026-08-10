@@ -19,12 +19,27 @@ function deferred() {
   return {promise, resolve, reject};
 }
 
-function jsonResponse(status, body, contentType = "application/json") {
+function streamResponse(status, chunks, headers = {}) {
+  let index = 0;
+  let cancelled = false;
+  const normalized = Object.fromEntries(Object.entries(headers).map(([key, value]) => [key.toLowerCase(), String(value)]));
   return {
     status,
-    headers: {get(name) { return name.toLowerCase() === "content-type" ? contentType : null; }},
-    json: async () => body
+    headers: {get(name) { return normalized[name.toLowerCase()] || null; }},
+    body: {getReader() { return {
+      async read() {
+        if (index >= chunks.length) return {done: true};
+        return {done: false, value: chunks[index++]};
+      },
+      async cancel() { cancelled = true; }
+    }; }},
+    wasCancelled: () => cancelled
   };
+}
+
+function jsonResponse(status, body, contentType = "application/json", extraHeaders = {}) {
+  const bytes = new TextEncoder().encode(JSON.stringify(body));
+  return streamResponse(status, [bytes], {"content-type": contentType, "content-length": bytes.length, ...extraHeaders});
 }
 
 function fixture(overrides = {}) {
@@ -61,7 +76,9 @@ test("exports the fixed limits and neutral image prompt", () => {
   assert.deepEqual(imageAttachments.LIMITS, {
     maxImages: 4,
     maxImageBytes: 3 * MiB,
-    maxTotalBytes: 8 * MiB
+    maxTotalBytes: 8 * MiB,
+    maxMessageBytes: 64 * 1024,
+    maxResponseBytes: 64 * 1024
   });
   assert.equal(imageAttachments.NEUTRAL_MESSAGE, "Please inspect the attached image(s).");
 });
@@ -94,15 +111,30 @@ test("keeps independent session drafts and restores the selected snapshot", () =
   assert.deepEqual(f.controller.selectSession("A"), f.controller.draft("A"));
 });
 
-test("rejects definitely unsupported MIME types while allowing an empty type", () => {
+test("normalizes aliases, permits generic unknown declarations, and rejects known unsupported types", () => {
   const f = fixture();
   const draft = stage(f.controller, "A", [
     imageFile("notes.txt", "text/plain", 1),
     imageFile("camera", "", 2),
-    imageFile("alias.jpg", "image/jpg", 3)
+    imageFile("alias.jpg", "IMAGE/JPG", 3),
+    imageFile("unknown.bin", "application/octet-stream", 4),
+    imageFile("drawing.svg", "image/svg+xml", 5),
+    imageFile("movie.mp4", "video/mp4", 6)
   ]);
-  assert.deepEqual(draft.images.map((image) => image.name), ["camera"]);
+  assert.deepEqual(draft.images.map((image) => [image.name, image.type]), [
+    ["camera", ""], ["alias.jpg", "image/jpeg"], ["unknown.bin", "application/octet-stream"]
+  ]);
   assert.match(f.statuses.at(-1), /PNG, JPEG, GIF, and WebP/);
+});
+
+ test("enforces the directive UTF-8 byte boundary before fetch", async () => {
+  const f = fixture();
+  f.controller.selectSession("A");
+  assert.equal(f.controller.setText("é".repeat(32 * 1024)), true);
+  assert.equal(f.controller.draft("A").text.length, 32 * 1024);
+  assert.equal(f.controller.setText("é".repeat(32 * 1024) + "x"), false);
+  assert.match(f.statuses.at(-1), /directive.*64 KiB/i);
+  assert.equal(f.requests.length, 0);
 });
 
 test("enforces image count, per-image size, and total size at exact boundaries", () => {
@@ -280,6 +312,45 @@ test("strict 4xx and 5xx rejection preserves and unlocks the draft", async () =>
   }
 });
 
+test("bounds declared and chunked responses while accepting only valid exact JSON shapes", async () => {
+  const declared = streamResponse(202, [], {"content-type": "application/json", "content-length": 64 * 1024 + 1});
+  const chunked = streamResponse(202, [new Uint8Array(64 * 1024), new Uint8Array([1])], {"content-type": "application/json"});
+  for (const response of [declared, chunked]) {
+    const f = fixture({fetch: async () => response});
+    f.controller.selectSession("A");
+    f.controller.setText("keep me");
+    assert.deepEqual(await f.controller.submit(), {outcome: "unknown"});
+    assert.equal(f.controller.draft("A").text, "keep me");
+    assert.equal(f.statuses.at(-1), "Delivery status unknown—check the transcript before retrying.");
+  }
+  assert.equal(chunked.wasCancelled(), true);
+
+  const malformedUTF8 = streamResponse(202, [new Uint8Array([0xff])], {"content-type": "application/json"});
+  const malformedJSON = streamResponse(202, [new TextEncoder().encode("not-json")], {"content-type": "application/json"});
+  for (const response of [malformedUTF8, malformedJSON]) {
+    const f = fixture({fetch: async () => response});
+    f.controller.selectSession("A");
+    f.controller.setText("keep me");
+    assert.deepEqual(await f.controller.submit(), {outcome: "unknown"});
+  }
+});
+
+test("plain authentication and authorization failures are definitive non-delivery", async () => {
+  for (const [status, message] of [
+    [401, "Authentication is required before sending messages."],
+    [403, "You are not authorized to send messages to this session."]
+  ]) {
+    const response = streamResponse(status, [new TextEncoder().encode("middleware rejection")], {"content-type": "text/plain"});
+    const f = fixture({fetch: async () => response});
+    f.controller.selectSession("A");
+    f.controller.setText("keep me");
+    assert.deepEqual(await f.controller.submit(), {outcome: "rejected", error: message});
+    assert.equal(f.controller.draft("A").text, "keep me");
+    assert.equal(f.controller.draft("A").busy, false);
+    assert.equal(f.statuses.at(-1), message);
+  }
+});
+
 test("malformed responses and thrown fetches preserve drafts and report unknown delivery", async () => {
   const malformed = [
     jsonResponse(202, {accepted: true, extra: true}),
@@ -287,7 +358,7 @@ test("malformed responses and thrown fetches preserve drafts and report unknown 
     jsonResponse(400, {accepted: false}),
     jsonResponse(400, {accepted: false, error: "x", extra: true}),
     jsonResponse(202, {accepted: true}, "text/plain"),
-    {status: 202, headers: {get: () => "application/json"}, json: async () => { throw new Error("broken JSON"); }}
+    streamResponse(202, [new TextEncoder().encode("broken JSON")], {"content-type": "application/json"})
   ];
   for (const response of malformed) {
     const f = fixture({fetch: async () => response});

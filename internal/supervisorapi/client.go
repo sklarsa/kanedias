@@ -23,6 +23,7 @@ import (
 const (
 	maxDescendantResponseBytes = 1 << 20
 	maxDescendantSSELineBytes  = pirpc.MaxRecordBytes + (1 << 20)
+	maxDescendantSSEEventBytes = maxDescendantSSELineBytes
 	defaultUnaryTimeout        = 10 * time.Second
 )
 
@@ -177,6 +178,21 @@ func (client *DescendantClient) Stop(ctx context.Context, sessionID string) erro
 	return nil
 }
 
+func appendDescendantSSEData(data *strings.Builder, value string, maxBytes int) error {
+	additional := len(value)
+	if data.Len() > 0 {
+		additional++
+	}
+	if additional > maxBytes-data.Len() {
+		return fmt.Errorf("child event data exceeds %d bytes", maxBytes)
+	}
+	if data.Len() > 0 {
+		data.WriteByte('\n')
+	}
+	data.WriteString(value)
+	return nil
+}
+
 func (client *DescendantClient) Subscribe(ctx context.Context) (supervisor.Subscription, error) {
 	streamCtx, cancel := context.WithCancel(ctx)
 	response, err := client.request(streamCtx, http.MethodGet, "/v1/events", nil)
@@ -191,7 +207,7 @@ func (client *DescendantClient) Subscribe(ctx context.Context) (supervisor.Subsc
 		return supervisor.Subscription{}, contract.NewError(contract.ErrorChildUnavailable, "child event stream is unavailable")
 	}
 
-	events := make(chan supervisor.EventEnvelope, supervisor.DefaultSubscriberMailboxCapacity)
+	events := make(chan supervisor.EventEnvelope, 1)
 	var closeOnce sync.Once
 	var errMu sync.Mutex
 	var streamErr error
@@ -223,14 +239,18 @@ func (client *DescendantClient) Subscribe(ctx context.Context) (supervisor.Subsc
 				case events <- event:
 				case <-streamCtx.Done():
 					return
+				default:
+					setStreamErr(contract.NewError(contract.ErrorChildUnavailable, "child event consumer exceeded bounded capacity"))
+					return
 				}
 				continue
 			}
 			if strings.HasPrefix(line, "data:") {
-				if data.Len() > 0 {
-					data.WriteByte('\n')
+				value := strings.TrimSpace(strings.TrimPrefix(line, "data:"))
+				if err := appendDescendantSSEData(&data, value, maxDescendantSSEEventBytes); err != nil {
+					setStreamErr(contract.NewError(contract.ErrorChildUnavailable, err.Error()))
+					return
 				}
-				data.WriteString(strings.TrimSpace(strings.TrimPrefix(line, "data:")))
 			}
 		}
 		if streamCtx.Err() != nil {

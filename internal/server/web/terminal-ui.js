@@ -94,15 +94,6 @@
     input.focus();
   }
 
-  function stagePickedFiles(fileInput, controller) {
-    if (!fileInput || !controller || typeof controller.stageFiles !== "function") return;
-    try {
-      controller.stageFiles(fileInput.files);
-    } finally {
-      fileInput.value = "";
-    }
-  }
-
   function createToolExpansionController() {
     var expansionMode = null;
     var seenCards = new WeakSet();
@@ -249,7 +240,6 @@
     setActionControlState: setActionControlState,
     syncDeckState: syncDeckState,
     observeDeckCapabilities: observeDeckCapabilities,
-    stagePickedFiles: stagePickedFiles,
     createToolExpansionController: createToolExpansionController,
     createDeckStatusController: createDeckStatusController,
     performAction: performAction

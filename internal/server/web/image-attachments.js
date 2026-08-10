@@ -6,10 +6,17 @@
 })(typeof globalThis !== "undefined" ? globalThis : this, function () {
   "use strict";
 
-  var LIMITS = {maxImages: 4, maxImageBytes: 3 * 1024 * 1024, maxTotalBytes: 8 * 1024 * 1024};
+  var LIMITS = {
+    maxImages: 4,
+    maxImageBytes: 3 * 1024 * 1024,
+    maxTotalBytes: 8 * 1024 * 1024,
+    maxMessageBytes: 64 * 1024,
+    maxResponseBytes: 64 * 1024
+  };
   var NEUTRAL_MESSAGE = "Please inspect the attached image(s).";
   var SUPPORTED_TYPES = new Set(["image/png", "image/jpeg", "image/gif", "image/webp"]);
-  var UNKNOWN_DELIVERY = "Delivery is unknown. Check the session transcript before retrying.";
+  var UNKNOWN_DELIVERY = "Delivery status unknown—check the transcript before retrying.";
+  var DIRECTIVE_TOO_LARGE = "The directive must be 64 KiB or smaller.";
 
   function createController(options) {
     if (!options || typeof options.fetch !== "function" || typeof options.FormData !== "function" ||
@@ -91,6 +98,10 @@
     return draftFor(state, state.selectedSessionID);
   }
 
+  function utf8Length(value) {
+    return new TextEncoder().encode(value).byteLength;
+  }
+
   function setDraftText(state, text, options) {
     var draft = requireSelectedDraft(state, options, "edit");
     if (!draft) return false;
@@ -98,7 +109,12 @@
       notifyStatus(options, "This draft is already being sent.", state.selectedSessionID);
       return false;
     }
-    draft.text = text === undefined || text === null ? "" : String(text);
+    var nextText = text === undefined || text === null ? "" : String(text);
+    if (utf8Length(nextText) > LIMITS.maxMessageBytes) {
+      notifyStatus(options, DIRECTIVE_TOO_LARGE, state.selectedSessionID);
+      return false;
+    }
+    draft.text = nextText;
     notifyChange(state, state.selectedSessionID, options);
     return true;
   }
@@ -121,9 +137,13 @@
     var lastError = "";
 
     list.forEach(function (file) {
-      var type = file && typeof file.type === "string" ? file.type.toLowerCase() : "";
+      var type = file && typeof file.type === "string" ? file.type.trim().toLowerCase() : "";
+      if (type === "image/jpg") type = "image/jpeg";
       var size = file && typeof file.size === "number" && Number.isFinite(file.size) && file.size >= 0 ? file.size : LIMITS.maxImageBytes + 1;
-      if (type && !SUPPORTED_TYPES.has(type)) {
+      var definitelyUnsupported = (type.indexOf("image/") === 0 && !SUPPORTED_TYPES.has(type)) ||
+        type.indexOf("text/") === 0 || type.indexOf("video/") === 0 || type.indexOf("audio/") === 0 ||
+        type === "application/pdf";
+      if (definitelyUnsupported) {
         lastError = "Only PNG, JPEG, GIF, and WebP images are supported.";
         return;
       }
@@ -207,6 +227,41 @@
     return keys.length === expectedKeys.length && keys.every(function (key, index) { return key === expectedKeys[index]; });
   }
 
+  async function readBoundedJSON(response) {
+    var contentType = response && response.headers && typeof response.headers.get === "function" ? response.headers.get("Content-Type") : "";
+    if (typeof contentType !== "string" || contentType.split(";", 1)[0].trim().toLowerCase() !== "application/json") {
+      throw new Error("malformed response content type");
+    }
+    var reader = response.body && typeof response.body.getReader === "function" ? response.body.getReader() : null;
+    if (!reader) throw new Error("response body is not streamable");
+    var declared = response.headers.get("Content-Length");
+    if (declared !== null && declared !== "") {
+      var declaredBytes = Number(declared);
+      if (!Number.isSafeInteger(declaredBytes) || declaredBytes < 0 || declaredBytes > LIMITS.maxResponseBytes) {
+        if (typeof reader.cancel === "function") await reader.cancel();
+        throw new Error("response body exceeds limit");
+      }
+    }
+    var chunks = [];
+    var total = 0;
+    while (true) {
+      var item = await reader.read();
+      if (item.done) break;
+      var chunk = item.value;
+      if (!(chunk instanceof Uint8Array)) throw new Error("response body chunk is invalid");
+      total += chunk.byteLength;
+      if (total > LIMITS.maxResponseBytes) {
+        if (typeof reader.cancel === "function") await reader.cancel();
+        throw new Error("response body exceeds limit");
+      }
+      chunks.push(chunk);
+    }
+    var bodyBytes = new Uint8Array(total);
+    var offset = 0;
+    chunks.forEach(function (chunk) { bodyBytes.set(chunk, offset); offset += chunk.byteLength; });
+    return JSON.parse(new TextDecoder("utf-8", {fatal: true}).decode(bodyBytes));
+  }
+
   function classifyResponse(response, body) {
     if (response.status === 202 && exactResponseShape(body, ["accepted"]) && body.accepted === true) {
       return {outcome: "accepted"};
@@ -236,6 +291,10 @@
       notifyStatus(options, emptyMessage, targetSessionID);
       return {outcome: "rejected", error: emptyMessage};
     }
+    if (utf8Length(draft.text) > LIMITS.maxMessageBytes) {
+      notifyStatus(options, DIRECTIVE_TOO_LARGE, targetSessionID);
+      return {outcome: "rejected", error: DIRECTIVE_TOO_LARGE};
+    }
 
     draft.busy = true;
     notifyChange(state, targetSessionID, options);
@@ -252,12 +311,15 @@
         method: "POST",
         body: formData
       });
-      var contentType = response && response.headers && typeof response.headers.get === "function" ? response.headers.get("Content-Type") : "";
-      if (typeof contentType !== "string" || contentType.trim().toLowerCase() !== "application/json" || typeof response.json !== "function") {
-        throw new Error("malformed response");
+      var result;
+      if (response && response.status === 401) {
+        result = {outcome: "rejected", error: "Authentication is required before sending messages."};
+      } else if (response && response.status === 403) {
+        result = {outcome: "rejected", error: "You are not authorized to send messages to this session."};
+      } else {
+        var body = await readBoundedJSON(response);
+        result = classifyResponse(response, body);
       }
-      var body = await response.json();
-      var result = classifyResponse(response, body);
 
       if (result.outcome === "accepted") {
         var acceptedDraftIsCurrent = state.drafts.get(targetSessionID) === draft;

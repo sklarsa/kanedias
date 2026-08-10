@@ -35,7 +35,7 @@ func decodePiResponse[T any](raw json.RawMessage, expectedCommand string) (T, er
 	if resp.Type == "" {
 		return zero, fmt.Errorf("pi response missing type field")
 	}
-	if resp.Command != "" && expectedCommand != "" && resp.Command != expectedCommand {
+	if expectedCommand != "" && resp.Command != expectedCommand {
 		return zero, fmt.Errorf("pi response command %q does not match expected %q", resp.Command, expectedCommand)
 	}
 	if !resp.Success {
@@ -164,10 +164,14 @@ func (m *Manager) SendMessage(ctx context.Context, sessionID, message string, im
 	}
 	command := piMessageCommand{Type: commandType, Message: message}
 	for _, image := range images {
+		mimeType := image.MIMEType
+		if mimeType == "image/jpg" {
+			mimeType = "image/jpeg"
+		}
 		command.Images = append(command.Images, piMessageImage{
 			Type:     "image",
 			Data:     base64.StdEncoding.EncodeToString(image.Data),
-			MIMEType: image.MIMEType,
+			MIMEType: mimeType,
 		})
 	}
 
