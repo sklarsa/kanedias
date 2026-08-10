@@ -105,6 +105,7 @@ func newHandlerWithOptions(logger *slog.Logger, advertisedAddress string, bootst
 	serveMarkdownRenderer := serveEmbeddedAsset(logger, "web/markdown-renderer.js", "text/javascript; charset=utf-8")
 	serveTerminalUI := serveEmbeddedAsset(logger, "web/terminal-ui.js", "text/javascript; charset=utf-8")
 	serveSessionModal := serveEmbeddedAsset(logger, "web/session-modal.js", "text/javascript; charset=utf-8")
+	serveImageAttachments := serveEmbeddedAsset(logger, "web/image-attachments.js", "text/javascript; charset=utf-8")
 
 	router := chi.NewRouter()
 	router.Use(requestLogger(logger), recoverPanics(logger))
@@ -122,6 +123,7 @@ func newHandlerWithOptions(logger *slog.Logger, advertisedAddress string, bootst
 	router.Get("/assets/markdown-renderer.js", serveMarkdownRenderer)
 	router.Get("/assets/terminal-ui.js", serveTerminalUI)
 	router.Get("/assets/session-modal.js", serveSessionModal)
+	router.Get("/assets/image-attachments.js", serveImageAttachments)
 	router.Get("/assets/app.js", serveAppJS)
 
 	var serveFleet, serveSession http.HandlerFunc

@@ -1483,7 +1483,7 @@ func TestAssetsAreEmbedded(t *testing.T) {
 	})
 
 	// Unauthenticated paths.
-	for _, path := range []string{"/healthz", "/assets/terminal.css", "/assets/app.css", "/assets/datastar.js", "/assets/terminal-ui.js", "/assets/session-modal.js", "/assets/app.js"} {
+	for _, path := range []string{"/healthz", "/assets/terminal.css", "/assets/app.css", "/assets/datastar.js", "/assets/terminal-ui.js", "/assets/session-modal.js", "/assets/image-attachments.js", "/assets/app.js"} {
 		if response := serveRequest(handler, http.MethodGet, path); response.Code != http.StatusOK {
 			t.Errorf("GET %s status = %d, want %d", path, response.Code, http.StatusOK)
 		}
@@ -1491,6 +1491,26 @@ func TestAssetsAreEmbedded(t *testing.T) {
 	// Authenticated paths.
 	if response := serveAuthenticatedRequest(t, handler, http.MethodGet, "/", cookie); response.Code != http.StatusOK {
 		t.Errorf("GET / status = %d, want %d", response.Code, http.StatusOK)
+	}
+}
+
+func TestImageAttachmentsAssetIsDormantLocalJavaScript(t *testing.T) {
+	handler, _ := mustNewHandlerWithAuth(t, slog.New(slog.NewTextHandler(&bytes.Buffer{}, nil)))
+	response := serveRequest(handler, http.MethodGet, "/assets/image-attachments.js")
+	if response.Code != http.StatusOK {
+		t.Fatalf("GET image attachment asset without session cookie = %d, want %d", response.Code, http.StatusOK)
+	}
+	if got := response.Header().Get("Content-Type"); got != "text/javascript; charset=utf-8" {
+		t.Errorf("Content-Type = %q, want JavaScript", got)
+	}
+	body := response.Body.String()
+	if !strings.Contains(body, "KanediasImageAttachments") {
+		t.Error("image attachment asset does not publish KanediasImageAttachments")
+	}
+	for _, external := range []string{"http://", "https://", "src=\"//", "src='//"} {
+		if strings.Contains(strings.ToLower(body), external) {
+			t.Errorf("image attachment asset contains external URL marker %q", external)
+		}
 	}
 }
 
