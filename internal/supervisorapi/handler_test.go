@@ -4,6 +4,7 @@ import (
 	"context"
 	"encoding/json"
 	"errors"
+	"fmt"
 	"io"
 	"net"
 	"net/http"
@@ -194,6 +195,35 @@ func TestHandlerChildProvisionFailureOmitsInternalDiagnostics(t *testing.T) {
 		t.Fatalf("public error = %#v, want exact typed generic failure", public)
 	}
 	for _, forbidden := range []string{"execute test", "fatal:", "delete owned child volume", "permission denied"} {
+		if strings.Contains(response.Body.String(), forbidden) {
+			t.Fatalf("public response %q exposed internal detail %q", response.Body.String(), forbidden)
+		}
+	}
+}
+
+func TestHandlerUntypedChildOwnershipFailureUsesFixedInternalCopy(t *testing.T) {
+	private := []string{
+		"chown kanedias:kanedias /workspace/repos",
+		"/workspace/repos -> /host/private",
+		"operation not permitted",
+		"delete owned child volume workspace-child-1 failed",
+	}
+	service := &fakeService{err: errors.Join(
+		fmt.Errorf("execute %s: %s: %s", private[0], private[1], private[2]),
+		errors.New(private[3]),
+	)}
+	response := jsonRequest(t, NewHandler(service), http.MethodPost, "/v1/sessions/self/children", `{"workerType":"reviewer","kind":"read","context":"fresh","task":"review"}`)
+	if response.Code != http.StatusInternalServerError {
+		t.Fatalf("status = %d body=%s, want 500", response.Code, response.Body.String())
+	}
+	var public contract.Error
+	if err := json.Unmarshal(response.Body.Bytes(), &public); err != nil {
+		t.Fatal(err)
+	}
+	if public.Code != contract.ErrorInternal || public.Message != "internal supervisor error" {
+		t.Fatalf("public error = %#v, want fixed internal copy", public)
+	}
+	for _, forbidden := range private {
 		if strings.Contains(response.Body.String(), forbidden) {
 			t.Fatalf("public response %q exposed internal detail %q", response.Body.String(), forbidden)
 		}

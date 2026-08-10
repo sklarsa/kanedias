@@ -74,8 +74,8 @@ func RunInheritedChild(ctx context.Context, bootstrapFD, livenessFD, reportFD, t
 	runErr := runner(childCtx, bootstrap, reporter)
 	var reportErr error
 	if runErr != nil && !reporter.TerminalSent() && (!errors.Is(runErr, context.Canceled) || childCtx.Err() == nil) {
-		code := contract.ErrorChildFailed
-		message := runErr.Error()
+		code := contract.ErrorInternal
+		message := "internal supervisor error"
 		var contractErr *contract.Error
 		if errors.As(runErr, &contractErr) {
 			code = contractErr.Code
@@ -83,7 +83,8 @@ func RunInheritedChild(ctx context.Context, bootstrapFD, livenessFD, reportFD, t
 		}
 		// The child context remains live while the terminal failure is reported;
 		// the direct parent's acknowledgement is the teardown boundary. Typed
-		// failures expose only their contract message; runErr retains diagnostics.
+		// failures expose only their contract message. Untyped failures become a
+		// fixed ErrorInternal copy; runErr retains the complete diagnostics.
 		reportErr = reporter.Failure(code, message)
 	}
 	_ = stop(context.WithoutCancel(ctx))

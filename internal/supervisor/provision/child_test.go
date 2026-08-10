@@ -296,6 +296,30 @@ func TestChildProvisionerCleansRepositoryValidationFailure(t *testing.T) {
 	)
 }
 
+func TestChildProvisionerCleansUnsafeRepositoryRootFailure(t *testing.T) {
+	primary := errors.New("repository root is a symlink to /host/private")
+	client := newRecordingChildClient()
+	client.execResults = map[string]execResult{
+		commandKey([]string{"test", "!", "-L", "/workspace/repos"}): {err: primary},
+	}
+	resources, err := newTestChildProvisioner(t, client).ProvisionChild(context.Background(), validChildRequest())
+	if resources != nil || !errors.Is(err, primary) {
+		t.Fatalf("ProvisionChild() = (%v, %v), want unsafe repository-root error", resources, err)
+	}
+	assertOrderedCalls(t, client.calls,
+		"start session-child-1",
+		"exec test ! -L /workspace/repos",
+		"stop session-child-1 force=true",
+		"delete instance session-child-1",
+		"delete volume workspace-child-1",
+	)
+	for _, call := range client.calls {
+		if strings.HasPrefix(call, "exec install ") || strings.HasPrefix(call, "exec chown ") || strings.HasPrefix(call, "exec chmod ") {
+			t.Fatalf("unsafe repository root reached privileged mutation: %s", call)
+		}
+	}
+}
+
 func TestProvisionChildFollowsFailClosedOrderAndReplacesInheritedState(t *testing.T) {
 	client := newRecordingChildClient()
 	provisioner := newTestChildProvisioner(t, client)

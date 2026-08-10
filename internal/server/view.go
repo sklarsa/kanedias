@@ -36,12 +36,11 @@ type sessionModalView struct {
 	Workers      []workerOptionView
 }
 
-// repositoryOptionView exposes only the configured slug and whether it is the
-// configured browser default. Repository paths and credentials never enter the
-// template projection.
+// repositoryOptionView exposes only the configured slug. Repository paths and
+// credentials never enter the template projection; /workspace is the fixed
+// browser default.
 type repositoryOptionView struct {
-	Slug     string
-	Selected bool
+	Slug string
 }
 
 // modelOptionView intentionally exposes only allowlisted browser-facing model

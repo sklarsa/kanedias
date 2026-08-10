@@ -584,6 +584,77 @@ func TestChildProvisionFailureWireMessageOmitsInternalDiagnostics(t *testing.T) 
 	}
 }
 
+func TestUntypedChildStartupFailureWireMessageOmitsInternalDiagnostics(t *testing.T) {
+	const (
+		publicMessage  = "internal supervisor error"
+		commandDetail  = "chown kanedias:kanedias /workspace/repos"
+		pathDetail     = "/workspace/repos -> /host/private"
+		stderrDetail   = "operation not permitted"
+		resourceDetail = "delete owned child volume workspace-child-1 failed"
+	)
+	if os.Getenv("KANEDIAS_UNTYPED_CHILD_FAILURE_HELPER") == "1" {
+		runErr := errors.Join(
+			fmt.Errorf("execute %s: %s: %s", commandDetail, pathDetail, stderrDetail),
+			errors.New(resourceDetail),
+		)
+		returned := RunInheritedChild(context.Background(), BootstrapFD, LivenessFD, ReportFD, TerminalAckFD, func(context.Context, Bootstrap, *Reporter) error {
+			return runErr
+		})
+		for _, detail := range []string{commandDetail, pathDetail, stderrDetail, resourceDetail} {
+			if returned == nil || !strings.Contains(returned.Error(), detail) {
+				t.Fatalf("RunInheritedChild() error = %v, want complete internal detail %q", returned, detail)
+			}
+		}
+		return
+	}
+
+	bootstrap := validBootstrap(t)
+	script := filepath.Join(t.TempDir(), "helper.sh")
+	contents := "#!/bin/sh\nexec \"$KANEDIAS_UNTYPED_CHILD_FAILURE_TEST_BINARY\" -test.run '^TestUntypedChildStartupFailureWireMessageOmitsInternalDiagnostics$'\n"
+	if err := os.WriteFile(script, []byte(contents), 0o700); err != nil {
+		t.Fatal(err)
+	}
+	t.Setenv("KANEDIAS_UNTYPED_CHILD_FAILURE_HELPER", "1")
+	t.Setenv("KANEDIAS_UNTYPED_CHILD_FAILURE_TEST_BINARY", os.Args[0])
+	child, err := (Spawner{Executable: script, ProbeInterval: time.Millisecond}).Spawn(context.Background(), bootstrap)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer func() { _ = child.Kill() }()
+	ctx, cancel := context.WithTimeout(context.Background(), 3*time.Second)
+	defer cancel()
+	failure := child.WaitReady(ctx)
+	var typed *contract.Error
+	if !errors.As(failure, &typed) || typed.Code != contract.ErrorInternal {
+		t.Fatalf("WaitReady() error = %v, want typed internal failure", failure)
+	}
+	if typed.Message != publicMessage {
+		t.Fatalf("public failure message = %q, want exactly %q", typed.Message, publicMessage)
+	}
+	for _, forbidden := range []string{commandDetail, pathDetail, stderrDetail, resourceDetail} {
+		if strings.Contains(failure.Error(), forbidden) {
+			t.Fatalf("public failure %q exposed internal detail %q", failure, forbidden)
+		}
+	}
+	if err := child.CloseLiveness(); err != nil {
+		t.Fatal(err)
+	}
+	if err := child.CloseTerminalAck(); err != nil {
+		t.Fatal(err)
+	}
+	select {
+	case <-child.Done():
+	case <-ctx.Done():
+		t.Fatal("child did not exit after liveness close")
+	}
+	if err := child.Wait(); err != nil {
+		t.Fatalf("helper process failed to retain internal run error: %v", err)
+	}
+	if err := child.CloseReports(); err != nil {
+		t.Fatal(err)
+	}
+}
+
 func TestParentStopUnblocksRealChildWaitingForTerminalAcknowledgement(t *testing.T) {
 	if os.Getenv("KANEDIAS_TERMINAL_ACK_HELPER") == "1" {
 		err := RunInheritedChild(context.Background(), BootstrapFD, LivenessFD, ReportFD, TerminalAckFD, func(ctx context.Context, bootstrap Bootstrap, reporter *Reporter) error {

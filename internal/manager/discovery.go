@@ -24,7 +24,8 @@ var (
 // rootHandle is the manager's in-memory record for one admitted root socket.
 //
 // Concurrency invariant: every mutable field below (client, identity, rootID,
-// name, actionable, tree, stale, streamConnected, mirror, monitoring, ctx/cancel) is
+// name, nameTouched, actionable, tree, stale, streamConnected, mirror,
+// monitoring, ctx/cancel) is
 // guarded by Manager.mu. The monitor loops (snapshotLoop/eventLoop) MUST read
 // handle.client — and any other mutable field they touch — only while holding
 // m.mu; they snapshot the pointer under the lock and use the snapshot for the
@@ -36,6 +37,7 @@ type rootHandle struct {
 	socketPath      string
 	rootID          string
 	name            string
+	nameTouched     bool
 	identity        socketIdentity
 	tree            supervisor.NodeSnapshot
 	mirror          *eventMirror
@@ -354,10 +356,21 @@ type commitResult struct {
 //     outside the lock (MGR-A). This never Closes a client a running loop may
 //     still call under the lock.
 func (m *Manager) commitTree(handle *rootHandle, tree supervisor.NodeSnapshot, candidate map[string]string) (commitResult, error) {
-	return m.commitTreeWithActionability(handle, tree, candidate, handle.actionable)
+	return m.commitTreeWithAdmission(handle, tree, candidate, handle.actionable, nil)
 }
 
 func (m *Manager) commitTreeWithActionability(handle *rootHandle, tree supervisor.NodeSnapshot, candidate map[string]string, actionable bool) (commitResult, error) {
+	return m.commitTreeWithAdmission(handle, tree, candidate, actionable, nil)
+}
+
+// commitSpawnTree folds a pending launch name into the same manager lock hold
+// that admits the root handle and its routes. A same-socket handle keeps a name
+// that a user has already explicitly renamed or cleared.
+func (m *Manager) commitSpawnTree(handle *rootHandle, tree supervisor.NodeSnapshot, candidate map[string]string, name string) (commitResult, error) {
+	return m.commitTreeWithAdmission(handle, tree, candidate, handle.actionable, &name)
+}
+
+func (m *Manager) commitTreeWithAdmission(handle *rootHandle, tree supervisor.NodeSnapshot, candidate map[string]string, actionable bool, launchName *string) (commitResult, error) {
 	m.mu.Lock()
 	defer m.mu.Unlock()
 
@@ -447,6 +460,9 @@ func (m *Manager) commitTreeWithActionability(handle *rootHandle, tree superviso
 	}
 	target.tree = tree
 	target.actionable = actionable
+	if launchName != nil && !target.nameTouched {
+		target.name = *launchName
+	}
 	if target.mirror == nil {
 		target.mirror = newEventMirror(m.opts.EventLimits)
 	}

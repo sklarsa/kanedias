@@ -478,16 +478,10 @@ func (m *Manager) commitSpawn(pending *pendingRoot, snapshot supervisor.NodeSnap
 		actionable: true,
 		client:     pending.client,
 	}
-	res, err := m.commitTree(handle, normalized, candidate)
+	res, err := m.commitSpawnTree(handle, normalized, candidate, pending.name)
 	if err != nil {
 		return "", fmt.Errorf("spawn admission route conflict: %w", err)
 	}
-	// The normalized pending name becomes durable only after successful tree
-	// admission. Set it on the committed handle (which may have been reused by a
-	// concurrent same-socket discovery) under the manager lock.
-	m.mu.Lock()
-	res.handle.name = pending.name
-	m.mu.Unlock()
 	// Transfer client ownership — pending.client is now owned by the committed
 	// handle (unless commitTree reused an existing handle and closed our client).
 	pending.client = nil
@@ -495,9 +489,8 @@ func (m *Manager) commitSpawn(pending *pendingRoot, snapshot supervisor.NodeSnap
 	// client outside the lock (MGR-A).
 	m.drainAndCloseDisplaced(res.displaced)
 
-	// Test seam (MGR-D): lets a test deterministically inject a concurrent
-	// discovery that reuses+starts monitoring res.handle in the window between
-	// our commitTree and our monitorRoot. nil in production.
+	// The launch name and routes are visible together before this existing
+	// post-admission, pre-monitor concurrency test seam runs.
 	if m.afterCommitSpawnHook != nil {
 		m.afterCommitSpawnHook(res.handle)
 	}

@@ -36,14 +36,21 @@ func (c *execRecordingClient) Exec(_ context.Context, _ string, request incuscli
 
 func commandKey(command []string) string { return strings.Join(command, "\x00") }
 
-func ownershipCommands() [][]string {
+func repositoryRootValidationCommands() [][]string {
 	return [][]string{
-		{"chown", "kanedias:kanedias", "/workspace"},
-		{"chmod", "0755", "/workspace"},
-		{"install", "-d", "-o", "kanedias", "-g", "kanedias", "-m", "0755", "/workspace/repos"},
-		{"chown", "kanedias:kanedias", "/workspace/repos"},
-		{"chmod", "0755", "/workspace/repos"},
+		{"test", "!", "-L", "/workspace/repos"},
+		{"test", "!", "-e", "/workspace/repos"},
 	}
+}
+
+func ownershipCommands() [][]string {
+	return append(repositoryRootValidationCommands(),
+		[]string{"chown", "kanedias:kanedias", "/workspace"},
+		[]string{"chmod", "0755", "/workspace"},
+		[]string{"install", "-d", "-o", "kanedias", "-g", "kanedias", "-m", "0755", "/workspace/repos"},
+		[]string{"chown", "kanedias:kanedias", "/workspace/repos"},
+		[]string{"chmod", "0755", "/workspace/repos"},
+	)
 }
 
 func checkoutValidationCommands() [][]string {
@@ -77,14 +84,64 @@ func TestPrepareSessionWorkspaceRepairsOwnershipOnlyForDefaultStart(t *testing.T
 
 func TestPrepareSessionWorkspacePropagatesOwnershipExecFailure(t *testing.T) {
 	primary := errors.New("exec failed")
-	client := &execRecordingClient{execErr: primary}
+	client := &execRecordingClient{results: map[string]execResult{
+		commandKey([]string{"chown", "kanedias:kanedias", "/workspace"}): {err: primary},
+	}}
 	err := prepareSessionWorkspace(context.Background(), client, "session-test", config.WorkspaceStart{})
 	if !errors.Is(err, primary) {
 		t.Fatalf("prepareSessionWorkspace error = %v, want wrapped %v", err, primary)
 	}
-	want := [][]string{{"chown", "kanedias:kanedias", "/workspace"}}
+	want := append(repositoryRootValidationCommands(), []string{"chown", "kanedias:kanedias", "/workspace"})
 	if !reflect.DeepEqual(client.calls, want) {
 		t.Fatalf("failing exec calls = %#v, want %#v", client.calls, want)
+	}
+}
+
+func TestPrepareSessionWorkspaceRejectsUnsafeRepositoryRootBeforeOwnershipMutation(t *testing.T) {
+	for _, start := range []struct {
+		name  string
+		value config.WorkspaceStart
+	}{
+		{name: "default", value: config.WorkspaceStart{}},
+		{name: "selected", value: config.WorkspaceStart{Repository: "owner/repo", Checkout: "repo"}},
+	} {
+		for _, state := range []struct {
+			name    string
+			results map[string]execResult
+			want    [][]string
+		}{
+			{
+				name: "symlink",
+				results: map[string]execResult{
+					commandKey([]string{"test", "!", "-L", "/workspace/repos"}): {err: errors.New("repository root is a symlink to /host/private")},
+				},
+				want: repositoryRootValidationCommands()[:1],
+			},
+			{
+				name: "non-directory",
+				results: map[string]execResult{
+					commandKey([]string{"test", "!", "-e", "/workspace/repos"}): {err: errors.New("repository root exists")},
+					commandKey([]string{"test", "-d", "/workspace/repos"}):      {err: errors.New("repository root is a regular file")},
+				},
+				want: append(repositoryRootValidationCommands(), []string{"test", "-d", "/workspace/repos"}),
+			},
+		} {
+			t.Run(start.name+"/"+state.name, func(t *testing.T) {
+				client := &execRecordingClient{results: state.results}
+				err := prepareSessionWorkspace(context.Background(), client, "session-test", start.value)
+				if err == nil || !strings.Contains(err.Error(), "repository root") {
+					t.Fatalf("prepareSessionWorkspace error = %v, want internal repository-root diagnostic", err)
+				}
+				if !reflect.DeepEqual(client.calls, state.want) {
+					t.Fatalf("exec calls = %#v, want fail-closed calls %#v", client.calls, state.want)
+				}
+				for _, call := range client.calls {
+					if call[0] == "install" || call[0] == "chown" || call[0] == "chmod" {
+						t.Fatalf("unsafe repository root reached ownership mutation: %#v", call)
+					}
+				}
+			})
+		}
 	}
 }
 

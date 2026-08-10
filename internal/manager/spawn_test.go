@@ -1088,6 +1088,136 @@ func TestSpawnRootNameCommitsOnlyAfterSuccessfulAdmission(t *testing.T) {
 	}
 }
 
+func TestSpawnAdmissionPublishesRoutesAndLaunchNameAtomically(t *testing.T) {
+	m := fakeManager(nil)
+	pending := &pendingRoot{
+		socketPath: "/tmp/atomic-name.root.sock",
+		identity:   socketIdentity{dev: 7, ino: 2},
+		client:     &fakeClient{snapshot: rootTree("spawned")},
+		rootID:     "spawned",
+		name:       "Visible At Admission",
+	}
+	m.afterCommitSpawnHook = func(_ *rootHandle) {
+		state, err := m.Session("spawned")
+		if err != nil {
+			t.Errorf("admitted route was unavailable: %v", err)
+			return
+		}
+		if state.RootName != "Visible At Admission" {
+			t.Errorf("admitted route exposed root name %q, want launch name", state.RootName)
+		}
+	}
+
+	if _, err := m.commitSpawn(pending, rootTree("spawned")); err != nil {
+		t.Fatalf("commitSpawn: %v", err)
+	}
+	ctx, cancel := context.WithTimeout(context.Background(), time.Second)
+	defer cancel()
+	if err := m.Close(ctx); err != nil {
+		t.Fatal(err)
+	}
+}
+
+func TestConcurrentRenameDuringSpawnAdmissionIsNeverOverwritten(t *testing.T) {
+	for _, test := range []struct {
+		name   string
+		rename string
+		want   string
+	}{
+		{name: "rename", rename: "User Name", want: "User Name"},
+		{name: "clear", rename: "", want: ""},
+	} {
+		t.Run(test.name, func(t *testing.T) {
+			m := fakeManager(nil)
+			admitted := make(chan struct{})
+			release := make(chan struct{})
+			m.afterCommitSpawnHook = func(_ *rootHandle) {
+				close(admitted)
+				<-release
+			}
+			pending := &pendingRoot{
+				socketPath: "/tmp/concurrent-rename.root.sock",
+				identity:   socketIdentity{dev: 7, ino: 4},
+				client:     &fakeClient{snapshot: rootTree("spawned")},
+				rootID:     "spawned",
+				name:       "Pending Launch Name",
+			}
+			spawned := make(chan error, 1)
+			go func() {
+				_, err := m.commitSpawn(pending, rootTree("spawned"))
+				spawned <- err
+			}()
+			select {
+			case <-admitted:
+			case <-time.After(time.Second):
+				t.Fatal("spawn admission hook was not reached")
+			}
+			if err := m.RenameRoot("spawned", test.rename); err != nil {
+				t.Fatalf("concurrent RenameRoot: %v", err)
+			}
+			close(release)
+			if err := <-spawned; err != nil {
+				t.Fatalf("commitSpawn: %v", err)
+			}
+			if got := m.Fleet().Roots[0].Name; got != test.want {
+				t.Fatalf("name after concurrent spawn completion = %q, want %q", got, test.want)
+			}
+			ctx, cancel := context.WithTimeout(context.Background(), time.Second)
+			defer cancel()
+			if err := m.Close(ctx); err != nil {
+				t.Fatal(err)
+			}
+		})
+	}
+}
+
+func TestSpawnSameSocketReuseDoesNotOverwriteTouchedName(t *testing.T) {
+	for _, test := range []struct {
+		name   string
+		rename string
+		want   string
+	}{
+		{name: "rename", rename: "User Name", want: "User Name"},
+		{name: "clear", rename: "", want: ""},
+	} {
+		t.Run(test.name, func(t *testing.T) {
+			m := fakeManager(nil)
+			identity := socketIdentity{dev: 7, ino: 3}
+			discovered := &rootHandle{
+				socketPath: "/tmp/touched-name.root.sock",
+				rootID:     "spawned",
+				identity:   identity,
+				actionable: true,
+				client:     &fakeClient{snapshot: rootTree("spawned")},
+			}
+			if _, err := m.commitTree(discovered, rootTree("spawned"), map[string]string{"spawned": "spawned"}); err != nil {
+				t.Fatal(err)
+			}
+			if err := m.RenameRoot("spawned", test.rename); err != nil {
+				t.Fatal(err)
+			}
+			pending := &pendingRoot{
+				socketPath: discovered.socketPath,
+				identity:   identity,
+				client:     &fakeClient{snapshot: rootTree("spawned")},
+				rootID:     "spawned",
+				name:       "Pending Launch Name",
+			}
+			if _, err := m.commitSpawn(pending, rootTree("spawned")); err != nil {
+				t.Fatalf("commitSpawn: %v", err)
+			}
+			if got := m.Fleet().Roots[0].Name; got != test.want {
+				t.Fatalf("name after same-socket reuse = %q, want touched value %q", got, test.want)
+			}
+			ctx, cancel := context.WithTimeout(context.Background(), time.Second)
+			defer cancel()
+			if err := m.Close(ctx); err != nil {
+				t.Fatal(err)
+			}
+		})
+	}
+}
+
 func TestSpawnRootFailedAdmissionLeavesNoHandleOrName(t *testing.T) {
 	m := fakeManager(nil)
 	existingChild := childTree("shared", "existing")

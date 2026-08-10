@@ -24,6 +24,9 @@ type instanceExecClient interface {
 // prepareSessionWorkspace enforces durable ownership and mode on a cloned
 // workspace's mounted seed, then validates an explicitly selected checkout.
 func prepareSessionWorkspace(ctx context.Context, client instanceExecClient, instance string, start config.WorkspaceStart) error {
+	if err := validateWorkspaceRepositoriesRoot(ctx, client, instance); err != nil {
+		return err
+	}
 	commands := [][]string{
 		{"chown", managedUser + ":" + managedUser, config.WorkspaceRoot},
 		{"chmod", "0755", config.WorkspaceRoot},
@@ -63,6 +66,36 @@ func prepareSessionWorkspace(ctx context.Context, client instanceExecClient, ins
 		}
 	}
 	return nil
+}
+
+// validateWorkspaceRepositoriesRoot rejects attacker-controlled path types
+// before any privileged install, chown, or chmod can dereference the repository
+// root. A missing root is allowed because the following install creates it.
+func validateWorkspaceRepositoriesRoot(ctx context.Context, client instanceExecClient, instance string) error {
+	path := config.WorkspaceRepositoriesRoot
+	command := []string{"test", "!", "-L", path}
+	if _, stderr, err := client.Exec(ctx, instance, incusclient.ExecRequest{Command: command}); err != nil {
+		return workspaceRepositoriesRootError(command, stderr, err)
+	}
+
+	missing := []string{"test", "!", "-e", path}
+	if _, _, err := client.Exec(ctx, instance, incusclient.ExecRequest{Command: missing}); err == nil {
+		return nil
+	}
+
+	command = []string{"test", "-d", path}
+	if _, stderr, err := client.Exec(ctx, instance, incusclient.ExecRequest{Command: command}); err != nil {
+		return workspaceRepositoriesRootError(command, stderr, err)
+	}
+	return nil
+}
+
+func workspaceRepositoriesRootError(command []string, stderr string, err error) error {
+	underlying := fmt.Errorf("validate workspace repository root: execute %q: %w", strings.Join(command, " "), err)
+	if trimmed := strings.TrimSpace(stderr); trimmed != "" {
+		underlying = fmt.Errorf("%w: %s", underlying, trimmed)
+	}
+	return underlying
 }
 
 func managedGitCommand(command ...string) []string {

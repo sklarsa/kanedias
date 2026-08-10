@@ -55,7 +55,7 @@ type Manager struct {
 	fleetRevision   uint64
 	sessionRevision uint64
 	// afterCommitSpawnHook, if non-nil, is invoked inside commitSpawn between
-	// commitTree and monitorRoot. Test-only seam for the MGR-D interleaving; nil
+	// atomic route/name admission and monitorRoot. Test-only seam for the MGR-D interleaving; nil
 	// in production.
 	afterCommitSpawnHook func(committed *rootHandle)
 
@@ -384,6 +384,10 @@ func (m *Manager) RenameRoot(sessionID, name string) error {
 		m.mu.Unlock()
 		return errors.Join(errNotFound, contract.NewError(contract.ErrorNotFound, "root session not found"))
 	}
+	// Record valid user intent even when the requested value already matches.
+	// In particular, clearing an as-yet unnamed concurrently discovered handle
+	// must prevent pending launch admission from restoring its launch name.
+	handle.nameTouched = true
 	if handle.name == normalized {
 		m.mu.Unlock()
 		return nil

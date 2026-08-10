@@ -410,18 +410,25 @@ func TestRootProvisionerRepairsClonedWorkspaceBeforeReadiness(t *testing.T) {
 	)
 }
 
-func TestRootProvisionerCleansWorkspacePreparationFailure(t *testing.T) {
-	primary := errors.New("workspace preparation failed")
-	client := &recordingRootClient{execErr: primary}
+func TestRootProvisionerCleansUnsafeRepositoryRootFailure(t *testing.T) {
+	primary := errors.New("repository root is a symlink to /host/private")
+	client := &recordingRootClient{execResults: map[string]execResult{
+		commandKey([]string{"test", "!", "-L", "/workspace/repos"}): {err: primary},
+	}}
 	provisioner := newRootProvisioner(rootTestConfig(), testRootDependencies(client))
 
 	resources, err := provisioner.ProvisionRoot(context.Background(), validRootRequest())
 	if resources != nil || !errors.Is(err, primary) {
-		t.Fatalf("ProvisionRoot() = (%v, %v), want nil resources and workspace prep error", resources, err)
+		t.Fatalf("ProvisionRoot() = (%v, %v), want nil resources and unsafe repository-root error", resources, err)
 	}
 	calls := strings.Join(client.calls, ",")
-	if !strings.Contains(calls, "start-instance,exec chown kanedias:kanedias /workspace,stop-instance,delete-instance,delete-volume") {
-		t.Fatalf("workspace preparation failure cleanup order = %s", calls)
+	if !strings.Contains(calls, "start-instance,exec test ! -L /workspace/repos,stop-instance,delete-instance,delete-volume") {
+		t.Fatalf("unsafe repository-root cleanup order = %s", calls)
+	}
+	for _, call := range client.calls {
+		if strings.HasPrefix(call, "exec install ") || strings.HasPrefix(call, "exec chown ") || strings.HasPrefix(call, "exec chmod ") {
+			t.Fatalf("unsafe repository root reached privileged mutation: %s", call)
+		}
 	}
 }
 

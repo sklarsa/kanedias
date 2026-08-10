@@ -14,7 +14,7 @@
       <label for="start-repository">Starting repository</label>
       <select id="start-repository" data-start-repository>
         <option value="" selected>/workspace</option>
-        {{range .Repositories}}<option value="{{.Slug}}"{{if .Selected}} selected{{end}}>{{.Slug}}</option>{{end}}
+        {{range .Repositories}}<option value="{{.Slug}}">{{.Slug}}</option>{{end}}
       </select>
     </fieldset>
 
