@@ -209,7 +209,7 @@ func (client *Client) readLoop() {
 		case <-client.done:
 			return
 		default:
-			_ = client.terminate(errors.New("Pi RPC event consumer exceeded bounded capacity"))
+			_ = client.terminate(errors.New("pi RPC event consumer exceeded bounded capacity"))
 			return
 		}
 	}
