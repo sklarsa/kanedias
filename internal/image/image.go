@@ -17,6 +17,7 @@ import (
 	"github.com/sklarsa/kanedias/internal/incusclient"
 	"github.com/sklarsa/kanedias/internal/network"
 	"github.com/sklarsa/kanedias/internal/profiles"
+	"github.com/sklarsa/kanedias/internal/proxy"
 	"golang.org/x/sys/unix"
 )
 
@@ -80,6 +81,7 @@ type buildInputs struct {
 	piSettings []byte
 	piAuth     []byte
 	piModels   []byte
+	proxyCA    []byte
 	profile    []byte
 	scripts    []buildScript
 }
@@ -149,7 +151,28 @@ func loadBuildInputs(cfg config.Config, openDirectory buildScriptsDirectoryOpene
 		return buildInputs{}, err
 	}
 	inputs.scripts = scripts
+
+	proxyCA, err := loadProxyCA()
+	if err != nil {
+		return buildInputs{}, err
+	}
+	inputs.proxyCA = proxyCA
 	return inputs, nil
+}
+
+func loadProxyCA() ([]byte, error) {
+	options, err := proxy.DefaultOptions()
+	if err != nil {
+		return nil, fmt.Errorf("resolve proxy CA paths: %w", err)
+	}
+	if err := proxy.InitCA(options.CACertPath, options.CAKeyPath); err != nil {
+		return nil, fmt.Errorf("initialize proxy CA: %w", err)
+	}
+	certificate, err := os.ReadFile(options.CACertPath)
+	if err != nil {
+		return nil, fmt.Errorf("read proxy CA certificate %q: %w", options.CACertPath, err)
+	}
+	return certificate, nil
 }
 
 func loadBuildScripts(cfg config.Config) ([]buildScript, error) {
@@ -364,6 +387,7 @@ func createWithClient(ctx context.Context, client imageClient, cfg config.Config
 		{path: "/root/assets/pi-settings.json", content: inputs.piSettings, mode: 0o644},
 		{path: "/root/assets/pi-auth.json", content: inputs.piAuth, mode: 0o600},
 		{path: "/root/assets/pi-models.json", content: inputs.piModels, mode: 0o644},
+		{path: "/root/assets/kanedias-proxy.crt", content: inputs.proxyCA, mode: 0o644},
 		{path: "/root/assets/kanedias-pi.socket", content: piRPCSocket, mode: 0o644},
 		{path: "/root/assets/kanedias-pi@.service", content: piRPCService, mode: 0o644},
 		{path: "/root/assets/kanedias-pi-env", content: piEnvironmentBridge, mode: 0o700},
