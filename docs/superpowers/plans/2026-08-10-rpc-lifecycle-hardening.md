@@ -767,6 +767,145 @@ After GREEN, restart Task 6 at Step 2. Run both existing isolated acceptances on
 
 ---
 
+### Task 6B: Honor the configured managed-server authentication mode in live acceptance
+
+**Failed invariant and evidence:**
+
+- Required invariant: `TestLiveServerManagedSupervisorAcceptance` must connect to a successfully started managed server using the authentication mode selected by its generated configuration, exercise the initial and restarted server, and restore the exact Incus baseline.
+- Task 6 Step 2 failed at `internal/supervisor/live_incus_test.go:1652` after 122.58 seconds while waiting for `bootstrap URL and effective address in log`; retained artifacts are at `/home/steven/.cache/kanedias/e2e/e2e-3304814-1786392737132818170/`.
+- `/home/steven/.cache/kanedias/e2e/e2e-3304814-1786392737132818170/managed-config.toml` resolves `[server] require_session = false`. Its `managed-server.log` proves successful product startup with `effective_address=127.0.0.1:45403` and `Web UI: http://steven-desktop:45403/`, correctly contains no `Bootstrap URL:`, and records clean shutdown. `baseline-incus.json` and `teardown-final-incus.json` match.
+- Earliest divergent boundary: `waitForBootstrapURL` and `bootstrapManagedServer` in `internal/supervisor/live_incus_test.go` unconditionally require and exchange a bootstrap capability even though trusted mode intentionally emits no capability. This is acceptance-contract drift introduced when session authentication became opt-in, not a production startup defect.
+
+**Files and scope:**
+
+- Modify/Test only: `internal/supervisor/live_incus_test.go`
+- Read comparison: `internal/server/handler_test.go`
+- Read artifacts: `/home/steven/.cache/kanedias/e2e/e2e-3304814-1786392737132818170/`
+- Do not modify any production file. Do not change configuration defaults, server output, authentication middleware, manager behavior, or live lifecycle semantics.
+
+**Interfaces:**
+
+- Consumes: `config.ServerConfig.Resolve`, `http.Client`, `cookiejar.New`, the server's `effective_address=`, `Web UI:`, and `Bootstrap URL:` output contracts.
+- Produces: a mode-aware managed live-acceptance connection that uses the effective loopback listener for host-side requests and performs bootstrap only when the resolved configuration requires it.
+
+Independent review of this Task 6B amendment is required before Step 1 edits `internal/supervisor/live_incus_test.go`.
+
+- [ ] **Step 1: Add pure RED tests for both startup modes and bootstrap URL normalization**
+
+In `internal/supervisor/live_incus_test.go`, extract a pure parser with this contract:
+
+```go
+type managedServerStartup struct {
+    origin       string
+    bootstrapURL string
+}
+
+func parseManagedServerStartup(text string, requireSession bool) (managedServerStartup, bool)
+```
+
+Add `TestParseManagedServerStartupModes` with these exact table cases:
+
+1. `trusted-ready`: input contains `effective_address=127.0.0.1:45403` and `Web UI: http://steven-desktop:45403/` but no bootstrap line; with `requireSession=false`, it is ready, origin is `http://127.0.0.1:45403`, and bootstrap URL is empty.
+2. `trusted-missing-web-ui`: input contains only the effective address; with `requireSession=false`, it is not ready.
+3. `authenticated-ready`: input contains `effective_address=127.0.0.1:45403` and `Bootstrap URL: http://steven-desktop:45403/bootstrap?capability=test-token`; with `requireSession=true`, it is ready and returns both the loopback origin and the complete advertised bootstrap URL.
+4. `authenticated-missing-bootstrap`: input contains the effective address and Web UI only; with `requireSession=true`, it is not ready.
+
+Add `TestNormalizeManagedBootstrapURLToEffectiveOrigin`. Given effective origin `http://127.0.0.1:45403` and advertised URL `http://steven-desktop:45403/bootstrap?capability=test-token`, require exactly `http://127.0.0.1:45403/bootstrap?capability=test-token`. Include a relative `/bootstrap?capability=test-token` case with the same result. This proves host-side requests target the actual listener while preserving the bootstrap path and capability query.
+
+- [ ] **Step 2: Run the focused tests and prove RED**
+
+Run:
+
+```bash
+go test -v -count=1 -tags=incus ./internal/supervisor \
+  -run '^Test(ParseManagedServerStartupModes|NormalizeManagedBootstrapURLToEffectiveOrigin)$'
+```
+
+Expected: FAIL to compile because `parseManagedServerStartup` and `normalizeManagedBootstrapURL` do not exist yet. The failure must be limited to those missing test seams; do not edit production to obtain RED.
+
+- [ ] **Step 3: Replace the bootstrap-only polling boundary with the mode-aware pure parser**
+
+Modify only `internal/supervisor/live_incus_test.go`:
+
+1. Implement `parseManagedServerStartup` without filesystem, process, network, test-harness, or timing dependencies. Parse the effective address into `http://127.0.0.1:PORT`. When `requireSession=false`, readiness requires the effective address and a nonempty `Web UI:` line and returns no bootstrap URL. When `requireSession=true`, readiness requires the effective address and a nonempty `Bootstrap URL:` line; Web UI output is not an authentication prerequisite.
+2. Replace `waitForBootstrapURL` with `waitForManagedServerStartup(logPath string, requireSession bool) managedServerStartup`. Keep the existing two-minute `h.poll`, read the current log each poll, and delegate all output interpretation and readiness decisions to the pure parser.
+3. Add `normalizeManagedBootstrapURL(origin, advertised string) (string, error)` using `net/url`. Resolve a relative advertised bootstrap reference against `origin`. For an absolute advertised URL, replace only its scheme and host with those from the effective origin; preserve its escaped path, raw query, and fragment. Reject an invalid or non-HTTP effective origin rather than issuing a request to the advertised hostname.
+
+- [ ] **Step 4: Make the managed connection helper honor `requireSession`**
+
+Rename `bootstrapManagedServer` to `connectManagedServer` and add `requireSession bool` to its parameters. Preserve log selection for the initial `managed-server.log` and restarted `managed-server-restart.log`, then:
+
+1. Call `waitForManagedServerStartup(logPath, requireSession)`.
+2. Always construct an `http.Client` with a new cookie jar, the existing 30-second timeout, and the existing no-follow `CheckRedirect`; trusted and authenticated paths therefore share identical subsequent client behavior.
+3. Only when `requireSession=true`, normalize the parsed advertised bootstrap URL to the effective origin, issue the bootstrap GET, close its body, and require HTTP 303 See Other. When `requireSession=false`, issue no bootstrap request.
+4. In both modes, GET `origin + "/"`, close the body, and require HTTP 200 OK. Return the effective origin and client only after this readiness/authentication check succeeds.
+
+In `runServerManaged`, immediately after `config.Load`, call `managedCfg.Server.Resolve()` once, fail with `resolve managed server configuration` on error, store `requireSession := resolvedServer.RequireSession`, and pass that same value to both the initial and restarted `connectManagedServer` calls. Do not infer authentication mode from which log lines happen to appear.
+
+- [ ] **Step 5: Prove focused GREEN, race safety, tagged compilation, and the production output comparison**
+
+Run exactly:
+
+```bash
+gofmt -w internal/supervisor/live_incus_test.go
+go test -v -count=1 -tags=incus ./internal/supervisor \
+  -run '^Test(ParseManagedServerStartupModes|NormalizeManagedBootstrapURLToEffectiveOrigin)$'
+go test -race -v -count=1 -tags=incus ./internal/supervisor \
+  -run '^Test(ParseManagedServerStartupModes|NormalizeManagedBootstrapURLToEffectiveOrigin)$'
+go test -count=1 -tags=incus ./internal/supervisor -run '^$'
+go test -v -count=1 ./internal/server \
+  -run '^TestHandler(PrintsAdvertisedURLs|TrustedNetworkModeBypassesBrowserSecurity)$'
+git diff --check
+```
+
+Expected: both pure tests pass normally and under the race detector; the tagged supervisor package compiles; the existing server tests continue proving that trusted mode emits Web UI without bootstrap while authenticated mode emits bootstrap; `git diff --check` is silent.
+
+- [ ] **Step 6: Rerun only the failed managed live acceptance**
+
+Run:
+
+```bash
+set -a; . /home/steven/source/github/kanedias/.env; set +a
+go test -v -count=1 -tags=incus ./internal/supervisor \
+  -run '^TestLiveServerManagedSupervisorAcceptance$' \
+  -timeout 90m
+```
+
+Expected: PASS through initial trusted connection, two managed root launches, server restart, trusted reconnection without bootstrap, fleet rediscovery, descendant controls, root cleanup, process/socket cleanup, and exact Incus baseline restoration. If it fails, preserve the new artifact directory and return to read-only systematic diagnosis; do not broaden this test-only fix.
+
+- [ ] **Step 7: Commit the acceptance-mode fix**
+
+After focused and live GREEN:
+
+```bash
+git add internal/supervisor/live_incus_test.go
+git commit -m "test: honor managed server authentication mode"
+```
+
+- [ ] **Step 8: Resume Task 6 only after live GREEN**
+
+First rerun Task 6 Step 2 exactly:
+
+```bash
+set -a; . /home/steven/source/github/kanedias/.env; set +a
+go test -v -count=1 -tags=incus ./internal/supervisor \
+  -run '^TestLive(ChildLivenessShutdown|ServerManagedSupervisor)Acceptance$' \
+  -timeout 90m
+```
+
+Only after both existing acceptances pass and restore the exact baseline, run Task 6 Step 3 exactly:
+
+```bash
+set -a; . /home/steven/source/github/kanedias/.env; set +a
+go test -v -count=1 -tags=incus ./internal/supervisor \
+  -run '^TestLiveRPC.*Lifecycle$' \
+  -timeout 4h
+```
+
+Do not count or run any Step 3 scenario before the managed live acceptance is GREEN.
+
+---
+
 ### Task 7: Prove five consecutive clean runs and complete verification
 
 **Files:**
