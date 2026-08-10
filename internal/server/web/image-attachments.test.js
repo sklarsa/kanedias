@@ -158,7 +158,7 @@ test("uses deterministic fallback labels for unnamed pasted images", () => {
   assert.deepEqual(draft.images.map((image) => image.name), ["Pasted image 1", "Pasted image 2"]);
 });
 
-test("submits percent-escaped sessions with message first and images in staged order", async () => {
+test("submits the server's singular image field after message in staged order", async () => {
   const f = fixture();
   f.controller.selectSession("a/b ?#");
   f.controller.setText("inspect");
@@ -172,9 +172,11 @@ test("submits percent-escaped sessions with message first and images in staged o
   assert.equal(f.requests[0].init.method, "POST");
   assert.deepEqual(f.requests[0].init.body.parts.map((part) => [part.name, part.value.name || part.value]), [
     ["message", "inspect"],
-    ["images", "first.png"],
-    ["images", "second.jpg"]
+    ["image", "first.png"],
+    ["image", "second.jpg"]
   ]);
+  assert.equal(f.requests[0].init.body.parts.some((part) => part.name === "images"), false,
+    "the server rejects the plural field name");
 });
 
 test("uses the neutral prompt for image-only drafts and rejects entirely empty drafts", async () => {
@@ -272,6 +274,57 @@ test("snapshots passed to observers are detached and immutable", () => {
   assert.equal("file" in observed.images[0], false);
   assert.throws(() => { observed.images.push({}); }, TypeError);
   assert.deepEqual(f.controller.draft("A").images.map((image) => image.name), ["a.png"]);
+});
+
+test("late accepted or rejected outcomes cannot affect a reconciled-away and recreated session", async (t) => {
+  const outcomes = [
+    {name: "accepted", response: jsonResponse(202, {accepted: true}), result: {outcome: "accepted"}},
+    {name: "rejected", response: jsonResponse(409, {accepted: false, error: "old rejection"}), result: {outcome: "rejected", error: "old rejection"}}
+  ];
+
+  for (const outcome of outcomes) {
+    await t.test(outcome.name, async () => {
+      const waiting = deferred();
+      const f = fixture({fetch: () => waiting.promise});
+      stage(f.controller, "A", [imageFile("old.png", "image/png", 1)]);
+      f.controller.setText("old draft");
+      const submitted = f.controller.submit("A");
+
+      f.controller.reconcileSessions([]);
+      f.controller.selectSession("A");
+      f.controller.setText("replacement draft");
+      f.controller.stageFiles([imageFile("replacement.png", "image/png", 1)]);
+      const changesAtDetach = f.changes.length;
+      const statusesAtDetach = f.statuses.length;
+
+      waiting.resolve(outcome.response);
+      assert.deepEqual(await submitted, outcome.result);
+      assert.equal(f.controller.draft("A").text, "replacement draft");
+      assert.deepEqual(f.controller.draft("A").images.map((image) => image.name), ["replacement.png"]);
+      assert.equal(f.controller.draft("A").busy, false);
+      assert.deepEqual(f.revoked, ["blob:old.png"]);
+      assert.equal(f.changes.length, changesAtDetach, "detached request must not emit onChange");
+      assert.equal(f.statuses.length, statusesAtDetach, "detached request must not emit onStatus");
+    });
+  }
+});
+
+test("destroy suppresses an in-flight request's late unknown-delivery observers", async () => {
+  const waiting = deferred();
+  const f = fixture({fetch: () => waiting.promise});
+  stage(f.controller, "A", [imageFile("old.png", "image/png", 1)]);
+  f.controller.setText("old draft");
+  const submitted = f.controller.submit("A");
+
+  f.controller.destroy();
+  const changesAtDestroy = f.changes.length;
+  const statusesAtDestroy = f.statuses.length;
+  waiting.reject(new Error("late transport failure"));
+
+  assert.deepEqual(await submitted, {outcome: "unknown"});
+  assert.deepEqual(f.revoked, ["blob:old.png"]);
+  assert.equal(f.changes.length, changesAtDestroy, "destroyed request must not emit onChange");
+  assert.equal(f.statuses.length, statusesAtDestroy, "destroyed request must not emit onStatus");
 });
 
 test("reconciliation revokes and deletes drafts for removed sessions", () => {

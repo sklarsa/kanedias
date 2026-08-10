@@ -245,7 +245,7 @@
       formData = new options.FormData();
       formData.append("message", draft.text.trim() ? draft.text : NEUTRAL_MESSAGE);
       draft.images.forEach(function (image) {
-        formData.append("images", image.file, image.name);
+        formData.append("image", image.file, image.name);
       });
 
       var response = await options.fetch("/ui/sessions/" + encodeURIComponent(targetSessionID) + "/messages", {
@@ -260,20 +260,21 @@
       var result = classifyResponse(response, body);
 
       if (result.outcome === "accepted") {
-        if (state.drafts.get(targetSessionID) === draft) {
+        var acceptedDraftIsCurrent = state.drafts.get(targetSessionID) === draft;
+        if (acceptedDraftIsCurrent) {
           revokeDraft(draft, options);
           state.drafts.delete(targetSessionID);
           notifyChange(state, targetSessionID, options);
+          notifyStatus(options, "");
         }
-        notifyStatus(options, "");
         return result;
       }
       if (result.outcome === "rejected") {
         if (state.drafts.get(targetSessionID) === draft) {
           draft.busy = false;
           notifyChange(state, targetSessionID, options);
+          notifyStatus(options, result.error);
         }
-        notifyStatus(options, result.error);
         return result;
       }
     } catch (_) {
@@ -284,8 +285,8 @@
     if (state.drafts.get(targetSessionID) === draft) {
       draft.busy = false;
       notifyChange(state, targetSessionID, options);
+      notifyStatus(options, UNKNOWN_DELIVERY);
     }
-    notifyStatus(options, UNKNOWN_DELIVERY);
     return {outcome: "unknown"};
   }
 
