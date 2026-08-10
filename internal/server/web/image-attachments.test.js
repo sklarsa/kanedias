@@ -31,6 +31,7 @@ function fixture(overrides = {}) {
   const revoked = [];
   const changes = [];
   const statuses = [];
+  const statusEvents = [];
   const requests = [];
   const options = {
     fetch: async (url, init) => {
@@ -41,10 +42,13 @@ function fixture(overrides = {}) {
     createObjectURL: (file) => "blob:" + (file.name || "pasted"),
     revokeObjectURL: (url) => revoked.push(url),
     onChange: (snapshot) => changes.push(snapshot),
-    onStatus: (status) => statuses.push(status),
+    onStatus: (status, sessionID) => {
+      statuses.push(status);
+      statusEvents.push({status, sessionID});
+    },
     ...overrides
   };
-  return {controller: imageAttachments.createController(options), revoked, changes, statuses, requests};
+  return {controller: imageAttachments.createController(options), revoked, changes, statuses, statusEvents, requests};
 }
 
 function stage(controller, sessionID, files) {
@@ -222,6 +226,46 @@ test("strict 202 acceptance clears and revokes only the captured draft", async (
   assert.equal(f.controller.draft("B").text, "beta");
   assert.deepEqual(f.controller.draft("B").images.map((image) => image.name), ["b.png"]);
   assert.deepEqual(f.revoked, ["blob:a.png"]);
+});
+
+test("status callbacks identify no-session and selected-session validation", async () => {
+  const f = fixture();
+  f.controller.stageFiles([imageFile("a.png", "image/png", 1)]);
+  assert.deepEqual(f.statusEvents.at(-1), {
+    status: "Select a session before attaching images.",
+    sessionID: ""
+  });
+
+  f.controller.selectSession("A");
+  await f.controller.submit();
+  assert.deepEqual(f.statusEvents.at(-1), {
+    status: "Enter a message or attach an image.",
+    sessionID: "A"
+  });
+});
+
+test("accepted, rejected, and unknown submit statuses retain the captured session ID", async (t) => {
+  const outcomes = [
+    {name: "accepted", response: jsonResponse(202, {accepted: true}), status: ""},
+    {name: "rejected", response: jsonResponse(409, {accepted: false, error: "A rejected"}), status: "A rejected"},
+    {name: "unknown", response: jsonResponse(202, {accepted: true}, "text/plain"), status: /unknown/i}
+  ];
+  for (const outcome of outcomes) {
+    await t.test(outcome.name, async () => {
+      const waiting = deferred();
+      const f = fixture({fetch: () => waiting.promise});
+      f.controller.selectSession("A");
+      f.controller.setText("send A");
+      const submitted = f.controller.submit("A");
+      f.controller.selectSession("B");
+      waiting.resolve(outcome.response);
+      await submitted;
+      const event = f.statusEvents.at(-1);
+      assert.equal(event.sessionID, "A");
+      if (outcome.status instanceof RegExp) assert.match(event.status, outcome.status);
+      else assert.equal(event.status, outcome.status);
+    });
+  }
 });
 
 test("strict 4xx and 5xx rejection preserves and unlocks the draft", async () => {

@@ -77,15 +77,15 @@
     return changed;
   }
 
-  function notifyStatus(options, message) {
-    if (typeof options.onStatus === "function") options.onStatus(message);
+  function notifyStatus(options, message, sessionID) {
+    if (typeof options.onStatus === "function") options.onStatus(message, normalizeSessionID(sessionID));
   }
 
   function requireSelectedDraft(state, options, action) {
     if (!state.selectedSessionID) {
       notifyStatus(options, action === "send" ?
         "Select a session before sending a message." :
-        "Select a session before attaching images.");
+        "Select a session before attaching images.", "");
       return null;
     }
     return draftFor(state, state.selectedSessionID);
@@ -95,7 +95,7 @@
     var draft = requireSelectedDraft(state, options, "edit");
     if (!draft) return false;
     if (draft.busy) {
-      notifyStatus(options, "This draft is already being sent.");
+      notifyStatus(options, "This draft is already being sent.", state.selectedSessionID);
       return false;
     }
     draft.text = text === undefined || text === null ? "" : String(text);
@@ -107,7 +107,7 @@
     var draft = requireSelectedDraft(state, options, "stage");
     if (!draft) return snapshot(state, "");
     if (draft.busy) {
-      notifyStatus(options, "This draft is already being sent.");
+      notifyStatus(options, "This draft is already being sent.", state.selectedSessionID);
       return snapshot(state, state.selectedSessionID);
     }
 
@@ -163,7 +163,7 @@
     });
 
     var changed = notifyChange(state, state.selectedSessionID, options);
-    if (lastError) notifyStatus(options, lastError);
+    if (lastError) notifyStatus(options, lastError, state.selectedSessionID);
     return changed;
   }
 
@@ -171,7 +171,7 @@
     var draft = requireSelectedDraft(state, options, "edit");
     if (!draft) return false;
     if (draft.busy) {
-      notifyStatus(options, "This draft is already being sent.");
+      notifyStatus(options, "This draft is already being sent.", state.selectedSessionID);
       return false;
     }
     var index = draft.images.findIndex(function (image) { return String(image.id) === String(attachmentID); });
@@ -222,18 +222,18 @@
     var targetSessionID = sessionID === undefined ? state.selectedSessionID : normalizeSessionID(sessionID);
     if (!targetSessionID) {
       var noSession = "Select a session before sending a message.";
-      notifyStatus(options, noSession);
+      notifyStatus(options, noSession, "");
       return {outcome: "rejected", error: noSession};
     }
     var draft = state.drafts.get(targetSessionID) || draftFor(state, targetSessionID);
     if (draft.busy) {
       var alreadySending = "This draft is already being sent.";
-      notifyStatus(options, alreadySending);
+      notifyStatus(options, alreadySending, targetSessionID);
       return {outcome: "rejected", error: alreadySending};
     }
     if (!draft.text.trim() && draft.images.length === 0) {
       var emptyMessage = "Enter a message or attach an image.";
-      notifyStatus(options, emptyMessage);
+      notifyStatus(options, emptyMessage, targetSessionID);
       return {outcome: "rejected", error: emptyMessage};
     }
 
@@ -265,7 +265,7 @@
           revokeDraft(draft, options);
           state.drafts.delete(targetSessionID);
           notifyChange(state, targetSessionID, options);
-          notifyStatus(options, "");
+          notifyStatus(options, "", targetSessionID);
         }
         return result;
       }
@@ -273,7 +273,7 @@
         if (state.drafts.get(targetSessionID) === draft) {
           draft.busy = false;
           notifyChange(state, targetSessionID, options);
-          notifyStatus(options, result.error);
+          notifyStatus(options, result.error, targetSessionID);
         }
         return result;
       }
@@ -285,7 +285,7 @@
     if (state.drafts.get(targetSessionID) === draft) {
       draft.busy = false;
       notifyChange(state, targetSessionID, options);
-      notifyStatus(options, UNKNOWN_DELIVERY);
+      notifyStatus(options, UNKNOWN_DELIVERY, targetSessionID);
     }
     return {outcome: "unknown"};
   }
