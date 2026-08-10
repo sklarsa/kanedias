@@ -4,11 +4,17 @@ import (
 	"errors"
 	"fmt"
 	"sync"
+	"time"
 )
 
 var (
 	ErrClosed = errors.New("event mailbox is closed")
 	ErrFull   = errors.New("event mailbox exceeded bounded capacity")
+)
+
+const (
+	initialDeliveryProbeDelay = 100 * time.Microsecond
+	maxDeliveryProbeDelay     = 10 * time.Millisecond
 )
 
 type Limits struct {
@@ -31,14 +37,15 @@ type entry[T any] struct {
 
 type Mailbox[T any] struct {
 	mu            sync.Mutex
-	ready         *sync.Cond
 	limits        Limits
 	state         state
 	queue         []entry[T]
 	retainedBytes int
 	events        chan T
+	wake          chan struct{}
 	abort         chan struct{}
 	done          chan struct{}
+	afterHandoff  func()
 }
 
 func New[T any](limits Limits) (*Mailbox[T], error) {
@@ -51,10 +58,10 @@ func New[T any](limits Limits) (*Mailbox[T], error) {
 	mailbox := &Mailbox[T]{
 		limits: limits,
 		events: make(chan T),
+		wake:   make(chan struct{}, 1),
 		abort:  make(chan struct{}),
 		done:   make(chan struct{}),
 	}
-	mailbox.ready = sync.NewCond(&mailbox.mu)
 	go mailbox.dispatch()
 	return mailbox, nil
 }
@@ -68,21 +75,23 @@ func (mailbox *Mailbox[T]) Send(value T, retainedBytes int) error {
 	}
 
 	mailbox.mu.Lock()
-	defer mailbox.mu.Unlock()
-
 	if mailbox.state != stateOpen {
+		mailbox.mu.Unlock()
 		return ErrClosed
 	}
 	if mailbox.limits.MaxEvents > 0 && len(mailbox.queue) >= mailbox.limits.MaxEvents {
+		mailbox.mu.Unlock()
 		return ErrFull
 	}
 	if mailbox.limits.MaxBytes > 0 && retainedBytes > mailbox.limits.MaxBytes-mailbox.retainedBytes {
+		mailbox.mu.Unlock()
 		return ErrFull
 	}
 
 	mailbox.queue = append(mailbox.queue, entry[T]{value: value, bytes: retainedBytes})
 	mailbox.retainedBytes += retainedBytes
-	mailbox.ready.Signal()
+	mailbox.mu.Unlock()
+	mailbox.signal()
 	return nil
 }
 
@@ -90,9 +99,9 @@ func (mailbox *Mailbox[T]) Close() {
 	mailbox.mu.Lock()
 	if mailbox.state == stateOpen {
 		mailbox.state = stateDraining
-		mailbox.ready.Broadcast()
 	}
 	mailbox.mu.Unlock()
+	mailbox.signal()
 }
 
 func (mailbox *Mailbox[T]) Abort() {
@@ -101,20 +110,17 @@ func (mailbox *Mailbox[T]) Abort() {
 		mailbox.state = stateAborted
 		close(mailbox.abort)
 		mailbox.clearQueue()
-		mailbox.ready.Broadcast()
 	}
 	mailbox.mu.Unlock()
+	mailbox.signal()
 
 	<-mailbox.done
 }
 
 func (mailbox *Mailbox[T]) dispatch() {
+	retryDelay := initialDeliveryProbeDelay
 	for {
 		mailbox.mu.Lock()
-		for mailbox.state == stateOpen && len(mailbox.queue) == 0 {
-			mailbox.ready.Wait()
-		}
-
 		if mailbox.state == stateAborted {
 			mailbox.clearQueue()
 			mailbox.mu.Unlock()
@@ -122,26 +128,64 @@ func (mailbox *Mailbox[T]) dispatch() {
 			return
 		}
 		if len(mailbox.queue) == 0 {
+			if mailbox.state == stateDraining {
+				mailbox.mu.Unlock()
+				mailbox.finish()
+				return
+			}
 			mailbox.mu.Unlock()
-			mailbox.finish()
-			return
+			retryDelay = initialDeliveryProbeDelay
+			select {
+			case <-mailbox.wake:
+			case <-mailbox.abort:
+			}
+			continue
 		}
 
 		head := mailbox.queue[0]
-		mailbox.mu.Unlock()
-
+		delivered := false
 		select {
 		case mailbox.events <- head.value:
-			mailbox.mu.Lock()
-			if mailbox.state != stateAborted {
-				var zero entry[T]
-				mailbox.queue[0] = zero
-				mailbox.queue = mailbox.queue[1:]
-				mailbox.retainedBytes -= head.bytes
+			if mailbox.afterHandoff != nil {
+				mailbox.afterHandoff()
 			}
-			mailbox.mu.Unlock()
-		case <-mailbox.abort:
+			var zero entry[T]
+			mailbox.queue[0] = zero
+			mailbox.queue = mailbox.queue[1:]
+			mailbox.retainedBytes -= head.bytes
+			delivered = true
+		default:
 		}
+		mailbox.mu.Unlock()
+
+		if delivered {
+			retryDelay = initialDeliveryProbeDelay
+			continue
+		}
+		mailbox.waitForProbe(retryDelay)
+		if retryDelay < maxDeliveryProbeDelay {
+			retryDelay *= 2
+			if retryDelay > maxDeliveryProbeDelay {
+				retryDelay = maxDeliveryProbeDelay
+			}
+		}
+	}
+}
+
+func (mailbox *Mailbox[T]) signal() {
+	select {
+	case mailbox.wake <- struct{}{}:
+	default:
+	}
+}
+
+func (mailbox *Mailbox[T]) waitForProbe(delay time.Duration) {
+	timer := time.NewTimer(delay)
+	defer timer.Stop()
+	select {
+	case <-mailbox.abort:
+	case <-mailbox.wake:
+	case <-timer.C:
 	}
 }
 

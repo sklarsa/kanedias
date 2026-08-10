@@ -60,6 +60,62 @@ func TestMailboxRejectsCountAndByteOverflow(t *testing.T) {
 	}
 }
 
+func TestMailboxReceiveReleasesCapacityBeforeReceiverContinues(t *testing.T) {
+	previousMaxProcs := runtime.GOMAXPROCS(1)
+	t.Cleanup(func() { runtime.GOMAXPROCS(previousMaxProcs) })
+
+	mailbox, err := New[int](Limits{MaxEvents: 1})
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer mailbox.Abort()
+	if err := mailbox.Send(1, 0); err != nil {
+		t.Fatal(err)
+	}
+	if got := <-mailbox.Events(); got != 1 {
+		t.Fatalf("event = %d, want 1", got)
+	}
+	if err := mailbox.Send(2, 0); err != nil {
+		t.Fatalf("first Send after completed receive = %v, want nil", err)
+	}
+}
+
+func TestMailboxHandoffAndCapacityReleaseAreLockCoupled(t *testing.T) {
+	mailbox, err := New[int](Limits{MaxEvents: 1})
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer mailbox.Abort()
+
+	handoffEntered := make(chan struct{})
+	releaseHandoff := make(chan struct{})
+	mailbox.mu.Lock()
+	mailbox.afterHandoff = func() {
+		close(handoffEntered)
+		<-releaseHandoff
+	}
+	mailbox.mu.Unlock()
+
+	if err := mailbox.Send(1, 0); err != nil {
+		t.Fatal(err)
+	}
+	received := make(chan int, 1)
+	go func() { received <- <-mailbox.Events() }()
+	<-handoffEntered
+	if mailbox.mu.TryLock() {
+		mailbox.mu.Unlock()
+		close(releaseHandoff)
+		t.Fatal("mailbox mutex was released between successful handoff and capacity release")
+	}
+	close(releaseHandoff)
+	if got := <-received; got != 1 {
+		t.Fatalf("event = %d, want 1", got)
+	}
+	if err := mailbox.Send(2, 0); err != nil {
+		t.Fatalf("first Send after completed receive = %v, want nil", err)
+	}
+}
+
 func TestMailboxDeliveryReleasesByteCapacity(t *testing.T) {
 	mailbox, err := New[int](Limits{MaxEvents: 2, MaxBytes: 4})
 	if err != nil {
@@ -72,16 +128,32 @@ func TestMailboxDeliveryReleasesByteCapacity(t *testing.T) {
 	if got := <-mailbox.Events(); got != 1 {
 		t.Fatalf("event = %d", got)
 	}
-	deadline := time.Now().Add(time.Second)
-	for {
-		err = mailbox.Send(2, 4)
-		if err == nil {
-			break
+	if err := mailbox.Send(2, 4); err != nil {
+		t.Fatalf("first Send after completed receive = %v, want nil", err)
+	}
+}
+
+func TestByteOnlyMailboxHasNoHiddenCountLimitForZeroByteEntries(t *testing.T) {
+	mailbox, err := New[int](Limits{MaxBytes: 1})
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer mailbox.Abort()
+
+	for value := range 256 {
+		if err := mailbox.Send(value, 0); err != nil {
+			t.Fatalf("zero-byte Send(%d) = %v, want nil", value, err)
 		}
-		if !errors.Is(err, ErrFull) || time.Now().After(deadline) {
-			t.Fatalf("capacity was not released after receive: %v", err)
+	}
+	for want := range 256 {
+		select {
+		case got := <-mailbox.Events():
+			if got != want {
+				t.Fatalf("event = %d, want %d", got, want)
+			}
+		case <-time.After(time.Second):
+			t.Fatalf("timed out waiting for zero-byte event %d", want)
 		}
-		runtime.Gosched()
 	}
 }
 

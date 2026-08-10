@@ -771,6 +771,62 @@ func TestDescendantSSEPreservesOrdinaryBurst(t *testing.T) {
 	}
 }
 
+func TestDescendantSSECapacityOneSurvivesRepeatedReceiveHandoffs(t *testing.T) {
+	path := filepath.Join(t.TempDir(), "capacity-one.sock")
+	ctx, cancel := context.WithCancel(context.Background())
+	release := make(chan struct{})
+	written := make(chan uint64)
+	serverDone := make(chan error, 1)
+	go func() {
+		serverDone <- ServeUnix(ctx, path, http.HandlerFunc(func(w http.ResponseWriter, request *http.Request) {
+			w.Header().Set("Content-Type", "text/event-stream")
+			w.WriteHeader(http.StatusOK)
+			w.(http.Flusher).Flush()
+			for seq := uint64(1); seq <= 100; seq++ {
+				<-release
+				_, _ = fmt.Fprintf(w, "data: {\"seq\":%d,\"sessionId\":\"child\",\"sourceSeq\":%d,\"kind\":\"pi\",\"payload\":{}}\n\n", seq, seq)
+				w.(http.Flusher).Flush()
+				written <- seq
+			}
+			<-request.Context().Done()
+		}))
+	}()
+	waitForSocket(t, path)
+	client, err := NewClient(path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	client.eventLimits = eventmailbox.Limits{MaxEvents: 1}
+	sub, err := client.Subscribe(context.Background())
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	for want := uint64(1); want <= 100; want++ {
+		release <- struct{}{}
+		if got := <-written; got != want {
+			t.Fatalf("server wrote sequence %d, want %d", got, want)
+		}
+		select {
+		case event, open := <-sub.Events:
+			if !open || event.Seq != want {
+				t.Fatalf("event %d = %#v, open=%t, stream error=%v", want, event, open, sub.Err())
+			}
+		case <-time.After(time.Second):
+			t.Fatalf("timed out waiting for event %d", want)
+		}
+		if err := sub.Err(); err != nil {
+			t.Fatalf("event %d terminated capacity-one stream: %v", want, err)
+		}
+	}
+
+	sub.Close()
+	cancel()
+	if err := <-serverDone; err != nil {
+		t.Fatal(err)
+	}
+}
+
 func TestDescendantSSEDisconnectsStalledConsumerAtBoundedCapacity(t *testing.T) {
 	path := filepath.Join(t.TempDir(), "stalled.sock")
 	ctx, cancel := context.WithCancel(context.Background())

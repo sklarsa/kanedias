@@ -645,6 +645,27 @@ func TestClientPreservesOrdinaryEventBurstAndRemainsUsable(t *testing.T) {
 	}
 }
 
+func TestClientCapacityOneSurvivesRepeatedReceiveHandoffs(t *testing.T) {
+	clientConn, peer := net.Pipe()
+	client := newClientWithEventLimits(clientConn, eventmailbox.Limits{MaxEvents: 1})
+	defer func() { _ = client.Close(); _ = peer.Close() }()
+
+	for want := uint64(1); want <= 100; want++ {
+		writeJSONLineAsync(t, peer, `{"type":"message_update"}`)
+		select {
+		case event, open := <-client.Events():
+			if !open || event.Seq != want {
+				t.Fatalf("event %d = %#v, open=%t", want, event, open)
+			}
+		case <-time.After(time.Second):
+			t.Fatalf("timed out waiting for event %d", want)
+		}
+		if err := client.Err(); err != nil {
+			t.Fatalf("event %d terminated capacity-one client: %v", want, err)
+		}
+	}
+}
+
 func TestClientDisconnectsStalledEventConsumerAtByteBoundedCapacity(t *testing.T) {
 	clientConn, peer := net.Pipe()
 	client := newClientWithEventLimits(clientConn, eventmailbox.Limits{MaxEvents: 1, MaxBytes: 1024})

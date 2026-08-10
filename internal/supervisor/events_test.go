@@ -298,6 +298,70 @@ func TestEventBrokerOverflowDisconnectsOnlySlowSubscriber(t *testing.T) {
 	}
 }
 
+func TestEventBrokerCountAndByteBoundedFastSubscriberSurvivesRepeatedHandoffs(t *testing.T) {
+	tests := []struct {
+		name      string
+		newBroker func() *EventBroker
+	}{
+		{
+			name: "count",
+			newBroker: func() *EventBroker {
+				return newEventBroker(4, 1)
+			},
+		},
+		{
+			name: "bytes",
+			newBroker: func() *EventBroker {
+				return newEventBrokerWithByteCapacity(4, 4, 32)
+			},
+		},
+	}
+	for _, test := range tests {
+		t.Run(test.name, func(t *testing.T) {
+			for iteration := 0; iteration < 100; iteration++ {
+				broker := test.newBroker()
+				slow := broker.Subscribe()
+				fast := broker.Subscribe()
+
+				first := broker.PublishLocal("root", "pi", json.RawMessage(`{}`))
+				if test.name == "bytes" && RetainedEventBytes(first) != 32 {
+					t.Fatalf("iteration %d: test event bytes = %d, want 32", iteration, RetainedEventBytes(first))
+				}
+				select {
+				case event, open := <-fast.Events:
+					if !open || event.Seq != 1 {
+						t.Fatalf("iteration %d: first fast event = %#v, open=%t", iteration, event, open)
+					}
+				case <-time.After(time.Second):
+					t.Fatalf("iteration %d: timed out waiting for first fast event", iteration)
+				}
+
+				broker.PublishLocal("root", "pi", json.RawMessage(`{}`))
+				select {
+				case event, open := <-fast.Events:
+					if !open || event.Seq != 2 {
+						t.Fatalf("iteration %d: second fast event = %#v, open=%t", iteration, event, open)
+					}
+				case <-time.After(time.Second):
+					t.Fatalf("iteration %d: fast subscriber detached at handoff boundary", iteration)
+				}
+				select {
+				case _, open := <-slow.Events:
+					if open {
+						t.Fatalf("iteration %d: slow subscriber delivered unread data after genuine overflow", iteration)
+					}
+				case <-time.After(time.Second):
+					t.Fatalf("iteration %d: genuinely full slow subscriber was not detached", iteration)
+				}
+
+				fast.Close()
+				slow.Close()
+				broker.Close()
+			}
+		})
+	}
+}
+
 func TestEventBrokerConcurrentPublishersDeliverMonotonicSequence(t *testing.T) {
 	const publishers = 256
 	broker := newEventBroker(publishers, publishers)
