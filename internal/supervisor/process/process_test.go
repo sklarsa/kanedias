@@ -731,6 +731,76 @@ func TestParentStopUnblocksRealChildWaitingForTerminalAcknowledgement(t *testing
 	}
 }
 
+func TestAcknowledgedTerminalChildExitsWhileParentLivenessRemainsOpen(t *testing.T) {
+	if os.Getenv("KANEDIAS_TERMINAL_EXIT_HELPER") == "1" {
+		err := RunInheritedChild(context.Background(), BootstrapFD, LivenessFD, ReportFD, TerminalAckFD, func(_ context.Context, bootstrap Bootstrap, reporter *Reporter) error {
+			info, err := os.Stat(bootstrap.SocketPath)
+			if err != nil {
+				return err
+			}
+			stat := info.Sys().(*syscall.Stat_t)
+			ticket := provision.RecoveryTicket{
+				SessionID: bootstrap.SessionID, ParentID: bootstrap.ParentID, RootID: bootstrap.RootID,
+				Pool: "pool", Instance: "session-" + bootstrap.SessionID, Volume: "workspace-" + bootstrap.SessionID,
+				SocketPath: bootstrap.SocketPath, Socket: provision.SocketIdentity{Device: uint64(stat.Dev), Inode: stat.Ino},
+				Kind: bootstrap.Request.Kind, Context: bootstrap.Request.Context, WorkerType: bootstrap.Request.WorkerType,
+			}
+			if err := reporter.Ownership(ticket); err != nil {
+				return err
+			}
+			if err := reporter.Ready(bootstrap.SocketPath); err != nil {
+				return err
+			}
+			return reporter.Read(contract.ReadChildResult{
+				Kind: contract.ChildKindRead, WorkerType: bootstrap.Request.WorkerType,
+				SessionID: bootstrap.SessionID, Output: "done",
+			})
+		})
+		if err != nil {
+			t.Fatal(err)
+		}
+		return
+	}
+
+	bootstrap := validBootstrap(t)
+	serveTree(t, bootstrap.SocketPath, bootstrap.SessionID, bootstrap.ParentID, bootstrap.RootID)
+	script := filepath.Join(t.TempDir(), "helper.sh")
+	contents := "#!/bin/sh\nexec \"$KANEDIAS_TERMINAL_EXIT_TEST_BINARY\" -test.run '^TestAcknowledgedTerminalChildExitsWhileParentLivenessRemainsOpen$'\n"
+	if err := os.WriteFile(script, []byte(contents), 0o700); err != nil {
+		t.Fatal(err)
+	}
+	t.Setenv("KANEDIAS_TERMINAL_EXIT_HELPER", "1")
+	t.Setenv("KANEDIAS_TERMINAL_EXIT_TEST_BINARY", os.Args[0])
+	child, err := (Spawner{Executable: script, ProbeInterval: time.Millisecond}).Spawn(context.Background(), bootstrap)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer func() { _ = child.Kill() }()
+	ctx, cancel := context.WithTimeout(context.Background(), 3*time.Second)
+	defer cancel()
+	if err := child.WaitReady(ctx); err != nil {
+		t.Fatal(err)
+	}
+	message, err := child.NextMessage(ctx)
+	if err != nil || message.Type != MessageRead {
+		t.Fatalf("terminal message = %#v, %v", message, err)
+	}
+	if err := child.AcknowledgeTerminal(message); err != nil {
+		t.Fatal(err)
+	}
+	select {
+	case <-child.Done():
+	case <-ctx.Done():
+		t.Fatal("acknowledged child remained blocked on the still-open parent liveness pipe")
+	}
+	if err := child.Wait(); err != nil {
+		t.Fatal(err)
+	}
+	if err := child.CloseReports(); err != nil {
+		t.Fatal(err)
+	}
+}
+
 func TestRealProcessGroupEscalatesFromDeadlineThroughTermToKill(t *testing.T) {
 	bootstrap := validBootstrap(t)
 	serveTree(t, bootstrap.SocketPath, bootstrap.SessionID, bootstrap.ParentID, bootstrap.RootID)
@@ -866,6 +936,23 @@ func runLivenessHelper(t *testing.T) {
 	}
 	if err := cmd.Wait(); err != nil {
 		t.Fatal(err)
+	}
+}
+
+func TestPrepareInheritedLivenessDescriptorRejectsClosedDescriptor(t *testing.T) {
+	readEnd, writeEnd, err := os.Pipe()
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer func() { _ = writeEnd.Close() }()
+	fd := int(readEnd.Fd())
+	if err := readEnd.Close(); err != nil {
+		t.Fatal(err)
+	}
+
+	err = prepareInheritedLivenessDescriptor(fd)
+	if err == nil || !strings.Contains(err.Error(), "set inherited parent-liveness descriptor nonblocking") {
+		t.Fatalf("prepare inherited liveness descriptor error = %v", err)
 	}
 }
 

@@ -84,6 +84,90 @@ func (child *fakeChildProcess) Wait() error           { <-child.done; return chi
 func (child *fakeChildProcess) Terminate() error      { child.terminated.Add(1); child.finish(); return nil }
 func (child *fakeChildProcess) Kill() error           { child.killed.Add(1); child.finish(); return nil }
 
+type terminalWedgeChildProcess struct {
+	messages           chan process.ChildMessage
+	ticket             provision.RecoveryTicket
+	done               chan struct{}
+	closeOnce          sync.Once
+	acknowledged       atomic.Int32
+	ackClosed          atomic.Int32
+	liveness           atomic.Int32
+	terminated         atomic.Int32
+	killed             atomic.Int32
+	escalatedBeforeAck atomic.Bool
+}
+
+func newTerminalWedgeChildProcess(sessionID string) *terminalWedgeChildProcess {
+	messages := make(chan process.ChildMessage, 1)
+	messages <- process.ChildMessage{
+		Type:      process.MessageRead,
+		SessionID: sessionID,
+		Read: &contract.ReadChildResult{
+			Kind: contract.ChildKindRead, WorkerType: "reviewer", SessionID: sessionID, Output: "done",
+		},
+	}
+	return &terminalWedgeChildProcess{
+		messages: messages,
+		ticket: provision.RecoveryTicket{
+			SessionID: sessionID, ParentID: "root-1", RootID: "root-1", Pool: "pool",
+			Instance: "session-" + sessionID, Volume: "workspace-" + sessionID,
+			SocketPath: "/tmp/" + sessionID + ".sock", Socket: provision.SocketIdentity{Device: 1, Inode: 1},
+			Kind: contract.ChildKindRead, Context: contract.ContextFresh, WorkerType: "reviewer",
+		},
+		done: make(chan struct{}),
+	}
+}
+
+func (*terminalWedgeChildProcess) WaitReady(context.Context) error { return nil }
+func (child *terminalWedgeChildProcess) RecoveryTicket() (provision.RecoveryTicket, bool) {
+	return child.ticket, true
+}
+func (child *terminalWedgeChildProcess) NextMessage(ctx context.Context) (process.ChildMessage, error) {
+	select {
+	case message := <-child.messages:
+		return message, nil
+	case <-child.done:
+		return process.ChildMessage{}, io.EOF
+	case <-ctx.Done():
+		return process.ChildMessage{}, ctx.Err()
+	}
+}
+func (child *terminalWedgeChildProcess) AcknowledgeTerminal(process.ChildMessage) error {
+	child.acknowledged.Add(1)
+	return nil
+}
+func (child *terminalWedgeChildProcess) CloseTerminalAck() error {
+	child.ackClosed.Add(1)
+	return nil
+}
+func (child *terminalWedgeChildProcess) CloseLiveness() error {
+	child.liveness.Add(1)
+	return nil
+}
+func (*terminalWedgeChildProcess) CloseReports() error { return nil }
+func (child *terminalWedgeChildProcess) Done() <-chan struct{} {
+	return child.done
+}
+func (child *terminalWedgeChildProcess) Wait() error {
+	<-child.done
+	return errors.New("terminal child exited after forced kill")
+}
+func (child *terminalWedgeChildProcess) Terminate() error {
+	if child.acknowledged.Load() == 0 {
+		child.escalatedBeforeAck.Store(true)
+	}
+	child.terminated.Add(1)
+	return nil
+}
+func (child *terminalWedgeChildProcess) Kill() error {
+	if child.acknowledged.Load() == 0 {
+		child.escalatedBeforeAck.Store(true)
+	}
+	child.killed.Add(1)
+	child.closeOnce.Do(func() { close(child.done) })
+	return nil
+}
+
 type stoppingDescendant struct {
 	fakeDescendantClient
 	process *fakeChildProcess
@@ -338,6 +422,66 @@ func TestStopDuringSpawnCancelsAdmissionAndWaitsForSpawnCleanup(t *testing.T) {
 	}
 	if len(node.children.snapshot()) != 0 {
 		t.Fatal("spawning child remains after stop")
+	}
+}
+
+func TestCreateChildBoundsAndReapsWedgedProcessAfterTerminalAcknowledgement(t *testing.T) {
+	child := newTerminalWedgeChildProcess("child-terminal-wedge")
+	recoverer := &orderingRecoverer{childDone: child.Done()}
+	node := childCreationNode(t,
+		func(context.Context, process.Bootstrap) (ChildProcess, error) { return child, nil },
+		func(string) (DescendantClient, error) {
+			return &fakeDescendantClient{snapshot: directChildSnapshot("child-terminal-wedge")}, nil
+		},
+	)
+	node.deps.ChildStopTimeout = 20 * time.Millisecond
+	node.deps.DirectChildRecoverer = recoverer
+	node.deps.NewSessionID = func() (string, error) { return "child-terminal-wedge", nil }
+
+	returned := make(chan error, 1)
+	go func() {
+		_, err := node.CreateChild(context.Background(), "root-1", readRequest())
+		returned <- err
+	}()
+
+	var err error
+	select {
+	case err = <-returned:
+	case <-time.After(time.Second):
+		t.Error("CreateChild did not bound post-terminal process settlement")
+		if killErr := child.Kill(); killErr != nil {
+			t.Errorf("timeout cleanup kill: %v", killErr)
+		}
+		err = <-returned
+	}
+
+	if child.acknowledged.Load() != 1 {
+		t.Errorf("terminal acknowledgements = %d, want 1", child.acknowledged.Load())
+	}
+	if child.ackClosed.Load() == 0 {
+		t.Error("terminal cleanup did not close the terminal acknowledgement endpoint")
+	}
+	if child.liveness.Load() == 0 {
+		t.Error("terminal cleanup did not close child liveness")
+	}
+	if child.terminated.Load() != 1 {
+		t.Errorf("TERM calls = %d, want 1", child.terminated.Load())
+	}
+	if child.killed.Load() != 1 {
+		t.Errorf("KILL calls = %d, want 1", child.killed.Load())
+	}
+	if child.escalatedBeforeAck.Load() {
+		t.Error("child process escalation preceded exact terminal acknowledgement")
+	}
+	if recoverer.called.Load() != 1 {
+		t.Errorf("recovery calls after process exit = %d, want 1", recoverer.called.Load())
+	}
+	if node.children.get("child-terminal-wedge") != nil {
+		t.Error("terminal child remains registered after CreateChild returned")
+	}
+	var typed *contract.Error
+	if !errors.As(err, &typed) || typed.Code != contract.ErrorChildFailed {
+		t.Errorf("error = %v, want typed %s", err, contract.ErrorChildFailed)
 	}
 }
 

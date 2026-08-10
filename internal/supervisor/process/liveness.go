@@ -33,6 +33,13 @@ const (
 
 type ChildRunner func(context.Context, Bootstrap, *Reporter) error
 
+func prepareInheritedLivenessDescriptor(fd int) error {
+	if err := syscall.SetNonblock(fd, true); err != nil {
+		return fmt.Errorf("set inherited parent-liveness descriptor nonblocking: %w", err)
+	}
+	return nil
+}
+
 // RunInheritedChild owns the hidden command's fixed inherited descriptors. It
 // marks every inherited descriptor close-on-exec before invoking runtime code,
 // so grandchildren cannot retain any ancestor protocol endpoint.
@@ -45,6 +52,9 @@ func RunInheritedChild(ctx context.Context, bootstrapFD, livenessFD, reportFD, t
 	}
 	for _, descriptor := range []int{bootstrapFD, livenessFD, reportFD, terminalAckFD} {
 		syscall.CloseOnExec(descriptor)
+	}
+	if err := prepareInheritedLivenessDescriptor(livenessFD); err != nil {
+		return err
 	}
 	bootstrapFile := os.NewFile(uintptr(bootstrapFD), "child-bootstrap")
 	livenessFile := os.NewFile(uintptr(livenessFD), "parent-liveness")

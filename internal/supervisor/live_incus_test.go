@@ -129,6 +129,78 @@ func TestPostNewSessionJSONRejectsInvalidResponses(t *testing.T) {
 	}
 }
 
+func TestWorkspaceStartForRepositoryUsesCanonicalCheckout(t *testing.T) {
+	workspace, err := workspaceStartForRepository("sklarsa/kanedias-testing")
+	if err != nil {
+		t.Fatal(err)
+	}
+	want := config.WorkspaceStart{Repository: "sklarsa/kanedias-testing", Checkout: "kanedias-testing"}
+	if workspace != want || workspace.Directory() != "/workspace/repos/kanedias-testing" {
+		t.Fatalf("workspace = %#v at %q, want %#v at canonical checkout", workspace, workspace.Directory(), want)
+	}
+}
+
+func TestControllableChildSnapshotRequiresBindingAndActiveLifecycle(t *testing.T) {
+	child := supervisor.NodeSnapshot{Kind: contract.ChildKindRead, Context: contract.ContextFresh, Lifecycle: string(supervisor.LifecycleStarting)}
+	if isControllableChildSnapshot(child, contract.ChildKindRead, contract.ContextFresh) {
+		t.Fatal("starting child snapshot was accepted as controllable")
+	}
+	child.Lifecycle = string(supervisor.LifecycleRunning)
+	if isControllableChildSnapshot(child, contract.ChildKindRead, contract.ContextFresh) {
+		t.Fatal("unbound running child snapshot was accepted as controllable")
+	}
+	child.PiSessionID = "pi-child"
+	child.SessionFile = "/workspace/.pi/child.jsonl"
+	child.Model = config.ModelProfile{Provider: "provider", Model: "model", ThinkingLevel: "off"}
+	for _, lifecycle := range []supervisor.LifecycleState{supervisor.LifecycleReady, supervisor.LifecycleRunning, supervisor.LifecycleAwaitingHandoff} {
+		child.Lifecycle = string(lifecycle)
+		if !isControllableChildSnapshot(child, contract.ChildKindRead, contract.ContextFresh) {
+			t.Fatalf("matching bound child in %s was rejected", lifecycle)
+		}
+	}
+	for _, lifecycle := range []supervisor.LifecycleState{
+		supervisor.LifecycleProvisioning, supervisor.LifecycleStarting, supervisor.LifecycleCompleted,
+		supervisor.LifecycleFailed, supervisor.LifecycleStopping, supervisor.LifecycleStopped,
+	} {
+		child.Lifecycle = string(lifecycle)
+		if isControllableChildSnapshot(child, contract.ChildKindRead, contract.ContextFresh) {
+			t.Fatalf("bound child in %s was accepted as controllable", lifecycle)
+		}
+	}
+	child.Lifecycle = string(supervisor.LifecycleRunning)
+	if isControllableChildSnapshot(child, contract.ChildKindWrite, contract.ContextFresh) {
+		t.Fatal("child with mismatched kind was accepted as controllable")
+	}
+	if isControllableChildSnapshot(child, contract.ChildKindRead, contract.ContextFork) {
+		t.Fatal("child with mismatched context was accepted as controllable")
+	}
+}
+
+func TestRecursiveAcceptanceUsesShortSocketPaths(t *testing.T) {
+	t.Setenv("XDG_RUNTIME_DIR", "/tmp")
+	h := &liveAcceptance{t: t, runDir: filepath.Join(t.TempDir(), strings.Repeat("deep-artifact-directory-", 4))}
+	rootPath := h.recursiveRootSocketPath("main")
+	childPath := h.recursiveDescendantSocketPath("session-" + strings.Repeat("a", 32))
+	if filepath.Dir(rootPath) == h.runDir {
+		t.Fatalf("recursive root socket remained under deep artifact directory %q", h.runDir)
+	}
+	for _, path := range []string{rootPath, childPath} {
+		if !filepath.IsAbs(path) {
+			t.Fatalf("socket path is not absolute: %q", path)
+		}
+		if len(path) >= len(syscall.RawSockaddrUnix{}.Path) {
+			t.Fatalf("socket path length = %d, want below platform bound %d: %q", len(path), len(syscall.RawSockaddrUnix{}.Path), path)
+		}
+	}
+	info, err := os.Stat(filepath.Dir(rootPath))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if info.Mode().Perm() != 0o700 {
+		t.Fatalf("recursive socket directory mode = %o, want 0700", info.Mode().Perm())
+	}
+}
+
 func TestWriteManagedConfigMergesExistingTables(t *testing.T) {
 	dir := t.TempDir()
 	source := filepath.Join(dir, "source.toml")
@@ -319,6 +391,15 @@ func TestLiveRecursiveSupervisorAcceptance(t *testing.T) {
 	harness.run()
 }
 
+// TestLiveChildLivenessShutdownAcceptance isolates the terminal child path so
+// unrelated writer and nested-cascade stress cannot obscure its result.
+func TestLiveChildLivenessShutdownAcceptance(t *testing.T) {
+	requireLiveSupervisorAuthorization(t)
+	harness := newLiveAcceptance(t)
+	defer harness.close()
+	harness.runChildLivenessShutdown()
+}
+
 // TestLiveServerManagedSupervisorAcceptance proves the full server-managed
 // supervisor lifecycle: spawn, buffering, server restart, rediscovery, Pi
 // control, descendant stop, root stop, and exact Incus cleanup.
@@ -351,6 +432,10 @@ type liveAcceptance struct {
 	roots     []*acceptanceProcess
 	processes []*acceptanceProcess
 	streams   []*sseCapture
+
+	// recursiveSocketDir keeps manual root and descendant socket paths below
+	// the platform Unix-address bound while artifacts remain under runDir.
+	recursiveSocketDir string
 
 	// managedSocketDir is the short root-socket directory used by the
 	// server-managed lifecycle test (kept short to stay under UNIX_PATH_MAX).
@@ -524,6 +609,29 @@ func newLiveAcceptance(t *testing.T) *liveAcceptance {
 	return h
 }
 
+func (h *liveAcceptance) runChildLivenessShutdown() {
+	h.buildReviewedCheckout()
+	h.startProxy()
+
+	rootProcess, socket, root, stream, stalled := h.startRoot("liveness")
+	defer stalled.Close()
+	h.exerciseFreshRead(root, socket, stream)
+
+	status, _, err := unixRequest(unixHTTPClient(socket), http.MethodDelete, "/v1/sessions/"+root.SessionID, nil)
+	if err != nil || status != http.StatusAccepted {
+		h.t.Fatalf("liveness root DELETE = %d, %v", status, err)
+	}
+	if err := h.waitProcess(rootProcess, 2*time.Minute); err != nil {
+		h.t.Fatalf("liveness root exited after DELETE: %v", err)
+	}
+	h.assertSessionAbsent(root.SessionID)
+	if _, err := os.Stat(socket); !errors.Is(err, os.ErrNotExist) {
+		h.t.Fatalf("liveness root socket remains: %v", err)
+	}
+	h.assertBaseline("after-child-liveness-shutdown")
+	h.success = true
+}
+
 func (h *liveAcceptance) run() {
 	h.buildReviewedCheckout()
 	h.startProxy()
@@ -589,9 +697,11 @@ func (h *liveAcceptance) close() {
 	}
 	h.cancel()
 	if h.success && !h.t.Failed() {
-		for _, id := range h.sessionIDs() {
-			if _, err := os.Lstat(filepath.Join(h.runDir, id+".sock")); !errors.Is(err, os.ErrNotExist) {
-				h.t.Fatalf("session socket %s remains before artifact cleanup: %v", id, err)
+		if h.recursiveSocketDir != "" {
+			for _, id := range h.sessionIDs() {
+				if _, err := os.Lstat(h.recursiveDescendantSocketPath(id)); !errors.Is(err, os.ErrNotExist) {
+					h.t.Fatalf("session socket %s remains before artifact cleanup: %v", id, err)
+				}
 			}
 		}
 		if err := os.RemoveAll(h.runDir); err != nil {
@@ -697,7 +807,7 @@ func (h *liveAcceptance) stopProxy() {
 }
 
 func (h *liveAcceptance) startRoot(label string) (*acceptanceProcess, string, supervisor.NodeSnapshot, *sseCapture, net.Conn) {
-	socket := filepath.Join(h.runDir, label+"-root.sock")
+	socket := h.recursiveRootSocketPath(label)
 	root := h.startProcess(label+"-root", h.binary, "--config", h.configPath, "session", "--socket", socket)
 	h.roots = append(h.roots, root)
 	client := unixHTTPClient(socket)
@@ -774,6 +884,27 @@ func (h *liveAcceptance) exerciseQuestionFixture(root supervisor.NodeSnapshot, s
 	h.writeJSON("question-fixture.json", map[string]any{"question": question, "answer": "deterministic-answer", "duplicateStatus": status})
 }
 
+func workspaceStartForRepository(repository string) (config.WorkspaceStart, error) {
+	repositories, err := config.ParseWorkspaceRepositories([]string{repository})
+	if err != nil {
+		return config.WorkspaceStart{}, err
+	}
+	return config.WorkspaceStart{Repository: repositories[0].Slug, Checkout: repositories[0].Checkout}, nil
+}
+
+func isControllableChildSnapshot(child supervisor.NodeSnapshot, kind contract.ChildKind, childContext contract.ContextMode) bool {
+	if child.Kind != kind || child.Context != childContext || child.PiSessionID == "" || child.SessionFile == "" ||
+		child.Model.Provider == "" || child.Model.Model == "" || child.Model.ThinkingLevel == "" {
+		return false
+	}
+	switch supervisor.LifecycleState(child.Lifecycle) {
+	case supervisor.LifecycleReady, supervisor.LifecycleRunning, supervisor.LifecycleAwaitingHandoff:
+		return true
+	default:
+		return false
+	}
+}
+
 func (h *liveAcceptance) exerciseFreshRead(root supervisor.NodeSnapshot, socket string, stream *sseCapture) {
 	client := unixHTTPClient(socket)
 	body, err := os.ReadFile(filepath.Join(h.repoRoot, "internal", "supervisor", "testdata", "read-task.md"))
@@ -789,7 +920,7 @@ func (h *liveAcceptance) exerciseFreshRead(root supervisor.NodeSnapshot, socket 
 			return false
 		}
 		child = current.Children[0]
-		return child.Kind == contract.ChildKindRead && child.Context == contract.ContextFresh
+		return isControllableChildSnapshot(child, contract.ChildKindRead, contract.ContextFresh)
 	})
 	h.trackTree(child)
 	h.waitSessionEvent(stream.events, child.SessionID, 2*time.Minute)
@@ -810,23 +941,36 @@ func (h *liveAcceptance) exerciseFreshRead(root supervisor.NodeSnapshot, socket 
 		h.t.Fatalf("delegate_session read answer missing marker: %q", text)
 	}
 	h.assertSessionAbsent(child.SessionID)
-	if _, err := os.Stat(filepath.Join(h.runDir, child.SessionID+".sock")); !errors.Is(err, os.ErrNotExist) {
+	if _, err := os.Stat(h.recursiveDescendantSocketPath(child.SessionID)); !errors.Is(err, os.ErrNotExist) {
 		h.t.Fatalf("fresh child socket remains: %v", err)
 	}
 	h.snapshotTree("fresh-read-complete", client)
 }
 
+func (h *liveAcceptance) ensureWorkspaceCheckout(instance string, workspace config.WorkspaceStart) {
+	checkout := workspace.Directory()
+	if _, _, err := h.client.Exec(h.ctx, instance, incusclient.ExecRequest{Command: []string{"test", "-d", filepath.Join(checkout, ".git")}}); err == nil {
+		return
+	}
+	h.execManagedInstance(instance, "gh", "repo", "clone", h.remote, checkout, "--", "--recurse-submodules")
+}
+
 func (h *liveAcceptance) exerciseForkedWrite(root supervisor.NodeSnapshot, socket string) {
 	client := unixHTTPClient(socket)
 	rootInstance := h.instanceForSession(root.SessionID)
-	checkout := "/workspace/repos/" + h.repository
-	checkoutOrigin := h.execInstance(rootInstance, "git", "-C", checkout, "config", "--get", "remote.origin.url")
+	workspace, err := workspaceStartForRepository(h.repository)
+	if err != nil {
+		h.t.Fatal(err)
+	}
+	checkout := workspace.Directory()
+	h.ensureWorkspaceCheckout(rootInstance, workspace)
+	checkoutOrigin := h.execManagedInstance(rootInstance, "git", "-C", checkout, "config", "--get", "remote.origin.url")
 	if err := preflightCheckoutOrigin(h.ctx, h.repository, h.remote, checkoutOrigin, resolveGitRemoteHEAD); err != nil {
 		h.t.Fatalf("actual writer checkout origin rejected before model prompt or push: %v", err)
 	}
 	beforeSize := h.execInstance(rootInstance, "stat", "-c", "%s", root.SessionFile)
 	beforeHash := strings.Fields(h.execInstance(rootInstance, "sha256sum", root.SessionFile))[0]
-	base := h.execInstance(rootInstance, "git", "-C", checkout, "rev-parse", "HEAD")
+	base := h.execManagedInstance(rootInstance, "git", "-C", checkout, "rev-parse", "HEAD")
 	branch := "kanedias-e2e/" + h.prefix
 	marker := "KANEDIAS_E2E_WRITE_" + h.prefix
 	body, err := os.ReadFile(filepath.Join(h.repoRoot, "internal", "supervisor", "testdata", "write-task.md"))
@@ -842,7 +986,7 @@ func (h *liveAcceptance) exerciseForkedWrite(root supervisor.NodeSnapshot, socke
 			return false
 		}
 		child = current.Children[0]
-		return child.Kind == contract.ChildKindWrite && child.Context == contract.ContextFork
+		return isControllableChildSnapshot(child, contract.ChildKindWrite, contract.ContextFork)
 	})
 	h.trackTree(child)
 	h.assertDistinct(root, child)
@@ -1393,6 +1537,11 @@ func (h *liveAcceptance) volumeForSession(sessionID string) string {
 	return ""
 }
 
+func (h *liveAcceptance) execManagedInstance(instance string, command ...string) string {
+	prefix := []string{"runuser", "-u", "kanedias", "--", "env", "HOME=/home/kanedias", "USER=kanedias", "LOGNAME=kanedias"}
+	return h.execInstance(instance, append(prefix, command...)...)
+}
+
 func (h *liveAcceptance) execInstance(instance string, command ...string) string {
 	stdout, stderr, err := h.client.Exec(h.ctx, instance, incusclient.ExecRequest{Command: command})
 	if err != nil {
@@ -1631,7 +1780,7 @@ func (h *liveAcceptance) assertDescendantSocketsAbsent(tree supervisor.NodeSnaps
 		ids = ids[1:]
 	}
 	for _, id := range ids {
-		if _, err := os.Lstat(filepath.Join(h.runDir, id+".sock")); !errors.Is(err, os.ErrNotExist) {
+		if _, err := os.Lstat(h.recursiveDescendantSocketPath(id)); !errors.Is(err, os.ErrNotExist) {
 			h.t.Fatalf("descendant socket %s remains before artifact cleanup: %v", id, err)
 		}
 	}
@@ -1858,11 +2007,26 @@ type managedRoot struct {
 	PID        int
 }
 
+func (h *liveAcceptance) recursiveSocketDirectory() string {
+	if h.recursiveSocketDir == "" {
+		h.recursiveSocketDir = h.shortSocketDir()
+	}
+	return h.recursiveSocketDir
+}
+
+func (h *liveAcceptance) recursiveRootSocketPath(label string) string {
+	return filepath.Join(h.recursiveSocketDirectory(), label+"-root.sock")
+}
+
+func (h *liveAcceptance) recursiveDescendantSocketPath(sessionID string) string {
+	return filepath.Join(h.recursiveSocketDirectory(), sessionID+".sock")
+}
+
 // shortSocketDir returns a short, private, EUID-owned mode-0700 directory for
-// managed root sockets. A root socket path is <base>/<32-hex>.root.sock and must
-// stay under UNIX_PATH_MAX (107 bytes); the deep e2e artifact runDir would
-// overflow it, so anchor sockets under XDG_RUNTIME_DIR (or /tmp) with a short
-// unique suffix. The directory is removed when the test finishes.
+// supervisor sockets. A root or child socket path must stay under UNIX_PATH_MAX
+// (107 bytes); the deep e2e artifact runDir can overflow it, so anchor sockets
+// under XDG_RUNTIME_DIR (or /tmp) with a short unique suffix. The directory is
+// removed when the test finishes.
 func (h *liveAcceptance) shortSocketDir() string {
 	base := strings.TrimSpace(os.Getenv("XDG_RUNTIME_DIR"))
 	if base == "" {

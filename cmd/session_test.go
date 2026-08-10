@@ -62,6 +62,24 @@ func TestSessionRequiresSocketAndRunsForegroundSupervisor(t *testing.T) {
 	}
 }
 
+func TestSessionWithoutStatusDescriptorPassesNilRootStatus(t *testing.T) {
+	service := stubServices()
+	service.loadConfig = func(string) (config.Config, error) { return validSupervisorConfig(), nil }
+	service.runSupervisor = func(_ context.Context, _ config.Config, options SessionOptions, _ io.Writer) error {
+		if options.RootStatus != nil {
+			t.Fatalf("root status = %#v, want nil without --status-fd", options.RootStatus)
+		}
+		return nil
+	}
+	root := newRootCommand(service, testProxyOptions())
+	root.SetOut(io.Discard)
+	root.SetErr(io.Discard)
+	root.SetArgs([]string{"session", "--socket", "/tmp/root.sock"})
+	if err := root.Execute(); err != nil {
+		t.Fatal(err)
+	}
+}
+
 func TestSessionRejectsMissingSocketBeforeLoadingConfig(t *testing.T) {
 	service := stubServices()
 	service.loadConfig = func(string) (config.Config, error) {
