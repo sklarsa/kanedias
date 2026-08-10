@@ -1138,6 +1138,119 @@ Update the Task 6B/6C/6D reports with the shared commit and evidence, obtain ind
 
 ---
 
+### Task 6E: Normalize the local E2E worker override to Pi's effective non-reasoning profile
+
+**Failed invariant and evidence:**
+
+- Required invariant: every managed/lifecycle child selected as `local-executor/Qwen3.6-27B-GGUF` must bind to the exact effective Pi profile before the local-model task runs; a simple local child failure must be diagnosed rather than dismissed.
+- The Task 6D live rerun passed trusted restart and root fleet rediscovery, then timed out after eight minutes waiting for a running bound descendant. Retained artifacts are at `/home/steven/.cache/kanedias/e2e/e2e-3368639-1786395695044513541/`.
+- `managed-logs/5b6ac72389c7e3396a64e0510c9d4698.log` records the exact pre-model failure: `effective Pi model ... ThinkingLevel:"off" does not match selected model ... ThinkingLevel:"xhigh"`. The asynchronous child POST returned normalized HTTP 500/internal, no child remained in the timeout Incus snapshot, and exact teardown restored the baseline.
+- `assets/pi-models.json` declares this local model with `reasoning: false` and provider compatibility `supportsReasoningEffort: false`; Pi therefore correctly reports effective thinking `off`. The generated `managed-config.toml` instead selects reviewer `xhigh` because `writeManagedConfig` redirects provider/model while preserving each remote worker's original thinking and even broadens the local model's declared thinking levels to make that invalid selection pass config validation.
+- Earliest divergent boundary: the test-only E2E config override constructs a selected profile the configured local Pi model cannot realize. `LocalSession.BindExpected` correctly enforces exact provider/model/thinking identity and must not be weakened. The model never received the child task, so this is not model noncompliance and no provider retry is appropriate.
+
+**Files and scope:**
+
+- Modify/Test: `internal/supervisor/live_incus_test.go`
+- Modify/Test: `internal/supervisor/live_rpc_lifecycle_support_test.go`
+- Read comparison only: `assets/pi-models.json`, `internal/config/model_policy.go`, and `internal/supervisor/local.go`
+- Read artifacts: `/home/steven/.cache/kanedias/e2e/e2e-3368639-1786395695044513541/`
+- Do not modify production binding invariants, Pi startup, model capability metadata, provider behavior, or any production file.
+
+**Interfaces:**
+
+- Consumes: the exact authorized local provider/model, its `off` effective thinking level, `writeManagedConfig`, and `validateLifecycleModelPolicy`.
+- Produces: generated E2E worker policies that all resolve to `local-executor/Qwen3.6-27B-GGUF/off`, plus preflight validation of provider, model, and thinking before live side effects.
+
+Independent review of this Task 6E amendment is required before Step 1 edits either test file.
+
+- [ ] **Step 1: Add behavioral RED for local thinking normalization and preflight drift rejection**
+
+Strengthen `TestWriteManagedConfigWorkerOverride` in `internal/supervisor/live_incus_test.go`:
+
+1. Preserve and assert every administrator-owned worker description.
+2. For both the existing matching local model and the added-model case, require every redirected worker to resolve to the requested provider/model with thinking exactly `off`, not its original remote `high`/`xhigh`.
+3. Require the generated target model definition to have `thinking_levels == []string{"off"}` and `default_thinking_level == "off"`. This prevents catalog validation from advertising unsupported reasoning effort merely to preserve a prior worker setting.
+
+Strengthen `TestValidateLifecycleModelPolicyRequiresLocalRootAndWorkers` in `internal/supervisor/live_rpc_lifecycle_support_test.go`. Change the helper contract to:
+
+```go
+func validateLifecycleModelPolicy(cfg config.Config, provider, model, thinkingLevel string) error
+```
+
+The valid policy is exact local/off for the root and worker. Keep the mixed-provider/model case, and add a catalog-valid same-provider/model worker at `xhigh`; require an error naming that worker and the thinking mismatch. Update the lifecycle setup call to expect `off`.
+
+- [ ] **Step 2: Prove RED before implementation**
+
+Run:
+
+```bash
+go test -v -count=1 -tags=incus ./internal/supervisor \
+  -run '^Test(WriteManagedConfigWorkerOverride|ValidateLifecycleModelPolicyRequiresLocalRootAndWorkers)$'
+```
+
+Expected: FAIL because the current generated workers retain `high`/`xhigh` and `validateLifecycleModelPolicy` neither accepts nor checks the new exact-thinking argument. Do not weaken `BindExpected` to obtain GREEN.
+
+- [ ] **Step 3: Generate one exact non-reasoning local worker profile**
+
+Modify only `writeManagedConfig` and its test-only helpers/comments in `internal/supervisor/live_incus_test.go`:
+
+1. Add a named test-only constant `const e2eLocalThinkingLevel = "off"` beside the managed acceptance helpers.
+2. When both `KANEDIAS_E2E_WORKER_PROVIDER` and `KANEDIAS_E2E_WORKER_MODEL` are set, retain every worker description but set every worker's `thinking_level` to `off`.
+3. Reuse an existing matching provider/model definition when present, but set its generated `thinking_levels` to exactly `[]string{"off"}` and `default_thinking_level` to `off`. When adding a model definition, use the same exact levels/default. Do not union prior worker levels or preserve an unrelated remote model's default.
+4. Continue selecting one shared model type for all workers and preserving the unique provider/model invariant. Leave the root session's existing local/off selection unchanged.
+5. Update comments so they no longer claim worker thinking is administrator-preserved during this explicit local E2E override. This normalization is test-only and applies only when both override environment variables are present.
+
+- [ ] **Step 4: Fail lifecycle preflight on exact-thinking drift**
+
+Modify only `internal/supervisor/live_rpc_lifecycle_support_test.go`:
+
+1. Extend `validateLifecycleModelPolicy` to compare root provider, model, and thinking level with the exact expected triple.
+2. Compare each sorted worker against the same triple and include the worker name in any mismatch.
+3. Update `prepareLifecycleConfig` to call it with `"off"` for `local-executor/Qwen3.6-27B-GGUF`.
+4. Do not infer that arbitrary nonempty thinking is acceptable; the checked asset/provider contract for this campaign is exact `off`.
+
+- [ ] **Step 5: Prove focused GREEN and race safety**
+
+Run:
+
+```bash
+gofmt -w internal/supervisor/live_incus_test.go internal/supervisor/live_rpc_lifecycle_support_test.go
+go test -v -count=1 -tags=incus ./internal/supervisor \
+  -run '^Test(WriteManagedConfigWorkerOverride|ValidateLifecycleModelPolicyRequiresLocalRootAndWorkers|ManagedDescendantFromTreeRequiresOneRunningBoundReadChild|FleetStreamContainsSessionEvaluatesIndividualPatches|FleetStreamContainsExactlyEvaluatesIndividualPatches|ParseManagedServerStartupModes|NormalizeManagedBootstrapURLToEffectiveOrigin|ManagedServerConnection(AuthenticatedAuthority|TrustedNoBootstrap))$'
+go test -race -v -count=1 -tags=incus ./internal/supervisor \
+  -run '^Test(WriteManagedConfigWorkerOverride|ValidateLifecycleModelPolicyRequiresLocalRootAndWorkers|ManagedDescendantFromTreeRequiresOneRunningBoundReadChild|FleetStreamContainsSessionEvaluatesIndividualPatches|FleetStreamContainsExactlyEvaluatesIndividualPatches|ParseManagedServerStartupModes|NormalizeManagedBootstrapURLToEffectiveOrigin|ManagedServerConnection(AuthenticatedAuthority|TrustedNoBootstrap))$'
+go test -count=1 -tags=incus ./internal/supervisor -run '^$'
+git diff --check
+```
+
+Expected: generated workers and lifecycle preflight require exact local/off; all Task 6B–6D tests remain green normally and under the race detector; tagged compilation succeeds; `git diff --check` is silent.
+
+- [ ] **Step 6: Rerun only the failed managed live acceptance**
+
+Run:
+
+```bash
+set -a; . /home/steven/source/github/kanedias/.env; set +a
+go test -v -count=1 -tags=incus ./internal/supervisor \
+  -run '^TestLiveServerManagedSupervisorAcceptance$' \
+  -timeout 90m
+```
+
+Expected: the local reviewer child binds as exact `local-executor/Qwen3.6-27B-GGUF/off`, reaches running, enters the restarted manager projection, and advances to all remaining controls with exact baseline restoration. If a later boundary fails, preserve artifacts and return to read-only diagnosis.
+
+- [ ] **Step 7: Commit all jointly verified managed-acceptance hardening only after live GREEN**
+
+Task 6B through 6E remain jointly uncommitted until the required live acceptance passes end to end. After focused/live GREEN and implementation review:
+
+```bash
+git add internal/supervisor/live_incus_test.go internal/supervisor/live_rpc_lifecycle_support_test.go
+git commit -m "test: harden managed server acceptance"
+```
+
+Update Task 6B/6C/6D/6E reports with the shared commit and evidence, then resume Task 6 Step 2. Do not run the eight new lifecycle scenarios before both existing acceptances pass together.
+
+---
+
 ### Task 7: Prove five consecutive clean runs and complete verification
 
 **Files:**
