@@ -929,6 +929,101 @@ Do not count or run any Step 3 scenario before the managed live acceptance is GR
 
 ---
 
+### Task 6C: Evaluate managed fleet rediscovery per SSE patch instead of across the whole stream
+
+**Failed invariant and evidence:**
+
+- Required invariant: after a non-destructive managed-server restart, `TestLiveServerManagedSupervisorAcceptance` must accept a fleet snapshot containing each surviving managed root exactly once, even when the manager subsequently publishes another valid replacement snapshot.
+- The Task 6B live rerun failed at `internal/supervisor/live_incus_test.go:1907` after 42.31 seconds while waiting for `restarted fleet contains all managed roots`; retained artifacts are at `/home/steven/.cache/kanedias/e2e/e2e-3335325-1786394270012822146/`.
+- Both pre-restart socket snapshots in that artifact show distinct expected session IDs with lifecycle `running`. `managed-server-restart.log` proves trusted reconnection succeeded and six `GET /ui/fleet` requests returned HTTP 200. The Incus timeout snapshot shows both root instances and volumes still running, and teardown exactly restored the baseline.
+- Earliest divergent boundary: `assertFleetContainsExactly` in `internal/supervisor/live_incus_test.go` scans each five-second SSE response to EOF, concatenates every event, then requires each expected `data-root` marker to occur exactly once across that whole response. `internal/manager/monitor.go` publishes a fleet revision after each configured one-second root snapshot, and `internal/server/handler.go` renders each revision as another complete `fleet-panel` replacement patch. Therefore a healthy stream containing two valid snapshots has two copies of each marker and the acceptance helper deterministically rejects it. This is a latent test-helper defect, not failed manager rediscovery or production SSE behavior.
+
+**Files and scope:**
+
+- Modify/Test only: `internal/supervisor/live_incus_test.go`
+- Read comparison only: `internal/manager/monitor.go`, `internal/server/handler.go`, and `internal/server/handler_test.go`
+- Read artifacts: `/home/steven/.cache/kanedias/e2e/e2e-3335325-1786394270012822146/`
+- Do not modify manager revision publication, fleet rendering, SSE framing, discovery timing, production authentication, or any production file.
+
+**Interfaces:**
+
+- Consumes: the Datastar `event: datastar-patch-elements` fleet stream and the stable top-level `data-root="SESSION_ID"` marker emitted once per root by `internal/server/web/fleet.html`.
+- Produces: a pure, bounded scanner that evaluates one complete SSE patch at a time and returns as soon as one patch contains exactly the expected root set.
+
+Independent review of this Task 6C amendment is required before Step 1 edits `internal/supervisor/live_incus_test.go`.
+
+- [ ] **Step 1: Add a hermetic repeated-snapshot regression**
+
+In `internal/supervisor/live_incus_test.go`, add a test-only helper:
+
+```go
+func fleetStreamContainsExactly(r io.Reader, roots []managedRoot) (bool, error)
+```
+
+Add `TestFleetStreamContainsExactlyEvaluatesIndividualPatches` beside the other hermetic managed-server helper tests. Build two complete `event: datastar-patch-elements` events separated by blank lines, with each event containing exactly one `data-root` marker for each of two expected roots. Require `fleetStreamContainsExactly` to return true even though the full input contains each marker twice. Add comparison cases requiring false for a single patch that is missing an expected root, duplicates one expected marker within that patch, or contains an unexpected root. The test must use only in-memory strings and must not source `.env`, start a server, or require Incus despite the file's existing `incus` build tag.
+
+- [ ] **Step 2: Prove RED against whole-stream counting**
+
+Run:
+
+```bash
+go test -v -count=1 -tags=incus ./internal/supervisor \
+  -run '^TestFleetStreamContainsExactlyEvaluatesIndividualPatches$'
+```
+
+Expected: FAIL to compile because `fleetStreamContainsExactly` does not exist. The RED must be limited to that missing test-only helper.
+
+- [ ] **Step 3: Scan and validate complete individual SSE patches**
+
+Modify only `internal/supervisor/live_incus_test.go`:
+
+1. Implement `fleetStreamContainsExactly` with `bufio.Scanner`, accumulating one SSE event until its blank-line boundary. Set an explicit bounded one-MiB maximum token size so a legitimate fleet line is not constrained by Scanner's 64-KiB default while oversized input still fails closed. Evaluate only complete `event: datastar-patch-elements` events.
+2. A patch matches only when the total number of `data-root="` markers equals `len(roots)` and every expected `data-root="SESSION_ID"` marker occurs exactly once in that same patch. This rejects missing, duplicated, and unexpected roots without comparing across later replacement patches.
+3. Return immediately on the first matching complete patch so the acceptance does not wait for the five-second request context after rediscovery is already visible. On EOF, evaluate a final nonempty event for robustness, and return `scanner.Err()` rather than hiding malformed/oversized input failures.
+4. Change `assertFleetContainsExactly` to pass `resp.Body` to the helper, close the body, and accept only `matched && err == nil`. Retain the existing five-second per-request context and 30-second outer observable-state poll. Do not add sleeps or retries and do not retain/log response bodies.
+
+- [ ] **Step 4: Prove focused GREEN and race safety**
+
+Run:
+
+```bash
+gofmt -w internal/supervisor/live_incus_test.go
+go test -v -count=1 -tags=incus ./internal/supervisor \
+  -run '^Test(FleetStreamContainsExactlyEvaluatesIndividualPatches|ParseManagedServerStartupModes|NormalizeManagedBootstrapURLToEffectiveOrigin|ManagedServerConnection(AuthenticatedAuthority|TrustedNoBootstrap))$'
+go test -race -v -count=1 -tags=incus ./internal/supervisor \
+  -run '^Test(FleetStreamContainsExactlyEvaluatesIndividualPatches|ParseManagedServerStartupModes|NormalizeManagedBootstrapURLToEffectiveOrigin|ManagedServerConnection(AuthenticatedAuthority|TrustedNoBootstrap))$'
+go test -count=1 -tags=incus ./internal/supervisor -run '^$'
+git diff --check
+```
+
+Expected: the repeated valid stream is accepted; malformed individual snapshots are rejected; all Task 6B tests still pass normally and under the race detector; tagged compilation succeeds; `git diff --check` is silent.
+
+- [ ] **Step 5: Rerun the failed managed live acceptance**
+
+Run:
+
+```bash
+set -a; . /home/steven/source/github/kanedias/.env; set +a
+go test -v -count=1 -tags=incus ./internal/supervisor \
+  -run '^TestLiveServerManagedSupervisorAcceptance$' \
+  -timeout 90m
+```
+
+Expected: PASS through fleet rediscovery and all remaining descendant/root controls, with exact process, socket, Incus instance, and volume baseline restoration. Preserve a new artifact and resume read-only diagnosis if any later boundary fails.
+
+- [ ] **Step 6: Commit the combined managed-acceptance hardening only after live GREEN**
+
+Task 6B and 6C both modify the same test-only file, and Task 6B correctly remained uncommitted when its live rerun exposed this latent helper defect. After focused and live GREEN, commit the jointly verified file without manufacturing an intermediate commit that still fails the required live acceptance:
+
+```bash
+git add internal/supervisor/live_incus_test.go
+git commit -m "test: harden managed server acceptance"
+```
+
+Then update both Task 6B and Task 6C reports with the shared commit and verification evidence, obtain independent implementation review, and resume Task 6 Step 2. Do not run the eight new lifecycle scenarios before both existing acceptances pass together.
+
+---
+
 ### Task 7: Prove five consecutive clean runs and complete verification
 
 **Files:**
