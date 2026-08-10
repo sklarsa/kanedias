@@ -507,7 +507,6 @@ Test:
 - 4/5 files, `3 MiB`/`3 MiB+1`, and `8 MiB`/`8 MiB+1`;
 - removal and URL revocation;
 - deterministic pasted-image fallback labels;
-- same file selectable after a picker reset at the binding layer;
 - submission URL percent-escapes the session ID;
 - multipart field order is message then images in staged order;
 - empty text with images uses the neutral prompt;
@@ -646,7 +645,7 @@ Extend the index tests to require:
 <button id="attach-images-button" type="button">…</button>
 ```
 
-Require `/assets/image-attachments.js` before `/assets/app.js`, no `data-bind="commandMessage"` on the directive input, no Datastar click action on `#steerBtn`, and no inline event handlers.
+Require `/assets/image-attachments.js` before `/assets/app.js`, no `data-bind="commandMessage"` on the directive input, no Datastar click action on `#steerBtn`, and no inline event handlers. Add a browser binding test that stages the same file after the picker resets `fileInput.value = ""`.
 
 - [ ] **Step 3: Run focused UI tests and verify red**
 
