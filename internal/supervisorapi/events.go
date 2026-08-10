@@ -21,12 +21,17 @@ func withSupervisorSSEWriteDeadline(controller *http.ResponseController, operati
 		}
 		deadlineSet = false
 	}
-
-	operationErr := errors.Join(operation(), controller.Flush())
-	if !deadlineSet {
-		return operationErr
+	clearDeadline := func(operationErr error) error {
+		if !deadlineSet {
+			return operationErr
+		}
+		return errors.Join(operationErr, controller.SetWriteDeadline(time.Time{}))
 	}
-	return errors.Join(operationErr, controller.SetWriteDeadline(time.Time{}))
+
+	if err := operation(); err != nil {
+		return clearDeadline(err)
+	}
+	return clearDeadline(controller.Flush())
 }
 
 func serveEvents(w http.ResponseWriter, request *http.Request, service Service) {
