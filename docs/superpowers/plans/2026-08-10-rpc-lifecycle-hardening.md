@@ -790,27 +790,38 @@ After GREEN, restart Task 6 at Step 2. Run both existing isolated acceptances on
 
 Independent review of this Task 6B amendment is required before Step 1 edits `internal/supervisor/live_incus_test.go`.
 
-- [ ] **Step 1: Add pure RED tests for both startup modes and bootstrap URL normalization**
+- [ ] **Step 1: Add RED parser, origin-validation, and hermetic HTTP authority regressions**
 
-In `internal/supervisor/live_incus_test.go`, extract a pure parser with this contract:
+In `internal/supervisor/live_incus_test.go`, extract a pure parser whose state keeps transport identity separate from browser identity:
 
 ```go
 type managedServerStartup struct {
-    origin       string
-    bootstrapURL string
+    effectiveOrigin  string
+    browserOrigin    string
+    browserAuthority string
+    bootstrapURL     string
 }
 
-func parseManagedServerStartup(text string, requireSession bool) (managedServerStartup, bool)
+func parseManagedServerStartup(text string, requireSession bool, configuredHostname string) (managedServerStartup, bool)
 ```
 
 Add `TestParseManagedServerStartupModes` with these exact table cases:
 
-1. `trusted-ready`: input contains `effective_address=127.0.0.1:45403` and `Web UI: http://steven-desktop:45403/` but no bootstrap line; with `requireSession=false`, it is ready, origin is `http://127.0.0.1:45403`, and bootstrap URL is empty.
-2. `trusted-missing-web-ui`: input contains only the effective address; with `requireSession=false`, it is not ready.
-3. `authenticated-ready`: input contains `effective_address=127.0.0.1:45403` and `Bootstrap URL: http://steven-desktop:45403/bootstrap?capability=test-token`; with `requireSession=true`, it is ready and returns both the loopback origin and the complete advertised bootstrap URL.
-4. `authenticated-missing-bootstrap`: input contains the effective address and Web UI only; with `requireSession=true`, it is not ready.
+1. `trusted-ready-configured-hostname`: input contains `effective_address=127.0.0.1:45403` and `Web UI: http://steven-desktop:45403/` but no bootstrap line; with `requireSession=false` and configured hostname `steven-desktop`, it is ready, effective origin is `http://127.0.0.1:45403`, browser authority is `steven-desktop:45403`, browser origin is `http://steven-desktop:45403`, and bootstrap URL is empty.
+2. `trusted-ready-empty-hostname`: the same effective address and `Web UI: http://127.0.0.1:45403/`; with an empty configured hostname, it is ready and browser authority falls back to `127.0.0.1:45403`.
+3. `trusted-missing-web-ui`: input contains only the effective address; with `requireSession=false`, it is not ready.
+4. `authenticated-ready`: input contains `effective_address=127.0.0.1:45403` and `Bootstrap URL: http://steven-desktop:45403/bootstrap?capability=test-token`; with `requireSession=true` and configured hostname `steven-desktop`, it is ready and returns the effective loopback origin, canonical advertised browser origin/authority, and complete advertised bootstrap URL.
+5. `authenticated-missing-bootstrap`: input contains the effective address and Web UI only; with `requireSession=true`, it is not ready.
+6. `malformed-effective-address` and `non-loopback-effective-address`: `effective_address=not-an-authority` and `effective_address=192.0.2.10:45403` are not ready in either authentication mode.
 
-Add `TestNormalizeManagedBootstrapURLToEffectiveOrigin`. Given effective origin `http://127.0.0.1:45403` and advertised URL `http://steven-desktop:45403/bootstrap?capability=test-token`, require exactly `http://127.0.0.1:45403/bootstrap?capability=test-token`. Include a relative `/bootstrap?capability=test-token` case with the same result. This proves host-side requests target the actual listener while preserving the bootstrap path and capability query.
+Add `TestNormalizeManagedBootstrapURLToEffectiveOrigin`. Given effective origin `http://127.0.0.1:45403` and advertised URL `http://steven-desktop:45403/bootstrap?capability=test-token`, require exactly `http://127.0.0.1:45403/bootstrap?capability=test-token`. Include a relative `/bootstrap?capability=test-token` case with the same result. Add rejection cases for HTTPS, non-loopback host, userinfo, nonempty path (including `/`), query, and fragment on the effective origin. These cases prove the dial target is a plain HTTP loopback origin and that only the advertised bootstrap path/query is transplanted.
+
+Add two hermetic `httptest` regressions using a listener at an effective `127.0.0.1:PORT` URL and a distinct configured hostname `steven-desktop`:
+
+1. `TestManagedServerConnectionAuthenticatedAuthority` supplies an advertised bootstrap URL `http://steven-desktop:PORT/bootstrap?capability=test-token`. Its server records that the bootstrap request reached the effective listener with exact path `/bootstrap` and query `capability=test-token`, received `Host: steven-desktop:PORT`, returned a 303 and a session cookie, and then received both `GET /` and subsequent `postNewSession` and `postDatastar` writes through the same effective listener. Require the cookie on those later requests and require their `Host` to equal `steven-desktop:PORT` and `Origin` to equal `http://steven-desktop:PORT`.
+2. `TestManagedServerConnectionTrustedNoBootstrap` supplies trusted startup state, counts bootstrap requests, and requires zero. It still requires `GET / == 200`; a subsequent write dials the effective listener and may use the effective authority for `Host` and `Origin` because browser security is disabled.
+
+The hermetic tests must not edit `/etc/hosts`, resolve `steven-desktop`, source `.env`, or require Incus. The advertised hostname is header identity only; every request URL and cookie-jar key remains the effective loopback URL.
 
 - [ ] **Step 2: Run the focused tests and prove RED**
 
@@ -818,29 +829,41 @@ Run:
 
 ```bash
 go test -v -count=1 -tags=incus ./internal/supervisor \
-  -run '^Test(ParseManagedServerStartupModes|NormalizeManagedBootstrapURLToEffectiveOrigin)$'
+  -run '^Test(ParseManagedServerStartupModes|NormalizeManagedBootstrapURLToEffectiveOrigin|ManagedServerConnection(AuthenticatedAuthority|TrustedNoBootstrap))$'
 ```
 
-Expected: FAIL to compile because `parseManagedServerStartup` and `normalizeManagedBootstrapURL` do not exist yet. The failure must be limited to those missing test seams; do not edit production to obtain RED.
+Expected: FAIL to compile because the new parser, normalization, connection-state, and request-authority seams do not exist yet. The failure must be limited to those missing test-only seams; do not edit production to obtain RED.
 
-- [ ] **Step 3: Replace the bootstrap-only polling boundary with the mode-aware pure parser**
+- [ ] **Step 3: Parse and validate the effective listener while deriving canonical browser identity**
 
 Modify only `internal/supervisor/live_incus_test.go`:
 
-1. Implement `parseManagedServerStartup` without filesystem, process, network, test-harness, or timing dependencies. Parse the effective address into `http://127.0.0.1:PORT`. When `requireSession=false`, readiness requires the effective address and a nonempty `Web UI:` line and returns no bootstrap URL. When `requireSession=true`, readiness requires the effective address and a nonempty `Bootstrap URL:` line; Web UI output is not an authentication prerequisite.
-2. Replace `waitForBootstrapURL` with `waitForManagedServerStartup(logPath string, requireSession bool) managedServerStartup`. Keep the existing two-minute `h.poll`, read the current log each poll, and delegate all output interpretation and readiness decisions to the pure parser.
-3. Add `normalizeManagedBootstrapURL(origin, advertised string) (string, error)` using `net/url`. Resolve a relative advertised bootstrap reference against `origin`. For an absolute advertised URL, replace only its scheme and host with those from the effective origin; preserve its escaped path, raw query, and fragment. Reject an invalid or non-HTTP effective origin rather than issuing a request to the advertised hostname.
+1. Implement `parseManagedServerStartup` without filesystem, process, network, test-harness, or timing dependencies. Extract the logged `effective_address`, parse it with `net.SplitHostPort`, require a non-nil `net.ParseIP(host)` whose `IsLoopback()` is true, require a nonempty port, and reconstruct the authority with `net.JoinHostPort`. A malformed or non-loopback address is not ready. Set `effectiveOrigin` to `http://` plus that reconstructed authority; it remains the URL and dial target for every host-side request.
+2. Derive `browserAuthority` exactly like production `advertisedAddress`: use `configuredHostname` when nonempty, otherwise the effective host, and combine it with the effective listener port using `net.JoinHostPort`. Derive `browserOrigin` as `http://` plus this authority. Do not derive browser identity from the request URL or DNS, and do not use the advertised hostname as a dial target.
+3. When `requireSession=false`, readiness requires the validated effective address and a nonempty `Web UI:` line and returns no bootstrap URL. When `requireSession=true`, readiness requires the validated effective address and a nonempty `Bootstrap URL:` line; Web UI output is not an authentication prerequisite.
+4. Replace `waitForBootstrapURL` with `waitForManagedServerStartup(logPath string, requireSession bool, configuredHostname string) managedServerStartup`. Keep the existing two-minute `h.poll`, read the current log each poll, and delegate all output interpretation, authority derivation, and readiness decisions to the pure parser.
+5. Implement `normalizeManagedBootstrapURL(effectiveOrigin, advertised string) (string, error)` using `net/url` and `net.SplitHostPort`. Require the effective URL to have scheme exactly `http`, no userinfo, no opaque component, no path or raw path, no query/forced query, and no fragment; require its host to be a syntactically valid loopback IP authority with a nonempty port. Resolve a relative advertised bootstrap reference against that origin. For an absolute advertised bootstrap URL, replace only its scheme and host with the validated effective scheme and authority, preserving escaped path, raw query, and fragment. Never request the advertised hostname.
 
-- [ ] **Step 4: Make the managed connection helper honor `requireSession`**
+- [ ] **Step 4: Carry effective and browser origins through connection and every managed write**
 
-Rename `bootstrapManagedServer` to `connectManagedServer` and add `requireSession bool` to its parameters. Preserve log selection for the initial `managed-server.log` and restarted `managed-server-restart.log`, then:
+Add a test-only `managedServerConnection` value that carries the `*http.Client`, `requireSession`, `effectiveOrigin`, `browserOrigin`, and `browserAuthority`. Rename `bootstrapManagedServer` to `connectManagedServer`; pass `requireSession` and the resolved configured hostname. Preserve log selection for `managed-server.log` and `managed-server-restart.log`, then:
 
-1. Call `waitForManagedServerStartup(logPath, requireSession)`.
-2. Always construct an `http.Client` with a new cookie jar, the existing 30-second timeout, and the existing no-follow `CheckRedirect`; trusted and authenticated paths therefore share identical subsequent client behavior.
-3. Only when `requireSession=true`, normalize the parsed advertised bootstrap URL to the effective origin, issue the bootstrap GET, close its body, and require HTTP 303 See Other. When `requireSession=false`, issue no bootstrap request.
-4. In both modes, GET `origin + "/"`, close the body, and require HTTP 200 OK. Return the effective origin and client only after this readiness/authentication check succeeds.
+1. Call `waitForManagedServerStartup(logPath, requireSession, configuredHostname)` and retain all returned transport/browser state.
+2. Always construct an `http.Client` with a new cookie jar, the existing 30-second timeout, and the existing no-follow `CheckRedirect`. The jar remains keyed to each effective loopback request URL; do not rewrite cookies to the advertised hostname.
+3. Only when `requireSession=true`, normalize the advertised bootstrap URL onto `effectiveOrigin`, build an explicit GET request to that effective URL, set `Request.Host = browserAuthority`, issue it through the jar client, close its body, and require HTTP 303 See Other. When `requireSession=false`, issue no bootstrap request.
+4. In both modes, build an explicit GET request to `effectiveOrigin + "/"`. In authenticated mode set `Request.Host = browserAuthority`; in trusted mode retain the effective authority. Issue it through the same client so the authenticated cookie associated with the effective URL is sent, close its body, and require HTTP 200 OK.
+5. Return `managedServerConnection` only after readiness/authentication succeeds. Add `managedRequestIdentity { authority, origin string }` and `func (c managedServerConnection) requestIdentity() managedRequestIdentity`; authenticated mode returns `browserAuthority`/`browserOrigin`, while trusted mode parses and returns the effective URL authority/origin.
 
-In `runServerManaged`, immediately after `config.Load`, call `managedCfg.Server.Resolve()` once, fail with `resolve managed server configuration` on error, store `requireSession := resolvedServer.RequireSession`, and pass that same value to both the initial and restarted `connectManagedServer` calls. Do not infer authentication mode from which log lines happen to appear.
+Change the helper contracts to `postNewSession(client *http.Client, fullURL string, identity managedRequestIdentity, body any)` and `func (h *liveAcceptance) postDatastar(client *http.Client, fullURL string, identity managedRequestIdentity, body any)`. They must always send `fullURL` under `effectiveOrigin` so transport dials loopback, while setting `Request.Host = identity.authority` and `Origin = identity.origin`. Keep `Sec-Fetch-Site: same-origin`, content type, response validation, and all existing payload behavior unchanged. Update every managed call site:
+
+- both initial `postNewSession` calls use the initial connection's effective origin and identity;
+- initial root steer and every initial `answerManagedQuestion` Datastar write use the initial connection identity;
+- after restart, descendant steer, interrupt, question answer, descendant stop, and both root stops use the restarted connection's effective origin and identity;
+- change `answerManagedQuestion` to accept the connection/request identity rather than reconstructing Host and Origin from `serverOrigin`.
+
+Existing standalone `postNewSession` contract tests must pass an explicit effective request identity so their behavior remains unchanged. No JSON or Datastar write may reconstruct browser identity from an effective request URL.
+
+In `runServerManaged`, immediately after `config.Load`, call `managedCfg.Server.Resolve()` once, fail with `resolve managed server configuration` on error, and retain both `resolvedServer.RequireSession` and `resolvedServer.Hostname`. Pass those same resolved values to both initial and restarted `connectManagedServer` calls. Use each returned connection's effective origin for all URLs and reads, while using its selected request identity for all writes. Do not infer mode or authority from whichever log lines happen to appear.
 
 - [ ] **Step 5: Prove focused GREEN, race safety, tagged compilation, and the production output comparison**
 
@@ -849,16 +872,16 @@ Run exactly:
 ```bash
 gofmt -w internal/supervisor/live_incus_test.go
 go test -v -count=1 -tags=incus ./internal/supervisor \
-  -run '^Test(ParseManagedServerStartupModes|NormalizeManagedBootstrapURLToEffectiveOrigin)$'
+  -run '^Test(ParseManagedServerStartupModes|NormalizeManagedBootstrapURLToEffectiveOrigin|ManagedServerConnection(AuthenticatedAuthority|TrustedNoBootstrap))$'
 go test -race -v -count=1 -tags=incus ./internal/supervisor \
-  -run '^Test(ParseManagedServerStartupModes|NormalizeManagedBootstrapURLToEffectiveOrigin)$'
+  -run '^Test(ParseManagedServerStartupModes|NormalizeManagedBootstrapURLToEffectiveOrigin|ManagedServerConnection(AuthenticatedAuthority|TrustedNoBootstrap))$'
 go test -count=1 -tags=incus ./internal/supervisor -run '^$'
 go test -v -count=1 ./internal/server \
   -run '^TestHandler(PrintsAdvertisedURLs|TrustedNetworkModeBypassesBrowserSecurity)$'
 git diff --check
 ```
 
-Expected: both pure tests pass normally and under the race detector; the tagged supervisor package compiles; the existing server tests continue proving that trusted mode emits Web UI without bootstrap while authenticated mode emits bootstrap; `git diff --check` is silent.
+Expected: parser/normalization and both hermetic connection tests pass normally and under the race detector; authenticated mode proves effective-loopback dialing, advertised bootstrap path/query, cookie retention on the effective URL, advertised Host/Origin on JSON and Datastar writes, and successful responses; trusted mode proves no bootstrap request and successful effective-authority access. The tagged supervisor package compiles; existing server tests continue proving production output/mode behavior; `git diff --check` is silent.
 
 - [ ] **Step 6: Rerun only the failed managed live acceptance**
 
