@@ -438,7 +438,7 @@ func (node *Node) CreateChild(ctx context.Context, parent string, request contra
 	// Mark SSE closure expected before acknowledging that same report. The child
 	// cannot return from Reporter.Read/Write/Failure and begin teardown until this
 	// inherited protocol write succeeds.
-	entry.expectEventStreamClose()
+	entry.markEventStreamCloseExpected()
 	if err := child.AcknowledgeTerminal(message); err != nil {
 		// A cancellation that won during the acknowledgement race is still an
 		// external cancellation, not a child_failed acknowledgement fault.

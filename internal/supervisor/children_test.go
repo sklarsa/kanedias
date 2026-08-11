@@ -4,6 +4,7 @@ import (
 	"context"
 	"encoding/json"
 	"errors"
+	"fmt"
 	"io"
 	"net"
 	"os"
@@ -35,6 +36,8 @@ type fakeChildProcess struct {
 	killed          atomic.Int32
 	acknowledged    atomic.Int32
 	ackClosed       atomic.Int32
+	ackEntered      chan struct{}
+	ackRelease      <-chan struct{}
 }
 
 func newFakeChildProcess() *fakeChildProcess {
@@ -69,6 +72,12 @@ func (child *fakeChildProcess) NextMessage(ctx context.Context) (process.ChildMe
 }
 func (child *fakeChildProcess) AcknowledgeTerminal(process.ChildMessage) error {
 	child.acknowledged.Add(1)
+	if child.ackEntered != nil {
+		close(child.ackEntered)
+	}
+	if child.ackRelease != nil {
+		<-child.ackRelease
+	}
 	if child.autoFinish {
 		child.finish()
 	}
@@ -270,6 +279,15 @@ func readRequest() contract.CreateChildRequest {
 
 func directChildSnapshot(id string) NodeSnapshot {
 	return NodeSnapshot{SessionID: id, ParentSessionID: "root-1", RootSessionID: "root-1", Kind: contract.ChildKindRead, Context: contract.ContextFresh, WorkerType: "reviewer", Lifecycle: string(LifecycleReady), Questions: []QuestionSummary{}, Children: []NodeSnapshot{}}
+}
+
+func naturalFakeDescendant(id string, child *fakeChildProcess) *fakeDescendantClient {
+	events := make(chan EventEnvelope)
+	go func() {
+		<-child.Done()
+		close(events)
+	}()
+	return &fakeDescendantClient{snapshot: directChildSnapshot(id), events: Subscription{Events: events}}
 }
 
 func TestStartingChildFallbackDoesNotClaimRequestedModelBeforeEffectiveBinding(t *testing.T) {
@@ -561,6 +579,153 @@ func TestCreateChildCancellationStopsAndSynchronouslyCleansChild(t *testing.T) {
 	}
 }
 
+func TestNaturalTerminalDrainsFinalChildEventBeforeCleanup(t *testing.T) {
+	const childID = "child-natural-drain"
+	ackRelease := make(chan struct{})
+	child := newFakeChildProcess()
+	child.autoFinish = true
+	child.ackEntered = make(chan struct{})
+	child.ackRelease = ackRelease
+	child.messages <- process.ChildMessage{
+		Type: process.MessageRead, SessionID: childID,
+		Read: &contract.ReadChildResult{Kind: contract.ChildKindRead, WorkerType: "reviewer", SessionID: childID, Output: "done"},
+	}
+	client := &eofDescendant{
+		fakeDescendantClient: fakeDescendantClient{snapshot: directChildSnapshot(childID)},
+		process:              child, events: make(chan EventEnvelope, 1), subscribed: make(chan struct{}),
+		subscriptionClosed: make(chan struct{}), eofObserved: make(chan struct{}),
+	}
+	node := childCreationNode(t,
+		func(context.Context, process.Bootstrap) (ChildProcess, error) { return child, nil },
+		func(string) (DescendantClient, error) { return client, nil },
+	)
+	node.deps.NewSessionID = func() (string, error) { return childID, nil }
+	parentEvents := node.broker.Subscribe()
+	defer parentEvents.Close()
+
+	created := make(chan struct {
+		result TerminalResult
+		err    error
+	}, 1)
+	go func() {
+		result, err := node.CreateChild(context.Background(), "root-1", readRequest())
+		created <- struct {
+			result TerminalResult
+			err    error
+		}{result: result, err: err}
+	}()
+	<-client.subscribed
+	<-child.ackEntered
+
+	final := EventEnvelope{Seq: 1, SessionID: childID, SourceSeq: 1, Kind: "pi", Payload: json.RawMessage(`{"type":"agent_settled"}`)}
+	client.events <- final
+	close(client.events)
+	close(ackRelease)
+
+	got := <-created
+	if got.err != nil || got.result.Read == nil || got.result.Read.SessionID != childID {
+		t.Fatalf("natural CreateChild result = %#v, %v", got.result, got.err)
+	}
+	select {
+	case event := <-parentEvents.Events:
+		if event.SessionID != childID || event.SourceSeq != final.SourceSeq || string(event.Payload) != string(final.Payload) {
+			t.Fatalf("forwarded final event = %#v, want %#v", event, final)
+		}
+	case <-time.After(time.Second):
+		t.Fatal("natural cleanup returned before the final child event was forwarded")
+	}
+	if node.children.get(childID) != nil {
+		t.Fatal("naturally completed child remains registered")
+	}
+}
+
+func TestNaturalCleanupTimeoutCancelsEventForwarderAndFails(t *testing.T) {
+	child := newFakeChildProcess()
+	child.finish()
+	cancelled := make(chan struct{})
+	var cancelOnce sync.Once
+	forwarderDone := make(chan struct{})
+	node := childCreationNode(t, nil, nil)
+	entry := &childEntry{id: "child-stalled-events", process: child}
+	if err := node.children.add(entry); err != nil {
+		t.Fatal(err)
+	}
+	entry.setEventForwarder(func() { cancelOnce.Do(func() { close(cancelled) }) }, forwarderDone)
+
+	ctx, cancel := context.WithTimeout(context.Background(), 20*time.Millisecond)
+	defer cancel()
+	err := node.cleanupChild(ctx, entry, false)
+	if !errors.Is(err, context.DeadlineExceeded) {
+		t.Fatalf("natural cleanup error = %v, want deadline exceeded", err)
+	}
+	select {
+	case <-cancelled:
+	default:
+		t.Fatal("timed-out natural cleanup did not cancel the event forwarder")
+	}
+	if node.children.get(entry.id) != nil {
+		t.Fatal("timed-out natural cleanup left the child registered")
+	}
+}
+
+func TestNaturalTerminalWithUndrainedEventsReturnsChildFailed(t *testing.T) {
+	const childID = "child-undrained-events"
+	child := newFakeChildProcess()
+	child.autoFinish = true
+	child.messages <- process.ChildMessage{
+		Type: process.MessageRead, SessionID: childID,
+		Read: &contract.ReadChildResult{Kind: contract.ChildKindRead, WorkerType: "reviewer", SessionID: childID, Output: "done"},
+	}
+	client := &eofDescendant{
+		fakeDescendantClient: fakeDescendantClient{snapshot: directChildSnapshot(childID)},
+		process:              child, events: make(chan EventEnvelope), subscribed: make(chan struct{}),
+		subscriptionClosed: make(chan struct{}), eofObserved: make(chan struct{}),
+	}
+	node := childCreationNode(t,
+		func(context.Context, process.Bootstrap) (ChildProcess, error) { return child, nil },
+		func(string) (DescendantClient, error) { return client, nil },
+	)
+	node.deps.NewSessionID = func() (string, error) { return childID, nil }
+	node.deps.ChildStopTimeout = 20 * time.Millisecond
+
+	_, err := node.CreateChild(context.Background(), "root-1", readRequest())
+	var typed *contract.Error
+	if !errors.As(err, &typed) || typed.Code != contract.ErrorChildFailed {
+		t.Fatalf("undrained natural child error = %v, want typed child_failed", err)
+	}
+	select {
+	case <-client.subscriptionClosed:
+	case <-time.After(time.Second):
+		t.Fatal("undrained natural child leaked its event subscription after cancellation")
+	}
+	if node.children.get(childID) != nil {
+		t.Fatal("undrained natural child remains registered")
+	}
+}
+
+func TestForcedCancellationCancelsWithoutNaturalEventDrain(t *testing.T) {
+	child := newFakeChildProcess()
+	node := childCreationNode(t, nil, nil)
+	entry := &childEntry{id: "child-forced-events", process: child}
+	if err := node.children.add(entry); err != nil {
+		t.Fatal(err)
+	}
+	cancelled := make(chan struct{})
+	var cancelOnce sync.Once
+	entry.setEventForwarder(func() { cancelOnce.Do(func() { close(cancelled) }) }, make(chan struct{}))
+
+	ctx, cancel := context.WithTimeout(context.Background(), time.Second)
+	defer cancel()
+	if err := node.cancelChildExternal(ctx, entry); err != nil {
+		t.Fatalf("external cancellation = %v", err)
+	}
+	select {
+	case <-cancelled:
+	default:
+		t.Fatal("external cancellation did not cancel the event forwarder")
+	}
+}
+
 func TestParentStopMarksCleanEventEOFExpectedBeforeStoppingChild(t *testing.T) {
 	child := newFakeChildProcess()
 	client := &eofDescendant{
@@ -599,7 +764,11 @@ func TestSiblingChildStartupRunsConcurrently(t *testing.T) {
 		func(socket string) (DescendantClient, error) {
 			id := filepath.Base(socket)
 			id = id[:len(id)-len(filepath.Ext(id))]
-			return &fakeDescendantClient{snapshot: directChildSnapshot(id)}, nil
+			stored, ok := processes.Load(id)
+			if !ok {
+				return nil, fmt.Errorf("missing fake process for %s", id)
+			}
+			return naturalFakeDescendant(id, stored.(*fakeChildProcess)), nil
 		},
 	)
 	node.deps.NewSessionID = func() (string, error) { return "child-" + string(rune('0'+sequence.Add(1))), nil }
@@ -752,7 +921,7 @@ func TestDirectChildTerminalAcceptanceRetainsResult(t *testing.T) {
 	child := newFakeChildProcess()
 	child.autoFinish = true
 	child.messages <- process.ChildMessage{Type: process.MessageRead, SessionID: "child-accept", Read: &contract.ReadChildResult{Kind: contract.ChildKindRead, WorkerType: "reviewer", SessionID: "child-accept", Output: "done"}}
-	client := &fakeDescendantClient{snapshot: directChildSnapshot("child-accept")}
+	client := naturalFakeDescendant("child-accept", child)
 	node := childCreationNode(t,
 		func(context.Context, process.Bootstrap) (ChildProcess, error) { return child, nil },
 		func(string) (DescendantClient, error) { return client, nil },

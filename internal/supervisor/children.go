@@ -77,6 +77,7 @@ type childEntry struct {
 	spawnDone   chan struct{}
 	spawnOnce   sync.Once
 	eventCancel context.CancelFunc
+	eventDone   chan struct{}
 	recovery    *provision.RecoveryTicket
 	disposition childDisposition
 
@@ -125,10 +126,17 @@ func (entry *childEntry) values() (DescendantClient, ChildProcess, context.Cance
 	return entry.client, entry.process, entry.eventCancel
 }
 
-func (entry *childEntry) setEventCancel(cancel context.CancelFunc) {
+func (entry *childEntry) setEventForwarder(cancel context.CancelFunc, done chan struct{}) {
 	entry.mu.Lock()
 	entry.eventCancel = cancel
+	entry.eventDone = done
 	entry.mu.Unlock()
+}
+
+func (entry *childEntry) eventForwarder() (context.CancelFunc, <-chan struct{}) {
+	entry.mu.RLock()
+	defer entry.mu.RUnlock()
+	return entry.eventCancel, entry.eventDone
 }
 
 func (entry *childEntry) setStreamError(err error) {
@@ -176,7 +184,13 @@ func (entry *childEntry) isAccepted() bool {
 	return entry.disposition == childAccepted
 }
 
-func (entry *childEntry) expectEventStreamClose() {
+func (entry *childEntry) markEventStreamCloseExpected() {
+	entry.mu.Lock()
+	entry.eventCloseExpected = true
+	entry.mu.Unlock()
+}
+
+func (entry *childEntry) cancelExpectedEventStream() {
 	entry.mu.Lock()
 	entry.eventCloseExpected = true
 	cancel := entry.eventCancel
@@ -245,8 +259,12 @@ func childUnavailable(id string, err error) error {
 
 func (node *Node) startChildEventForwarder(entry *childEntry) {
 	ctx, cancel := context.WithCancel(context.Background())
-	entry.setEventCancel(cancel)
-	go node.forwardChildEvents(ctx, cancel, entry)
+	done := make(chan struct{})
+	entry.setEventForwarder(cancel, done)
+	go func() {
+		defer close(done)
+		node.forwardChildEvents(ctx, cancel, entry)
+	}()
 }
 
 func (node *Node) forwardChildEvents(ctx context.Context, cancel context.CancelFunc, entry *childEntry) {
@@ -330,6 +348,7 @@ func (node *Node) cleanupChildMode(ctx context.Context, entry *childEntry, mode 
 	entry.cleanupOnce.Do(func() {
 		defer close(entry.cleanupDone)
 		client, child, cancelEvents := entry.values()
+		_, forwarderDone := entry.eventForwarder()
 		if child == nil {
 			entry.mu.RLock()
 			spawnCancel := entry.spawnCancel
@@ -339,6 +358,7 @@ func (node *Node) cleanupChildMode(ctx context.Context, entry *childEntry, mode 
 			}
 			<-entry.spawnDone
 			client, child, cancelEvents = entry.values()
+			_, forwarderDone = entry.eventForwarder()
 		}
 		var cleanupErr error
 		if child != nil {
@@ -351,7 +371,7 @@ func (node *Node) cleanupChildMode(ctx context.Context, entry *childEntry, mode 
 				// Mark and cancel event ownership before any intentional child stop.
 				// Its server may close SSE as part of Stop before the process/report
 				// paths have otherwise had a chance to classify that EOF.
-				entry.expectEventStreamClose()
+				entry.cancelExpectedEventStream()
 				if client != nil {
 					cleanupErr = errors.Join(cleanupErr, client.Stop(ctx, entry.id))
 				} else {
@@ -364,7 +384,7 @@ func (node *Node) cleanupChildMode(ctx context.Context, entry *childEntry, mode 
 				// cancellation signal. Do not wait for a descendant HTTP stop before
 				// the liveness EOF.
 				cleanupErr = errors.Join(cleanupErr, child.CloseTerminalAck())
-				entry.expectEventStreamClose()
+				entry.cancelExpectedEventStream()
 				cleanupErr = errors.Join(cleanupErr, child.CloseLiveness())
 			}
 		}
@@ -389,6 +409,20 @@ func (node *Node) cleanupChildMode(ctx context.Context, entry *childEntry, mode 
 				}
 			}
 			cleanupErr = errors.Join(cleanupErr, child.Wait(), child.CloseTerminalAck(), child.CloseLiveness(), child.CloseReports())
+			if mode == childCleanupComplete && forwarderDone != nil {
+				select {
+				case <-forwarderDone:
+				default:
+					select {
+					case <-forwarderDone:
+					case <-ctx.Done():
+						cleanupErr = errors.Join(cleanupErr, ctx.Err())
+						if cancelEvents != nil {
+							cancelEvents()
+						}
+					}
+				}
+			}
 			entry.mu.RLock()
 			ticket := entry.recovery
 			entry.mu.RUnlock()
