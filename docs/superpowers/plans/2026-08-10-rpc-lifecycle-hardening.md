@@ -1957,6 +1957,106 @@ After independent implementation review and live GREEN, rerun all eight scenario
 
 ---
 
+### Task 6O: Drain naturally completing child SSE before registry removal
+
+**Failed invariant and evidence:**
+
+- In the final-code one-pass matrix, `/home/steven/.cache/kanedias/e2e/e2e-3651375-1786406080233507494/` proves all three parallel model-directed `delegate_session` calls started in one tool batch and all three ended with explicit success. The root received all three typed child results with exact markers, emitted its exact aggregate marker response, and settled.
+- Two children forwarded `message_end(stop) -> agent_end -> agent_settled`. The third forwarded the successful assistant message and `agent_end` but not `agent_settled`, causing `waitForLifecycleNaturalChildEvents` to time out. Its delegate tool result still succeeded.
+- `RunReadTask` returns a successful read result only after observing local `agent_settled` and fetching final assistant text. Therefore the missing event existed inside the child before its terminal report; it was lost only in parent forwarding.
+- Earliest divergence: after `CreateChild` accepts a terminal report, `entry.expectEventStreamClose()` sets closure expected **and cancels the event-forwarder context immediately** before acknowledging the report. Terminal acknowledgement releases child teardown while the independent descendant SSE transport may still contain the final accepted event. `cleanupChildMode(childCleanupComplete)` later cancels again/removes the entry without waiting for the forwarder to finish.
+- Forced/external cancellation intentionally truncates streams and remains covered by Task 6J exact cancellation identity. Natural terminal acceptance must instead mark EOF expected without cancellation, then drain the forwarder through the child server's natural close before removal.
+
+**Files:**
+
+- Modify/Test: `internal/supervisor/children.go`, `internal/supervisor/children_test.go`
+- Modify/Test if the stronger HTTP/SSE seam is needed: `internal/supervisor/ordering_integration_test.go`
+- Read comparison: `internal/supervisorapi/events.go`, `internal/supervisorapi/client.go`, `internal/eventmailbox`
+
+**Interfaces and ordering:**
+
+- Terminal acceptance: claim acceptance -> mark descendant EOF expected without cancelling -> acknowledge exact report -> child teardown closes server/SSE -> forward all accepted events -> forwarder exits -> bounded normal cleanup removes entry.
+- Forced/external cancellation: mark EOF expected and cancel forwarding immediately; truncated open generations remain allowed only through Task 6J exact cancellation evidence.
+- Unexpected SSE EOF/error remains fatal and closes child liveness as today.
+
+Independent review of this Task 6O amendment is required before Step 1 edits production.
+
+- [ ] **Step 1: Add RED natural-drain versus forced-cancel regressions**
+
+Add channel-coordinated tests proving:
+
+1. Marking terminal-accepted SSE closure expected does not cancel the forwarder.
+2. A final child event admitted before natural stream close is forwarded to the parent broker before normal cleanup returns/removes the entry.
+3. Normal cleanup waits for forwarder completion after child process/server completion; no sleep is the ordering seam.
+4. Forced and external cancellation still mark expected and cancel the forwarder promptly without waiting for a natural final event.
+5. A natural forwarder that cannot finish remains bounded by the existing child cleanup context and is cancelled on timeout; it cannot leak a goroutine or registry entry.
+
+Use explicit event, stream-close, forwarder-done, cleanup-returned, and cancellation channels. If an integration test is used, retain one exact final `agent_settled` envelope and verify broker order/identity rather than model text.
+
+- [ ] **Step 2: Prove RED before implementation**
+
+Run the exact new focused tests. Expected RED: the terminal-accepted path's existing `expectEventStreamClose` cancels immediately and drops the held final event, or compile failure for the missing mark-versus-cancel/forwarder-done seams. Record the exact output before production edits.
+
+- [ ] **Step 3: Separate expected natural EOF from intentional forwarder cancellation**
+
+In `childEntry`:
+
+1. Replace the conflated helper with one method that only sets `eventCloseExpected` and another that sets it then invokes `eventCancel`.
+2. Terminal acceptance in `CreateChild` uses mark-only before acknowledgement.
+3. `childCleanupForced` and `childCleanupCancelled` use mark-and-cancel before stopping the child.
+4. Starting a child event forwarder installs a per-entry done channel before launching the goroutine; every return path closes it exactly once. Entries that never started forwarding expose no done channel and require no wait.
+
+Preserve locking so the done/cancel handles are copied under `entry.mu` but no mutex is held while cancelling or waiting.
+
+- [ ] **Step 4: Bound natural forwarder drain before normal cleanup returns**
+
+For `childCleanupComplete` only, after the child process/server has completed and before cancelling events, closing the descendant client, or removing the registry entry:
+
+1. wait for the installed forwarder-done channel using the existing cleanup context;
+2. if it completes, continue normal close/removal with every forwarded event durable in the parent broker;
+3. if the context expires, join the context error, cancel the forwarder, and continue existing escalation/close/removal so cleanup remains bounded. For an otherwise successful child, the existing `CreateChild` cleanup classification must expose that pathological incomplete drain as `child_failed`; do not return success after losing an unforwarded natural event.
+
+Forced/external paths do not gain a drain wait. Do not add sleeps, new timeout values, mailbox capacity changes, or event reordering/deduplication.
+
+- [ ] **Step 5: Prove focused/full GREEN and race safety**
+
+```bash
+gofmt -w internal/supervisor/children.go internal/supervisor/children_test.go \
+  internal/supervisor/ordering_integration_test.go
+go test -v -count=1 ./internal/supervisor \
+  -run '<exact Task 6O natural-drain/forced-cancel regression alternation>'
+go test -race -v -count=1 ./internal/supervisor \
+  -run '<exact Task 6O natural-drain/forced-cancel regression alternation>'
+go test -count=1 ./internal/supervisor
+go test -race -count=1 ./internal/supervisor
+go vet ./internal/supervisor
+git diff --check
+```
+
+Omit `ordering_integration_test.go` from gofmt/staging if unchanged. Expected: natural final event is retained before cleanup; forced cancellation remains prompt; full/race/vet/diff gates pass.
+
+- [ ] **Step 6: Rerun model-directed lifecycle once**
+
+```bash
+set -a; . /home/steven/source/github/kanedias/.env; set +a
+go test -v -count=1 -tags=incus ./internal/supervisor \
+  -run '^TestLiveRPCModelChildLifecycle$' -timeout 90m
+```
+
+Expected: single and all three model-directed parallel children have exact successful tool contracts and exact natural stop/end/settled events, disappear cleanly, root remains usable, and baseline is restored.
+
+- [ ] **Step 7: Review, commit, and rerun complete one-pass matrix**
+
+```bash
+git add internal/supervisor/children.go internal/supervisor/children_test.go \
+  internal/supervisor/ordering_integration_test.go
+git commit -m "fix: drain natural child event forwarding"
+```
+
+Stage only changed files. After review/live GREEN, rerun all eight scenarios once. Any further failure receives another evidence-gated amendment before Task 7.
+
+---
+
 ### Task 7: Prove five consecutive clean runs and complete verification
 
 **Files:**
