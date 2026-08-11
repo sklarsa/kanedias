@@ -20,30 +20,33 @@ import (
 	"github.com/sklarsa/kanedias/internal/supervisor"
 	"github.com/sklarsa/kanedias/internal/supervisor/contract"
 	"github.com/sklarsa/kanedias/internal/supervisor/pirpc"
+	"golang.org/x/sys/unix"
 )
 
 type fakeService struct {
-	mu             sync.Mutex
-	snapshot       supervisor.NodeSnapshot
-	workers        []contract.WorkerSummary
-	rpcSession     string
-	rpcBody        json.RawMessage
-	rpcResponse    json.RawMessage
-	answerSession  string
-	answerID       string
-	answerBody     json.RawMessage
-	sub            supervisor.Subscription
-	stopSession    string
-	stopCalled     chan struct{}
-	stopMayObserve <-chan struct{}
-	childRequest   contract.CreateChildRequest
-	childResult    supervisor.TerminalResult
-	childStarted   chan struct{}
-	childRelease   <-chan struct{}
-	handoffRequest supervisor.WriteHandoffRequest
-	handoffResult  supervisor.HandoffAcceptance
-	ackCalled      chan struct{}
-	err            error
+	mu              sync.Mutex
+	snapshot        supervisor.NodeSnapshot
+	workers         []contract.WorkerSummary
+	rpcSession      string
+	rpcBody         json.RawMessage
+	rpcResponse     json.RawMessage
+	answerSession   string
+	answerID        string
+	answerBody      json.RawMessage
+	sub             supervisor.Subscription
+	subscribeCalled chan struct{}
+	subscribeOnce   sync.Once
+	stopSession     string
+	stopCalled      chan struct{}
+	stopMayObserve  <-chan struct{}
+	childRequest    contract.CreateChildRequest
+	childResult     supervisor.TerminalResult
+	childStarted    chan struct{}
+	childRelease    <-chan struct{}
+	handoffRequest  supervisor.WriteHandoffRequest
+	handoffResult   supervisor.HandoffAcceptance
+	ackCalled       chan struct{}
+	err             error
 }
 
 func (service *fakeService) Snapshot(context.Context) (supervisor.NodeSnapshot, error) {
@@ -67,6 +70,9 @@ func (service *fakeService) AnswerQuestion(_ context.Context, session, id string
 	return service.err
 }
 func (service *fakeService) Subscribe(context.Context) (supervisor.Subscription, error) {
+	if service.subscribeCalled != nil {
+		service.subscribeOnce.Do(func() { close(service.subscribeCalled) })
+	}
 	return service.sub, service.err
 }
 func (service *fakeService) CreateChild(ctx context.Context, session string, request contract.CreateChildRequest) (supervisor.TerminalResult, error) {
@@ -266,6 +272,135 @@ func TestHandlerEventsUsesStandardSSEFraming(t *testing.T) {
 	body := response.Body.String()
 	if !strings.HasPrefix(body, "id: 7\n") || !strings.Contains(body, "event: pi\n") || !strings.Contains(body, "data: {\"seq\":7") || !strings.HasSuffix(body, "\n\n") {
 		t.Fatalf("SSE body = %q", body)
+	}
+}
+
+type sseDeadlineResponseWriter struct {
+	header     http.Header
+	deadlines  []time.Time
+	setErr     error
+	clearErr   error
+	flushErr   error
+	flushCalls int
+}
+
+func (writer *sseDeadlineResponseWriter) Header() http.Header {
+	if writer.header == nil {
+		writer.header = make(http.Header)
+	}
+	return writer.header
+}
+
+func (*sseDeadlineResponseWriter) Write(body []byte) (int, error) { return len(body), nil }
+func (*sseDeadlineResponseWriter) WriteHeader(int)                {}
+
+func (writer *sseDeadlineResponseWriter) SetWriteDeadline(deadline time.Time) error {
+	writer.deadlines = append(writer.deadlines, deadline)
+	if deadline.IsZero() {
+		return writer.clearErr
+	}
+	return writer.setErr
+}
+
+func (writer *sseDeadlineResponseWriter) FlushError() error {
+	writer.flushCalls++
+	return writer.flushErr
+}
+
+func requireSupervisorSSEDeadlineSetAndCleared(t *testing.T, writer *sseDeadlineResponseWriter) {
+	t.Helper()
+	if len(writer.deadlines) != 2 || writer.deadlines[0].IsZero() || !writer.deadlines[1].IsZero() {
+		t.Fatalf("write deadlines = %v, want one nonzero set followed by one clear", writer.deadlines)
+	}
+}
+
+func TestSupervisorSSEWriteFailureSkipsFlushAndJoinsClearFailure(t *testing.T) {
+	writeErr := errors.New("write failed")
+	clearErr := errors.New("clear failed")
+	writer := &sseDeadlineResponseWriter{clearErr: clearErr}
+	err := withSupervisorSSEWriteDeadline(http.NewResponseController(writer), func() error { return writeErr })
+	if !errors.Is(err, writeErr) || !errors.Is(err, clearErr) {
+		t.Fatalf("error = %v, want joined write and clear failures", err)
+	}
+	if writer.flushCalls != 0 {
+		t.Fatalf("flush calls after write failure = %d, want 0", writer.flushCalls)
+	}
+	requireSupervisorSSEDeadlineSetAndCleared(t, writer)
+}
+
+func TestSupervisorSSEFlushFailureJoinsClearFailure(t *testing.T) {
+	flushErr := errors.New("flush failed")
+	clearErr := errors.New("clear failed")
+	writer := &sseDeadlineResponseWriter{flushErr: flushErr, clearErr: clearErr}
+	err := withSupervisorSSEWriteDeadline(http.NewResponseController(writer), func() error { return nil })
+	if !errors.Is(err, flushErr) || !errors.Is(err, clearErr) {
+		t.Fatalf("error = %v, want joined flush and clear failures", err)
+	}
+	if writer.flushCalls != 1 {
+		t.Fatalf("flush calls = %d, want 1", writer.flushCalls)
+	}
+	requireSupervisorSSEDeadlineSetAndCleared(t, writer)
+}
+
+func TestSupervisorSSEClearFailureReturnedAfterSuccessfulWriteAndFlush(t *testing.T) {
+	clearErr := errors.New("clear failed")
+	writer := &sseDeadlineResponseWriter{clearErr: clearErr}
+	err := withSupervisorSSEWriteDeadline(http.NewResponseController(writer), func() error { return nil })
+	if !errors.Is(err, clearErr) {
+		t.Fatalf("error = %v, want clear failure", err)
+	}
+	if writer.flushCalls != 1 {
+		t.Fatalf("flush calls = %d, want 1", writer.flushCalls)
+	}
+	requireSupervisorSSEDeadlineSetAndCleared(t, writer)
+}
+
+func TestSupervisorSSEUnsupportedDeadlineStillWritesAndFlushes(t *testing.T) {
+	writer := &sseDeadlineResponseWriter{setErr: http.ErrNotSupported}
+	writeCalls := 0
+	err := withSupervisorSSEWriteDeadline(http.NewResponseController(writer), func() error {
+		writeCalls++
+		return nil
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if writeCalls != 1 || writer.flushCalls != 1 {
+		t.Fatalf("write calls = %d, flush calls = %d; want 1 each", writeCalls, writer.flushCalls)
+	}
+	if len(writer.deadlines) != 1 || writer.deadlines[0].IsZero() {
+		t.Fatalf("write deadlines = %v, want one unsupported nonzero set and no clear", writer.deadlines)
+	}
+}
+
+func TestSupervisorSSEUnsupportedDeadlineWriteFailureSkipsFlush(t *testing.T) {
+	writeErr := errors.New("write failed")
+	writer := &sseDeadlineResponseWriter{setErr: http.ErrNotSupported}
+	err := withSupervisorSSEWriteDeadline(http.NewResponseController(writer), func() error { return writeErr })
+	if !errors.Is(err, writeErr) {
+		t.Fatalf("error = %v, want write failure", err)
+	}
+	if writer.flushCalls != 0 {
+		t.Fatalf("flush calls after unsupported-deadline write failure = %d, want 0", writer.flushCalls)
+	}
+	if len(writer.deadlines) != 1 || writer.deadlines[0].IsZero() {
+		t.Fatalf("write deadlines = %v, want one unsupported nonzero set and no clear", writer.deadlines)
+	}
+}
+
+func TestFakeServiceSubscribeNotificationIsIdempotent(t *testing.T) {
+	notified := make(chan struct{})
+	service := &fakeService{subscribeCalled: notified}
+	if _, err := service.Subscribe(context.Background()); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := service.Subscribe(context.Background()); err != nil {
+		t.Fatal(err)
+	}
+	select {
+	case <-notified:
+	default:
+		t.Fatal("Subscribe did not notify")
 	}
 }
 
@@ -508,6 +643,76 @@ func TestActiveParentToChildSSEBrokerCloseAllowsPromptCleanUnixShutdown(t *testi
 		t.Fatalf("active SSE shutdown took %s", elapsed)
 	}
 	parentStream.Close()
+}
+
+func TestStalledSupervisorSSEClientDoesNotBlockUnixShutdown(t *testing.T) {
+	path := filepath.Join(t.TempDir(), "stalled-supervisor.sock")
+	broker := supervisor.NewEventBroker()
+	defer broker.Close()
+
+	payload := json.RawMessage(`{"chunk":"` + strings.Repeat("x", 96<<10) + `"}`)
+	for range 96 {
+		broker.PublishLocal("root", "pi", payload)
+	}
+	subscribed := make(chan struct{})
+	service := &fakeService{sub: broker.Subscribe(), subscribeCalled: subscribed}
+	server, err := StartUnix(path, NewHandler(service))
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	stalled, err := net.DialUnix("unix", nil, &net.UnixAddr{Name: path, Net: "unix"})
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer stalled.Close()
+	const receiveBufferLimit = 4 << 10
+	if err := stalled.SetReadBuffer(receiveBufferLimit); err != nil {
+		t.Fatalf("set stalled SSE receive buffer: %v", err)
+	}
+	rawConnection, err := stalled.SyscallConn()
+	if err != nil {
+		t.Fatal(err)
+	}
+	var receiveBuffer int
+	var receiveBufferErr error
+	if err := rawConnection.Control(func(fd uintptr) {
+		receiveBuffer, receiveBufferErr = unix.GetsockoptInt(int(fd), unix.SOL_SOCKET, unix.SO_RCVBUF)
+	}); err != nil {
+		t.Fatal(err)
+	}
+	if receiveBufferErr != nil {
+		t.Fatalf("inspect stalled SSE receive buffer: %v", receiveBufferErr)
+	}
+	if receiveBuffer > 2*receiveBufferLimit {
+		t.Fatalf("stalled SSE receive buffer = %d, want at most %d", receiveBuffer, 2*receiveBufferLimit)
+	}
+	if _, err := io.WriteString(stalled, "GET /v1/events HTTP/1.1\r\nHost: unix\r\nAccept: text/event-stream\r\n\r\n"); err != nil {
+		t.Fatal(err)
+	}
+	select {
+	case <-subscribed:
+	case <-time.After(time.Second):
+		t.Fatal("stalled SSE request did not subscribe")
+	}
+
+	broker.Close()
+	shutdownCtx, cancel := context.WithTimeout(context.Background(), 3*time.Second)
+	defer cancel()
+	started := time.Now()
+	if err := server.Close(shutdownCtx); err != nil {
+		t.Fatalf("stalled SSE shutdown error = %v", err)
+	}
+	elapsed := time.Since(started)
+	if elapsed < 750*time.Millisecond {
+		t.Fatalf("stalled SSE shutdown took %s, want at least 750ms to prove write-deadline expiry", elapsed)
+	}
+	if elapsed >= 2*time.Second {
+		t.Fatalf("stalled SSE shutdown took %s, want under 2s", elapsed)
+	}
+	if _, err := os.Lstat(path); !errors.Is(err, os.ErrNotExist) {
+		t.Fatalf("Unix socket remains after stalled SSE shutdown: %v", err)
+	}
 }
 
 func TestDescendantClientMapsSocketFailureToGatewayError(t *testing.T) {

@@ -44,6 +44,27 @@ type ChildProcess interface {
 
 type ChildSpawner func(context.Context, process.Bootstrap) (ChildProcess, error)
 
+// childDisposition is the single linearization point between terminal acceptance
+// and an external direct-child cancellation. Exactly one side wins; later claims
+// from the losing side are rejected, so a race can never both acknowledge a
+// terminal report and cancel a child.
+type childDisposition uint8
+
+const (
+	childUndecided childDisposition = iota
+	childAccepted                   // terminal acceptance linearized first
+	childCancelled                  // external cancellation linearized first
+)
+
+// childCleanupMode selects how a direct child's cleanup signals its stop.
+type childCleanupMode uint8
+
+const (
+	childCleanupComplete  childCleanupMode = iota // terminal acceptance: no stop signaled
+	childCleanupForced                            // generic startup/runtime failure: route descendant stop
+	childCleanupCancelled                         // external cancellation: ack + liveness, no HTTP stop
+)
+
 type childEntry struct {
 	id       string
 	socket   string
@@ -56,7 +77,9 @@ type childEntry struct {
 	spawnDone   chan struct{}
 	spawnOnce   sync.Once
 	eventCancel context.CancelFunc
+	eventDone   chan struct{}
 	recovery    *provision.RecoveryTicket
+	disposition childDisposition
 
 	cleanupOnce        sync.Once
 	cleanupDone        chan struct{}
@@ -103,10 +126,17 @@ func (entry *childEntry) values() (DescendantClient, ChildProcess, context.Cance
 	return entry.client, entry.process, entry.eventCancel
 }
 
-func (entry *childEntry) setEventCancel(cancel context.CancelFunc) {
+func (entry *childEntry) setEventForwarder(cancel context.CancelFunc, done chan struct{}) {
 	entry.mu.Lock()
 	entry.eventCancel = cancel
+	entry.eventDone = done
 	entry.mu.Unlock()
+}
+
+func (entry *childEntry) eventForwarder() (context.CancelFunc, <-chan struct{}) {
+	entry.mu.RLock()
+	defer entry.mu.RUnlock()
+	return entry.eventCancel, entry.eventDone
 }
 
 func (entry *childEntry) setStreamError(err error) {
@@ -115,7 +145,52 @@ func (entry *childEntry) setStreamError(err error) {
 	entry.mu.Unlock()
 }
 
-func (entry *childEntry) expectEventStreamClose() {
+// claimAccepted claims the terminal-acceptance disposition, marking descendant SSE
+// closure expected is deferred to the caller only after a successful claim. It
+// returns true only for the first (winning) claim; once cancellation has already
+// won, a terminal report must never be acknowledged.
+func (entry *childEntry) claimAccepted() bool {
+	entry.mu.Lock()
+	defer entry.mu.Unlock()
+	if entry.disposition != childUndecided {
+		return false
+	}
+	entry.disposition = childAccepted
+	return true
+}
+
+// claimCancelled claims the external-cancellation disposition. It returns true
+// only for the first (winning) claim; after terminal acceptance has already won,
+// an external cancellation is benign and still bounds its own cleanup.
+func (entry *childEntry) claimCancelled() bool {
+	entry.mu.Lock()
+	defer entry.mu.Unlock()
+	if entry.disposition != childUndecided {
+		return false
+	}
+	entry.disposition = childCancelled
+	return true
+}
+
+func (entry *childEntry) isCancelled() bool {
+	entry.mu.RLock()
+	defer entry.mu.RUnlock()
+	return entry.disposition == childCancelled
+}
+
+func (entry *childEntry) isAccepted() bool {
+	entry.mu.RLock()
+	defer entry.mu.RUnlock()
+	return entry.disposition == childAccepted
+}
+
+func (entry *childEntry) markEventStreamCloseExpected() {
+	entry.mu.Lock()
+	entry.eventCloseExpected = true
+	entry.mu.Unlock()
+}
+
+func (entry *childEntry) cancelExpectedEventStream() {
 	entry.mu.Lock()
 	entry.eventCloseExpected = true
 	cancel := entry.eventCancel
@@ -184,8 +259,12 @@ func childUnavailable(id string, err error) error {
 
 func (node *Node) startChildEventForwarder(entry *childEntry) {
 	ctx, cancel := context.WithCancel(context.Background())
-	entry.setEventCancel(cancel)
-	go node.forwardChildEvents(ctx, cancel, entry)
+	done := make(chan struct{})
+	entry.setEventForwarder(cancel, done)
+	go func() {
+		defer close(done)
+		node.forwardChildEvents(ctx, cancel, entry)
+	}()
 }
 
 func (node *Node) forwardChildEvents(ctx context.Context, cancel context.CancelFunc, entry *childEntry) {
@@ -234,9 +313,42 @@ func (node *Node) forwardChildEvents(ctx context.Context, cancel context.CancelF
 }
 
 func (node *Node) cleanupChild(ctx context.Context, entry *childEntry, requestStop bool) error {
+	if requestStop {
+		return node.cleanupChildMode(ctx, entry, childCleanupForced)
+	}
+	return node.cleanupChildMode(ctx, entry, childCleanupComplete)
+}
+
+// cancelChildExternal is the parent-owned cancellation path for a directly-owned
+// child. It linearizes external cancellation ahead of any terminal acceptance,
+// closes the terminal-ack endpoint without acknowledging and the inherited
+// parent-liveness endpoint (the canonical cancellation signal that recursively
+// stops the child subtree), then bounds process wait/escalation/recovery/removal.
+// It never routes a descendant HTTP stop before the liveness EOF and never turns
+// the expected closed child server into a cleanup failure.
+func (node *Node) cancelChildExternal(ctx context.Context, entry *childEntry) error {
+	entry.claimCancelled()
+	return node.cleanupChildMode(ctx, entry, childCleanupCancelled)
+}
+
+// awaitChildCancellation waits for the one bounded cleanup already running for an
+// externally cancelled child and reports exact child_aborted to the blocked
+// CreateChild caller. It never acknowledges a terminal report.
+func (node *Node) awaitChildCancellation(ctx context.Context, entry *childEntry) error {
+	cleanupCtx, cancel := context.WithTimeout(context.WithoutCancel(ctx), node.childStopTimeout())
+	defer cancel()
+	select {
+	case <-entry.cleanupDone:
+	case <-cleanupCtx.Done():
+	}
+	return contract.NewError(contract.ErrorChildAborted, "child was stopped")
+}
+
+func (node *Node) cleanupChildMode(ctx context.Context, entry *childEntry, mode childCleanupMode) error {
 	entry.cleanupOnce.Do(func() {
 		defer close(entry.cleanupDone)
 		client, child, cancelEvents := entry.values()
+		_, forwarderDone := entry.eventForwarder()
 		if child == nil {
 			entry.mu.RLock()
 			spawnCancel := entry.spawnCancel
@@ -246,20 +358,33 @@ func (node *Node) cleanupChild(ctx context.Context, entry *childEntry, requestSt
 			}
 			<-entry.spawnDone
 			client, child, cancelEvents = entry.values()
+			_, forwarderDone = entry.eventForwarder()
 		}
 		var cleanupErr error
-		if child != nil && requestStop {
-			// A forced/cancelled stop is not a terminal acceptance. Closing the
-			// private ack endpoint unblocks any terminal reporter without granting
-			// acknowledgement, then normal stop cascades through the child subtree.
-			cleanupErr = errors.Join(cleanupErr, child.CloseTerminalAck())
-			// Mark and cancel event ownership before any intentional child stop.
-			// Its server may close SSE as part of Stop before the process/report
-			// paths have otherwise had a chance to classify that EOF.
-			entry.expectEventStreamClose()
-			if client != nil {
-				cleanupErr = errors.Join(cleanupErr, client.Stop(ctx, entry.id))
-			} else {
+		if child != nil {
+			switch mode {
+			case childCleanupForced:
+				// A forced/cancelled stop is not a terminal acceptance. Closing the
+				// private ack endpoint unblocks any terminal reporter without granting
+				// acknowledgement, then normal stop cascades through the child subtree.
+				cleanupErr = errors.Join(cleanupErr, child.CloseTerminalAck())
+				// Mark and cancel event ownership before any intentional child stop.
+				// Its server may close SSE as part of Stop before the process/report
+				// paths have otherwise had a chance to classify that EOF.
+				entry.cancelExpectedEventStream()
+				if client != nil {
+					cleanupErr = errors.Join(cleanupErr, client.Stop(ctx, entry.id))
+				} else {
+					cleanupErr = errors.Join(cleanupErr, child.CloseLiveness())
+				}
+			case childCleanupCancelled:
+				// External cancellation already claimed the disposition in
+				// cancelChildExternal. Close the ack endpoint without acknowledging
+				// and close the inherited parent-liveness endpoint as the canonical
+				// cancellation signal. Do not wait for a descendant HTTP stop before
+				// the liveness EOF.
+				cleanupErr = errors.Join(cleanupErr, child.CloseTerminalAck())
+				entry.cancelExpectedEventStream()
 				cleanupErr = errors.Join(cleanupErr, child.CloseLiveness())
 			}
 		}
@@ -284,6 +409,20 @@ func (node *Node) cleanupChild(ctx context.Context, entry *childEntry, requestSt
 				}
 			}
 			cleanupErr = errors.Join(cleanupErr, child.Wait(), child.CloseTerminalAck(), child.CloseLiveness(), child.CloseReports())
+			if mode == childCleanupComplete && forwarderDone != nil {
+				select {
+				case <-forwarderDone:
+				default:
+					select {
+					case <-forwarderDone:
+					case <-ctx.Done():
+						cleanupErr = errors.Join(cleanupErr, ctx.Err())
+						if cancelEvents != nil {
+							cancelEvents()
+						}
+					}
+				}
+			}
 			entry.mu.RLock()
 			ticket := entry.recovery
 			entry.mu.RUnlock()
@@ -328,7 +467,7 @@ func (node *Node) stopChildren(ctx context.Context) error {
 		wait.Add(1)
 		go func(index int, entry *childEntry) {
 			defer wait.Done()
-			errorsByChild[index] = node.cleanupChild(ctx, entry, true)
+			errorsByChild[index] = node.cancelChildExternal(ctx, entry)
 		}(index, entry)
 	}
 	wait.Wait()

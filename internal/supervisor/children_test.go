@@ -4,6 +4,7 @@ import (
 	"context"
 	"encoding/json"
 	"errors"
+	"fmt"
 	"io"
 	"net"
 	"os"
@@ -21,18 +22,22 @@ import (
 )
 
 type fakeChildProcess struct {
-	readyEntered chan struct{}
-	readyRelease <-chan struct{}
-	messages     chan process.ChildMessage
-	done         chan struct{}
-	waitErr      error
-	autoFinish   bool
-	closeOnce    sync.Once
-	liveness     atomic.Int32
-	terminated   atomic.Int32
-	killed       atomic.Int32
-	acknowledged atomic.Int32
-	ackClosed    atomic.Int32
+	readyEntered    chan struct{}
+	readyRelease    <-chan struct{}
+	messages        chan process.ChildMessage
+	done            chan struct{}
+	waitErr         error
+	autoFinish      bool
+	closeOnce       sync.Once
+	liveness        atomic.Int32
+	livenessEntered chan struct{}
+	livenessRelease <-chan struct{}
+	terminated      atomic.Int32
+	killed          atomic.Int32
+	acknowledged    atomic.Int32
+	ackClosed       atomic.Int32
+	ackEntered      chan struct{}
+	ackRelease      <-chan struct{}
 }
 
 func newFakeChildProcess() *fakeChildProcess {
@@ -67,6 +72,12 @@ func (child *fakeChildProcess) NextMessage(ctx context.Context) (process.ChildMe
 }
 func (child *fakeChildProcess) AcknowledgeTerminal(process.ChildMessage) error {
 	child.acknowledged.Add(1)
+	if child.ackEntered != nil {
+		close(child.ackEntered)
+	}
+	if child.ackRelease != nil {
+		<-child.ackRelease
+	}
 	if child.autoFinish {
 		child.finish()
 	}
@@ -74,6 +85,12 @@ func (child *fakeChildProcess) AcknowledgeTerminal(process.ChildMessage) error {
 }
 func (child *fakeChildProcess) CloseTerminalAck() error { child.ackClosed.Add(1); return nil }
 func (child *fakeChildProcess) CloseLiveness() error {
+	if child.livenessEntered != nil {
+		child.livenessEntered <- struct{}{}
+	}
+	if child.livenessRelease != nil {
+		<-child.livenessRelease
+	}
 	child.liveness.Add(1)
 	child.finish()
 	return nil
@@ -262,6 +279,15 @@ func readRequest() contract.CreateChildRequest {
 
 func directChildSnapshot(id string) NodeSnapshot {
 	return NodeSnapshot{SessionID: id, ParentSessionID: "root-1", RootSessionID: "root-1", Kind: contract.ChildKindRead, Context: contract.ContextFresh, WorkerType: "reviewer", Lifecycle: string(LifecycleReady), Questions: []QuestionSummary{}, Children: []NodeSnapshot{}}
+}
+
+func naturalFakeDescendant(id string, child *fakeChildProcess) *fakeDescendantClient {
+	events := make(chan EventEnvelope)
+	go func() {
+		<-child.Done()
+		close(events)
+	}()
+	return &fakeDescendantClient{snapshot: directChildSnapshot(id), events: Subscription{Events: events}}
 }
 
 func TestStartingChildFallbackDoesNotClaimRequestedModelBeforeEffectiveBinding(t *testing.T) {
@@ -553,6 +579,153 @@ func TestCreateChildCancellationStopsAndSynchronouslyCleansChild(t *testing.T) {
 	}
 }
 
+func TestNaturalTerminalDrainsFinalChildEventBeforeCleanup(t *testing.T) {
+	const childID = "child-natural-drain"
+	ackRelease := make(chan struct{})
+	child := newFakeChildProcess()
+	child.autoFinish = true
+	child.ackEntered = make(chan struct{})
+	child.ackRelease = ackRelease
+	child.messages <- process.ChildMessage{
+		Type: process.MessageRead, SessionID: childID,
+		Read: &contract.ReadChildResult{Kind: contract.ChildKindRead, WorkerType: "reviewer", SessionID: childID, Output: "done"},
+	}
+	client := &eofDescendant{
+		fakeDescendantClient: fakeDescendantClient{snapshot: directChildSnapshot(childID)},
+		process:              child, events: make(chan EventEnvelope, 1), subscribed: make(chan struct{}),
+		subscriptionClosed: make(chan struct{}), eofObserved: make(chan struct{}),
+	}
+	node := childCreationNode(t,
+		func(context.Context, process.Bootstrap) (ChildProcess, error) { return child, nil },
+		func(string) (DescendantClient, error) { return client, nil },
+	)
+	node.deps.NewSessionID = func() (string, error) { return childID, nil }
+	parentEvents := node.broker.Subscribe()
+	defer parentEvents.Close()
+
+	created := make(chan struct {
+		result TerminalResult
+		err    error
+	}, 1)
+	go func() {
+		result, err := node.CreateChild(context.Background(), "root-1", readRequest())
+		created <- struct {
+			result TerminalResult
+			err    error
+		}{result: result, err: err}
+	}()
+	<-client.subscribed
+	<-child.ackEntered
+
+	final := EventEnvelope{Seq: 1, SessionID: childID, SourceSeq: 1, Kind: "pi", Payload: json.RawMessage(`{"type":"agent_settled"}`)}
+	client.events <- final
+	close(client.events)
+	close(ackRelease)
+
+	got := <-created
+	if got.err != nil || got.result.Read == nil || got.result.Read.SessionID != childID {
+		t.Fatalf("natural CreateChild result = %#v, %v", got.result, got.err)
+	}
+	select {
+	case event := <-parentEvents.Events:
+		if event.SessionID != childID || event.SourceSeq != final.SourceSeq || string(event.Payload) != string(final.Payload) {
+			t.Fatalf("forwarded final event = %#v, want %#v", event, final)
+		}
+	case <-time.After(time.Second):
+		t.Fatal("natural cleanup returned before the final child event was forwarded")
+	}
+	if node.children.get(childID) != nil {
+		t.Fatal("naturally completed child remains registered")
+	}
+}
+
+func TestNaturalCleanupTimeoutCancelsEventForwarderAndFails(t *testing.T) {
+	child := newFakeChildProcess()
+	child.finish()
+	cancelled := make(chan struct{})
+	var cancelOnce sync.Once
+	forwarderDone := make(chan struct{})
+	node := childCreationNode(t, nil, nil)
+	entry := &childEntry{id: "child-stalled-events", process: child}
+	if err := node.children.add(entry); err != nil {
+		t.Fatal(err)
+	}
+	entry.setEventForwarder(func() { cancelOnce.Do(func() { close(cancelled) }) }, forwarderDone)
+
+	ctx, cancel := context.WithTimeout(context.Background(), 20*time.Millisecond)
+	defer cancel()
+	err := node.cleanupChild(ctx, entry, false)
+	if !errors.Is(err, context.DeadlineExceeded) {
+		t.Fatalf("natural cleanup error = %v, want deadline exceeded", err)
+	}
+	select {
+	case <-cancelled:
+	default:
+		t.Fatal("timed-out natural cleanup did not cancel the event forwarder")
+	}
+	if node.children.get(entry.id) != nil {
+		t.Fatal("timed-out natural cleanup left the child registered")
+	}
+}
+
+func TestNaturalTerminalWithUndrainedEventsReturnsChildFailed(t *testing.T) {
+	const childID = "child-undrained-events"
+	child := newFakeChildProcess()
+	child.autoFinish = true
+	child.messages <- process.ChildMessage{
+		Type: process.MessageRead, SessionID: childID,
+		Read: &contract.ReadChildResult{Kind: contract.ChildKindRead, WorkerType: "reviewer", SessionID: childID, Output: "done"},
+	}
+	client := &eofDescendant{
+		fakeDescendantClient: fakeDescendantClient{snapshot: directChildSnapshot(childID)},
+		process:              child, events: make(chan EventEnvelope), subscribed: make(chan struct{}),
+		subscriptionClosed: make(chan struct{}), eofObserved: make(chan struct{}),
+	}
+	node := childCreationNode(t,
+		func(context.Context, process.Bootstrap) (ChildProcess, error) { return child, nil },
+		func(string) (DescendantClient, error) { return client, nil },
+	)
+	node.deps.NewSessionID = func() (string, error) { return childID, nil }
+	node.deps.ChildStopTimeout = 20 * time.Millisecond
+
+	_, err := node.CreateChild(context.Background(), "root-1", readRequest())
+	var typed *contract.Error
+	if !errors.As(err, &typed) || typed.Code != contract.ErrorChildFailed {
+		t.Fatalf("undrained natural child error = %v, want typed child_failed", err)
+	}
+	select {
+	case <-client.subscriptionClosed:
+	case <-time.After(time.Second):
+		t.Fatal("undrained natural child leaked its event subscription after cancellation")
+	}
+	if node.children.get(childID) != nil {
+		t.Fatal("undrained natural child remains registered")
+	}
+}
+
+func TestForcedCancellationCancelsWithoutNaturalEventDrain(t *testing.T) {
+	child := newFakeChildProcess()
+	node := childCreationNode(t, nil, nil)
+	entry := &childEntry{id: "child-forced-events", process: child}
+	if err := node.children.add(entry); err != nil {
+		t.Fatal(err)
+	}
+	cancelled := make(chan struct{})
+	var cancelOnce sync.Once
+	entry.setEventForwarder(func() { cancelOnce.Do(func() { close(cancelled) }) }, make(chan struct{}))
+
+	ctx, cancel := context.WithTimeout(context.Background(), time.Second)
+	defer cancel()
+	if err := node.cancelChildExternal(ctx, entry); err != nil {
+		t.Fatalf("external cancellation = %v", err)
+	}
+	select {
+	case <-cancelled:
+	default:
+		t.Fatal("external cancellation did not cancel the event forwarder")
+	}
+}
+
 func TestParentStopMarksCleanEventEOFExpectedBeforeStoppingChild(t *testing.T) {
 	child := newFakeChildProcess()
 	client := &eofDescendant{
@@ -591,7 +764,11 @@ func TestSiblingChildStartupRunsConcurrently(t *testing.T) {
 		func(socket string) (DescendantClient, error) {
 			id := filepath.Base(socket)
 			id = id[:len(id)-len(filepath.Ext(id))]
-			return &fakeDescendantClient{snapshot: directChildSnapshot(id)}, nil
+			stored, ok := processes.Load(id)
+			if !ok {
+				return nil, fmt.Errorf("missing fake process for %s", id)
+			}
+			return naturalFakeDescendant(id, stored.(*fakeChildProcess)), nil
 		},
 	)
 	node.deps.NewSessionID = func() (string, error) { return "child-" + string(rune('0'+sequence.Add(1))), nil }
@@ -615,13 +792,13 @@ func TestSiblingChildStartupRunsConcurrently(t *testing.T) {
 }
 
 func TestStopCascadesToDirectChildrenConcurrentlyAndIdempotently(t *testing.T) {
-	active, maximum := &atomic.Int32{}, &atomic.Int32{}
-	started, release := make(chan struct{}, 2), make(chan struct{})
+	entered, release := make(chan struct{}, 2), make(chan struct{})
 	node := childCreationNode(t, nil, nil)
 	node.resources = nil
 	for _, id := range []string{"child-a", "child-b"} {
 		child := newFakeChildProcess()
-		client := &stoppingDescendant{process: child, started: started, release: release, active: active, maximum: maximum}
+		child.livenessEntered, child.livenessRelease = entered, release
+		client := &fakeDescendantClient{snapshot: directChildSnapshot(id)}
 		if err := node.children.add(&childEntry{id: id, process: child, client: client}); err != nil {
 			t.Fatal(err)
 		}
@@ -630,9 +807,9 @@ func TestStopCascadesToDirectChildrenConcurrentlyAndIdempotently(t *testing.T) {
 	go func() { first <- node.Stop(context.Background(), StopReasonRequested) }()
 	for range 2 {
 		select {
-		case <-started:
+		case <-entered:
 		case <-time.After(time.Second):
-			t.Fatal("cascade was not concurrent")
+			t.Fatal("cascade cancellation was not concurrent")
 		}
 	}
 	go func() { second <- node.Stop(context.Background(), StopReasonRequested) }()
@@ -643,11 +820,175 @@ func TestStopCascadesToDirectChildrenConcurrentlyAndIdempotently(t *testing.T) {
 	if err := <-second; err != nil {
 		t.Fatal(err)
 	}
-	if maximum.Load() != 2 {
-		t.Fatalf("maximum concurrent stops = %d", maximum.Load())
-	}
 	if len(node.children.snapshot()) != 0 {
 		t.Fatal("children remain after cascade")
+	}
+}
+
+// TestChildEntryCancellationAndAcceptanceAreMonotonic proves the childEntry
+// terminal-acceptance versus external-cancellation disposition can set exactly
+// one winner, and that a later claim from the losing side is rejected.
+func TestChildEntryCancellationAndAcceptanceAreMonotonic(t *testing.T) {
+	acceptedFirst := &childEntry{id: "acc"}
+	if !acceptedFirst.claimAccepted() {
+		t.Fatal("first claimAccepted should win")
+	}
+	if acceptedFirst.claimAccepted() {
+		t.Fatal("second claimAccepted must fail")
+	}
+	if acceptedFirst.claimCancelled() {
+		t.Fatal("claimCancelled after acceptance must fail")
+	}
+	if !acceptedFirst.isAccepted() || acceptedFirst.isCancelled() {
+		t.Fatal("accepted-first disposition wrong")
+	}
+
+	cancelledFirst := &childEntry{id: "cancel"}
+	if !cancelledFirst.claimCancelled() {
+		t.Fatal("first claimCancelled should win")
+	}
+	if cancelledFirst.claimCancelled() {
+		t.Fatal("second claimCancelled must fail")
+	}
+	if cancelledFirst.claimAccepted() {
+		t.Fatal("claimAccepted after cancellation must fail")
+	}
+	if !cancelledFirst.isCancelled() || cancelledFirst.isAccepted() {
+		t.Fatal("cancelled-first disposition wrong")
+	}
+
+	undecided := &childEntry{id: "undecided"}
+	if undecided.isCancelled() || undecided.isAccepted() {
+		t.Fatal("undecided entry wrongly resolved")
+	}
+}
+
+// TestExternalCancellationWinsBeforeTerminalAcceptanceReturnsChildAborted proves
+// that an external direct-child cancellation that linearizes before any terminal
+// acceptance closes ack and liveness, never acknowledges a terminal, does not
+// route a descendant HTTP stop, and resolves the blocked CreateChild as exact
+// child_aborted (not child_failed).
+func TestExternalCancellationWinsBeforeTerminalAcceptanceReturnsChildAborted(t *testing.T) {
+	child := newFakeChildProcess()
+	client := &fakeDescendantClient{snapshot: directChildSnapshot("child-cancel-win")}
+	node := childCreationNode(t,
+		func(context.Context, process.Bootstrap) (ChildProcess, error) { return child, nil },
+		func(string) (DescendantClient, error) { return client, nil },
+	)
+	node.deps.NewSessionID = func() (string, error) { return "child-cancel-win", nil }
+
+	createResult := make(chan error, 1)
+	go func() { _, err := node.CreateChild(context.Background(), "root-1", readRequest()); createResult <- err }()
+	for node.children.get("child-cancel-win") == nil {
+		time.Sleep(time.Millisecond)
+	}
+	entry := node.children.get("child-cancel-win")
+	cancelDone := make(chan error, 1)
+	go func() { cancelDone <- node.cancelChildExternal(context.Background(), entry) }()
+
+	err := <-createResult
+	var typed *contract.Error
+	if !errors.As(err, &typed) || typed.Code != contract.ErrorChildAborted {
+		t.Fatalf("create error = %v, want exact child_aborted", err)
+	}
+	if child.acknowledged.Load() != 0 {
+		t.Fatalf("terminal acknowledged %d times despite cancellation", child.acknowledged.Load())
+	}
+	if child.ackClosed.Load() == 0 {
+		t.Fatal("external cancellation did not close terminal ack")
+	}
+	if child.liveness.Load() == 0 {
+		t.Fatal("external cancellation did not close parent liveness")
+	}
+	client.mu.Lock()
+	stops := append([]string(nil), client.stops...)
+	client.mu.Unlock()
+	if len(stops) != 0 {
+		t.Fatalf("external cancellation routed descendant HTTP stops: %v", stops)
+	}
+	if err := <-cancelDone; err != nil {
+		t.Fatalf("cancelChildExternal error = %v", err)
+	}
+	if node.children.get("child-cancel-win") != nil {
+		t.Fatal("cancelled child remains registered")
+	}
+}
+
+// TestDirectChildTerminalAcceptanceRetainsResult proves a valid terminal report
+// that wins the disposition is acknowledged exactly once and returns its exact
+// read result, with no external cancellation involved.
+func TestDirectChildTerminalAcceptanceRetainsResult(t *testing.T) {
+	child := newFakeChildProcess()
+	child.autoFinish = true
+	child.messages <- process.ChildMessage{Type: process.MessageRead, SessionID: "child-accept", Read: &contract.ReadChildResult{Kind: contract.ChildKindRead, WorkerType: "reviewer", SessionID: "child-accept", Output: "done"}}
+	client := naturalFakeDescendant("child-accept", child)
+	node := childCreationNode(t,
+		func(context.Context, process.Bootstrap) (ChildProcess, error) { return child, nil },
+		func(string) (DescendantClient, error) { return client, nil },
+	)
+	node.deps.NewSessionID = func() (string, error) { return "child-accept", nil }
+
+	result, err := node.CreateChild(context.Background(), "root-1", readRequest())
+	if err != nil {
+		t.Fatalf("create error = %v", err)
+	}
+	if result.Read == nil || result.Read.Output != "done" || result.Read.SessionID != "child-accept" {
+		t.Fatalf("result = %#v", result)
+	}
+	if child.acknowledged.Load() != 1 {
+		t.Fatalf("acknowledgements = %d, want 1", child.acknowledged.Load())
+	}
+	if node.children.get("child-accept") != nil {
+		t.Fatal("accepted child remains registered after return")
+	}
+}
+
+// TestGenuineChildEOFWithoutCancellationRemainsChildFailed proves a report EOF
+// that is not the product of external cancellation is still a child_failed
+// failure, so generic cleanup is never relabelled as a cancellation.
+func TestGenuineChildEOFWithoutCancellationRemainsChildFailed(t *testing.T) {
+	child := newFakeChildProcess()
+	child.finish()
+	client := &fakeDescendantClient{snapshot: directChildSnapshot("child-eof-fail")}
+	node := childCreationNode(t,
+		func(context.Context, process.Bootstrap) (ChildProcess, error) { return child, nil },
+		func(string) (DescendantClient, error) { return client, nil },
+	)
+	node.deps.NewSessionID = func() (string, error) { return "child-eof-fail", nil }
+
+	_, err := node.CreateChild(context.Background(), "root-1", readRequest())
+	var typed *contract.Error
+	if !errors.As(err, &typed) || typed.Code != contract.ErrorChildFailed {
+		t.Fatalf("error = %v, want exact child_failed", err)
+	}
+}
+
+// TestRouterStopDirectChildAppliesParentCancellation proves the manager's
+// router stop for a directly-owned child applies parent-side cancellation
+// (ack + liveness closure) instead of routing a descendant HTTP stop.
+func TestRouterStopDirectChildAppliesParentCancellation(t *testing.T) {
+	child := newFakeChildProcess()
+	client := &fakeDescendantClient{snapshot: directChildSnapshot("router-child")}
+	node := childCreationNode(t, nil, nil)
+	node.resources = nil
+	if err := node.children.add(&childEntry{id: "router-child", process: child, client: client}); err != nil {
+		t.Fatal(err)
+	}
+	router := NewRouter(node)
+	if err := router.Stop(context.Background(), "router-child"); err != nil {
+		t.Fatalf("router stop = %v", err)
+	}
+	client.mu.Lock()
+	stops := append([]string(nil), client.stops...)
+	client.mu.Unlock()
+	if len(stops) != 0 {
+		t.Fatalf("router descended to HTTP stop for a direct child: %v", stops)
+	}
+	if child.liveness.Load() == 0 {
+		t.Fatal("direct child liveness was not closed by router stop")
+	}
+	if node.children.get("router-child") != nil {
+		t.Fatal("direct child remains registered after router stop")
 	}
 }
 
@@ -779,27 +1120,6 @@ func TestCleanupChildNeverUnlinksChildOwnedReplacementSocket(t *testing.T) {
 	_ = connection.Close()
 }
 
-type deadlineDescendant struct{ deadlineSeen atomic.Bool }
-
-func (client *deadlineDescendant) Snapshot(context.Context) (NodeSnapshot, error) {
-	return NodeSnapshot{}, nil
-}
-func (client *deadlineDescendant) Subscribe(context.Context) (Subscription, error) {
-	return Subscription{}, nil
-}
-func (client *deadlineDescendant) CallRPC(context.Context, string, json.RawMessage) (json.RawMessage, error) {
-	return nil, nil
-}
-func (client *deadlineDescendant) AnswerQuestion(context.Context, string, string, json.RawMessage) error {
-	return nil
-}
-func (client *deadlineDescendant) Stop(ctx context.Context, _ string) error {
-	_, hasDeadline := ctx.Deadline()
-	client.deadlineSeen.Store(hasDeadline)
-	<-ctx.Done()
-	return ctx.Err()
-}
-
 type escalatingChildProcess struct {
 	done       chan struct{}
 	closeOnce  sync.Once
@@ -910,7 +1230,7 @@ func TestUnexpectedFinishUsesIndependentDeadlinesForDescendantsResourcesAndListe
 		}
 		return os.Remove(path)
 	}
-	client := &deadlineDescendant{}
+	client := &fakeDescendantClient{}
 	child := newEscalatingChildProcess()
 	if err := node.children.add(&childEntry{id: "child-hanging", client: client, process: child}); err != nil {
 		t.Fatal(err)
@@ -959,9 +1279,6 @@ func TestUnexpectedFinishUsesIndependentDeadlinesForDescendantsResourcesAndListe
 
 	if elapsed := time.Since(started); elapsed > time.Second {
 		t.Fatalf("unexpected finish took %s, want bounded cleanup", elapsed)
-	}
-	if !client.deadlineSeen.Load() {
-		t.Error("unexpected descendant Stop did not receive a bounded cleanup context")
 	}
 	if child.terminated.Load() != 1 || child.killed.Load() != 1 {
 		t.Errorf("escalation TERM=%d KILL=%d, want 1 each", child.terminated.Load(), child.killed.Load())

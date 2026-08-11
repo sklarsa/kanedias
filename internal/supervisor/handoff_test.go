@@ -212,11 +212,11 @@ func TestAcceptedHandoffWatchdogForcesCleanupWhenPiDoesNotEOF(t *testing.T) {
 		t.Fatal(err)
 	}
 	unfinished := newFakeChildProcess()
-	descendant := &stoppingDescendant{process: unfinished}
+	client := &fakeDescendantClient{}
 	entry := &childEntry{id: "unfinished-descendant", socket: "/tmp/unfinished.sock"}
 	entry.init()
 	entry.setProcess(unfinished)
-	entry.setClient(descendant)
+	entry.setClient(client)
 	if err := node.children.add(entry); err != nil {
 		t.Fatal(err)
 	}
@@ -256,11 +256,12 @@ func TestAcceptedHandoffWatchdogForcesCleanupWhenPiDoesNotEOF(t *testing.T) {
 	if got := destroyCount(); got != 1 {
 		t.Fatalf("destroy calls = %d, want 1", got)
 	}
-	descendant.mu.Lock()
-	stops := append([]string(nil), descendant.stops...)
-	descendant.mu.Unlock()
-	if len(stops) != 1 || stops[0] != "unfinished-descendant" {
-		t.Fatalf("descendant stops = %#v, want unfinished descendant cancellation", stops)
+	if unfinished.ackClosed.Load() == 0 || unfinished.liveness.Load() == 0 {
+		t.Fatalf("unfinished descendant was not cancelled parent-side: ackClosed=%d liveness=%d",
+			unfinished.ackClosed.Load(), unfinished.liveness.Load())
+	}
+	if node.children.get("unfinished-descendant") != nil {
+		t.Fatal("unfinished descendant remains registered after forced cleanup")
 	}
 	select {
 	case <-parentReturned:

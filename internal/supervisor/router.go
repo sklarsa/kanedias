@@ -138,6 +138,12 @@ func (router *Router) Stop(ctx context.Context, target string) error {
 	if target == router.node.identity.Snapshot().SessionID {
 		return router.node.Stop(ctx, StopReasonRequested)
 	}
+	// A directly-owned child is cancelled parent-side via its inherited
+	// terminal-ack and parent-liveness endpoints, which recursively stop the
+	// child subtree, rather than a descendant HTTP stop.
+	if entry := router.node.children.get(target); entry != nil {
+		return router.node.cancelChildExternal(ctx, entry)
+	}
 	client, err := router.descendantFor(ctx, target)
 	if err != nil {
 		return err

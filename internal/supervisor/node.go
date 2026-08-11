@@ -66,6 +66,14 @@ type Node struct {
 	finishOnce          sync.Once
 	finishErr           error
 	done                chan struct{}
+
+	// rpcGate coordinates terminal quiescence of admitted routed RPC handlers.
+	// admission closes permanently; active counts admitted calls; idle is the
+	// notification channel created on the zero-to-one active transition and
+	// closed on the one-to-zero transition. No sync.WaitGroup Add/Wait race is
+	// used: the in-flight call's deferred decrement reacquires the gate mutex to
+	// close idle after QuiesceRPC has already released it to wait.
+	rpcGate rpcAdmissionGate
 }
 
 func NewRoot(identity Identity, deps Dependencies, broker *EventBroker) (*Node, error) {
@@ -384,6 +392,12 @@ func (node *Node) CreateChild(ctx context.Context, parent string, request contra
 
 	message, err := child.NextMessage(ctx)
 	if err != nil {
+		// External cancellation linearized before a terminal report; this expected
+		// stream end is a cancellation, never a child_failed. Wait for the one
+		// bounded cleanup already running and report exact child_aborted.
+		if entry.isCancelled() {
+			return TerminalResult{}, node.awaitChildCancellation(ctx, entry)
+		}
 		return TerminalResult{}, node.failChildCreation(ctx, entry, err)
 	}
 	if message.SessionID != childID {
@@ -415,11 +429,22 @@ func (node *Node) CreateChild(ctx context.Context, parent string, request contra
 	}
 
 	// The terminal report has now been ingested and checked against the exact
-	// admission. Mark SSE closure expected before acknowledging that same report.
-	// The child cannot return from Reporter.Read/Write/Failure and begin teardown
-	// until this inherited protocol write succeeds.
-	entry.expectEventStreamClose()
+	// admission. If an external cancellation already won the disposition, never
+	// acknowledge a terminal; await the running cancellation and report
+	// child_aborted instead.
+	if !entry.claimAccepted() {
+		return TerminalResult{}, node.awaitChildCancellation(ctx, entry)
+	}
+	// Mark SSE closure expected before acknowledging that same report. The child
+	// cannot return from Reporter.Read/Write/Failure and begin teardown until this
+	// inherited protocol write succeeds.
+	entry.markEventStreamCloseExpected()
 	if err := child.AcknowledgeTerminal(message); err != nil {
+		// A cancellation that won during the acknowledgement race is still an
+		// external cancellation, not a child_failed acknowledgement fault.
+		if entry.isCancelled() {
+			return TerminalResult{}, node.awaitChildCancellation(ctx, entry)
+		}
 		return TerminalResult{}, node.failChildCreation(ctx, entry, errors.Join(contract.NewError(contract.ErrorChildFailed, "acknowledge child terminal report failed"), err))
 	}
 
@@ -467,7 +492,73 @@ func (node *Node) CallRPC(ctx context.Context, command json.RawMessage) (json.Ra
 	if local == nil {
 		return nil, contract.NewError(contract.ErrorChildUnavailable, "root Pi RPC is not ready")
 	}
+	// Preserve the lifecycle/local checks, then atomically admit under the RPC
+	// gate: terminal quiescence closes admission permanently, and every admitted
+	// call is drained (decremented) after local.CallRPC returns exactly.
+	if err := node.rpcGate.admit(); err != nil {
+		return nil, err
+	}
+	defer node.rpcGate.release()
 	return local.CallRPC(ctx, command)
+}
+
+// rpcAdmissionGate is the per-node monotonic RPC admission/drain gate used for
+// child terminal quiescence. closed permanently rejects new calls; active counts
+// admitted calls until their exact return; idle is the notification channel
+// recreated on the zero-to-one active transition and closed on one-to-zero.
+type rpcAdmissionGate struct {
+	mu     sync.Mutex
+	closed bool
+	active int
+	idle   chan struct{}
+}
+
+func (gate *rpcAdmissionGate) admit() error {
+	gate.mu.Lock()
+	defer gate.mu.Unlock()
+	if gate.closed {
+		return contract.NewError(contract.ErrorSessionStopping, "root session is not accepting new RPC calls")
+	}
+	if gate.active == 0 {
+		gate.idle = make(chan struct{})
+	}
+	gate.active++
+	return nil
+}
+
+func (gate *rpcAdmissionGate) release() {
+	gate.mu.Lock()
+	defer gate.mu.Unlock()
+	gate.active--
+	if gate.active == 0 && gate.idle != nil {
+		close(gate.idle)
+		gate.idle = nil
+	}
+}
+
+// QuiesceRPC atomically closes new RPC admission and waits for every already
+// admitted call to return. It returns immediately when no call is active, or
+// snapshots the idle channel, releases the gate mutex, and only then waits for
+// idle/context so the in-flight call's deferred decrement can reacquire the
+// mutex and close the channel. Repeated callers are idempotent. It is used only
+// by the read-child terminal path; it never stops Pi, closes the listener,
+// mutates binding/model identity, or reopens admission.
+func (node *Node) QuiesceRPC(ctx context.Context) error {
+	gate := &node.rpcGate
+	gate.mu.Lock()
+	gate.closed = true
+	idle := gate.idle
+	hasActive := gate.active > 0
+	gate.mu.Unlock()
+	if !hasActive {
+		return nil
+	}
+	select {
+	case <-idle:
+		return nil
+	case <-ctx.Done():
+		return ctx.Err()
+	}
 }
 
 func (node *Node) Snapshot() NodeSnapshot {

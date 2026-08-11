@@ -12,7 +12,9 @@ import (
 	"path/filepath"
 	"reflect"
 	"strings"
+	"sync"
 	"testing"
+	"time"
 
 	"github.com/sklarsa/kanedias/internal/config"
 	"github.com/sklarsa/kanedias/internal/supervisor"
@@ -468,6 +470,338 @@ model_type = "missing-current-worker-default"
 	if len(nested[1].Policy.Workers) != len(originalPolicy.Workers) {
 		t.Fatalf("nested workers = %#v, want every role %#v", nested[1].Policy.Workers, originalPolicy.Workers)
 	}
+}
+
+func TestProductionReadFailurePublishesTypedMessageAndWaitsForAcknowledgement(t *testing.T) {
+	report := &recordingWriteCloser{onWrite: make(chan struct{}, 1)}
+	ackReport, ackAck := net.Pipe()
+	reporter := process.NewAcknowledgedReporter(context.Background(), report, ackAck, "session-child")
+
+	done := make(chan error, 1)
+	go func() {
+		done <- publishReadFailure(context.Background(), reporter,
+			contract.NewError(contract.ErrorChildAborted, "child was stopped"))
+	}()
+
+	select {
+	case <-report.onWrite:
+	case <-time.After(time.Second):
+		t.Fatal("typed failure was not published")
+	}
+	// The helper must remain blocked awaiting the parent acknowledgement before
+	// returning, so the runtime's deferred node teardown cannot precede ingestion.
+	select {
+	case err := <-done:
+		t.Fatalf("publishReadFailure returned before acknowledgement: %v", err)
+	case <-time.After(20 * time.Millisecond):
+	}
+	if _, err := ackReport.Write([]byte{process.TerminalAckByte}); err != nil {
+		t.Fatal(err)
+	}
+	_ = ackReport.Close()
+
+	var msg process.ChildMessage
+	if err := json.Unmarshal([]byte(report.String()), &msg); err != nil {
+		t.Fatalf("decode published failure: %v", err)
+	}
+	if msg.Type != process.MessageFailure || msg.Error == nil ||
+		msg.Error.Code != contract.ErrorChildAborted || msg.Error.Message != "child was stopped" ||
+		msg.SessionID != "session-child" {
+		t.Fatalf("published failure = %#v", msg)
+	}
+	if err := <-done; err == nil {
+		t.Fatal("publishReadFailure returned no error for a failed read")
+	}
+	if !reporter.TerminalSent() {
+		t.Fatal("terminal failure was not marked sent")
+	}
+}
+
+func TestProductionReadFailureMapsUntypedErrorToInternal(t *testing.T) {
+	report := &recordingWriteCloser{}
+	ackReport, ackAck := net.Pipe()
+	reporter := process.NewAcknowledgedReporter(context.Background(), report, ackAck, "session-child")
+	done := make(chan error, 1)
+	go func() {
+		done <- publishReadFailure(context.Background(), reporter, errors.New("boom"))
+	}()
+	if _, err := ackReport.Write([]byte{process.TerminalAckByte}); err != nil {
+		t.Fatal(err)
+	}
+	_ = ackReport.Close()
+	if err := <-done; err == nil {
+		t.Fatal("publishReadFailure returned no joined error")
+	}
+	var msg process.ChildMessage
+	if err := json.Unmarshal([]byte(report.String()), &msg); err != nil {
+		t.Fatalf("decode published failure: %v", err)
+	}
+	if msg.Error == nil || msg.Error.Code != contract.ErrorInternal || msg.Error.Message != "internal supervisor error" {
+		t.Fatalf("untyped failure mapped to %#v", msg.Error)
+	}
+}
+
+func TestInheritedCancellationPublishesNoTerminalFailure(t *testing.T) {
+	report := &recordingWriteCloser{}
+	ackReport, ackAck := net.Pipe()
+	defer func() { _ = ackAck.Close() }()
+	defer func() { _ = ackReport.Close() }()
+	reporter := process.NewAcknowledgedReporter(context.Background(), report, ackAck, "session-child")
+	ctx, cancel := context.WithCancel(context.Background())
+	cancel()
+	err := publishReadFailure(ctx, reporter, contract.NewError(contract.ErrorChildAborted, "child was stopped"))
+	if !errors.Is(err, context.Canceled) {
+		t.Fatalf("publishReadFailure returned %v, want context.Canceled under inherited cancellation", err)
+	}
+	if reporter.TerminalSent() {
+		t.Fatal("terminal failure published under inherited cancellation")
+	}
+	if report.String() != "" {
+		t.Fatalf("terminal report written under inherited cancellation: %q", report.String())
+	}
+}
+
+// TestProductionReadFailureDrainsAdmittedRPCBeforePublishing proves the Task 6L
+// ordering seam: an admitted abort-like Node.CallRPC stays blocked while the
+// read task observes aborted settlement, and no terminal failure is published
+// until that admitted RPC response is released. Only after the admitted RPC
+// returns exact success is the single typed child_aborted failure published,
+// acknowledged by the direct parent, and only then does runtime teardown run.
+func TestProductionReadFailureDrainsAdmittedRPCBeforePublishing(t *testing.T) {
+	report := &recordingWriteCloser{onWrite: make(chan struct{}, 1)}
+	ackReport, ackAck := net.Pipe()
+	defer func() { _ = ackReport.Close() }()
+	defer func() { _ = ackAck.Close() }()
+	reporter := process.NewAcknowledgedReporter(context.Background(), report, ackAck, "session-child")
+
+	configPath := filepath.Join(t.TempDir(), "config.toml")
+	if err := os.WriteFile(configPath, []byte(validChildRuntimeConfig()), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	t.Setenv("KANEDIAS_CONFIG", configPath)
+
+	bootstrap := runtimePolicyBootstrap(t)
+	bootstrap.SocketPath = filepath.Join(t.TempDir(), "child.sock")
+
+	abortReceived := make(chan struct{})
+	releaseAbort := make(chan struct{})
+	promptAcked := make(chan struct{})
+	emitSettlement := make(chan struct{})
+	settlementWritten := make(chan struct{})
+	serverDone := make(chan struct{})
+	abortReturned := make(chan struct{})
+
+	runtime := defaultProductionChildRuntime()
+	runtime.newChildProvisioner = func(context.Context, config.Config) (provision.ChildProvisioner, func(), error) {
+		return &recordingRuntimeChildProvisioner{}, func() {}, nil
+	}
+	runtime.newDirectChildRecoverer = func(context.Context, config.Config) (provision.DirectChildRecoverer, func(), error) {
+		return runtimeTestRecoverer{}, func() {}, nil
+	}
+	runtime.spawnChild = func(string) supervisor.ChildSpawner {
+		return func(context.Context, process.Bootstrap) (supervisor.ChildProcess, error) {
+			return nil, errors.New("unexpected child spawn")
+		}
+	}
+	runtime.descendantClient = func(string) (supervisor.DescendantClient, error) {
+		return nil, errors.New("unexpected descendant client")
+	}
+
+	// afterReady runs before RunReadTask, so the abort-like RPC is already
+	// admitted (and its response held) while the read task is running.
+	runtime.afterReady = func(_ context.Context, node *supervisor.Node) error {
+		go func() {
+			_, _ = node.CallRPC(context.Background(), json.RawMessage(`{"type":"abort"}`))
+			close(abortReturned)
+		}()
+		return nil
+	}
+
+	host, peer := net.Pipe()
+	runtime.dialRPC = func(context.Context, string) (io.ReadWriteCloser, error) { return host, nil }
+
+	go func() {
+		defer close(serverDone)
+		reader := bufio.NewReader(peer)
+		for {
+			line, err := reader.ReadBytes('\n')
+			if err != nil {
+				return
+			}
+			var command struct {
+				ID   string `json:"id"`
+				Type string `json:"type"`
+			}
+			if json.Unmarshal(line, &command) != nil {
+				continue
+			}
+			switch command.Type {
+			case "get_state":
+				_ = writeRuntimeResponse(peer, command.ID, "get_state", true, map[string]any{
+					"sessionId": "pi-child", "sessionFile": "/tmp/pi-child.jsonl", "isStreaming": false,
+					"model":         map[string]any{"provider": "admitted-provider", "id": "admitted-model"},
+					"thinkingLevel": "xhigh",
+				})
+			case "prompt":
+				if err := writeRuntimeResponse(peer, command.ID, "prompt", true, nil); err != nil {
+					return
+				}
+				close(promptAcked)
+			case "abort":
+				close(abortReceived)
+				go func(id string) {
+					<-releaseAbort
+					_ = writeRuntimeResponse(peer, id, "abort", true, nil)
+				}(command.ID)
+			}
+		}
+	}()
+
+	// Emit the aborted settlement only when the test is ready to observe it; the
+	// events are written to the transport so RunReadTask settles.
+	go func() {
+		defer close(settlementWritten)
+		<-emitSettlement
+		_, _ = peer.Write([]byte(`{"type":"message_end","message":{"role":"assistant","stopReason":"aborted"}}` + "\n"))
+		_, _ = peer.Write([]byte(`{"type":"agent_settled"}` + "\n"))
+	}()
+
+	runnerDone := make(chan error, 1)
+	go func() {
+		runnerDone <- productionChildRunnerWithRuntime(context.Background(), bootstrap, reporter, supervisor.NewEventBrokerWithOptions, runtime)
+	}()
+
+	select {
+	case <-abortReceived:
+	case err := <-runnerDone:
+		t.Fatalf("runner exited before abort was admitted: %v", err)
+	}
+	<-promptAcked
+	close(emitSettlement)
+	<-settlementWritten
+
+	// RunReadTask observes the aborted settlement and the runtime reaches the
+	// drain boundary. While the admitted abort RPC is still held, no terminal
+	// failure may be published: the runtime stays blocked in QuiesceRPC.
+	deadline := time.Now().Add(2 * time.Second)
+	for time.Now().Before(deadline) && !reporter.TerminalSent() {
+		time.Sleep(time.Millisecond)
+	}
+	if reporter.TerminalSent() {
+		t.Fatalf("terminal failure was published before the admitted abort RPC was released")
+	}
+
+	// Release the admitted abort RPC: it returns exact success, the drain
+	// completes, and exactly one typed child_aborted failure is published.
+	close(releaseAbort)
+	select {
+	case <-abortReturned:
+	case <-time.After(time.Second):
+		t.Fatal("admitted abort RPC did not return after release")
+	}
+	testWaitFor(t, func() bool { return reporter.TerminalSent() }, "typed child_aborted failure after drain")
+
+	var terminal *process.ChildMessage
+	failureCount := 0
+	dec := json.NewDecoder(bytes.NewReader([]byte(report.String())))
+	for {
+		var m process.ChildMessage
+		if err := dec.Decode(&m); err != nil {
+			break
+		}
+		if m.Type == process.MessageFailure {
+			failureCount++
+			terminal = &m
+		}
+	}
+	if terminal == nil || failureCount != 1 || terminal.Error == nil ||
+		terminal.Error.Code != contract.ErrorChildAborted || terminal.Error.Message != "read child was aborted" {
+		t.Fatalf("published terminal failure = %#v (failures=%d, report %q)", terminal, failureCount, report.String())
+	}
+
+	// Parent acknowledgement unblocks the report; only then does the deferred
+	// node teardown run and the runner return.
+	if _, err := ackReport.Write([]byte{process.TerminalAckByte}); err != nil {
+		t.Fatal(err)
+	}
+	_ = ackReport.Close()
+	select {
+	case err := <-runnerDone:
+		// The runner returns only after the acknowledged teardown, carrying the
+		// exact typed read failure (the child runtime's natural exit error).
+		var typed *contract.Error
+		if !errors.As(err, &typed) || typed.Code != contract.ErrorChildAborted {
+			t.Fatalf("runner error = %v, want child_aborted after acknowledgement", err)
+		}
+	case <-time.After(time.Second):
+		t.Fatal("runner did not finish after terminal acknowledgement")
+	}
+}
+
+func validChildRuntimeConfig() string {
+	return `[network]
+ipv4 = "10.76.111.1/24"
+[base_image]
+name = "sandbox"
+source = "images:"
+image = "debian/13"
+[session]
+model_type = "irrelevant"
+[supervisor.events]
+max_events = 7
+max_bytes = 1024
+`
+}
+
+func writeRuntimeResponse(peer net.Conn, id, command string, success bool, data any) error {
+	value := map[string]any{"id": id, "type": "response", "command": command, "success": success}
+	if data != nil {
+		value["data"] = data
+	}
+	wire, err := json.Marshal(value)
+	if err != nil {
+		return err
+	}
+	_, err = peer.Write(append(wire, '\n'))
+	return err
+}
+
+func testWaitFor(t *testing.T, condition func() bool, description string) {
+	t.Helper()
+	deadline := time.Now().Add(2 * time.Second)
+	for time.Now().Before(deadline) {
+		if condition() {
+			return
+		}
+		time.Sleep(time.Millisecond)
+	}
+	t.Fatalf("timed out waiting for %s", description)
+}
+
+// recordingWriteCloser captures report bytes and optionally signals once per write.
+type recordingWriteCloser struct {
+	mu      sync.Mutex
+	buf     bytes.Buffer
+	onWrite chan struct{}
+}
+
+func (w *recordingWriteCloser) Write(p []byte) (int, error) {
+	w.mu.Lock()
+	defer w.mu.Unlock()
+	w.buf.Write(p)
+	if w.onWrite != nil {
+		select {
+		case w.onWrite <- struct{}{}:
+		default:
+		}
+	}
+	return len(p), nil
+}
+
+func (w *recordingWriteCloser) String() string {
+	w.mu.Lock()
+	defer w.mu.Unlock()
+	return w.buf.String()
 }
 
 func runtimePolicyBootstrap(t *testing.T) process.Bootstrap {

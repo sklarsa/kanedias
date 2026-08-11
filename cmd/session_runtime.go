@@ -375,7 +375,23 @@ func productionChildRunnerWithRuntime(ctx context.Context, bootstrap process.Boo
 	case contract.ChildKindRead:
 		readResult, err := node.RunReadTask(ctx, bootstrap.Request.Task)
 		if err != nil {
-			return err
+			return publishReadFailureAfterDrain(ctx, node, reporter, err)
+		}
+		// A natural read result still quiesces already-admitted routed RPC
+		// handlers before the terminal success is acknowledged. When the
+		// inherited context already won, publish nothing (Task 6G parent-owned
+		// cancellation path).
+		if ctx.Err() != nil {
+			return ctx.Err()
+		}
+		drainCtx, cancelDrain := context.WithTimeout(context.WithoutCancel(ctx), supervisorCleanupTimeout)
+		drainErr := node.QuiesceRPC(drainCtx)
+		cancelDrain()
+		if drainErr != nil {
+			// A quiescence failure must never publish success; report one fixed
+			// privacy-safe internal failure and join the drain diagnostics.
+			return errors.Join(drainErr, publishReadFailure(context.WithoutCancel(ctx), reporter,
+				contract.NewError(contract.ErrorInternal, "read child RPC did not drain")))
 		}
 		return reporter.Read(readResult)
 	case contract.ChildKindWrite:
@@ -391,6 +407,48 @@ func productionChildRunnerWithRuntime(ctx context.Context, bootstrap process.Boo
 	default:
 		return contract.NewError(contract.ErrorConflict, "unsupported child kind")
 	}
+}
+
+// publishReadFailureAfterDrain quiesces every already-admitted Node.CallRPC
+// handler before publishing a read-child terminal failure, so the admitted
+// handler can return its exact response to the direct parent before the terminal
+// report is published and the child teardown starts. Inherited-context
+// cancellation skips terminal publication entirely (Task 6G parent-owned
+// cancellation path). An existing typed failure keeps its exact type after the
+// drain; a quiescence error is retained only in the joined local diagnostics and
+// never changes the published code/message.
+func publishReadFailureAfterDrain(ctx context.Context, node *supervisor.Node, reporter *process.Reporter, runErr error) error {
+	if ctx.Err() != nil {
+		return ctx.Err()
+	}
+	drainCtx, cancel := context.WithTimeout(context.WithoutCancel(ctx), supervisorCleanupTimeout)
+	defer cancel()
+	drainErr := node.QuiesceRPC(drainCtx)
+	reportErr := publishReadFailure(ctx, reporter, runErr)
+	return errors.Join(drainErr, reportErr)
+}
+
+// publishReadFailure publishes a typed privacy-safe terminal failure over the
+// inherited report/ack channels for a failed read child while its supervisor
+// transport is still live, so the runtime's deferred node teardown cannot close
+// Unix/SSE before the direct parent ingests and acknowledges the report. When the
+// inherited context is already cancelled, it publishes nothing and returns the
+// context error: parent-liveness cancellation is already the canonical signal and
+// must not produce a terminal report. reporter.Failure blocks for the exact
+// parent acknowledgement; parent-liveness cancellation still unblocks that wait.
+func publishReadFailure(ctx context.Context, reporter *process.Reporter, runErr error) error {
+	if ctx.Err() != nil {
+		return ctx.Err()
+	}
+	code := contract.ErrorInternal
+	message := "internal supervisor error"
+	var typed *contract.Error
+	if errors.As(runErr, &typed) {
+		code = typed.Code
+		message = typed.Message
+	}
+	reportErr := reporter.Failure(code, message)
+	return errors.Join(runErr, reportErr)
 }
 
 func recoverySocketIdentity(path string) (provision.SocketIdentity, error) {
